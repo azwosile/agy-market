@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "pluginRoot": ".",
+  "categories": ["productivity", "developer-tools"],
+  "tags": ["marketplace", "sidecar", "plugin-manager"],
+  "platforms": ["win32", "darwin", "linux"],
+  "releaseAsset": "agy-market.tar.gz",
+  "preservePaths": []
+}

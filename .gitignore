@@ -1,16 +1,7 @@
-# Dependencies & build caches
 node_modules/
-.cache/
 dist/
-out/
-*.tgz
-*.tar.gz
-*.sha256
-
-# Local runtime & OS files
+docs/
+.tmp/
+*.tmp
 .DS_Store
 Thumbs.db
-*.log
-*.old.*
-.env
-.env.*

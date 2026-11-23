@@ -1,0 +1,1524 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AGY Market · 反重力插件市场</title>
+  <script src="/preload.js"></script>
+  <style id="agy-market-styles">
+:root {
+  --m-bg: var(--color-background-primary, var(--vscode-editor-background, #0d0f14));
+  --m-surface: var(--color-background-secondary, var(--vscode-sideBar-background, #151923));
+  --m-surface-hover: var(--color-background-tertiary, #1c2230);
+  --m-border: var(--color-border-primary, rgba(148, 163, 184, 0.16));
+  --m-text: var(--color-text-primary, var(--vscode-foreground, #f1f5f9));
+  --m-muted: var(--color-text-secondary, #94a3b8);
+  --m-accent: #6366f1;
+  --m-accent-hover: #4f46e5;
+  --m-radius: 12px;
+  --m-font: var(--font-sans, -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif);
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --m-bg: var(--color-background-primary, #f8fafc);
+    --m-surface: var(--color-background-secondary, #ffffff);
+    --m-surface-hover: var(--color-background-tertiary, #f1f5f9);
+    --m-border: var(--color-border-primary, rgba(15, 23, 42, 0.12));
+    --m-text: var(--color-text-primary, #0f172a);
+    --m-muted: var(--color-text-secondary, #475569);
+  }
+}
+
+html[data-theme="light"] {
+  --m-bg: var(--color-background-primary, #f8fafc);
+  --m-surface: var(--color-background-secondary, #ffffff);
+  --m-surface-hover: var(--color-background-tertiary, #f1f5f9);
+  --m-border: var(--color-border-primary, rgba(15, 23, 42, 0.12));
+  --m-text: var(--color-text-primary, #0f172a);
+  --m-muted: var(--color-text-secondary, #475569);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html, body, #app {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  background: var(--m-bg);
+  color: var(--m-text);
+  font-family: var(--m-font);
+  font-size: 13px;
+  line-height: 1.45;
+  overflow: hidden;
+}
+
+.market-shell {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  width: 100%;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--m-border);
+  background: var(--m-surface);
+  flex-shrink: 0;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+}
+
+.brand-icon {
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  background: linear-gradient(135deg, #4f46e5, #7c3aed 55%, #06b6d4);
+  display: grid;
+  place-items: center;
+  color: #fff;
+  font-weight: 700;
+  font-size: 14px;
+  flex-shrink: 0;
+}
+
+.brand-title {
+  font-weight: 700;
+  font-size: 14px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.brand-sub {
+  font-size: 11px;
+  color: var(--m-muted);
+}
+
+.top-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.nav-tabs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--m-border);
+  background: var(--m-bg);
+  flex-shrink: 0;
+}
+
+.tab-btn {
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--m-muted);
+  padding: 6px 11px;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.tab-btn:hover {
+  background: var(--m-surface-hover);
+  color: var(--m-text);
+}
+
+.tab-btn.active {
+  background: rgba(99, 102, 241, 0.14);
+  color: #818cf8;
+  border-color: rgba(99, 102, 241, 0.35);
+}
+
+.count-pill {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(99, 102, 241, 0.22);
+  color: inherit;
+}
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--m-border);
+  flex-shrink: 0;
+}
+
+.search-input, .select-input, .text-input {
+  background: var(--m-surface);
+  color: var(--m-text);
+  border: 1px solid var(--m-border);
+  border-radius: 8px;
+  padding: 7px 10px;
+  font-size: 12px;
+  outline: none;
+}
+
+.search-input {
+  flex: 1 1 180px;
+}
+
+.search-input:focus, .select-input:focus, .text-input:focus {
+  border-color: var(--m-accent);
+}
+
+.track2-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  padding: 5px 10px;
+  border-radius: 8px;
+  border: 1px dashed var(--m-border);
+  background: var(--m-surface);
+  color: var(--m-muted);
+  cursor: pointer;
+  user-select: none;
+}
+
+.track2-toggle.enabled {
+  border-color: rgba(245, 158, 11, 0.45);
+  color: #fbbf24;
+  background: rgba(245, 158, 11, 0.08);
+}
+
+.main-scroll {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 12px 14px 28px;
+}
+
+.cards-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(270px, 1fr));
+  gap: 10px;
+}
+
+.plugin-card {
+  background: var(--m-surface);
+  border: 1px solid var(--m-border);
+  border-radius: var(--m-radius);
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  transition: border-color 0.15s ease, transform 0.12s ease;
+}
+
+.plugin-card:hover {
+  border-color: rgba(99, 102, 241, 0.45);
+}
+
+.card-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  cursor: pointer;
+}
+
+.plugin-logo {
+  width: 38px;
+  height: 38px;
+  border-radius: 9px;
+  background: rgba(99, 102, 241, 0.15);
+  border: 1px solid var(--m-border);
+  display: grid;
+  place-items: center;
+  font-weight: 700;
+  font-size: 15px;
+  color: #818cf8;
+  flex-shrink: 0;
+  overflow: hidden;
+}
+
+.plugin-logo img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.card-title-wrap {
+  min-width: 0;
+  flex: 1;
+}
+
+.card-title-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.card-title {
+  font-weight: 700;
+  font-size: 13.5px;
+}
+
+.version-tag {
+  font-size: 10.5px;
+  color: var(--m-muted);
+  background: var(--m-bg);
+  padding: 1px 6px;
+  border-radius: 5px;
+  border: 1px solid var(--m-border);
+}
+
+.track-tag {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 5px;
+  background: rgba(245, 158, 11, 0.14);
+  color: #fbbf24;
+}
+
+.card-slug {
+  font-size: 11px;
+  color: var(--m-muted);
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.card-desc {
+  font-size: 12px;
+  color: var(--m-text);
+  opacity: 0.9;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  margin: 0;
+  cursor: pointer;
+}
+
+.badge-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.cap-badge {
+  font-size: 10.5px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  white-space: nowrap;
+}
+
+.cap-badge.tone-green { background: rgba(16, 185, 129, 0.13); color: #34d399; border-color: rgba(16, 185, 129, 0.28); }
+.cap-badge.tone-blue { background: rgba(59, 130, 246, 0.13); color: #60a5fa; border-color: rgba(59, 130, 246, 0.28); }
+.cap-badge.tone-purple { background: rgba(168, 85, 247, 0.14); color: #c084fc; border-color: rgba(168, 85, 247, 0.3); }
+.cap-badge.tone-amber { background: rgba(245, 158, 11, 0.14); color: #fbbf24; border-color: rgba(245, 158, 11, 0.28); }
+.cap-badge.tone-cyan { background: rgba(6, 182, 212, 0.14); color: #22d3ee; border-color: rgba(6, 182, 212, 0.28); }
+.cap-badge.tone-orange { background: rgba(249, 115, 22, 0.14); color: #fb923c; border-color: rgba(249, 115, 22, 0.28); }
+/* Gentle, subtle informational styling for host-enhancement (CDP / app.asar) — never scary red! */
+.cap-badge.tone-subtle {
+  background: rgba(148, 163, 184, 0.12);
+  color: var(--m-text);
+  border-color: var(--m-border);
+}
+
+.card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: auto;
+  padding-top: 6px;
+  border-top: 1px solid var(--m-border);
+}
+
+.foot-links {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.btn {
+  border: 1px solid var(--m-border);
+  background: var(--m-surface-hover);
+  color: var(--m-text);
+  padding: 5px 11px;
+  border-radius: 7px;
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.btn:hover:not(:disabled) {
+  border-color: rgba(99, 102, 241, 0.5);
+}
+
+.btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.btn-primary {
+  background: var(--m-accent);
+  border-color: var(--m-accent);
+  color: #ffffff;
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: var(--m-accent-hover);
+}
+
+.btn-update {
+  background: #0ea5e9;
+  border-color: #0ea5e9;
+  color: #ffffff;
+}
+
+.pill-link {
+  font-size: 11px;
+  color: #818cf8;
+  text-decoration: none;
+  padding: 2px 7px;
+  border-radius: 6px;
+  background: rgba(99, 102, 241, 0.12);
+  border: 1px solid rgba(99, 102, 241, 0.25);
+}
+
+.pill-link:hover {
+  background: rgba(99, 102, 241, 0.22);
+}
+
+.empty-state {
+  text-align: center;
+  padding: 38px 18px;
+  border: 1px dashed var(--m-border);
+  border-radius: var(--m-radius);
+  background: var(--m-surface);
+  color: var(--m-muted);
+}
+
+.settings-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  max-width: 640px;
+}
+
+.field-card {
+  background: var(--m-surface);
+  border: 1px solid var(--m-border);
+  border-radius: var(--m-radius);
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.field-label {
+  font-weight: 600;
+  font-size: 12.5px;
+}
+
+.field-hint {
+  font-size: 11.5px;
+  color: var(--m-muted);
+  margin: 0;
+}
+
+.toast-bar {
+  position: fixed;
+  bottom: 14px;
+  right: 14px;
+  left: 14px;
+  background: var(--m-surface);
+  border: 1px solid rgba(99, 102, 241, 0.5);
+  border-radius: 10px;
+  padding: 10px 13px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.35);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  z-index: 60;
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(2, 6, 23, 0.68);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  z-index: 50;
+}
+
+.modal-box {
+  background: var(--m-surface);
+  border: 1px solid var(--m-border);
+  border-radius: 14px;
+  width: 100%;
+  max-width: 580px;
+  max-height: 86vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.modal-header {
+  padding: 13px 16px;
+  border-bottom: 1px solid var(--m-border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-weight: 700;
+}
+
+.modal-body {
+  padding: 14px 16px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.modal-footer {
+  padding: 11px 16px;
+  border-top: 1px solid var(--m-border);
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.meta-kv {
+  display: grid;
+  grid-template-columns: 110px 1fr;
+  gap: 5px 10px;
+  font-size: 11.5px;
+  padding: 10px;
+  border-radius: 8px;
+  background: var(--m-bg);
+  border: 1px solid var(--m-border);
+  word-break: break-all;
+}
+
+.md-pre {
+  background: var(--m-bg);
+  border: 1px solid var(--m-border);
+  padding: 9px 11px;
+  border-radius: 8px;
+  overflow-x: auto;
+  font-size: 11.5px;
+}
+
+.md-h { margin: 10px 0 4px; }
+.md-p { margin: 5px 0; }
+.md-ul { margin: 5px 0; padding-left: 18px; }
+.md-quote {
+  margin: 6px 0;
+  padding-left: 10px;
+  border-left: 3px solid var(--m-accent);
+  color: var(--m-muted);
+}
+.muted { color: var(--m-muted); }
+
+</style>
+</head>
+<body>
+  <div id="app"></div>
+  <script id="agy-market-bundle">
+(function(){
+'use strict';
+const __market_mod_2 = (function() {
+// Shared constants, capability badge metadata, host path resolvers & process hygiene (`src/shared/constants.mjs`).
+const PLUGIN_ID = 'agy-market';
+const PLUGIN_DISPLAY_NAME = 'AGY Market · 反重力插件市场';
+const PLUGIN_VERSION = '1.0.0';
+const SIDECAR_ID = 'market_pane';
+const SIDECAR_URI = 'sidecar://agy-market/market_pane/';
+const CUSTOMIZATION_URI = 'customization://agy-market';
+const MAX_TARBALL_BYTES = 100 * 1024 * 1024; // 100 MB
+const PRIMARY_CATALOG_BASE_URL = 'https://azwosile.github.io/agy-market-catalog';
+const RAW_GH_PAGES_CATALOG_BASE_URL = 'https://raw.githubusercontent.com/azwosile/agy-market-catalog/gh-pages';
+const PRIMARY_FETCH_TIMEOUT_MS = 3500;
+const CHINA_NPM_MIRRORS = Object.freeze([
+  'https://registry.npmmirror.com',
+  'https://mirrors.cloud.tencent.com/npm',
+]);
+const CATALOG_NPM_PACKAGE = '@agy-market/catalog';
+const PLUGIN_JSON_ALLOWED_KEYS = new Set([
+  'name',
+  'displayName',
+  'description',
+  'version',
+  'logo',
+  'author',
+  'homepage',
+  'repository',
+  'suggestedPrompts',
+  'disabled',
+]);
+const PRIVILEGE_ESCALATION_BADGES = new Set([
+  'lifecycle-hooks',
+  'mcp-stdio',
+  'mcp-remote',
+  'sidecar-ui',
+  'host-enhancement',
+  'global-rules',
+]);
+const CAPABILITY_BADGE_SPECS = Object.freeze({
+  'declarative-only': {
+    id: 'declarative-only',
+    tone: 'green',
+    icon: '🟢',
+    zh: '纯声明式 · 0进程',
+    en: 'Declarative · 0 Process',
+    descZh: '仅包含声明式 SKILL.md 或 Subagent，无后台常驻进程或钩子。',
+    descEn: 'Pure declarative skills/subagents with zero background processes or hooks.',
+  },
+  'global-rules': {
+    id: 'global-rules',
+    tone: 'blue',
+    icon: '🔵',
+    zh: '常驻规则 (~{tokens} tok)',
+    en: 'Global Rules (~{tokens} tok)',
+    descZh: '包含启用期间常驻注入上下文的 rules/*.md 规则文件。',
+    descEn: 'Includes rules/*.md active in prompt context while enabled.',
+  },
+  'sidecar-ui': {
+    id: 'sidecar-ui',
+    tone: 'purple',
+    icon: '🟣',
+    zh: 'Sidecar 面板 · 0 Token',
+    en: 'Sidecar Pane · 0 Token',
+    descZh: '在右侧辅助面板渲染独立 Web 界面，空闲时不消耗对话 Token。',
+    descEn: 'Renders a visual auxiliary Sidecar web pane with zero idle LLM token cost.',
+  },
+  'mcp-stdio': {
+    id: 'mcp-stdio',
+    tone: 'amber',
+    icon: '🟠',
+    zh: '本地 MCP 进程',
+    en: 'Local MCP Process',
+    descZh: '通过 mcp_config.json 启动本地 Stdio 工具服务进程。',
+    descEn: 'Spawns a local stdio MCP server process defined in mcp_config.json.',
+  },
+  'mcp-remote': {
+    id: 'mcp-remote',
+    tone: 'cyan',
+    icon: '🌐',
+    zh: '远程 MCP 服务',
+    en: 'Remote MCP Service',
+    descZh: '连接外部 HTTPS MCP 服务端点。',
+    descEn: 'Connects to an external HTTPS MCP server endpoint.',
+  },
+  'lifecycle-hooks': {
+    id: 'lifecycle-hooks',
+    tone: 'orange',
+    icon: '🔶',
+    zh: '生命周期钩子 (Hooks)',
+    en: 'Lifecycle Hooks',
+    descZh: '注册了 hooks.json 会话或工具生命周期拦截脚本。',
+    descEn: 'Registers lifecycle event hooks via hooks.json.',
+  },
+  'host-enhancement': {
+    id: 'host-enhancement',
+    tone: 'subtle',
+    icon: '💡',
+    zh: '💡 宿主界面增强',
+    en: '💡 Host UI Enhancement',
+    descZh: '使用本地 CDP 调试桥或工作台界面增强机制（如毛玻璃主题、挂件），社区完全允许，温和提示。',
+    descEn: 'Uses local CDP bridge or workbench UI enhancements (e.g. glass skins, companion widgets). Fully permitted.',
+  },
+});
+const CATEGORY_LABELS = Object.freeze({
+  all: { zh: '全部插件', en: 'All Plugins' },
+  productivity: { zh: '效率与工作流', en: 'Productivity' },
+  'ui-themes': { zh: '界面与主题美化', en: 'UI & Themes' },
+  'developer-tools': { zh: '开发者工具', en: 'Developer Tools' },
+  'mcp-integrations': { zh: 'MCP 服务集成', en: 'MCP Integrations' },
+  'skills-workflows': { zh: '技能与自动化', en: 'Skills & Workflows' },
+  'data-science': { zh: '数据与科学计算', en: 'Data & Science' },
+  'cloud-devops': { zh: '云原生与部署', en: 'Cloud & DevOps' },
+  'creative-media': { zh: '设计与多媒体', en: 'Creative & Media' },
+  'writing-knowledge': { zh: '写作与知识库', en: 'Writing & Knowledge' },
+  automation: { zh: '定时与守护任务', en: 'Automation' },
+  security: { zh: '安全与审计', en: 'Security' },
+  other: { zh: '其他扩展', en: 'Other' },
+});
+const DEFAULT_PREFS = Object.freeze({
+  schemaVersion: 1,
+  locale: 'zh',
+  enableExperimentalTrack2: false,
+  networkMode: 'auto', // 'auto' | 'china-mirror' | 'direct'
+  primaryCatalogUrl: PRIMARY_CATALOG_BASE_URL,
+  githubReleaseMirrorPrefix: '',
+  customFeeds: [],
+});
+function formatBadgeLabel(badgeId, capabilities = {}, locale = 'zh') {
+  const spec = CAPABILITY_BADGE_SPECS[badgeId];
+  if (!spec) return badgeId;
+  const tpl = locale === 'en' ? spec.en : spec.zh;
+  const tokens = Number(capabilities?.rulesEstimatedTokens || 0);
+  return tpl.replace('{tokens}', tokens > 0 ? String(tokens) : '0');
+}
+function toScopedPluginName(owner, slug) {
+  const cleanOwner = String(owner || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, '-')
+    .replace(/-{2,}/g, '-')
+    .replace(/^-+|-+$/g, '');
+  const cleanSlug = String(slug || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, '-')
+    .replace(/-{2,}/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return `${cleanOwner}--${cleanSlug}`;
+}
+
+/**
+ * Scrubs `ELECTRON_RUN_AS_NODE` so any optional child tool never spawns duplicate Antigravity IDE windows.
+ */
+function scrubChildProcessEnv(baseEnv = process.env) {
+  const clean = { ...baseEnv };
+  delete clean.ELECTRON_RUN_AS_NODE;
+  return clean;
+}
+
+return { formatBadgeLabel: formatBadgeLabel, toScopedPluginName: toScopedPluginName, scrubChildProcessEnv: scrubChildProcessEnv, PLUGIN_ID: PLUGIN_ID, PLUGIN_DISPLAY_NAME: PLUGIN_DISPLAY_NAME, PLUGIN_VERSION: PLUGIN_VERSION, SIDECAR_ID: SIDECAR_ID, SIDECAR_URI: SIDECAR_URI, CUSTOMIZATION_URI: CUSTOMIZATION_URI, MAX_TARBALL_BYTES: MAX_TARBALL_BYTES, PRIMARY_CATALOG_BASE_URL: PRIMARY_CATALOG_BASE_URL, RAW_GH_PAGES_CATALOG_BASE_URL: RAW_GH_PAGES_CATALOG_BASE_URL, PRIMARY_FETCH_TIMEOUT_MS: PRIMARY_FETCH_TIMEOUT_MS, CHINA_NPM_MIRRORS: CHINA_NPM_MIRRORS, CATALOG_NPM_PACKAGE: CATALOG_NPM_PACKAGE, PLUGIN_JSON_ALLOWED_KEYS: PLUGIN_JSON_ALLOWED_KEYS, PRIVILEGE_ESCALATION_BADGES: PRIVILEGE_ESCALATION_BADGES, CAPABILITY_BADGE_SPECS: CAPABILITY_BADGE_SPECS, CATEGORY_LABELS: CATEGORY_LABELS, DEFAULT_PREFS: DEFAULT_PREFS };
+})();
+
+const __market_mod_3 = (function() {
+// Safe zero-dependency Markdown-to-HTML renderer for plugin README previews (`src/ui/markdown.mjs`).
+// Escapes all raw HTML first so untrusted READMEs cannot inject scripts or event handlers.
+function escapeHtml(str) {
+  return String(str ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function formatInline(escapedLine) {
+  return escapedLine
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*([^*]+)\*/g, '<em>$1</em>')
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+|sidecar:\/\/[^\s)]+|customization:\/\/[^\s)]+)\)/g, (_m, label, url) => {
+      return `<a href="${url}" target="_blank" rel="noopener noreferrer" class="md-link">${label}</a>`;
+    });
+}
+function renderSafeMarkdown(rawMd) {
+  const src = String(rawMd || '').trim();
+  if (!src) return '<p class="muted">暂无 README 文档 / No README provided.</p>';
+
+  const lines = src.replace(/\r\n/g, '\n').split('\n');
+  const out = [];
+  let inCode = false;
+  let codeBuf = [];
+  let inList = false;
+
+  const closeList = () => {
+    if (inList) {
+      out.push('</ul>');
+      inList = false;
+    }
+  };
+
+  for (const rawLine of lines) {
+    if (rawLine.trim().startsWith('```')) {
+      closeList();
+      if (!inCode) {
+        inCode = true;
+        codeBuf = [];
+      } else {
+        out.push(`<pre class="md-pre"><code>${escapeHtml(codeBuf.join('\n'))}</code></pre>`);
+        inCode = false;
+      }
+      continue;
+    }
+    if (inCode) {
+      codeBuf.push(rawLine);
+      continue;
+    }
+
+    const trimmed = rawLine.trim();
+    if (!trimmed) {
+      closeList();
+      continue;
+    }
+
+    const hMatch = /^(#{1,4})\s+(.*)$/.exec(trimmed);
+    if (hMatch) {
+      closeList();
+      const lvl = hMatch[1].length + 1;
+      out.push(`<h${lvl} class="md-h">${formatInline(escapeHtml(hMatch[2]))}</h${lvl}>`);
+      continue;
+    }
+
+    const liMatch = /^[-*+]\s+(.*)$/.exec(trimmed);
+    if (liMatch) {
+      if (!inList) {
+        out.push('<ul class="md-ul">');
+        inList = true;
+      }
+      out.push(`<li>${formatInline(escapeHtml(liMatch[1]))}</li>`);
+      continue;
+    }
+
+    closeList();
+    if (trimmed.startsWith('>')) {
+      out.push(`<blockquote class="md-quote">${formatInline(escapeHtml(trimmed.replace(/^>\s?/, '')))}</blockquote>`);
+    } else {
+      out.push(`<p class="md-p">${formatInline(escapeHtml(trimmed))}</p>`);
+    }
+  }
+
+  closeList();
+  if (inCode && codeBuf.length) {
+    out.push(`<pre class="md-pre"><code>${escapeHtml(codeBuf.join('\n'))}</code></pre>`);
+  }
+  return out.join('\n');
+}
+
+return { escapeHtml: escapeHtml, renderSafeMarkdown: renderSafeMarkdown };
+})();
+
+const __market_mod_1 = (function() {
+const CAPABILITY_BADGE_SPECS = __market_mod_2.CAPABILITY_BADGE_SPECS;
+const CATEGORY_LABELS = __market_mod_2.CATEGORY_LABELS;
+const formatBadgeLabel = __market_mod_2.formatBadgeLabel;
+const escapeHtml = __market_mod_3.escapeHtml;
+const renderSafeMarkdown = __market_mod_3.renderSafeMarkdown;
+// Visual AGY Market Sidecar Application (`src/ui/app.mjs`).
+// Zero external dependencies; bundled into `sidecars/market_pane/index.html`.
+
+
+
+const state = {
+  loading: true,
+  busyId: '',
+  activeTab: 'discover', // 'discover' | 'installed' | 'sources'
+  search: '',
+  category: 'all',
+  sortBy: 'stars', // 'stars' | 'updated' | 'name'
+  serverState: null,
+  workspaceUris: [],
+  detailPlugin: null,
+  detailReadme: '',
+  detailLoading: false,
+  conflictModal: null, // { plugin, conflict, scopedFallbackName, choices }
+  escalationModal: null, // { plugin, installedVersion, targetVersion, escalation }
+  toast: null,
+};
+
+function getBootToken() {
+  const params = new URLSearchParams(window.location.search);
+  return params.get('token') || window.__SIDECAR_BOOT__?.token || '';
+}
+
+async function apiFetch(path, { method = 'GET', body = null } = {}) {
+  const token = getBootToken();
+  const headers = {};
+  if (token) headers['X-Sidecar-Token'] = token;
+  if (body !== null) headers['Content-Type'] = 'application/json';
+
+  const fn =
+    window.sidecar?.__marketFetch ||
+    window.sidecar?.fetch?.bind(window.sidecar) ||
+    window.fetch.bind(window);
+
+  const res = await fn(path, {
+    method,
+    headers,
+    body: body !== null ? JSON.stringify(body) : undefined,
+  });
+  const data = await res.json().catch(() => ({ ok: false, error: `HTTP ${res.status}` }));
+  if (!res.ok && !data.status) {
+    throw new Error(data.error || `HTTP ${res.status}`);
+  }
+  return data;
+}
+
+function t(zh, en) {
+  const loc = state.serverState?.prefs?.locale || 'zh';
+  return loc === 'en' ? en : zh;
+}
+
+function showToast(message, extraUri = '') {
+  state.toast = { message, extraUri };
+  render();
+  setTimeout(() => {
+    if (state.toast?.message === message) {
+      state.toast = null;
+      render();
+    }
+  }, 6000);
+}
+
+async function loadState(forceRefresh = false) {
+  state.loading = true;
+  render();
+  try {
+    if (window.sidecar?.getWorkspaceUris) {
+      state.workspaceUris = await window.sidecar.getWorkspaceUris().catch(() => []);
+    }
+    if (forceRefresh) {
+      state.serverState = await apiFetch('/api/catalog/refresh', {
+        method: 'POST',
+        body: { workspaceUris: state.workspaceUris },
+      });
+    } else {
+      const qs = state.workspaceUris.length
+        ? `?workspaceUris=${encodeURIComponent(state.workspaceUris.join(','))}`
+        : '';
+      state.serverState = await apiFetch(`/api/state${qs}`);
+    }
+  } catch (err) {
+    showToast(`${t('加载失败', 'Load failed')}: ${err?.message || String(err)}`);
+  } finally {
+    state.loading = false;
+    render();
+  }
+}
+
+async function triggerInstall(plugin, { conflictStrategy = 'prompt', confirmEscalation = false } = {}) {
+  state.busyId = plugin.id;
+  render();
+  try {
+    const endpoint = plugin.installStatus?.installed ? '/api/update' : '/api/install';
+    const res = await apiFetch(endpoint, {
+      method: 'POST',
+      body: {
+        id: plugin.id,
+        plugin,
+        conflictStrategy,
+        confirmEscalation,
+        workspaceUris: state.workspaceUris,
+      },
+    });
+
+    if (res.state) {
+      state.serverState = res.state;
+    }
+
+    if (res.status === 'CONFLICT_CHOICE_REQUIRED') {
+      state.conflictModal = {
+        plugin,
+        conflict: res.conflict,
+        scopedFallbackName: res.scopedFallbackName,
+        choices: res.choices || ['isolate'],
+      };
+      return;
+    }
+
+    if (res.status === 'CAPABILITY_ESCALATION_CONFIRM_REQUIRED') {
+      state.escalationModal = {
+        plugin,
+        installedVersion: res.installedVersion,
+        targetVersion: res.targetVersion,
+        escalation: res.escalation,
+      };
+      return;
+    }
+
+    if (res.ok) {
+      state.conflictModal = null;
+      state.escalationModal = null;
+      const noteSuffix = res.compatibilityNotes?.length ? ` (${res.compatibilityNotes[0]})` : '';
+      showToast(
+        `${t('已就绪并立即启用', 'Installed & active')}: ${res.installedDir} v${res.version}${noteSuffix}`,
+        res.sidecarPane?.uri || res.customizationUri || '',
+      );
+    } else {
+      showToast(res.error || t('安装未完成', 'Install did not complete'));
+    }
+  } catch (err) {
+    showToast(`${t('安装失败', 'Install error')}: ${err?.message || String(err)}`);
+  } finally {
+    state.busyId = '';
+    render();
+  }
+}
+
+async function openPluginDetail(plugin) {
+  state.detailPlugin = plugin;
+  state.detailReadme = '';
+  state.detailLoading = true;
+  render();
+  try {
+    const res = await apiFetch(`/api/readme?id=${encodeURIComponent(plugin.id)}`);
+    state.detailReadme = res.markdown || '';
+  } catch {
+    state.detailReadme = '';
+  } finally {
+    state.detailLoading = false;
+    render();
+  }
+}
+
+async function updatePrefs(patch) {
+  try {
+    state.loading = true;
+    render();
+    state.serverState = await apiFetch('/api/prefs', {
+      method: 'POST',
+      body: { ...patch, workspaceUris: state.workspaceUris },
+    });
+    showToast(t('已保存源与网络加速设置', 'Saved catalog & mirror preferences'));
+  } catch (err) {
+    showToast(`${t('保存失败', 'Save error')}: ${err?.message || String(err)}`);
+  } finally {
+    state.loading = false;
+    render();
+  }
+}
+
+function renderBadgesHtml(capabilities = {}) {
+  const loc = state.serverState?.prefs?.locale || 'zh';
+  const badges = Array.isArray(capabilities.badges) ? capabilities.badges : [];
+  return badges
+    .map((id) => {
+      const spec = CAPABILITY_BADGE_SPECS[id] || { tone: 'subtle', descZh: id, descEn: id };
+      const label = formatBadgeLabel(id, capabilities, loc);
+      const tip = loc === 'en' ? spec.descEn : spec.descZh;
+      return `<span class="cap-badge tone-${escapeHtml(spec.tone)}" title="${escapeHtml(tip)}">${escapeHtml(label)}</span>`;
+    })
+    .join('');
+}
+
+function getFilteredPlugins() {
+  const list = state.serverState?.catalog?.plugins || [];
+  const loc = state.serverState?.prefs?.locale || 'zh';
+  const q = state.search.trim().toLowerCase();
+
+  const filtered = list.filter((p) => {
+    if (state.category !== 'all') {
+      const cats = p.taxonomy?.categories || [];
+      if (!cats.includes(state.category)) return false;
+    }
+    if (!q) return true;
+    const desc = typeof p.description === 'object' ? `${p.description.zh || ''} ${p.description.en || ''}` : String(p.description || '');
+    const hay = `${p.displayName || ''} ${p.canonicalName || ''} ${p.scopedName || ''} ${p.id || ''} ${desc} ${(p.taxonomy?.tags || []).join(' ')}`.toLowerCase();
+    return hay.includes(q);
+  });
+
+  filtered.sort((a, b) => {
+    if (state.sortBy === 'updated') {
+      return String(b.updatedAt || '').localeCompare(String(a.updatedAt || ''));
+    }
+    if (state.sortBy === 'name') {
+      return String(a.displayName || a.canonicalName).localeCompare(String(b.displayName || b.canonicalName), loc);
+    }
+    return Number(b.repository?.stars || 0) - Number(a.repository?.stars || 0);
+  });
+
+  return filtered;
+}
+
+function renderPluginCard(p) {
+  const loc = state.serverState?.prefs?.locale || 'zh';
+  const desc =
+    typeof p.description === 'object'
+      ? p.description[loc] || p.description.zh || p.description.en || ''
+      : String(p.description || '');
+  const st = p.installStatus || {};
+  const isBusy = state.busyId === p.id;
+  const monogram = String(p.displayName || p.canonicalName || 'P').trim().charAt(0).toUpperCase();
+
+  let actionBtn = '';
+  if (isBusy) {
+    actionBtn = `<button class="btn btn-primary" disabled>${t('处理中…', 'Working…')}</button>`;
+  } else if (st.installed && st.hasUpdate) {
+    actionBtn = `<button class="btn btn-update" data-action="install" data-id="${escapeHtml(p.id)}">${t(`更新 v${p.version}`, `Update v${p.version}`)}</button>`;
+  } else if (st.installed) {
+    actionBtn = `<button class="btn" disabled>${t('已安装', 'Installed')} ✓</button>`;
+  } else {
+    actionBtn = `<button class="btn btn-primary" data-action="install" data-id="${escapeHtml(p.id)}">${t('一键安装', 'Install')}</button>`;
+  }
+
+  const effectiveSlug = p.forceScopedInstall ? p.scopedName : p.canonicalName;
+
+  return `
+    <article class="plugin-card">
+      <div class="card-head" data-action="detail" data-id="${escapeHtml(p.id)}">
+        <div class="plugin-logo">
+          ${p.media?.iconUrl ? `<img src="${escapeHtml(p.media.iconUrl)}" alt="" loading="lazy" onerror="this.remove()" />` : escapeHtml(monogram)}
+        </div>
+        <div class="card-title-wrap">
+          <div class="card-title-row">
+            <span class="card-title">${escapeHtml(p.displayName || p.canonicalName)}</span>
+            <span class="version-tag">v${escapeHtml(p.version)}</span>
+            ${p.forceScopedInstall ? `<span class="track-tag" title="Track 2 Experimental Topic">${t('实验源·隔离安装', 'Track-2 Scoped')}</span>` : ''}
+          </div>
+          <div class="card-slug">${escapeHtml(effectiveSlug)} · ★ ${Number(p.repository?.stars || 0)}</div>
+        </div>
+      </div>
+
+      <p class="card-desc" data-action="detail" data-id="${escapeHtml(p.id)}">${escapeHtml(desc)}</p>
+
+      <div class="badge-row">
+        ${renderBadgesHtml(p.capabilities)}
+      </div>
+
+      <div class="card-foot">
+        <div class="foot-links">
+          ${st.sidecarPane?.uri ? `<a class="pill-link" href="${escapeHtml(st.sidecarPane.uri)}">${t('打开面板', 'Open Pane')}</a>` : ''}
+          ${st.customizationUri ? `<a class="pill-link" href="${escapeHtml(st.customizationUri)}">${t('管理', 'Manage')}</a>` : ''}
+        </div>
+        ${actionBtn}
+      </div>
+    </article>
+  `;
+}
+
+function renderDiscoverView() {
+  const prefs = state.serverState?.prefs || {};
+  const loc = prefs.locale || 'zh';
+  const plugins = getFilteredPlugins();
+
+  const categoryOpts = Object.entries(CATEGORY_LABELS)
+    .map(
+      ([key, labels]) =>
+        `<option value="${escapeHtml(key)}" ${state.category === key ? 'selected' : ''}>${escapeHtml(labels[loc] || labels.zh)}</option>`,
+    )
+    .join('');
+
+  return `
+    <div class="toolbar">
+      <input
+        id="market-search-input"
+        class="search-input"
+        type="search"
+        placeholder="${escapeHtml(t('搜索插件名称、功能、MCP 或标签…', 'Search plugins, capabilities, or tags…'))}"
+        value="${escapeHtml(state.search)}"
+      />
+      <select id="market-cat-select" class="select-input">${categoryOpts}</select>
+      <select id="market-sort-select" class="select-input">
+        <option value="stars" ${state.sortBy === 'stars' ? 'selected' : ''}>${escapeHtml(t('按星标排序', 'Most Stars'))}</option>
+        <option value="updated" ${state.sortBy === 'updated' ? 'selected' : ''}>${escapeHtml(t('最近更新', 'Recently Updated'))}</option>
+        <option value="name" ${state.sortBy === 'name' ? 'selected' : ''}>${escapeHtml(t('按名称排序', 'Name A-Z'))}</option>
+      </select>
+      <label class="track2-toggle ${prefs.enableExperimentalTrack2 ? 'enabled' : ''}">
+        <input id="track2-checkbox" type="checkbox" ${prefs.enableExperimentalTrack2 ? 'checked' : ''} style="margin:0" />
+        <span>${escapeHtml(t('实验性 Topic 自动发现 (Track 2)', 'Experimental Topic Feed (Track 2)'))}</span>
+      </label>
+    </div>
+
+    <div class="main-scroll">
+      ${
+        state.loading && !plugins.length
+          ? `<div class="empty-state">${escapeHtml(t('正在同步实时插件目录…', 'Syncing live plugin catalog…'))}</div>`
+          : plugins.length
+            ? `<div class="cards-grid">${plugins.map(renderPluginCard).join('')}</div>`
+            : `<div class="empty-state">
+                <div style="font-weight:700;margin-bottom:6px">${escapeHtml(t('当前筛选条件下暂无插件', 'No matching plugins in current feed'))}</div>
+                <div>${escapeHtml(t('可在「镜像与源设置」配置自定义目录源，或前往 agy-market-catalog 提交首个社区插件 PR。', 'Configure a custom feed in Sources or submit a YAML PR in agy-market-catalog.'))}</div>
+              </div>`
+      }
+    </div>
+  `;
+}
+
+function renderInstalledView() {
+  const installed = state.serverState?.installed || [];
+  const updatesMap = new Map((state.serverState?.updatesAvailable || []).map((u) => [u.installedDir, u]));
+  const catalogById = new Map((state.serverState?.catalog?.plugins || []).map((p) => [p.id, p]));
+
+  return `
+    <div class="main-scroll">
+      ${
+        installed.length === 0
+          ? `<div class="empty-state">${escapeHtml(t('尚未检测到已安装的插件。', 'No local plugins detected yet.'))}</div>`
+          : `<div class="cards-grid">
+              ${installed
+                .map((loc) => {
+                  const upd = updatesMap.get(loc.dir);
+                  const catEntry = upd ? catalogById.get(upd.id) : loc.receipt ? catalogById.get(loc.receipt.id) : null;
+                  return `
+                    <article class="plugin-card">
+                      <div class="card-head">
+                        <div class="plugin-logo">${escapeHtml(loc.displayName.charAt(0).toUpperCase())}</div>
+                        <div class="card-title-wrap">
+                          <div class="card-title-row">
+                            <span class="card-title">${escapeHtml(loc.displayName)}</span>
+                            <span class="version-tag">v${escapeHtml(loc.version)}</span>
+                            <span class="cap-badge ${loc.enabled ? 'tone-green' : 'tone-subtle'}">${escapeHtml(loc.enabled ? t('已启用', 'Enabled') : t('已停用', 'Disabled'))}</span>
+                          </div>
+                          <div class="card-slug">${escapeHtml(loc.dir)} · ${escapeHtml(loc.scope)}</div>
+                        </div>
+                      </div>
+                      <p class="card-desc">${escapeHtml(loc.description || '')}</p>
+                      ${loc.receipt?.grantedCapabilities ? `<div class="badge-row">${renderBadgesHtml(loc.receipt.grantedCapabilities)}</div>` : ''}
+                      <div class="card-foot">
+                        <div class="foot-links">
+                          ${loc.sidecarPane?.uri ? `<a class="pill-link" href="${escapeHtml(loc.sidecarPane.uri)}">${escapeHtml(t('打开面板', 'Open Pane'))}</a>` : ''}
+                          <a class="pill-link" href="${escapeHtml(loc.customizationUri)}">${escapeHtml(t('启用/停用/卸载', 'Manage in Host'))}</a>
+                        </div>
+                        ${
+                          upd && catEntry
+                            ? `<button class="btn btn-update" data-action="install" data-id="${escapeHtml(catEntry.id)}">${escapeHtml(t(`升级至 v${upd.latestVersion}`, `Update v${upd.latestVersion}`))}</button>`
+                            : ''
+                        }
+                      </div>
+                    </article>
+                  `;
+                })
+                .join('')}
+            </div>`
+      }
+    </div>
+  `;
+}
+
+function renderSourcesView() {
+  const prefs = state.serverState?.prefs || {};
+  const cat = state.serverState?.catalog || {};
+  const customLines = (prefs.customFeeds || []).join('\n');
+
+  return `
+    <div class="main-scroll">
+      <form id="sources-form" class="settings-panel">
+        <div class="field-card">
+          <div class="field-label">${escapeHtml(t('当前目录通道状态', 'Active Catalog Transport'))}</div>
+          <p class="field-hint">
+            ${escapeHtml(t('通道', 'Channel'))}: <strong>${escapeHtml(cat.channelUsed || 'n/a')}</strong> ·
+            ${escapeHtml(t('目录版本', 'Catalog Version'))}: <strong>${escapeHtml(cat.catalogVersion || 'n/a')}</strong>
+          </p>
+        </div>
+
+        <div class="field-card">
+          <label class="field-label" for="net-mode-select">${escapeHtml(t('目录镜像与国内网络模式', 'Catalog Mirror & Network Mode'))}</label>
+          <p class="field-hint">${escapeHtml(t('自动模式下优先通过 ETag 304 请求 GitHub Pages，超时 (>3.5s) 自动无缝切换至 npmmirror / 腾讯云 @agy-market/catalog 纯 JSON 镜像包。', 'Auto mode queries GitHub Pages with ETag 304 and falls back to @agy-market/catalog on npmmirror / Tencent mirror on timeout.'))}</p>
+          <select id="net-mode-select" class="select-input">
+            <option value="auto" ${prefs.networkMode === 'auto' ? 'selected' : ''}>${escapeHtml(t('自动切换 (GitHub Pages -> 国内镜像兜底)', 'Auto (GitHub Pages -> China Mirror Fallback)'))}</option>
+            <option value="china-mirror" ${prefs.networkMode === 'china-mirror' ? 'selected' : ''}>${escapeHtml(t('国内镜像优先 (npmmirror / 腾讯云)', 'China Mirror Priority (npmmirror / Tencent)'))}</option>
+            <option value="direct" ${prefs.networkMode === 'direct' ? 'selected' : ''}>${escapeHtml(t('仅直连主源 (Direct Only)', 'Direct Primary Only'))}</option>
+          </select>
+        </div>
+
+        <div class="field-card">
+          <label class="field-label" for="mirror-prefix-input">${escapeHtml(t('GitHub Release 下载加速前缀 (SHA-256 强校验防篡改)', 'GitHub Release Download Mirror Prefix (SHA-256 Verified)'))}</label>
+          <p class="field-hint">${escapeHtml(t('可选。例如填写加速代理前缀后，下载的 .tar.gz 仍会强制比对权威目录中的 SHA-256 摘要，杜绝任何中间人篡改。', 'Optional mirror prefix for GitHub Release tarballs. Every download is verified against the catalog SHA-256 before unpacking.'))}</p>
+          <input id="mirror-prefix-input" class="text-input" type="text" placeholder="https://mirror.example.com/" value="${escapeHtml(prefs.githubReleaseMirrorPrefix || '')}" />
+        </div>
+
+        <div class="field-card">
+          <label class="field-label" for="primary-url-input">${escapeHtml(t('主目录源地址 (Primary Catalog Base URL)', 'Primary Catalog Base URL'))}</label>
+          <input id="primary-url-input" class="text-input" type="url" value="${escapeHtml(prefs.primaryCatalogUrl || '')}" />
+        </div>
+
+        <div class="field-card">
+          <label class="field-label" for="custom-feeds-textarea">${escapeHtml(t('自定义 / 团队私有静态源 (每行一个 index.json URL)', 'Custom / Team Static Feeds (one index.json URL per line)'))}</label>
+          <textarea id="custom-feeds-textarea" class="text-input" rows="3" placeholder="https://plugins.internal.example/index.json">${escapeHtml(customLines)}</textarea>
+        </div>
+
+        <div>
+          <button type="submit" class="btn btn-primary">${escapeHtml(t('保存并重新同步目录', 'Save & Revalidate Catalog'))}</button>
+        </div>
+      </form>
+    </div>
+  `;
+}
+
+function renderModals() {
+  let html = '';
+
+  if (state.detailPlugin) {
+    const p = state.detailPlugin;
+    html += `
+      <div class="modal-backdrop" data-action="close-modal">
+        <div class="modal-box" onclick="event.stopPropagation()">
+          <div class="modal-header">
+            <span>${escapeHtml(p.displayName || p.canonicalName)} <span class="version-tag">v${escapeHtml(p.version)}</span></span>
+            <button class="btn" data-action="close-modal">✕</button>
+          </div>
+          <div class="modal-body">
+            <div class="badge-row">${renderBadgesHtml(p.capabilities)}</div>
+            <div class="meta-kv">
+              <span class="muted">ID / Name</span><span>${escapeHtml(p.id)} (${escapeHtml(p.forceScopedInstall ? p.scopedName : p.canonicalName)})</span>
+              <span class="muted">Repository</span><span><a class="pill-link" href="${escapeHtml(p.repository?.url || '#')}" target="_blank" rel="noopener noreferrer">${escapeHtml(p.repository?.url || '')}</a></span>
+              <span class="muted">Git Tag / SHA</span><span>${escapeHtml(p.gitTag || '')} · ${escapeHtml(String(p.commitSha || '').slice(0, 12))}</span>
+              <span class="muted">SHA-256</span><span>${escapeHtml(p.distribution?.sha256 || '')}</span>
+            </div>
+            <div>
+              ${state.detailLoading ? `<p class="muted">${escapeHtml(t('正在加载 README…', 'Loading README…'))}</p>` : renderSafeMarkdown(state.detailReadme)}
+            </div>
+          </div>
+          <div class="modal-footer">
+            <button class="btn" data-action="close-modal">${escapeHtml(t('关闭', 'Close'))}</button>
+            <button class="btn btn-primary" data-action="install" data-id="${escapeHtml(p.id)}">${escapeHtml(p.installStatus?.installed ? t('重新同步 / 更新', 'Sync / Update') : t('立即安装并启用', 'Install Now'))}</button>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  if (state.conflictModal) {
+    const cm = state.conflictModal;
+    html += `
+      <div class="modal-backdrop" data-action="close-modal">
+        <div class="modal-box" onclick="event.stopPropagation()">
+          <div class="modal-header">
+            <span>${escapeHtml(t('检测到本地同名插件冲突', 'Local Plugin Name Collision Detected'))}</span>
+            <button class="btn" data-action="close-modal">✕</button>
+          </div>
+          <div class="modal-body">
+            <p>${escapeHtml(t(`本地已存在来自其他来源的插件 "${cm.conflict.dir}" (${cm.conflict.scope})。Antigravity 对同名插件会静默丢弃后者，请选择安装方式：`, `A local plugin "${cm.conflict.dir}" (${cm.conflict.scope}) already claims this identifier. Choose how to proceed:`))}</p>
+          </div>
+          <div class="modal-footer">
+            <button class="btn" data-action="close-modal">${escapeHtml(t('取消', 'Cancel'))}</button>
+            ${
+              cm.choices.includes('replace')
+                ? `<button class="btn" data-action="resolve-conflict" data-strategy="replace">${escapeHtml(t('覆盖替换本地同名插件', 'Replace Existing Local Plugin'))}</button>`
+                : ''
+            }
+            <button class="btn btn-primary" data-action="resolve-conflict" data-strategy="isolate">
+              ${escapeHtml(t(`隔离安装为 ${cm.scopedFallbackName}`, `Install Isolated as ${cm.scopedFallbackName}`))}
+            </button>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  if (state.escalationModal) {
+    const em = state.escalationModal;
+    html += `
+      <div class="modal-backdrop" data-action="close-modal">
+        <div class="modal-box" onclick="event.stopPropagation()">
+          <div class="modal-header">
+            <span>${escapeHtml(t('版本更新包含新增能力声明', 'Update Adds New Capabilities'))}</span>
+            <button class="btn" data-action="close-modal">✕</button>
+          </div>
+          <div class="modal-body">
+            <p>${escapeHtml(t(`插件 "${em.plugin.displayName}" 从 v${em.installedVersion} 升级至 v${em.targetVersion} 新增了以下能力：`, `Updating "${em.plugin.displayName}" from v${em.installedVersion} to v${em.targetVersion} introduces new capabilities:`))}</p>
+            <div class="badge-row">${renderBadgesHtml({ badges: em.escalation.addedBadges })}</div>
+            ${
+              em.escalation.addedRemoteDomains?.length
+                ? `<p class="muted">${escapeHtml(t('新增远程 MCP 域名', 'New Remote MCP Domains'))}: ${escapeHtml(em.escalation.addedRemoteDomains.join(', '))}</p>`
+                : ''
+            }
+            ${
+              em.escalation.addedHookEvents?.length
+                ? `<p class="muted">${escapeHtml(t('新增生命周期钩子', 'New Lifecycle Hooks'))}: ${escapeHtml(em.escalation.addedHookEvents.join(', '))}</p>`
+                : ''
+            }
+          </div>
+          <div class="modal-footer">
+            <button class="btn" data-action="close-modal">${escapeHtml(t('暂不更新', 'Cancel'))}</button>
+            <button class="btn btn-primary" data-action="confirm-escalation">${escapeHtml(t('确认并立即更新', 'Confirm & Update'))}</button>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  return html;
+}
+
+function render() {
+  const root = document.getElementById('app');
+  if (!root) return;
+
+  const focusId = document.activeElement?.id || '';
+  const selStart = document.activeElement?.selectionStart ?? null;
+  const selEnd = document.activeElement?.selectionEnd ?? null;
+
+  const catalogCount = state.serverState?.catalog?.plugins?.length || 0;
+  const installedCount = state.serverState?.installed?.length || 0;
+  const updatesCount = state.serverState?.updatesAvailable?.length || 0;
+  const curLocale = state.serverState?.prefs?.locale || 'zh';
+
+  root.innerHTML = `
+    <div class="market-shell">
+      <header class="topbar">
+        <div class="brand">
+          <div class="brand-icon">◆</div>
+          <div>
+            <div class="brand-title">${escapeHtml(t('AGY Market · 反重力插件市场', 'AGY Market · Plugin Marketplace'))}</div>
+            <div class="brand-sub">${escapeHtml(state.serverState?.catalog?.channelUsed || t('零 Token 辅助面板', 'Zero-Token Sidecar'))}</div>
+          </div>
+        </div>
+        <div class="top-actions">
+          <button class="btn" data-action="toggle-locale">${curLocale === 'en' ? '中文' : 'EN'}</button>
+          <button class="btn" data-action="refresh" ${state.loading ? 'disabled' : ''}>↻ ${escapeHtml(t('刷新', 'Refresh'))}</button>
+        </div>
+      </header>
+
+      <nav class="nav-tabs">
+        <button class="tab-btn ${state.activeTab === 'discover' ? 'active' : ''}" data-action="tab" data-tab="discover">
+          ${escapeHtml(t('探索市场', 'Discover'))} <span class="count-pill">${catalogCount}</span>
+        </button>
+        <button class="tab-btn ${state.activeTab === 'installed' ? 'active' : ''}" data-action="tab" data-tab="installed">
+          ${escapeHtml(t('已安装 / 更新', 'Installed'))} <span class="count-pill">${updatesCount > 0 ? `${installedCount} · ↑${updatesCount}` : installedCount}</span>
+        </button>
+        <button class="tab-btn ${state.activeTab === 'sources' ? 'active' : ''}" data-action="tab" data-tab="sources">
+          ${escapeHtml(t('镜像与源设置', 'Sources & Mirrors'))}
+        </button>
+      </nav>
+
+      ${
+        state.activeTab === 'discover'
+          ? renderDiscoverView()
+          : state.activeTab === 'installed'
+            ? renderInstalledView()
+            : renderSourcesView()
+      }
+
+      ${renderModals()}
+
+      ${
+        state.toast
+          ? `<div class="toast-bar">
+              <span>${escapeHtml(state.toast.message)}</span>
+              ${state.toast.extraUri ? `<a class="pill-link" href="${escapeHtml(state.toast.extraUri)}">${escapeHtml(t('打开', 'Open'))}</a>` : ''}
+            </div>`
+          : ''
+      }
+    </div>
+  `;
+
+  bindDomEvents(root);
+
+  if (focusId) {
+    const el = document.getElementById(focusId);
+    if (el) {
+      el.focus();
+      if (selStart !== null && typeof el.setSelectionRange === 'function') {
+        try {
+          el.setSelectionRange(selStart, selEnd);
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+  }
+}
+
+function bindDomEvents(root) {
+  const searchEl = root.querySelector('#market-search-input');
+  if (searchEl) {
+    searchEl.addEventListener('input', (e) => {
+      state.search = e.target.value;
+      render();
+    });
+  }
+
+  const catEl = root.querySelector('#market-cat-select');
+  if (catEl) {
+    catEl.addEventListener('change', (e) => {
+      state.category = e.target.value;
+      render();
+    });
+  }
+
+  const sortEl = root.querySelector('#market-sort-select');
+  if (sortEl) {
+    sortEl.addEventListener('change', (e) => {
+      state.sortBy = e.target.value;
+      render();
+    });
+  }
+
+  const track2El = root.querySelector('#track2-checkbox');
+  if (track2El) {
+    track2El.addEventListener('change', (e) => {
+      void updatePrefs({ enableExperimentalTrack2: Boolean(e.target.checked) });
+    });
+  }
+
+  const sourcesForm = root.querySelector('#sources-form');
+  if (sourcesForm) {
+    sourcesForm.addEventListener('submit', (e) => {
+      e.preventDefault();
+      const networkMode = root.querySelector('#net-mode-select')?.value || 'auto';
+      const githubReleaseMirrorPrefix = root.querySelector('#mirror-prefix-input')?.value?.trim() || '';
+      const primaryCatalogUrl = root.querySelector('#primary-url-input')?.value?.trim() || '';
+      const rawCustom = root.querySelector('#custom-feeds-textarea')?.value || '';
+      const customFeeds = rawCustom
+        .split(/\r?\n/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+      void updatePrefs({ networkMode, githubReleaseMirrorPrefix, primaryCatalogUrl, customFeeds });
+    });
+  }
+
+  root.querySelectorAll('[data-action]').forEach((el) => {
+    el.addEventListener('click', (e) => {
+      const action = el.getAttribute('data-action');
+      if (action === 'tab') {
+        state.activeTab = el.getAttribute('data-tab') || 'discover';
+        render();
+      } else if (action === 'refresh') {
+        void loadState(true);
+      } else if (action === 'toggle-locale') {
+        const nextLocale = (state.serverState?.prefs?.locale || 'zh') === 'en' ? 'zh' : 'en';
+        void updatePrefs({ locale: nextLocale });
+      } else if (action === 'close-modal') {
+        state.detailPlugin = null;
+        state.conflictModal = null;
+        state.escalationModal = null;
+        render();
+      } else if (action === 'detail') {
+        const id = el.getAttribute('data-id');
+        const p = (state.serverState?.catalog?.plugins || []).find((x) => x.id === id);
+        if (p) void openPluginDetail(p);
+      } else if (action === 'install') {
+        e.stopPropagation();
+        const id = el.getAttribute('data-id');
+        const p = (state.serverState?.catalog?.plugins || []).find((x) => x.id === id) || state.detailPlugin;
+        if (p) void triggerInstall(p);
+      } else if (action === 'resolve-conflict' && state.conflictModal) {
+        const strategy = el.getAttribute('data-strategy') || 'isolate';
+        void triggerInstall(state.conflictModal.plugin, { conflictStrategy: strategy });
+      } else if (action === 'confirm-escalation' && state.escalationModal) {
+        void triggerInstall(state.escalationModal.plugin, { confirmEscalation: true });
+      }
+    });
+  });
+}
+
+if (window.sidecar?.onWorkspaceChange) {
+  window.sidecar.onWorkspaceChange((uris) => {
+    state.workspaceUris = uris;
+    void loadState(false);
+  });
+}
+
+void loadState(false);
+
+return {  };
+})();
+})();
+</script>
+</body>
+</html>

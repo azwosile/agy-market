@@ -1,0 +1,21 @@
+{
+  "command": "node",
+  "args": ["main.mjs"],
+  "restart_policy": "on-failure",
+  "display_name": "AGY Market · 反重力插件市场",
+  "description": "Zero-token community plugin marketplace for Google Antigravity — browse verified & experimental plugins, inspect capability badges, and one-click install prebuilt release tarballs.",
+  "has_web_ui": true,
+  "agent_permissions": {
+    "allows_user_interactions": false
+  },
+  "ui_config": {
+    "display_name": "AGY Market",
+    "views": [
+      {
+        "path": "/",
+        "entrypoint": "SIDECAR_UI_ENTRYPOINT_AUX_PANE",
+        "title": "AGY Market"
+      }
+    ]
+  }
+}
