@@ -6,6 +6,7 @@ import { createServer } from 'node:http';
 import { dirname, join, resolve } from 'node:path';
 import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
+import { fetchPluginDiscussions } from '../discussions/index.mjs';
 import { installOrUpdateCatalogPlugin, removeMarketPluginFiles } from '../installer/index.mjs';
 import { recoverInterruptedJournal } from '../installer/journal.mjs';
 import { sweepRetiredBinaries } from '../installer/sync-dir.mjs';
@@ -17,11 +18,13 @@ import {
   PLUGIN_DISPLAY_NAME,
   PLUGIN_ID,
   PLUGIN_VERSION,
+  SELF_CATALOG_ID,
   SIDECAR_URI,
 } from '../shared/constants.mjs';
 import { resolveAntigravityConfigDir, resolveMarketDataDir, resolvePluginsDir } from '../shared/paths.mjs';
-import { computeCapabilityEscalation, sanitizePrefs } from '../shared/schemas.mjs';
+import { computeCapabilityEscalation, sanitizePrefs, toPublicPrefs } from '../shared/schemas.mjs';
 import { isNewerVersion } from '../shared/semver.mjs';
+import { checkPluginUpdates, isCatalogPluginInstallable } from '../updates/index.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, '..', '..');
@@ -122,14 +125,18 @@ function injectBootIntoHtml(rawHtml, token, conversationId = '') {
   return html;
 }
 
-function sendJson(res, status, payload) {
+function sendJson(res, status, payload, onFlushed = null) {
   const body = JSON.stringify(payload);
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store',
     'X-Content-Type-Options': 'nosniff',
   });
-  res.end(body);
+  if (typeof onFlushed === 'function') {
+    res.end(body, onFlushed);
+  } else {
+    res.end(body);
+  }
 }
 
 function readJsonBody(req, maxBytes = MAX_JSON_BODY) {
@@ -175,10 +182,20 @@ function savePrefsToDisk(dataDir, nextPrefs) {
   const clean = sanitizePrefs(nextPrefs);
   const tmpPath = join(dataDir, `prefs.json.${process.pid}.tmp`);
   const dstPath = join(dataDir, 'prefs.json');
-  writeFileSync(tmpPath, `${JSON.stringify(clean, null, 2)}\n`, 'utf8');
-  writeFileSync(dstPath, `${JSON.stringify(clean, null, 2)}\n`, 'utf8');
+  const writeOpts = clean.githubToken ? { encoding: 'utf8', mode: 0o600 } : { encoding: 'utf8' };
+  const serialized = `${JSON.stringify(clean, null, 2)}\n`;
+  writeFileSync(tmpPath, serialized, writeOpts);
+  writeFileSync(dstPath, serialized, writeOpts);
   rmSync(tmpPath, { force: true });
   return clean;
+}
+
+function isSelfPluginCandidate(plugin, installedDir = '') {
+  return (
+    installedDir === PLUGIN_ID ||
+    plugin?.id === SELF_CATALOG_ID ||
+    plugin?.canonicalName === PLUGIN_ID
+  );
 }
 
 export async function createMarketSidecarServer(options = {}) {
@@ -188,6 +205,10 @@ export async function createMarketSidecarServer(options = {}) {
   const indexHtmlPath = options.indexHtmlPath || DEFAULT_INDEX_HTML_PATH;
   const fetchImpl = options.fetchImpl || fetch;
   const mirrors = options.mirrors || undefined;
+  const nowFn = typeof options.nowFn === 'function' ? options.nowFn : () => Date.now();
+  const currentSelfVersion = options.currentSelfVersion || PLUGIN_VERSION;
+  const githubApiBaseUrl = options.githubApiBaseUrl || undefined;
+  const updateCheckTtlMs = options.updateCheckTtlMs ?? undefined;
   const onSelfRestart =
     typeof options.onSelfRestart === 'function'
       ? options.onSelfRestart
@@ -235,18 +256,30 @@ export async function createMarketSidecarServer(options = {}) {
 
   let prefs = loadPrefsFromDisk(dataDir);
   let lastCatalog = null;
+  let updateCheckGeneration = 0;
+  let inFlightUpdates = null; // { key, generation, promise }
 
-  async function buildEnrichedState({ forceCatalogRefresh = false, workspaceUris = [] } = {}) {
-    if (!lastCatalog || forceCatalogRefresh) {
+  function invalidateUpdateCheckState() {
+    updateCheckGeneration += 1;
+    inFlightUpdates = null;
+  }
+
+  async function ensureCatalogLoaded({ forceCatalogRefresh = false, includeReadmes = false } = {}) {
+    if (!lastCatalog || forceCatalogRefresh || (includeReadmes && !Object.keys(lastCatalog.readmes || {}).length)) {
       lastCatalog = await resolveMarketCatalog({
         dataDir,
         prefs,
         forceRefresh: forceCatalogRefresh,
-        includeReadmes: false,
+        includeReadmes,
         fetchImpl,
         mirrors,
       });
     }
+    return lastCatalog;
+  }
+
+  async function buildEnrichedState({ forceCatalogRefresh = false, workspaceUris = [] } = {}) {
+    await ensureCatalogLoaded({ forceCatalogRefresh, includeReadmes: false });
 
     const inventory = scanLocalPluginInventory({ configDir, workspaceUris });
     const updatesAvailable = [];
@@ -289,11 +322,11 @@ export async function createMarketSidecarServer(options = {}) {
       plugin: {
         id: PLUGIN_ID,
         displayName: PLUGIN_DISPLAY_NAME,
-        version: PLUGIN_VERSION,
+        version: currentSelfVersion,
         sidecarUri: SIDECAR_URI,
         customizationUri: CUSTOMIZATION_URI,
       },
-      prefs,
+      prefs: toPublicPrefs(prefs),
       catalog: {
         channelUsed: lastCatalog.channelUsed,
         catalogVersion: lastCatalog.catalogVersion,
@@ -328,7 +361,7 @@ export async function createMarketSidecarServer(options = {}) {
     const pathname = urlObj.pathname;
 
     if (req.method === 'GET' && pathname === '/healthz') {
-      sendJson(res, 200, { ok: true, plugin: PLUGIN_ID, version: PLUGIN_VERSION });
+      sendJson(res, 200, { ok: true, plugin: PLUGIN_ID, version: currentSelfVersion });
       return;
     }
 
@@ -360,6 +393,103 @@ export async function createMarketSidecarServer(options = {}) {
       const workspaceUris = wsParam ? wsParam.split(',').filter(Boolean) : [];
       const state = await buildEnrichedState({ forceCatalogRefresh: refresh, workspaceUris });
       sendJson(res, 200, state);
+      return;
+    }
+
+    if (req.method === 'GET' && pathname === '/api/updates') {
+      const force = urlObj.searchParams.get('force') === '1' || urlObj.searchParams.get('force') === 'true';
+      const wsParam = urlObj.searchParams.get('workspaceUris') || '';
+      const workspaceUris = wsParam ? wsParam.split(',').filter(Boolean) : [];
+      const flightKey = `${force ? '1' : '0'}|${workspaceUris.join(',')}`;
+
+      if (!force && inFlightUpdates && inFlightUpdates.key === flightKey && inFlightUpdates.generation === updateCheckGeneration) {
+        const sharedReport = await inFlightUpdates.promise;
+        sendJson(res, 200, sharedReport);
+        return;
+      }
+
+      const generation = updateCheckGeneration;
+      const runCheck = async () => {
+        await ensureCatalogLoaded({ forceCatalogRefresh: force, includeReadmes: false });
+        const inventory = scanLocalPluginInventory({ configDir, workspaceUris });
+        return checkPluginUpdates({
+          catalog: lastCatalog,
+          inventory,
+          dataDir,
+          prefs,
+          force,
+          fetchImpl,
+          nowMs: nowFn(),
+          ...(updateCheckTtlMs !== undefined ? { ttlMs: updateCheckTtlMs } : {}),
+          currentSelfVersion,
+          githubApiBaseUrl,
+          shouldPersistCache: () => generation === updateCheckGeneration,
+        });
+      };
+
+      const promise = runCheck();
+      if (!force) {
+        inFlightUpdates = { key: flightKey, generation, promise };
+      }
+      try {
+        const report = await promise;
+        sendJson(res, 200, report);
+      } finally {
+        if (inFlightUpdates?.promise === promise) {
+          inFlightUpdates = null;
+        }
+      }
+      return;
+    }
+
+    if (req.method === 'GET' && pathname === '/api/discussions') {
+      const pluginId = String(urlObj.searchParams.get('id') || '').trim();
+      if (!pluginId) {
+        sendJson(res, 400, {
+          ok: false,
+          error: 'Missing query parameter: id',
+          url: '',
+          newDiscussionUrl: '',
+          items: [],
+          disabled: true,
+          needsToken: false,
+          rateLimited: false,
+        });
+        return;
+      }
+      const force = urlObj.searchParams.get('force') === '1' || urlObj.searchParams.get('force') === 'true';
+      const wsParam = urlObj.searchParams.get('workspaceUris') || '';
+      const workspaceUris = wsParam ? wsParam.split(',').filter(Boolean) : [];
+      if (!lastCatalog) {
+        await ensureCatalogLoaded({ forceCatalogRefresh: false, includeReadmes: false }).catch(() => null);
+      }
+      const inventory = scanLocalPluginInventory({ configDir, workspaceUris });
+      const disc = await fetchPluginDiscussions({
+        id: pluginId,
+        catalog: lastCatalog || { plugins: [] },
+        inventory,
+        dataDir,
+        prefs,
+        force,
+        fetchImpl,
+        nowMs: nowFn(),
+        githubApiBaseUrl,
+      });
+      if (!disc.ok) {
+        sendJson(res, disc.statusCode || 404, {
+          ok: false,
+          error: disc.error,
+          id: disc.id,
+          url: '',
+          newDiscussionUrl: '',
+          items: [],
+          disabled: true,
+          needsToken: false,
+          rateLimited: false,
+        });
+        return;
+      }
+      sendJson(res, 200, disc);
       return;
     }
 
@@ -406,7 +536,14 @@ export async function createMarketSidecarServer(options = {}) {
       }
 
       if (pathname === '/api/prefs' || pathname === '/api/sources') {
-        prefs = savePrefsToDisk(dataDir, { ...prefs, ...body });
+        const merged = { ...prefs, ...body };
+        if (body.clearGithubToken === true) {
+          merged.githubToken = '';
+        } else if (!Object.prototype.hasOwnProperty.call(body, 'githubToken')) {
+          merged.githubToken = prefs.githubToken || '';
+        }
+        prefs = savePrefsToDisk(dataDir, merged);
+        invalidateUpdateCheckState();
         const state = await buildEnrichedState({
           forceCatalogRefresh: true,
           workspaceUris: Array.isArray(body.workspaceUris) ? body.workspaceUris : [],
@@ -463,6 +600,7 @@ export async function createMarketSidecarServer(options = {}) {
           fetchImpl,
         });
 
+        invalidateUpdateCheckState();
         const state = await buildEnrichedState({
           forceCatalogRefresh: false,
           workspaceUris: Array.isArray(body.workspaceUris) ? body.workspaceUris : [],
@@ -475,12 +613,217 @@ export async function createMarketSidecarServer(options = {}) {
         return;
       }
 
+      if (pathname === '/api/update-all') {
+        const workspaceUris = Array.isArray(body.workspaceUris) ? body.workspaceUris : [];
+        const confirmEscalation = Boolean(body.confirmEscalation);
+        await ensureCatalogLoaded({ forceCatalogRefresh: false, includeReadmes: false });
+        const inventory = scanLocalPluginInventory({ configDir, workspaceUris });
+        const catalogPlugins = lastCatalog?.plugins || [];
+
+        const queue = [];
+        if (Array.isArray(body.ids)) {
+          const seenReqIds = new Set();
+          for (const rawId of body.ids) {
+            const reqId = String(rawId || '').trim();
+            if (!reqId || seenReqIds.has(reqId)) continue;
+            seenReqIds.add(reqId);
+            const plugin = catalogPlugins.find((p) => p.id === reqId || p.canonicalName === reqId) || null;
+            if (!plugin) {
+              queue.push({
+                id: reqId,
+                missing: true,
+                isSelf: reqId === SELF_CATALOG_ID || reqId === PLUGIN_ID,
+              });
+              continue;
+            }
+            const preflight = resolveInstallPreflight(plugin, inventory, { conflictStrategy: 'prompt' });
+            const localDir = preflight.existingInstall?.dir || plugin.canonicalName;
+            const isSelf = isSelfPluginCandidate(plugin, localDir);
+            if (!isCatalogPluginInstallable(plugin)) {
+              queue.push({
+                id: plugin.id,
+                dir: localDir,
+                plugin,
+                notInstallable: true,
+                isSelf,
+              });
+              continue;
+            }
+            queue.push({
+              id: plugin.id,
+              dir: localDir,
+              plugin,
+              isSelf,
+            });
+          }
+        } else {
+          for (const plugin of catalogPlugins) {
+            if (!isCatalogPluginInstallable(plugin)) continue;
+            const preflight = resolveInstallPreflight(plugin, inventory, { conflictStrategy: 'prompt' });
+            const localMatch = preflight.action === 'update' ? preflight.existingInstall : null;
+            if (!localMatch || !isNewerVersion(plugin.version, localMatch.version)) continue;
+            queue.push({
+              id: plugin.id,
+              dir: localMatch.dir,
+              plugin,
+              isSelf: isSelfPluginCandidate(plugin, localMatch.dir),
+            });
+          }
+        }
+
+        // Strict ordering invariant: non-self plugins first, self (`agy-market`) ALWAYS last
+        const orderedQueue = [
+          ...queue.filter((item) => !item.isSelf),
+          ...queue.filter((item) => item.isSelf),
+        ];
+
+        const results = [];
+        let didSelfUpdate = false;
+
+        for (const item of orderedQueue) {
+          if (item.missing) {
+            results.push({
+              id: item.id,
+              ok: false,
+              status: 'NOT_FOUND',
+              error: `Plugin "${item.id}" not found in active catalog`,
+            });
+            continue;
+          }
+          if (item.notInstallable) {
+            results.push({
+              id: item.id,
+              dir: item.dir,
+              displayName: item.plugin.displayName || item.plugin.canonicalName,
+              ok: false,
+              status: 'NOT_INSTALLABLE',
+              error: `Plugin "${item.id}" lacks a verified catalog tarball/sha256`,
+            });
+            continue;
+          }
+
+          const plugin = item.plugin;
+          try {
+            const out = await installOrUpdateCatalogPlugin({
+              plugin,
+              track: plugin._track || (plugin.forceScopedInstall ? 'unverified' : 'verified'),
+              prefs,
+              conflictStrategy: item.isSelf ? 'replace' : 'prompt',
+              confirmEscalation,
+              configDir,
+              dataDir,
+              workspaceUris,
+              fetchImpl,
+            });
+
+            if (out.ok && out.isSelfUpdate) {
+              didSelfUpdate = true;
+            }
+
+            results.push({
+              id: plugin.id,
+              dir: out.installedDir || item.dir || plugin.canonicalName,
+              displayName: plugin.displayName || plugin.canonicalName,
+              ok: Boolean(out.ok),
+              status: out.status || (out.ok ? 'INSTALLED' : 'ERROR'),
+              ...(out.error ? { error: out.error } : {}),
+              ...(out.installedDir ? { installedDir: out.installedDir } : {}),
+              ...(out.version ? { version: out.version } : {}),
+              ...(out.installedVersion ? { installedVersion: out.installedVersion } : {}),
+              ...(out.targetVersion ? { targetVersion: out.targetVersion } : {}),
+              ...(out.escalation ? { escalation: out.escalation } : {}),
+              ...(out.conflict ? { conflict: out.conflict } : {}),
+              ...(out.isSelfUpdate ? { isSelfUpdate: true } : {}),
+              ...(out.reloadRequired !== undefined ? { reloadRequired: out.reloadRequired } : {}),
+              ...(out.customizationUri ? { customizationUri: out.customizationUri } : {}),
+              ...(out.sidecarPane !== undefined ? { sidecarPane: out.sidecarPane } : {}),
+            });
+          } catch (err) {
+            results.push({
+              id: plugin.id,
+              dir: item.dir || plugin.canonicalName,
+              displayName: plugin.displayName || plugin.canonicalName,
+              ok: false,
+              status: 'ERROR',
+              error: err?.message || String(err),
+            });
+          }
+        }
+
+        invalidateUpdateCheckState();
+        const state = await buildEnrichedState({ forceCatalogRefresh: false, workspaceUris });
+        const allOk = results.every((r) => r.ok);
+        sendJson(
+          res,
+          200,
+          {
+            ok: allOk,
+            results,
+            willRestart: didSelfUpdate,
+            state,
+          },
+          didSelfUpdate ? () => onSelfRestart() : null,
+        );
+        return;
+      }
+
+      if (pathname === '/api/self-update') {
+        const workspaceUris = Array.isArray(body.workspaceUris) ? body.workspaceUris : [];
+        const forceRefresh = Boolean(body.force);
+        await ensureCatalogLoaded({ forceCatalogRefresh: forceRefresh, includeReadmes: false });
+        let selfPlugin =
+          (lastCatalog?.plugins || []).find((p) => p.id === SELF_CATALOG_ID || p.canonicalName === PLUGIN_ID) || null;
+
+        if (!selfPlugin && !forceRefresh) {
+          await ensureCatalogLoaded({ forceCatalogRefresh: true, includeReadmes: false });
+          selfPlugin =
+            (lastCatalog?.plugins || []).find((p) => p.id === SELF_CATALOG_ID || p.canonicalName === PLUGIN_ID) || null;
+        }
+
+        if (!selfPlugin) {
+          sendJson(res, 404, {
+            ok: false,
+            status: 'NOT_FOUND',
+            error: `Self plugin "${SELF_CATALOG_ID}" not found in active catalog`,
+          });
+          return;
+        }
+
+        if (!isCatalogPluginInstallable(selfPlugin)) {
+          sendJson(res, 400, {
+            ok: false,
+            status: 'NOT_INSTALLABLE',
+            error: `Self plugin "${selfPlugin.id}" lacks a verified catalog tarball/sha256`,
+          });
+          return;
+        }
+
+        const result = await installOrUpdateCatalogPlugin({
+          plugin: selfPlugin,
+          track: selfPlugin._track || 'verified',
+          prefs,
+          conflictStrategy: 'replace',
+          confirmEscalation: Boolean(body.confirmEscalation),
+          configDir,
+          dataDir,
+          workspaceUris,
+          fetchImpl,
+        });
+
+        invalidateUpdateCheckState();
+        const state = await buildEnrichedState({ forceCatalogRefresh: false, workspaceUris });
+        const willRestart = Boolean(result.ok && result.isSelfUpdate);
+        sendJson(res, 200, { ...result, willRestart, state }, willRestart ? () => onSelfRestart() : null);
+        return;
+      }
+
       if (pathname === '/api/remove-files') {
         const out = removeMarketPluginFiles({
           dir: body.dir,
           configDir,
           dataDir,
         });
+        invalidateUpdateCheckState();
         const state = await buildEnrichedState({ forceCatalogRefresh: false });
         sendJson(res, 200, { ok: true, ...out, state });
         return;
@@ -597,9 +940,13 @@ export async function createMarketSidecarServer(options = {}) {
         if (chunk) outChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
         return true;
       },
-      end(chunk) {
+      end(chunk, cb) {
         if (ended) return;
         ended = true;
+        if (typeof chunk === 'function') {
+          cb = chunk;
+          chunk = null;
+        }
         if (chunk) outChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
         const rawBody = Buffer.concat(outChunks);
         const text = rawBody.toString('utf8');
@@ -612,6 +959,9 @@ export async function createMarketSidecarServer(options = {}) {
             return JSON.parse(text);
           },
         });
+        if (typeof cb === 'function') {
+          cb();
+        }
       },
     };
 

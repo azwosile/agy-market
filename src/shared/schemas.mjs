@@ -98,6 +98,7 @@ export function sanitizePrefs(input = {}) {
       : DEFAULT_PREFS.primaryCatalogUrl;
   const githubReleaseMirrorPrefix =
     typeof src.githubReleaseMirrorPrefix === 'string' ? src.githubReleaseMirrorPrefix.trim() : '';
+  const githubToken = typeof src.githubToken === 'string' ? src.githubToken.trim() : '';
   const customFeeds = Array.isArray(src.customFeeds)
     ? [...new Set(src.customFeeds.map((u) => String(u || '').trim()).filter((u) => /^https?:\/\/|^file:\/\//i.test(u)))]
     : [];
@@ -109,7 +110,20 @@ export function sanitizePrefs(input = {}) {
     networkMode,
     primaryCatalogUrl,
     githubReleaseMirrorPrefix,
+    githubToken,
     customFeeds,
+  };
+}
+
+/**
+ * Produces an HTTP-safe prefs projection that never echoes `githubToken` back over localhost HTTP.
+ */
+export function toPublicPrefs(prefs = {}) {
+  const clean = sanitizePrefs(prefs);
+  const { githubToken, ...rest } = clean;
+  return {
+    ...rest,
+    hasGithubToken: Boolean(githubToken),
   };
 }
 

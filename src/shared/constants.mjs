@@ -1,8 +1,10 @@
 // Shared constants, capability badge metadata, host path resolvers & process hygiene (`src/shared/constants.mjs`).
 
 export const PLUGIN_ID = 'agy-market';
+export const SELF_CATALOG_ID = 'azwosile__agy-market';
+export const SELF_REPO_URL = 'https://github.com/azwosile/agy-market';
 export const PLUGIN_DISPLAY_NAME = 'AGY Market · 反重力插件市场';
-export const PLUGIN_VERSION = '1.0.1';
+export const PLUGIN_VERSION = '1.1.0';
 export const SIDECAR_ID = 'market_pane';
 export const SIDECAR_URI = 'sidecar://agy-market/market_pane/';
 export const CUSTOMIZATION_URI = 'customization://agy-market';
@@ -11,6 +13,9 @@ export const MAX_TARBALL_BYTES = 100 * 1024 * 1024; // 100 MB
 export const PRIMARY_CATALOG_BASE_URL = 'https://azwosile.github.io/agy-market-catalog';
 export const RAW_GH_PAGES_CATALOG_BASE_URL = 'https://raw.githubusercontent.com/azwosile/agy-market-catalog/gh-pages';
 export const PRIMARY_FETCH_TIMEOUT_MS = 3500;
+export const GITHUB_API_BASE_URL = 'https://api.github.com';
+export const UPDATE_CHECK_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
+export const DISCUSSIONS_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
 export const CHINA_NPM_MIRRORS = Object.freeze([
   'https://registry.npmmirror.com',
@@ -130,6 +135,7 @@ export const DEFAULT_PREFS = Object.freeze({
   networkMode: 'auto', // 'auto' | 'china-mirror' | 'direct'
   primaryCatalogUrl: PRIMARY_CATALOG_BASE_URL,
   githubReleaseMirrorPrefix: '',
+  githubToken: '',
   customFeeds: [],
 });
 

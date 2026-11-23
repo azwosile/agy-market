@@ -1,6 +1,6 @@
 {
   "name": "agy-market",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "Visual community plugin marketplace for Google Antigravity — zero-token Sidecar UI, SHA-256 verified tarball installer, and npx agy-market bootstrap CLI.",
   "type": "module",
   "license": "MIT",
