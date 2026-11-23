@@ -85,7 +85,7 @@ export async function installLocalAgyMarket({ destPluginsDir = '' } = {}) {
     schemaVersion: 1,
     id: 'azwosile__agy-market',
     track: 'verified',
-    repositoryId: 0,
+    repositoryId: 1468650761,
     installedDir: PLUGIN_ID,
     effectivePluginName: PLUGIN_ID,
     scopedRewriteApplied: false,

@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { copyFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import test from 'node:test';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { compileCatalogArtifacts } from '../../agy-market-catalog/scripts/build-catalog.mjs';
 import { evaluateSubmission } from '../../agy-market-catalog/scripts/check-submission.mjs';
@@ -17,9 +18,16 @@ import { packReleaseBundle } from '../scripts/pack-release.mjs';
 import { installOrUpdateCatalogPlugin } from '../src/installer/index.mjs';
 import { recoverInterruptedJournal, writePendingJournal } from '../src/installer/journal.mjs';
 import { sweepRetiredBinaries } from '../src/installer/sync-dir.mjs';
-import { createDeterministicTarGz } from '../src/installer/tar-extract.mjs';
+import {
+  createDeterministicTarGz,
+  encodePaxRecord,
+  extractTarGzToDir,
+  parsePaxRecords,
+  parseTarGzToMap,
+} from '../src/installer/tar-extract.mjs';
 import { resolveInstallPreflight, scanLocalPluginInventory } from '../src/preflight/index.mjs';
 import { resolveMarketCatalog } from '../src/registry/index.mjs';
+import { scrubChildProcessEnv } from '../src/shared/constants.mjs';
 import { sanitizeNativePluginManifest } from '../src/shared/schemas.mjs';
 import { createMarketSidecarServer } from '../src/sidecar/server.mjs';
 
@@ -635,6 +643,114 @@ test('Real-world plugin manifest compatibility: author string/object, repo {type
     );
     assert.equal(preflightNeko.action, 'update');
     assert.equal(preflightNeko.targetDir, 'gemini-neko-cockpit');
+  } finally {
+    ws.cleanup();
+  }
+});
+
+test('POSIX PAX multi-record UTF-8 byte-length parser & Windows NTFS extraction + install.ps1 catalog fallback', () => {
+  const ws = makeTempWorkspace('agy-pax-boot-');
+  try {
+    // 1. Direct multi-record UTF-8 PAX buffer verification (Chinese + emoji + subsequent numeric records)
+    const utf8RelPath =
+      'assets/猫娘挂件_超长多字节路径测试目录_反重力观察台/双击安装观察窗补丁_表情差分立绘_idle_eat_grin_xd_测试文件.txt';
+    const rawPaxBlock = Buffer.concat([
+      encodePaxRecord('comment', '反重力插件市场 UTF-8 PAX 扩展头测试 🚀'),
+      encodePaxRecord('path', utf8RelPath),
+      encodePaxRecord('mtime', '1732363200'),
+      encodePaxRecord('size', '21'),
+    ]);
+    const parsedPax = parsePaxRecords(rawPaxBlock);
+    assert.equal(parsedPax.comment, '反重力插件市场 UTF-8 PAX 扩展头测试 🚀');
+    assert.equal(parsedPax.path, utf8RelPath);
+    assert.equal(parsedPax.mtime, '1732363200');
+    assert.equal(parsedPax.size, '21');
+
+    // 2. Full PAX .tar.gz archive creation, map parsing, and real NTFS disk extraction (verifies zero trailing \n EINVAL)
+    const paxArchive = createDeterministicTarGz(
+      {
+        'plugin.json': JSON.stringify({ name: 'pax-utf8-plugin', version: '1.0.1' }),
+        [utf8RelPath]: 'UTF8_PAX_PAYLOAD_OK',
+        '双击安装观察窗补丁.bat': '@echo off\r\necho ok\r\n',
+      },
+      { forcePax: true },
+    );
+    const paxMap = parseTarGzToMap(paxArchive);
+    assert.equal(paxMap.has(utf8RelPath), true);
+    assert.equal(paxMap.get(utf8RelPath).toString('utf8'), 'UTF8_PAX_PAYLOAD_OK');
+
+    const extractedDir = join(ws.artifactsDir, 'pax-extracted');
+    extractTarGzToDir(paxArchive, extractedDir);
+    assert.equal(readFileSync(join(extractedDir, utf8RelPath), 'utf8'), 'UTF8_PAX_PAYLOAD_OK');
+    assert.equal(existsSync(join(extractedDir, '双击安装观察窗补丁.bat')), true);
+
+    // 3. Test scripts/install.ps1 404 release fallback -> catalog index.json -> nested top-dir tarball unwrap & SHA-256 verification
+    if (process.platform === 'win32') {
+      const nestedTagTar = createDeterministicTarGz({
+        'agy-market-1.0.1/plugin.json': JSON.stringify({
+          name: 'agy-market',
+          displayName: 'AGY Market · 反重力插件市场',
+          version: '1.0.1',
+        }),
+        'agy-market-1.0.1/sidecars/market_pane/index.html': '<!doctype html><title>AGY Market</title>',
+      });
+      const nestedTarPath = join(ws.artifactsDir, 'agy-market-tag-v1.0.1.tar.gz');
+      writeFileSync(nestedTarPath, nestedTagTar);
+      const nestedSha = createHash('sha256').update(nestedTagTar).digest('hex');
+
+      const mockCatalogPath = join(ws.artifactsDir, 'mock-catalog-index.json');
+      writeFileSync(
+        mockCatalogPath,
+        JSON.stringify({
+          schemaVersion: 1,
+          track: 'verified',
+          plugins: [
+            {
+              id: 'azwosile__agy-market',
+              canonicalName: 'agy-market',
+              version: '1.0.1',
+              repository: { repositoryId: 1468650761 },
+              distribution: {
+                tarballUrl: pathToFileURL(nestedTarPath).href,
+                sha256: nestedSha,
+              },
+            },
+          ],
+        }),
+      );
+
+      const repoRoot = resolve(fileURLToPath(new URL('..', import.meta.url)));
+      const ps1Script = join(repoRoot, 'scripts', 'install.ps1');
+      const missingReleaseBase = pathToFileURL(join(ws.artifactsDir, 'missing-release-404')).href;
+
+      execFileSync(
+        'powershell.exe',
+        [
+          '-NoProfile',
+          '-ExecutionPolicy',
+          'Bypass',
+          '-File',
+          ps1Script,
+          '-ReleaseBaseUrl',
+          missingReleaseBase,
+          '-CatalogUrls',
+          pathToFileURL(mockCatalogPath).href,
+        ],
+        {
+          env: { ...scrubChildProcessEnv(process.env), ANTIGRAVITY_CONFIG_DIR: ws.configDir },
+          stdio: 'pipe',
+        },
+      );
+
+      const installedTarget = join(ws.pluginsDir, 'agy-market');
+      assert.equal(existsSync(join(installedTarget, 'plugin.json')), true);
+      assert.equal(existsSync(join(installedTarget, 'sidecars', 'market_pane', 'index.html')), true);
+      const bootReceipt = JSON.parse(readFileSync(join(installedTarget, '.agy-market-receipt.json'), 'utf8'));
+      assert.equal(bootReceipt.id, 'azwosile__agy-market');
+      assert.equal(bootReceipt.installedVersion, '1.0.1');
+      assert.equal(bootReceipt.repositoryId, 1468650761);
+      assert.equal(bootReceipt.sha256, nestedSha);
+    }
   } finally {
     ws.cleanup();
   }

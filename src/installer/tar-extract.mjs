@@ -30,21 +30,32 @@ function parseTarOctal(buf, start, length) {
   return parsed;
 }
 
-function parsePaxRecords(buf) {
-  const text = buf.toString('utf8');
+export function parsePaxRecords(buf) {
   const attrs = {};
-  let idx = 0;
-  while (idx < text.length) {
-    const sp = text.indexOf(' ', idx);
+  let offset = 0;
+  while (offset < buf.length) {
+    const sp = buf.indexOf(0x20, offset);
     if (sp === -1) break;
-    const len = parseInt(text.slice(idx, sp), 10);
-    if (!Number.isFinite(len) || len <= 0) break;
-    const record = text.slice(sp + 1, idx + len - 1);
+    const len = parseInt(buf.subarray(offset, sp).toString('ascii'), 10);
+    if (!Number.isFinite(len) || len <= sp - offset + 1 || offset + len > buf.length) break;
+    let end = offset + len;
+    if (buf[end - 1] === 0x0a) end -= 1;
+    const record = buf.subarray(sp + 1, end).toString('utf8');
     const eq = record.indexOf('=');
     if (eq !== -1) attrs[record.slice(0, eq)] = record.slice(eq + 1);
-    idx += len;
+    offset += len;
   }
   return attrs;
+}
+
+export function encodePaxRecord(key, value) {
+  const body = `${key}=${value}\n`;
+  const bodyBytes = Buffer.byteLength(body, 'utf8');
+  let totalLen = String(bodyBytes + 3).length + 1 + bodyBytes;
+  while (String(totalLen).length + 1 + bodyBytes !== totalLen) {
+    totalLen = String(totalLen).length + 1 + bodyBytes;
+  }
+  return Buffer.from(`${totalLen} ${body}`, 'utf8');
 }
 
 export function validateSafeRelPath(rawPath) {
@@ -221,7 +232,7 @@ function writeOctal(buf, strVal, offset, length) {
   buf[offset + length - 1] = 0;
 }
 
-function buildUstarHeader(relPath, byteLength, mode = 0o644) {
+function buildUstarHeader(relPath, byteLength, mode = 0o644, typeFlagChar = '0') {
   const header = Buffer.alloc(512, 0);
   const safe = validateSafeRelPath(relPath);
   let name = safe;
@@ -229,10 +240,15 @@ function buildUstarHeader(relPath, byteLength, mode = 0o644) {
 
   if (Buffer.byteLength(safe, 'utf8') > 100) {
     const slash = safe.lastIndexOf('/');
-    if (slash === -1) throw new Error(`Filename >100 bytes: ${safe}`);
-    prefix = safe.slice(0, slash);
-    name = safe.slice(slash + 1);
+    if (slash !== -1) {
+      prefix = safe.slice(0, slash);
+      name = safe.slice(slash + 1);
+    }
   }
+
+  // Truncate UTF-8 cleanly at char boundary when an accompanying PAX 'x' header carries the full path
+  while (Buffer.byteLength(name, 'utf8') > 100) name = name.slice(0, -1);
+  while (Buffer.byteLength(prefix, 'utf8') > 155) prefix = prefix.slice(0, -1);
 
   header.write(name, 0, Math.min(100, Buffer.byteLength(name)), 'utf8');
   writeOctal(header, mode.toString(8), 100, 8);
@@ -241,7 +257,7 @@ function buildUstarHeader(relPath, byteLength, mode = 0o644) {
   writeOctal(header, byteLength.toString(8), 124, 12);
   writeOctal(header, '0', 136, 12); // mtime = 0 for reproducible builds
   header.fill(0x20, 148, 156);
-  header.write('0', 156, 1, 'ascii');
+  header.write(typeFlagChar, 156, 1, 'ascii');
   header.write('ustar\0', 257, 6, 'ascii');
   header.write('00', 263, 2, 'ascii');
   if (prefix) header.write(prefix, 345, Math.min(155, Buffer.byteLength(prefix)), 'utf8');
@@ -254,7 +270,7 @@ function buildUstarHeader(relPath, byteLength, mode = 0o644) {
   return header;
 }
 
-export function createDeterministicTarGz(entries) {
+export function createDeterministicTarGz(entries, { forcePax = false } = {}) {
   const pairs = entries instanceof Map ? [...entries.entries()] : Object.entries(entries || {});
   const sorted = pairs
     .map(([p, content]) => [
@@ -264,9 +280,30 @@ export function createDeterministicTarGz(entries) {
     .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
 
   const chunks = [];
+  let paxSeq = 0;
   for (const [relPath, buf] of sorted) {
+    const slash = relPath.lastIndexOf('/');
+    const baseName = slash === -1 ? relPath : relPath.slice(slash + 1);
+    const dirPrefix = slash === -1 ? '' : relPath.slice(0, slash);
+    const needsPax =
+      forcePax ||
+      Buffer.byteLength(baseName, 'utf8') > 100 ||
+      Buffer.byteLength(dirPrefix, 'utf8') > 155;
+
+    if (needsPax) {
+      const paxPayload = Buffer.concat([
+        encodePaxRecord('mtime', '0'),
+        encodePaxRecord('path', relPath),
+        encodePaxRecord('size', String(buf.length)),
+      ]);
+      chunks.push(buildUstarHeader(`PaxHeader/entry-${++paxSeq}`, paxPayload.length, 0o644, 'x'));
+      chunks.push(paxPayload);
+      const paxRem = paxPayload.length % 512;
+      if (paxRem !== 0) chunks.push(Buffer.alloc(512 - paxRem, 0));
+    }
+
     const mode = relPath.startsWith('bin/') || relPath.endsWith('.sh') ? 0o755 : 0o644;
-    chunks.push(buildUstarHeader(relPath, buf.length, mode));
+    chunks.push(buildUstarHeader(relPath, buf.length, mode, '0'));
     chunks.push(buf);
     const rem = buf.length % 512;
     if (rem !== 0) chunks.push(Buffer.alloc(512 - rem, 0));

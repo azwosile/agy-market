@@ -2,7 +2,7 @@
 
 export const PLUGIN_ID = 'agy-market';
 export const PLUGIN_DISPLAY_NAME = 'AGY Market · 反重力插件市场';
-export const PLUGIN_VERSION = '1.0.0';
+export const PLUGIN_VERSION = '1.0.1';
 export const SIDECAR_ID = 'market_pane';
 export const SIDECAR_URI = 'sidecar://agy-market/market_pane/';
 export const CUSTOMIZATION_URI = 'customization://agy-market';

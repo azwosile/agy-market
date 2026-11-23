@@ -28,8 +28,8 @@ npm test
 ### One-Line User Bootstrap
 
 - **Node / npx**: `npx agy-market@latest`
-- **Windows PowerShell (Zero npm)**: `irm https://github.com/azwosile/agy-market/releases/latest/download/install.ps1 | iex`
-- **macOS / Linux Shell (Zero npm)**: `curl -fsSL https://github.com/azwosile/agy-market/releases/latest/download/install.sh | sh`
+- **Windows PowerShell (Zero npm)**: `irm https://raw.githubusercontent.com/azwosile/agy-market/main/scripts/install.ps1 | iex`
+- **macOS / Linux Shell (Zero npm)**: `curl -fsSL https://raw.githubusercontent.com/azwosile/agy-market/main/scripts/install.sh | sh`
 
 Once installed in Antigravity:
 - Open Auxiliary Pane: `[AGY Market](sidecar://agy-market/market_pane/)`
