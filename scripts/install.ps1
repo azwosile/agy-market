@@ -1,4 +1,4 @@
-﻿# Zero-npm PowerShell Bootstrap Installer for AGY Market (`scripts/install.ps1`)
+# Zero-npm PowerShell Bootstrap Installer for AGY Market (`scripts/install.ps1`)
 # Verifies SHA-256 digest before extracting real files into ~/.gemini/config/plugins/agy-market
 # Automatically falls back to the authoritative AGY Market catalog index when binary release assets are absent.
 
@@ -88,7 +88,14 @@ try {
     Save-UriToFile -Uri $FallbackTarUrl -OutFile $TarFile
   }
 
-  $ActualHash = (Get-FileHash -Path $TarFile -Algorithm SHA256).Hash.ToLowerInvariant()
+  $Sha256 = [System.Security.Cryptography.SHA256]::Create()
+  $TarStream = [System.IO.File]::OpenRead($TarFile)
+  try {
+    $ActualHash = ([System.BitConverter]::ToString($Sha256.ComputeHash($TarStream))).Replace("-", "").ToLowerInvariant()
+  } finally {
+    $TarStream.Dispose()
+    $Sha256.Dispose()
+  }
   if ($ExpectedHash -ne $ActualHash) {
     throw "INTEGRITY_SHA256_MISMATCH: Expected $ExpectedHash, got $ActualHash"
   }

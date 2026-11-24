@@ -7,6 +7,15 @@ import { dirname } from 'node:path';
 import { CHINA_NPM_MIRRORS, MAX_TARBALL_BYTES } from '../shared/constants.mjs';
 import { fileUriToLocalPath } from '../shared/paths.mjs';
 
+export function resolveMutableTagCommitFallbackUrl(plugin) {
+  const rawUrl = String(plugin?.distribution?.tarballUrl || '').trim();
+  const m = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/archive\/refs\/tags\/[^/]+\.tar\.gz$/i.exec(rawUrl);
+  if (!m) return null;
+  const commitSha = String(plugin?.commitSha || '').trim();
+  if (!/^[0-9a-f]{40}$/i.test(commitSha)) return null;
+  return `https://github.com/${m[1]}/archive/${commitSha}.tar.gz`;
+}
+
 export function buildCandidateDownloadUrls(plugin, prefs = {}) {
   const dist = plugin?.distribution || {};
   const rawUrl = String(dist.tarballUrl || '').trim();
@@ -176,10 +185,31 @@ export async function fetchVerifiedPluginTarball({
     }
   }
 
-  rmSync(stagingDir, { recursive: true, force: true });
   const joined = errors.join(' | ');
   if (joined.includes('INTEGRITY_SHA256_MISMATCH')) {
-    throw new Error(joined);
+    const commitFallbackUrl = resolveMutableTagCommitFallbackUrl(plugin);
+    if (commitFallbackUrl) {
+      try {
+        const { sha256, bytes } = await streamUrlToFileAndHash(commitFallbackUrl, stagingArchivePath, {
+          maxBytes,
+          fetchImpl,
+        });
+        return {
+          archivePath: stagingArchivePath,
+          sha256,
+          bytes,
+          channelUsed: 'github-commit-fallback',
+          urlUsed: commitFallbackUrl,
+        };
+      } catch (err) {
+        rmSync(stagingArchivePath, { force: true });
+        errors.push(`github-commit-fallback (${commitFallbackUrl}): ${err?.message || String(err)}`);
+      }
+    }
+    rmSync(stagingDir, { recursive: true, force: true });
+    throw new Error(errors.join(' | '));
   }
+
+  rmSync(stagingDir, { recursive: true, force: true });
   throw new Error(`ERR_TARBALL_DOWNLOAD_FAILED: ${joined}`);
 }

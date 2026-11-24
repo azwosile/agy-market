@@ -15,6 +15,7 @@ import { validatePluginTarball } from '../../agy-market-catalog/scripts/validate
 
 import { runCli } from '../bin/agy-market.mjs';
 import { packReleaseBundle } from '../scripts/pack-release.mjs';
+import { fetchVerifiedPluginTarball, resolveMutableTagCommitFallbackUrl } from '../src/installer/fetch-tarball.mjs';
 import { installOrUpdateCatalogPlugin } from '../src/installer/index.mjs';
 import { recoverInterruptedJournal, writePendingJournal } from '../src/installer/journal.mjs';
 import { sweepRetiredBinaries } from '../src/installer/sync-dir.mjs';
@@ -214,6 +215,7 @@ test('Dual-channel registry: ETag 304 cache hit + automatic @agy-market/catalog 
     ws.cleanup();
   }
 });
+
 
 test('Installer enforces SHA-256 tamper protection, Track-2 <owner>--<slug> rewrite, local collision modal, escalation guard & Windows EBUSY lock-safe sync', async () => {
   const ws = makeTempWorkspace();
@@ -457,6 +459,7 @@ test('Installer enforces SHA-256 tamper protection, Track-2 <owner>--<slug> rewr
   }
 });
 
+
 test('Sidecar HTTP server enforces X-Sidecar-Token & Origin CSRF guards and CLI bootstrap passes doctor', async () => {
   const ws = makeTempWorkspace();
   try {
@@ -537,6 +540,7 @@ test('Sidecar HTTP server enforces X-Sidecar-Token & Origin CSRF guards and CLI 
     ws.cleanup();
   }
 });
+
 
 test('Real-world plugin manifest compatibility: author string/object, repo {type,url}/README fallback, PNG logo & custom sidecar path', () => {
   const ws = makeTempWorkspace('agy-real-compat-');
@@ -648,6 +652,7 @@ test('Real-world plugin manifest compatibility: author string/object, repo {type
   }
 });
 
+
 test('POSIX PAX multi-record UTF-8 byte-length parser & Windows NTFS extraction + install.ps1 catalog fallback', () => {
   const ws = makeTempWorkspace('agy-pax-boot-');
   try {
@@ -721,6 +726,24 @@ test('POSIX PAX multi-record UTF-8 byte-length parser & Windows NTFS extraction 
 
       const repoRoot = resolve(fileURLToPath(new URL('..', import.meta.url)));
       const ps1Script = join(repoRoot, 'scripts', 'install.ps1');
+      const ps1Bytes = readFileSync(ps1Script);
+      assert.equal(
+        ps1Bytes.length >= 3 && ps1Bytes[0] === 0xef && ps1Bytes[1] === 0xbb && ps1Bytes[2] === 0xbf,
+        false,
+        'scripts/install.ps1 must not have a UTF-8 BOM (breaks irm ... | iex with param block)',
+      );
+      execFileSync(
+        'powershell.exe',
+        [
+          '-NoProfile',
+          '-Command',
+          '[scriptblock]::Create([System.Text.Encoding]::UTF8.GetString([System.IO.File]::ReadAllBytes($env:AGY_PS1_PATH))) | Out-Null',
+        ],
+        {
+          env: { ...scrubChildProcessEnv(process.env), AGY_PS1_PATH: ps1Script },
+          stdio: 'pipe',
+        },
+      );
       const missingReleaseBase = pathToFileURL(join(ws.artifactsDir, 'missing-release-404')).href;
 
       execFileSync(
@@ -753,5 +776,93 @@ test('POSIX PAX multi-record UTF-8 byte-length parser & Windows NTFS extraction 
     }
   } finally {
     ws.cleanup();
+  }
+});
+
+test('fetchVerifiedPluginTarball falls back to commit-pinned GitHub archive only when mutable tag archive drifts', async () => {
+  const commitSha = 'eb55259f0e17ec75794e7a3fad411a177eb94bb7';
+  assert.equal(
+    resolveMutableTagCommitFallbackUrl({
+      commitSha,
+      distribution: { tarballUrl: 'https://github.com/zou172866/agy-dart/archive/refs/tags/v1.7.0.tar.gz' },
+    }),
+    `https://github.com/zou172866/agy-dart/archive/${commitSha}.tar.gz`,
+  );
+  assert.equal(
+    resolveMutableTagCommitFallbackUrl({
+      commitSha,
+      distribution: { tarballUrl: 'https://github.com/zou172866/agy-dart/releases/download/v1.7.0/agy-dart.tar.gz' },
+    }),
+    null,
+  );
+  assert.equal(
+    resolveMutableTagCommitFallbackUrl({
+      commitSha: 'not-a-sha',
+      distribution: { tarballUrl: 'https://github.com/zou172866/agy-dart/archive/refs/tags/v1.7.0.tar.gz' },
+    }),
+    null,
+  );
+
+  const stageRoot = mkdtempSync(join(tmpdir(), 'agy-commit-fb-'));
+  try {
+    const expectedOldPayload = Buffer.from('original-tag-archive-bytes');
+    const driftedTagPayload = Buffer.from('retagged-archive-bytes');
+    const commitPayload = Buffer.from('immutable-commit-archive-bytes');
+    const expectedSha = createHash('sha256').update(expectedOldPayload).digest('hex');
+
+    const requestedUrls = [];
+    const mockFetch = async (url) => {
+      requestedUrls.push(String(url));
+      if (String(url).includes('/archive/refs/tags/')) {
+        return new Response(driftedTagPayload, { status: 200 });
+      }
+      if (String(url).includes(`/archive/${commitSha}.tar.gz`)) {
+        return new Response(commitPayload, { status: 200 });
+      }
+      return new Response('not found', { status: 404 });
+    };
+
+    const result = await fetchVerifiedPluginTarball({
+      plugin: {
+        id: 'zou172866__agy-dart',
+        version: '1.7.0',
+        commitSha,
+        distribution: {
+          tarballUrl: 'https://github.com/zou172866/agy-dart/archive/refs/tags/v1.7.0.tar.gz',
+          sha256: expectedSha,
+        },
+      },
+      stagingDir: join(stageRoot, 'stage-1'),
+      stagingArchivePath: join(stageRoot, 'stage-1', 'archive.tar.gz'),
+      fetchImpl: mockFetch,
+    });
+
+    assert.equal(result.channelUsed, 'github-commit-fallback');
+    assert.equal(result.urlUsed, `https://github.com/zou172866/agy-dart/archive/${commitSha}.tar.gz`);
+    assert.deepEqual(requestedUrls, [
+      'https://github.com/zou172866/agy-dart/archive/refs/tags/v1.7.0.tar.gz',
+      `https://github.com/zou172866/agy-dart/archive/${commitSha}.tar.gz`,
+    ]);
+
+    // Release assets must STILL strictly fail on SHA-256 mismatch (never fall back)
+    await assert.rejects(
+      fetchVerifiedPluginTarball({
+        plugin: {
+          id: 'zou172866__agy-dart',
+          version: '1.7.0',
+          commitSha,
+          distribution: {
+            tarballUrl: 'https://github.com/zou172866/agy-dart/releases/download/v1.7.0/agy-dart.tar.gz',
+            sha256: expectedSha,
+          },
+        },
+        stagingDir: join(stageRoot, 'stage-2'),
+        stagingArchivePath: join(stageRoot, 'stage-2', 'archive.tar.gz'),
+        fetchImpl: async () => new Response(driftedTagPayload, { status: 200 }),
+      }),
+      /INTEGRITY_SHA256_MISMATCH/,
+    );
+  } finally {
+    rmSync(stageRoot, { recursive: true, force: true });
   }
 });
