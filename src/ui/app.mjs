@@ -51,11 +51,14 @@ function writeStorage(key, value) {
 }
 
 const CATEGORY_ACCENTS = Object.freeze({
+  'monitoring-quota': { a1: '#06b6d4', a2: '#3b82f6' },
+  'context-cache': { a1: '#14b8a6', a2: '#6366f1' },
   'ui-themes': { a1: '#a855f7', a2: '#ec4899' },
+  'agents-reasoning': { a1: '#8b5cf6', a2: '#f43f5e' },
   'developer-tools': { a1: '#6366f1', a2: '#06b6d4' },
-  productivity: { a1: '#38bdf8', a2: '#14b8a6' },
   'mcp-integrations': { a1: '#f59e0b', a2: '#f97316' },
   'skills-workflows': { a1: '#10b981', a2: '#34d399' },
+  productivity: { a1: '#38bdf8', a2: '#14b8a6' },
   'data-science': { a1: '#3b82f6', a2: '#8b5cf6' },
   'cloud-devops': { a1: '#06b6d4', a2: '#3b82f6' },
   'creative-media': { a1: '#ec4899', a2: '#f97316' },
@@ -152,10 +155,10 @@ const state = {
     error: '',
   },
 
-  // Dismissible Smart Restart / Reload Banner (shown ONLY after a successful update/install or locked binary)
-  restartBanner: null, // null | { level: 'host-restart'|'reload-pane', plugins: string[], reasons: string[] }
+  // Dismissible Smart Restart / Reload Banner (shown ONLY after a completed install/update/uninstall/toggle)
+  restartBanner: null, // null | { level: 'host-restart'|'reload-pane', operation: 'install'|'update'|'uninstall'|'toggle', plugins: string[], reasons: string[] }
 
-  // Prominent Red Error Alert Banner (shown whenever install / update / update-all / self-update fails)
+  // Prominent Red Error Alert Banner (shown whenever install / update / update-all / self-update / uninstall fails)
   errorBanner: null, // null | { title, items: [{ pluginName, message }], retryAction }
 
   // Batch update state (`POST /api/update-all`)
@@ -179,7 +182,7 @@ const state = {
   githubUrlModal: null, // null | { phase, url, inspectToken, selectedPluginRoot, installMode, confirmEscalation, inspectResult, subpathCandidates, error }
   conflictModal: null,
   escalationModal: null,
-  removeConfirmModal: null, // null | { dir, displayName, version }
+  removeConfirmModal: null, // null | { dir, displayName, version, isFavorited, removeFavorite }
 
   // Clean Feedback Toast
   toast: null, // null | { message, subtext?, tone }
@@ -293,6 +296,55 @@ function isFavoritedKey(key) {
   return Boolean(key && state.favorites.includes(key));
 }
 
+function isPluginDirFavorited(dir, extraFavKey = '') {
+  if (extraFavKey && isFavoritedKey(extraFavKey)) return true;
+  const cleanDir = String(dir || '').trim();
+  if (!cleanDir) return false;
+  if (isFavoritedKey(`local:${cleanDir}`) || isFavoritedKey(cleanDir)) return true;
+  const loc = getInstalledByDirMap().get(cleanDir) || null;
+  const { byId: catById, byDir: catByDir } = getCatalogMaps();
+  const catEntry = (loc?.receipt?.id && catById.get(loc.receipt.id)) || catByDir.get(cleanDir) || null;
+  if (catEntry?.id && isFavoritedKey(catEntry.id)) return true;
+  if (loc?.receipt?.id && isFavoritedKey(loc.receipt.id)) return true;
+  return false;
+}
+
+function isDirectGithubUpdateItem(upd) {
+  if (!upd) return false;
+  return (
+    upd.updateChannel === 'github-upstream' ||
+    upd.updateChannel === 'github-url' ||
+    upd.source === 'github-release' ||
+    upd.source === 'github-tag' ||
+    upd.source === 'github-branch'
+  );
+}
+
+function formatCategoryLabel(catId, locale = getLocale()) {
+  const key = String(catId || '').trim();
+  if (!key) return '';
+  const entry = CATEGORY_LABELS[key];
+  if (entry) return locale === 'en' ? entry.en || entry.zh || key : entry.zh || entry.en || key;
+  return key;
+}
+
+function renderCategoryTagsHtml(categories = [], { maxCount = 2, clickable = false } = {}) {
+  const list = (Array.isArray(categories) ? categories : []).filter(Boolean);
+  if (!list.length) return '';
+  const shown = maxCount > 0 ? list.slice(0, maxCount) : list;
+  return shown
+    .map((catId) => {
+      const label = formatCategoryLabel(catId);
+      const accent = CATEGORY_ACCENTS[catId] || CATEGORY_ACCENTS.other;
+      const styleAttr = `style="--cat-dot:${accent.a1}"`;
+      if (clickable) {
+        return `<button type="button" class="cat-tag-pill is-clickable" ${styleAttr} data-action="category" data-category="${escapeHtml(catId)}" data-stop-card="1" title="${escapeHtml(t(`筛选分类：${label}`, `Filter by ${label}`))}"><span class="cat-tag-dot" aria-hidden="true"></span><span>${escapeHtml(label)}</span></button>`;
+      }
+      return `<span class="cat-tag-pill" ${styleAttr}><span class="cat-tag-dot" aria-hidden="true"></span><span>${escapeHtml(label)}</span></span>`;
+    })
+    .join('');
+}
+
 function getUiBadgeSpec(badgeId) {
   const base = CAPABILITY_BADGE_SPECS[badgeId] || { tone: 'subtle', descZh: badgeId, descEn: badgeId };
   if (badgeId === 'sidecar-ui') {
@@ -404,49 +456,71 @@ function resolveActivationInfo(sourceObj, capabilitiesFallback = {}) {
 
 function maybeTriggerRestartBanner({
   pluginName = '',
+  operation = 'update',
   restartRequired = false,
   reloadRequired = false,
   retiredBinaries = [],
   lockedOnDisable = false,
+  lockedOnRemove = false,
   activation = null,
 } = {}) {
   const hasRetired = Array.isArray(retiredBinaries) && retiredBinaries.length > 0;
+  const isLocked = Boolean(lockedOnDisable || lockedOnRemove || hasRetired);
+  const op = operation || 'update';
   let level = '';
   let reason = '';
 
-  if (restartRequired || hasRetired || lockedOnDisable || activation?.level === 'host-restart') {
+  if (restartRequired || isLocked || activation?.level === 'host-restart') {
     level = 'host-restart';
-    if (lockedOnDisable || hasRetired) {
-      reason = t(
-        'Windows 后台进程句柄占用（已安全退役旧二进制），重启 Antigravity 客户端后即可完全释放生效。',
-        'Windows background binary handle lock detected; restart Antigravity to fully release and apply.',
-      );
+    if (isLocked) {
+      reason =
+        (getLocale() === 'en' ? activation?.reasonEn : activation?.reasonZh) ||
+        (op === 'uninstall'
+          ? t(
+              '插件清单已摘除，部分被后台进程占用的旧文件将在重启 Antigravity 客户端后自动回收清理。',
+              'Manifest removed; locked files will be cleaned up automatically after restarting Antigravity.',
+            )
+          : t(
+              'Windows 后台进程句柄占用（已安全退役旧二进制），重启 Antigravity 客户端后即可完全释放生效。',
+              'Windows background binary handle lock detected; restart Antigravity to fully release and apply.',
+            ));
     } else {
       reason =
         (getLocale() === 'en' ? activation?.reasonEn : activation?.reasonZh) ||
-        t(
-          `该插件涉及 ${ASAR_LABEL} 界面补丁或 CDP 调试端口宿主增强，请重启 Antigravity 客户端生效。`,
-          `This plugin modifies ${ASAR_LABEL} or CDP host enhancements; restart Antigravity to apply.`,
-        );
+        (op === 'uninstall'
+          ? t(
+              `已卸载涉及 ${ASAR_LABEL} 界面补丁或 CDP 宿主增强的插件，请重启 Antigravity 客户端以彻底释放残留状态。`,
+              `Uninstalled plugin with ${ASAR_LABEL} or CDP host enhancements; restart Antigravity to release remaining state.`,
+            )
+          : t(
+              `该插件涉及 ${ASAR_LABEL} 界面补丁或 CDP 调试端口宿主增强，请重启 Antigravity 客户端生效。`,
+              `This plugin modifies ${ASAR_LABEL} or CDP host enhancements; restart Antigravity to apply.`,
+            ));
     }
   } else if (reloadRequired || activation?.level === 'reload-pane') {
     level = 'reload-pane';
     reason =
       (getLocale() === 'en' ? activation?.reasonEn : activation?.reasonZh) ||
-      t(
-        '该插件包含 Sidebar 侧边栏、MCP 服务或钩子，建议重开对应侧边栏或刷新 MCP 列表。',
-        'This plugin includes a Sidebar panel, MCP server, or hooks; reopen Sidebar or refresh MCP.',
-      );
+      (op === 'uninstall'
+        ? t(
+            '已卸载包含 Sidebar 侧边栏、MCP 服务或钩子的插件，建议关闭对应侧边栏或刷新 MCP 列表。',
+            'Uninstalled plugin with Sidebar panel, MCP server, or hooks; close its Sidebar or refresh MCP.',
+          )
+        : t(
+            '该插件包含 Sidebar 侧边栏、MCP 服务或钩子，建议重开对应侧边栏或刷新 MCP 列表。',
+            'This plugin includes a Sidebar panel, MCP server, or hooks; reopen Sidebar or refresh MCP.',
+          ));
   }
 
   if (!level) return null;
 
   const existing = state.restartBanner;
+  const sameOp = existing && existing.operation === op;
   const nextLevel =
-    existing?.level === 'host-restart' || level === 'host-restart' ? 'host-restart' : 'reload-pane';
-  const plugins = [...new Set([...(existing?.plugins || []), ...(pluginName ? [pluginName] : [])])];
-  const reasons = [...new Set([...(existing?.reasons || []), ...(reason ? [reason] : [])])];
-  state.restartBanner = { level: nextLevel, plugins, reasons };
+    (sameOp && existing.level === 'host-restart') || level === 'host-restart' ? 'host-restart' : 'reload-pane';
+  const plugins = [...new Set([...(sameOp ? existing.plugins || [] : []), ...(pluginName ? [pluginName] : [])])];
+  const reasons = [...new Set([...(sameOp ? existing.reasons || [] : []), ...(reason ? [reason] : [])])];
+  state.restartBanner = { level: nextLevel, operation: op, plugins, reasons };
   return { level, reason };
 }
 
@@ -595,6 +669,10 @@ function buildLocalDetailModel(loc, catEntry) {
         toggleDisabledReason:
           loc.toggleDisabledReason ??
           (loc.dir === 'agy-market' ? 'self' : loc.hostDisabled ? 'host-disabled' : loc.scope !== 'global' ? loc.scope : ''),
+        canUninstall: loc.canUninstall ?? (loc.scope === 'global' && loc.dir !== 'agy-market'),
+        uninstallDisabledReason:
+          loc.uninstallDisabledReason ??
+          (loc.dir === 'agy-market' ? 'self' : loc.scope !== 'global' ? loc.scope : ''),
         sidecarPane: loc.sidecarPane || catEntry.installStatus?.sidecarPane || null,
       },
       _track: loc.receipt?.track || catEntry._track || 'verified',
@@ -639,6 +717,10 @@ function buildLocalDetailModel(loc, catEntry) {
       toggleDisabledReason:
         loc.toggleDisabledReason ??
         (loc.dir === 'agy-market' ? 'self' : loc.hostDisabled ? 'host-disabled' : loc.scope !== 'global' ? loc.scope : ''),
+      canUninstall: loc.canUninstall ?? (loc.scope === 'global' && loc.dir !== 'agy-market'),
+      uninstallDisabledReason:
+        loc.uninstallDisabledReason ??
+        (loc.dir === 'agy-market' ? 'self' : loc.scope !== 'global' ? loc.scope : ''),
       hasUpdate: false,
       sidecarPane: loc.sidecarPane || null,
     },
@@ -831,6 +913,7 @@ async function triggerTogglePlugin(dir, nextEnabled) {
       if (hasLockedOrRetired) {
         maybeTriggerRestartBanner({
           pluginName: dir,
+          operation: 'toggle',
           restartRequired: true,
           retiredBinaries: res.retiredBinaries || [],
           lockedOnDisable: Boolean(res.lockedOnDisable),
@@ -856,47 +939,51 @@ async function triggerTogglePlugin(dir, nextEnabled) {
   }
 }
 
-async function triggerRemovePluginFiles(dir) {
-  if (!dir || dir === 'agy-market') return;
-  state.removingDir = dir;
+async function triggerUninstallPlugin(dir, { removeFavorite = false, displayName = '' } = {}) {
+  const cleanDir = String(dir || '').trim();
+  if (!cleanDir || cleanDir === 'agy-market') return;
+  const label = String(displayName || state.removeConfirmModal?.displayName || cleanDir).trim();
+  state.removingDir = cleanDir;
+  state.errorBanner = null;
   render();
   try {
-    const res = await apiFetch('/api/remove-files', {
+    const res = await apiFetch('/api/uninstall', {
       method: 'POST',
-      body: { dir, workspaceUris: state.workspaceUris },
+      body: {
+        dir: cleanDir,
+        removeFavorite: Boolean(removeFavorite),
+        workspaceUris: state.workspaceUris,
+      },
     });
     if (res.state) {
       state.serverState = res.state;
       syncFavoritesFromServerState();
     }
     state.removeConfirmModal = null;
-    if (res?.locked && !res?.removed) {
+
+    if (res?.ok === false || res?.removed === false) {
       syncDetailPluginReference();
       if (state.conflicts.loaded) {
         void loadConflicts({ silent: true });
       }
-      const lockMsg = t(
-        `插件 "${dir}" 的文件正被后台进程占用，无法立即删除。请关闭或重启 Antigravity 后重试。`,
-        `Files for "${dir}" are locked by a background process and could not be removed. Close or restart Antigravity and try again.`,
-      );
+      const isLocked = Boolean(res?.locked);
+      const errMsg =
+        res?.error ||
+        (isLocked
+          ? t(
+              `插件 "${cleanDir}" 的文件正被后台进程占用，无法立即卸载。请关闭或重启 Antigravity 后重试。`,
+              `Files for "${cleanDir}" are locked by a background process and could not be uninstalled. Close or restart Antigravity and try again.`,
+            )
+          : t('插件未能卸载', 'Failed to uninstall plugin'));
       setErrorBanner({
-        title: t('插件文件移除受阻', 'Plugin Files Locked'),
-        items: [{ pluginName: dir, message: res?.error || lockMsg }],
+        title: isLocked ? t('插件卸载受阻', 'Plugin Uninstall Blocked') : t('插件卸载失败', 'Failed to Uninstall Plugin'),
+        items: [{ pluginName: label, message: errMsg }],
       });
-      showToast(lockMsg, { tone: 'err', durationMs: 7000 });
+      showToast(`${t('卸载失败', 'Uninstall failed')}: ${errMsg}`, { tone: 'err', durationMs: 7000 });
       return;
     }
-    if (res?.ok === false || res?.removed === false) {
-      syncDetailPluginReference();
-      const errMsg = res?.error || t('插件文件未能移除', 'Failed to remove plugin files');
-      setErrorBanner({
-        title: t('插件文件移除失败', 'Failed to Remove Plugin Files'),
-        items: [{ pluginName: dir, message: errMsg }],
-      });
-      showToast(`${t('移除失败', 'Remove failed')}: ${errMsg}`, { tone: 'err', durationMs: 7000 });
-      return;
-    }
-    if (state.detailPlugin?.installStatus?.installedDir === dir) {
+
+    if (state.detailPlugin?.installStatus?.installedDir === cleanDir) {
       if (state.detailPlugin._localOnly) {
         state.detailPlugin = null;
       } else {
@@ -906,14 +993,46 @@ async function triggerRemovePluginFiles(dir) {
     if (state.conflicts.loaded) {
       void loadConflicts({ silent: true });
     }
-    showToast(t(`已移除插件文件：${dir}`, `Removed plugin files: ${dir}`), { tone: 'ok' });
+
+    const isPartiallyLocked = Boolean(res?.locked);
+    const restartInfo = maybeTriggerRestartBanner({
+      pluginName: label,
+      operation: 'uninstall',
+      restartRequired: Boolean(res?.restartRequired || isPartiallyLocked),
+      reloadRequired: Boolean(res?.reloadRequired),
+      retiredBinaries: res?.retiredBinaries || [],
+      lockedOnRemove: Boolean(res?.lockedOnRemove || isPartiallyLocked),
+      activation: res?.activation || null,
+    });
+
+    showToast(t(`已卸载插件：${label}`, `Uninstalled plugin: ${label}`), {
+      subtext:
+        restartInfo?.reason ||
+        (isPartiallyLocked
+          ? t(
+              '清单已立即摘除，残留的被占用文件将在下次重启 Antigravity 后自动清理',
+              'Manifest removed immediately; locked files will be cleaned up after restarting Antigravity',
+            )
+          : ''),
+      tone: 'ok',
+      durationMs: restartInfo || isPartiallyLocked ? 6500 : 4000,
+    });
     void checkUpdates(false, { silent: true });
   } catch (err) {
-    showToast(`${t('移除失败', 'Remove failed')}: ${err?.message || String(err)}`, { tone: 'danger' });
+    const errMsg = err?.message || String(err);
+    setErrorBanner({
+      title: t('插件卸载失败', 'Failed to Uninstall Plugin'),
+      items: [{ pluginName: label, message: errMsg }],
+    });
+    showToast(`${t('卸载失败', 'Uninstall failed')}: ${errMsg}`, { tone: 'danger', durationMs: 7000 });
   } finally {
     state.removingDir = '';
     render();
   }
+}
+
+async function triggerRemovePluginFiles(dir, opts = {}) {
+  return triggerUninstallPlugin(dir, opts);
 }
 
 async function toggleFavorite(key, displayName = '') {
@@ -1124,6 +1243,7 @@ async function triggerInstall(plugin, { conflictStrategy = 'prompt', confirmEsca
       const act = res.activation || resolveActivationInfo(plugin);
       const restartInfo = maybeTriggerRestartBanner({
         pluginName: plugin.displayName || res.installedDir || plugin.canonicalName,
+        operation: isUpdate ? 'update' : 'install',
         restartRequired: Boolean(res.restartRequired),
         reloadRequired: Boolean(res.reloadRequired),
         retiredBinaries: res.retiredBinaries || [],
@@ -1171,10 +1291,39 @@ async function triggerInstall(plugin, { conflictStrategy = 'prompt', confirmEsca
 }
 
 async function triggerUpdateAll(ids = null, { confirmEscalation = false } = {}) {
-  const installable = getInstallableUpdates();
-  const targetIds = Array.isArray(ids) && ids.length ? ids : installable.map((u) => u.id);
+  let targetIds = Array.isArray(ids) && ids.length ? ids : getInstallableUpdates().map((u) => u.id);
+  let didLiveCheck = false;
+
+  if (!targetIds.length && (!Array.isArray(ids) || ids.length === 0)) {
+    state.batchUpdating = true;
+    state.batchTargetIds = [];
+    state.errorBanner = null;
+    render();
+    didLiveCheck = true;
+    await checkUpdates(true, { silent: true });
+    targetIds = getInstallableUpdates().map((u) => u.id);
+    if (!targetIds.length) {
+      state.batchUpdating = false;
+      state.batchTargetIds = [];
+      render();
+      if (state.updates.error) {
+        showToast(`${t('检查更新失败', 'Update check failed')}: ${state.updates.error}`, {
+          tone: 'danger',
+          durationMs: 7000,
+        });
+      } else {
+        showToast(t('全部已安装插件均已是最新版本', 'All installed plugins are already up to date'), {
+          tone: 'ok',
+        });
+      }
+      return;
+    }
+  }
+
   if (!targetIds.length) {
-    showToast(t('当前没有可通过目录直接安装的更新', 'No catalog-installable updates available'));
+    showToast(t('全部已安装插件均已是最新版本', 'All installed plugins are already up to date'), {
+      tone: 'ok',
+    });
     return;
   }
 
@@ -1189,6 +1338,7 @@ async function triggerUpdateAll(ids = null, { confirmEscalation = false } = {}) 
       body: {
         ids: targetIds,
         confirmEscalation,
+        ...(didLiveCheck ? { forceCheck: true } : {}),
         workspaceUris: state.workspaceUris,
       },
     });
@@ -1212,6 +1362,7 @@ async function triggerUpdateAll(ids = null, { confirmEscalation = false } = {}) 
       if (r.ok) {
         maybeTriggerRestartBanner({
           pluginName: r.displayName || r.installedDir || r.id,
+          operation: 'update',
           restartRequired: Boolean(r.restartRequired),
           reloadRequired: Boolean(r.reloadRequired),
           retiredBinaries: r.retiredBinaries || [],
@@ -1320,12 +1471,29 @@ async function triggerUpdateAll(ids = null, { confirmEscalation = false } = {}) 
   }
 }
 
-async function triggerSelfUpdate({ confirmEscalation = false } = {}) {
+async function triggerSelfUpdate({
+  confirmEscalation = false,
+  updateChannel = '',
+  targetVersion = '',
+  latestVersion = '',
+  targetRef = '',
+} = {}) {
   state.selfUpdateBusy = true;
   state.errorBanner = null;
   render();
+  const su = state.updates.selfUpdate || null;
+  const resolvedChannel = String(updateChannel || su?.updateChannel || '').trim();
+  const resolvedVersion = String(targetVersion || latestVersion || su?.latestVersion || '').trim();
+  const resolvedRef = String(targetRef || su?.targetRef || '').trim();
   try {
-    const body = confirmEscalation ? { confirmEscalation: true } : {};
+    const body = {
+      workspaceUris: state.workspaceUris,
+    };
+    if (confirmEscalation) body.confirmEscalation = true;
+    if (resolvedChannel) body.updateChannel = resolvedChannel;
+    if (resolvedVersion) body.targetVersion = resolvedVersion;
+    if (resolvedRef) body.targetRef = resolvedRef;
+
     const res = await apiFetch('/api/self-update', {
       method: 'POST',
       body,
@@ -1337,7 +1505,6 @@ async function triggerSelfUpdate({ confirmEscalation = false } = {}) {
     }
 
     if (res.status === 'CAPABILITY_ESCALATION_CONFIRM_REQUIRED') {
-      const su = state.updates.selfUpdate;
       state.escalationModal = {
         mode: 'self',
         items: [
@@ -1345,7 +1512,9 @@ async function triggerSelfUpdate({ confirmEscalation = false } = {}) {
             id: su?.id || 'azwosile__agy-market',
             displayName: 'AGY Market · 反重力插件市场',
             installedVersion: res.installedVersion || su?.installedVersion || state.serverState?.plugin?.version || '?',
-            targetVersion: res.targetVersion || su?.latestVersion || '?',
+            targetVersion: res.targetVersion || resolvedVersion || '?',
+            updateChannel: resolvedChannel,
+            targetRef: resolvedRef,
             escalation: res.escalation || { addedBadges: [], addedRemoteDomains: [], addedHookEvents: [] },
           },
         ],
@@ -1357,13 +1526,18 @@ async function triggerSelfUpdate({ confirmEscalation = false } = {}) {
       state.escalationModal = null;
       state.selfChangelogModal = false;
       state.errorBanner = null;
-      startReconnectPolling(res.version || state.updates.selfUpdate?.latestVersion || '');
+      startReconnectPolling(res.version || resolvedVersion || '');
     } else {
       const errMsg = res.error || res.status || t('插件市场自更新未完成', 'Self-update did not complete');
       setErrorBanner({
         title: t('AGY Market 自更新失败', 'AGY Market Self-Update Failed'),
         items: [{ pluginName: 'AGY Market', message: errMsg }],
-        retryAction: { type: 'self-update' },
+        retryAction: {
+          type: 'self-update',
+          updateChannel: resolvedChannel,
+          targetVersion: resolvedVersion,
+          targetRef: resolvedRef,
+        },
       });
       showToast(`${t('市场更新失败', 'Self-update failed')}: ${errMsg}`, { tone: 'danger', durationMs: 8000 });
     }
@@ -1372,7 +1546,12 @@ async function triggerSelfUpdate({ confirmEscalation = false } = {}) {
     setErrorBanner({
       title: t('AGY Market 自更新失败', 'AGY Market Self-Update Failed'),
       items: [{ pluginName: 'AGY Market', message: errMsg }],
-      retryAction: { type: 'self-update' },
+      retryAction: {
+        type: 'self-update',
+        updateChannel: resolvedChannel,
+        targetVersion: resolvedVersion,
+        targetRef: resolvedRef,
+      },
     });
     showToast(`${t('市场更新失败', 'Self-update failed')}: ${errMsg}`, { tone: 'danger', durationMs: 8000 });
   } finally {
@@ -1657,6 +1836,7 @@ async function triggerGithubUrlInstall() {
       const act = res.activation || resolveActivationInfo(pluginInfo);
       const restartInfo = maybeTriggerRestartBanner({
         pluginName: pluginInfo.displayName || installedDir || pluginLabel,
+        operation: isUpdate ? 'update' : 'install',
         restartRequired: Boolean(res.restartRequired),
         reloadRequired: Boolean(res.reloadRequired),
         retiredBinaries: res.retiredBinaries || [],
@@ -1711,24 +1891,54 @@ async function triggerGithubUrlInstall() {
   }
 }
 
-async function triggerUpdateLocalGithub({ id = '', dir = '', displayName = '', confirmEscalation = false } = {}) {
+async function triggerDirectPluginUpdate({
+  id = '',
+  dir = '',
+  displayName = '',
+  source = '',
+  updateChannel = '',
+  targetRef = '',
+  updateKind = '',
+  trackBranch = '',
+  repositoryUrl = '',
+  preferUpstream = false,
+  confirmEscalation = false,
+} = {}) {
   const cleanDir = String(dir || '').trim();
   const targetId = String(id || cleanDir).trim();
   if (!targetId && !cleanDir) return;
   const label = String(displayName || cleanDir || targetId).trim();
 
+  if (cleanDir === 'agy-market' || targetId === 'azwosile__agy-market') {
+    await triggerSelfUpdate({
+      confirmEscalation,
+      updateChannel,
+      targetRef,
+    });
+    return;
+  }
+
   state.busyId = targetId || cleanDir;
   state.errorBanner = null;
   render();
   try {
+    const body = {
+      id: targetId,
+      dir: cleanDir,
+      confirmEscalation: Boolean(confirmEscalation),
+      workspaceUris: state.workspaceUris,
+    };
+    if (source) body.source = source;
+    if (updateChannel) body.updateChannel = updateChannel;
+    if (targetRef) body.targetRef = targetRef;
+    if (updateKind) body.updateKind = updateKind;
+    if (trackBranch) body.trackBranch = trackBranch;
+    if (repositoryUrl) body.repositoryUrl = repositoryUrl;
+    if (preferUpstream) body.preferUpstream = true;
+
     const res = await apiFetch('/api/update', {
       method: 'POST',
-      body: {
-        id: targetId,
-        dir: cleanDir,
-        confirmEscalation: Boolean(confirmEscalation),
-        workspaceUris: state.workspaceUris,
-      },
+      body,
     });
 
     if (res.state) {
@@ -1740,12 +1950,19 @@ async function triggerUpdateLocalGithub({ id = '', dir = '', displayName = '', c
     if (res.status === 'CAPABILITY_ESCALATION_CONFIRM_REQUIRED') {
       const normEsc = normalizeInspectEscalation(res.escalation);
       state.escalationModal = {
-        mode: 'local-github',
+        mode: 'direct-update',
         items: [
           {
             id: targetId,
             dir: cleanDir,
             displayName: label,
+            source,
+            updateChannel,
+            targetRef,
+            updateKind,
+            trackBranch,
+            repositoryUrl,
+            preferUpstream,
             installedVersion: res.installedVersion || '?',
             targetVersion: res.targetVersion || '?',
             escalation: {
@@ -1762,8 +1979,13 @@ async function triggerUpdateLocalGithub({ id = '', dir = '', displayName = '', c
     if (res.ok) {
       state.escalationModal = null;
       state.errorBanner = null;
+      if (res.isSelfUpdate || res.willRestart) {
+        startReconnectPolling(res.version || '');
+        return;
+      }
       const restartInfo = maybeTriggerRestartBanner({
         pluginName: label,
+        operation: 'update',
         restartRequired: Boolean(res.restartRequired),
         reloadRequired: Boolean(res.reloadRequired),
         retiredBinaries: res.retiredBinaries || [],
@@ -1784,7 +2006,19 @@ async function triggerUpdateLocalGithub({ id = '', dir = '', displayName = '', c
       setErrorBanner({
         title: t('插件更新失败', 'Plugin Update Failed'),
         items: [{ pluginName: label, message: errMsg }],
-        retryAction: { type: 'update-local-github', id: targetId, dir: cleanDir, displayName: label },
+        retryAction: {
+          type: 'update-plugin-direct',
+          id: targetId,
+          dir: cleanDir,
+          displayName: label,
+          source,
+          updateChannel,
+          targetRef,
+          updateKind,
+          trackBranch,
+          repositoryUrl,
+          preferUpstream,
+        },
       });
       showToast(`${t('更新失败', 'Update failed')} (${label}): ${errMsg}`, {
         tone: 'danger',
@@ -1796,7 +2030,19 @@ async function triggerUpdateLocalGithub({ id = '', dir = '', displayName = '', c
     setErrorBanner({
       title: t('插件更新失败', 'Plugin Update Failed'),
       items: [{ pluginName: label, message: errMsg }],
-      retryAction: { type: 'update-local-github', id: targetId, dir: cleanDir, displayName: label },
+      retryAction: {
+        type: 'update-plugin-direct',
+        id: targetId,
+        dir: cleanDir,
+        displayName: label,
+        source,
+        updateChannel,
+        targetRef,
+        updateKind,
+        trackBranch,
+        repositoryUrl,
+        preferUpstream,
+      },
     });
     showToast(`${t('更新失败', 'Update failed')} (${label}): ${errMsg}`, {
       tone: 'danger',
@@ -1806,6 +2052,80 @@ async function triggerUpdateLocalGithub({ id = '', dir = '', displayName = '', c
     state.busyId = '';
     render();
   }
+}
+
+async function triggerUpdateLocalGithub(opts = {}) {
+  return triggerDirectPluginUpdate(opts);
+}
+
+async function triggerSyncInstalledPlugin({ dir = '', id = '', displayName = '' } = {}) {
+  const cleanDir = String(dir || '').trim();
+  const targetId = String(id || cleanDir).trim();
+  if (!cleanDir && !targetId) return;
+  const label = String(displayName || cleanDir || targetId).trim();
+
+  if (cleanDir === 'agy-market' || targetId === 'azwosile__agy-market') {
+    state.busyId = cleanDir || targetId;
+    state.selfUpdateBusy = true;
+    state.errorBanner = null;
+    render();
+    try {
+      await checkUpdates(true, { silent: true });
+      const su = state.updates.selfUpdate || null;
+      await triggerSelfUpdate({
+        confirmEscalation: false,
+        updateChannel: su?.updateChannel || '',
+        targetVersion: su?.latestVersion || '',
+        targetRef: su?.targetRef || '',
+      });
+    } finally {
+      state.busyId = '';
+      render();
+    }
+    return;
+  }
+
+  state.busyId = targetId || cleanDir;
+  state.errorBanner = null;
+  render();
+  await checkUpdates(true, { silent: true });
+
+  const { byId: updById, byDir: updByDir } = getUpdateMaps();
+  const { byId: catById, byDir: catByDir } = getCatalogMaps();
+  const loc = getInstalledByDirMap().get(cleanDir) || null;
+  const freshUpd =
+    (cleanDir && updByDir.get(cleanDir)) ||
+    (targetId && updById.get(targetId)) ||
+    (loc?.receipt?.id && updById.get(loc.receipt.id)) ||
+    null;
+  const catEntry =
+    (freshUpd?.id && catById.get(freshUpd.id)) ||
+    (targetId && catById.get(targetId)) ||
+    (loc?.receipt?.id && catById.get(loc.receipt.id)) ||
+    (cleanDir && catByDir.get(cleanDir)) ||
+    null;
+
+  if (freshUpd && isDirectGithubUpdateItem(freshUpd)) {
+    await triggerDirectPluginUpdate({
+      id: freshUpd.id || catEntry?.id || targetId,
+      dir: freshUpd.dir || cleanDir,
+      displayName: label,
+      source: freshUpd.source || '',
+      updateChannel: freshUpd.updateChannel || '',
+      targetRef: freshUpd.targetRef || '',
+      updateKind: freshUpd.updateKind || '',
+      trackBranch: freshUpd.trackBranch || '',
+      repositoryUrl: freshUpd.repositoryUrl || catEntry?.repository?.url || loc?.repositoryUrl || '',
+    });
+    return;
+  }
+
+  await triggerDirectPluginUpdate({
+    id: catEntry?.id || targetId,
+    dir: cleanDir,
+    displayName: label,
+    repositoryUrl: catEntry?.repository?.url || loc?.repositoryUrl || loc?.receipt?.repositoryUrl || '',
+  });
 }
 
 function startReconnectPolling(targetVersion = '') {
@@ -2252,7 +2572,10 @@ function getFilteredPlugins() {
     }
     if (!q) return true;
     const desc = `${resolveCatalogDescription(p, 'zh')} ${resolveCatalogDescription(p, 'en')}`;
-    const hay = `${p.displayName || ''} ${p.canonicalName || ''} ${p.scopedName || ''} ${p.id || ''} ${desc} ${(p.taxonomy?.tags || []).join(' ')} ${(p.capabilities?.badges || []).join(' ')}`.toLowerCase();
+    const catTerms = (p.taxonomy?.categories || [])
+      .map((c) => `${c} ${CATEGORY_LABELS[c]?.zh || ''} ${CATEGORY_LABELS[c]?.en || ''}`)
+      .join(' ');
+    const hay = `${p.displayName || ''} ${p.canonicalName || ''} ${p.scopedName || ''} ${p.id || ''} ${desc} ${catTerms} ${(p.taxonomy?.tags || []).join(' ')} ${(p.capabilities?.badges || []).join(' ')}`.toLowerCase();
     return hay.includes(q);
   });
 
@@ -2363,17 +2686,38 @@ function renderRestartBanner() {
   const rn = state.restartBanner;
   if (!rn) return '';
   const isHostRestart = rn.level === 'host-restart';
+  const op = rn.operation || 'update';
+  let bannerTitle = '';
+  if (op === 'uninstall') {
+    bannerTitle = isHostRestart
+      ? t(
+          '插件已卸载：请重启 Antigravity 客户端以彻底释放残留状态',
+          'Plugin uninstalled: restart Antigravity to release remaining state',
+        )
+      : t(
+          '插件已卸载：建议关闭目标侧边栏或刷新 MCP',
+          'Plugin uninstalled: close target Sidebar or refresh MCP',
+        );
+  } else if (op === 'install') {
+    bannerTitle = isHostRestart
+      ? t('安装已完成：请重启 Antigravity 客户端以生效', 'Installed: restart Antigravity to take effect')
+      : t('安装已完成：建议重开目标侧边栏或刷新 MCP 生效', 'Installed: reopen Sidebar or refresh MCP');
+  } else if (op === 'toggle') {
+    bannerTitle = isHostRestart
+      ? t('状态已切换：请重启 Antigravity 客户端以彻底释放句柄', 'Status updated: restart Antigravity to release file handles')
+      : t('状态已切换：建议重开目标侧边栏或刷新 MCP 生效', 'Status updated: reopen Sidebar or refresh MCP');
+  } else {
+    bannerTitle = isHostRestart
+      ? t('更新已就绪：请重启 Antigravity 客户端以生效', 'Update applied: restart Antigravity to take effect')
+      : t('更新已就绪：建议重开目标侧边栏或刷新 MCP 生效', 'Update applied: reopen Sidebar or refresh MCP');
+  }
   return `
     <div class="restart-notice-banner ${isHostRestart ? 'is-host-restart' : 'is-reload-pane'}" role="status" aria-live="polite" data-agy-restart-banner="1">
       <div class="restart-notice-main">
         <div class="restart-notice-icon">${icon(isHostRestart ? 'rocket' : 'refresh', 14)}</div>
         <div class="restart-notice-copy">
           <div class="restart-notice-title">
-            <span>${escapeHtml(
-              isHostRestart
-                ? t('更新已就绪：请重启 Antigravity 客户端以生效', 'Update applied: restart Antigravity to take effect')
-                : t('更新已就绪：建议重开目标侧边栏或刷新 MCP 生效', 'Update applied: reopen Sidebar or refresh MCP'),
-            )}</span>
+            <span>${escapeHtml(bannerTitle)}</span>
             ${rn.plugins.length ? `<span class="restart-notice-tags">${rn.plugins.map((n) => `<span class="restart-plugin-chip">${escapeHtml(n)}</span>`).join('')}</span>` : ''}
           </div>
           <div class="restart-notice-reason">${escapeHtml(rn.reasons.join(' · '))}</div>
@@ -2591,9 +2935,10 @@ function renderFavoritesShelf() {
             const isEnabled = Boolean(loc ? loc.enabled : p?.installStatus?.enabled);
             const sidecarPane = loc?.sidecarPane || p?.installStatus?.sidecarPane || null;
             const upd = (p && updById.get(p.id)) || (dir ? updByDir.get(dir) : null);
-            const hasUpdate = Boolean((upd && upd.installable !== false) || (!upd && p?.installStatus?.hasUpdate));
-            const isGithubUrlLocal = Boolean(!p && loc && loc.receipt?.track === 'github-url');
-            const canGithubUpdate = Boolean(isGithubUrlLocal && upd && upd.installable !== false);
+            const hasUpdate = Boolean(upd || (loc && p?.installStatus?.hasUpdate));
+            const isSelfUpdate = Boolean(upd?.isSelf || isSelf);
+            const isDirectGhUpdate = Boolean(upd && isDirectGithubUpdateItem(upd));
+            const repoUrl = p?.repository?.url || loc?.repositoryUrl || loc?.receipt?.repositoryUrl || '';
             const accent = resolveCardAccent(loc || p, p);
             const iconUrl = p?.media?.iconUrl || '';
             const monogram = String(displayName).trim().charAt(0).toUpperCase() || 'P';
@@ -2607,11 +2952,16 @@ function renderFavoritesShelf() {
                 btnClass: 'dock-btn is-pane',
                 label: t('面板', 'Pane'),
               });
+            } else if (hasUpdate && isSelfUpdate) {
+              quickActionHtml = `<button type="button" class="btn btn-update-outline btn-sm" data-action="self-update" data-update-channel="${escapeHtml(upd?.updateChannel || '')}" data-target-version="${escapeHtml(upd?.latestVersion || p?.version || '')}" data-target-ref="${escapeHtml(upd?.targetRef || '')}" data-stop-card="1">${icon('update', 11)} ${escapeHtml(t('更新', 'Update'))}</button>`;
+            } else if (hasUpdate && isDirectGhUpdate) {
+              const targetId = upd?.id || p?.id || loc?.receipt?.id || dir;
+              quickActionHtml = `<button type="button" class="btn btn-update-outline btn-sm" data-action="update-plugin-direct" data-id="${escapeHtml(targetId)}" data-dir="${escapeHtml(upd?.dir || dir)}" data-name="${escapeHtml(displayName)}" data-source="${escapeHtml(upd?.source || '')}" data-update-channel="${escapeHtml(upd?.updateChannel || '')}" data-target-ref="${escapeHtml(upd?.targetRef || '')}" data-update-kind="${escapeHtml(upd?.updateKind || '')}" data-track-branch="${escapeHtml(upd?.trackBranch || '')}" data-repo-url="${escapeHtml(upd?.repositoryUrl || repoUrl)}" data-stop-card="1">${icon('update', 11)} ${escapeHtml(t('更新', 'Update'))}</button>`;
             } else if (hasUpdate && p) {
               quickActionHtml = `<button type="button" class="btn btn-update-outline btn-sm" data-action="install" data-id="${escapeHtml(p.id)}" data-stop-card="1">${icon('update', 11)} ${escapeHtml(t('更新', 'Update'))}</button>`;
-            } else if (canGithubUpdate) {
+            } else if (hasUpdate && loc) {
               const targetId = upd?.id || loc.receipt?.id || loc.dir;
-              quickActionHtml = `<button type="button" class="btn btn-update-outline btn-sm" data-action="update-local-github" data-id="${escapeHtml(targetId)}" data-dir="${escapeHtml(loc.dir)}" data-name="${escapeHtml(displayName)}" data-stop-card="1">${icon('update', 11)} ${escapeHtml(t('更新', 'Update'))}</button>`;
+              quickActionHtml = `<button type="button" class="btn btn-update-outline btn-sm" data-action="update-plugin-direct" data-id="${escapeHtml(targetId)}" data-dir="${escapeHtml(loc.dir)}" data-name="${escapeHtml(displayName)}" data-source="${escapeHtml(upd?.source || '')}" data-update-channel="${escapeHtml(upd?.updateChannel || '')}" data-target-ref="${escapeHtml(upd?.targetRef || '')}" data-update-kind="${escapeHtml(upd?.updateKind || '')}" data-track-branch="${escapeHtml(upd?.trackBranch || '')}" data-repo-url="${escapeHtml(upd?.repositoryUrl || repoUrl)}" data-stop-card="1">${icon('update', 11)} ${escapeHtml(t('更新', 'Update'))}</button>`;
             } else if (!loc && p) {
               quickActionHtml = `<button type="button" class="btn btn-primary btn-sm" data-action="install" data-id="${escapeHtml(p.id)}" data-stop-card="1">${icon('download', 11)} ${escapeHtml(t('安装', 'Install'))}</button>`;
             }
@@ -2668,15 +3018,23 @@ function renderPluginCard(p, updateById, installedByDir) {
   const st = p.installStatus || {};
   const localItem = st.installedDir ? installedByDir.get(st.installedDir) || null : null;
   const upd = updateById.get(p.id) || null;
-  const hasCatalogUpdate = Boolean((upd && upd.installable !== false) || (!upd && st.installed && st.hasUpdate));
-  const hasUpstreamOnly = Boolean(upd && upd.installable === false);
-  const isBusy = state.busyId === p.id || (state.batchUpdating && state.batchTargetIds.includes(p.id));
+  const isSelf = st.installedDir === 'agy-market' || p.canonicalName === 'agy-market' || p.id === 'azwosile__agy-market';
+  const hasAnyUpdate = Boolean(upd || (st.installed && st.hasUpdate));
+  const isSelfUpdate = Boolean(upd?.isSelf || isSelf);
+  const isDirectGhUpdate = Boolean(upd && isDirectGithubUpdateItem(upd));
+  const isCommitUpdate = Boolean(upd && upd.updateKind === 'commit' && upd.latestCommitSha);
+  const isBusy = Boolean(
+    state.busyId === p.id ||
+      (st.installedDir && state.busyId === st.installedDir) ||
+      (isSelf && state.selfUpdateBusy) ||
+      (state.batchUpdating &&
+        (state.batchTargetIds.includes(p.id) || (st.installedDir && state.batchTargetIds.includes(st.installedDir)))),
+  );
   const effectiveSlug = p.forceScopedInstall ? p.scopedName : p.canonicalName;
   const repoUrl = p.repository?.url || '';
   const discussUrl = deriveDiscussionsUrl(repoUrl);
   const relUpdated = formatRelativeTime(p.updatedAt);
   const accent = resolveCardAccent(p);
-  const isSelf = st.installedDir === 'agy-market' || p.canonicalName === 'agy-market' || p.id === 'azwosile__agy-market';
   const isEnabled = st.installed ? Boolean(localItem ? localItem.enabled : st.enabled) : false;
   const isParked = Boolean(st.installed && !isEnabled);
   const canToggle = localItem ? localItem.canToggle : st.canToggle;
@@ -2686,11 +3044,9 @@ function renderPluginCard(p, updateById, installedByDir) {
 
   let versionChip = `<span class="version-tag">v${escapeHtml(p.version)}</span>`;
   if (upd && st.installed) {
-    versionChip = `<span class="version-delta ${hasUpstreamOnly ? 'is-upstream' : ''}" title="${escapeHtml(
-      hasUpstreamOnly
-        ? t('上游 GitHub 有新版，等待目录同步与 SHA-256 校验', 'Newer upstream release awaiting catalog sync')
-        : t('发现可用更新', 'Update available'),
-    )}">v${escapeHtml(upd.installedVersion || st.installedVersion || p.version)} → v${escapeHtml(upd.latestVersion)}</span>`;
+    versionChip = isCommitUpdate
+      ? `<span class="version-delta" title="${escapeHtml(t('发现可用更新', 'Update available'))}">v${escapeHtml(upd.installedVersion || st.installedVersion || p.version)} (${escapeHtml(upd.installedCommitSha || 'HEAD')} → ${escapeHtml(upd.latestCommitSha)})</span>`
+      : `<span class="version-delta" title="${escapeHtml(t('发现可用更新', 'Update available'))}">v${escapeHtml(upd.installedVersion || st.installedVersion || p.version)} → v${escapeHtml(upd.latestVersion)}</span>`;
   } else if (st.installed && st.hasUpdate) {
     versionChip = `<span class="version-delta">v${escapeHtml(st.installedVersion || '?')} → v${escapeHtml(p.version)}</span>`;
   }
@@ -2698,13 +3054,18 @@ function renderPluginCard(p, updateById, installedByDir) {
   let actionBtn = '';
   if (isBusy) {
     actionBtn = `<button type="button" class="btn btn-primary btn-sm" disabled>${icon('refresh', 12, 'spin')} ${escapeHtml(t('处理中…', 'Working…'))}</button>`;
-  } else if (hasCatalogUpdate) {
+  } else if (hasAnyUpdate) {
     const targetV = upd?.latestVersion || p.version;
-    actionBtn = `<button type="button" class="btn btn-update-outline btn-sm" data-action="install" data-id="${escapeHtml(p.id)}">${icon('update', 12)} ${escapeHtml(t(`更新 v${targetV}`, `Update v${targetV}`))}</button>`;
-  } else if (hasUpstreamOnly) {
-    actionBtn = upd.releaseUrl
-      ? `<a class="btn btn-upstream btn-sm" href="${escapeHtml(upd.releaseUrl)}" target="_blank" rel="noopener noreferrer" data-stop-card="1" title="${escapeHtml(t('上游有新版，等待目录同步', 'Available upstream, awaiting catalog sync'))}">${escapeHtml(t(`上游 v${upd.latestVersion}`, `Upstream v${upd.latestVersion}`))} ${icon('arrowUpRight', 12)}</a>`
-      : `<span class="version-delta is-upstream">${escapeHtml(t('待目录同步', 'Awaiting Sync'))}</span>`;
+    const updLabel = isCommitUpdate
+      ? t(`更新 ${upd.latestCommitSha}`, `Update ${upd.latestCommitSha}`)
+      : t(`更新 v${targetV}`, `Update v${targetV}`);
+    if (isSelfUpdate) {
+      actionBtn = `<button type="button" class="btn btn-update-outline btn-sm" data-action="self-update" data-update-channel="${escapeHtml(upd?.updateChannel || '')}" data-target-version="${escapeHtml(targetV)}" data-target-ref="${escapeHtml(upd?.targetRef || '')}" data-stop-card="1">${icon('update', 12)} ${escapeHtml(updLabel)}</button>`;
+    } else if (isDirectGhUpdate) {
+      actionBtn = `<button type="button" class="btn btn-update-outline btn-sm" data-action="update-plugin-direct" data-id="${escapeHtml(upd.id || p.id)}" data-dir="${escapeHtml(upd.dir || st.installedDir || p.canonicalName)}" data-name="${escapeHtml(displayName)}" data-source="${escapeHtml(upd.source || '')}" data-update-channel="${escapeHtml(upd.updateChannel || '')}" data-target-ref="${escapeHtml(upd.targetRef || '')}" data-update-kind="${escapeHtml(upd.updateKind || '')}" data-track-branch="${escapeHtml(upd.trackBranch || '')}" data-repo-url="${escapeHtml(upd.repositoryUrl || repoUrl)}" data-stop-card="1">${icon('update', 12)} ${escapeHtml(updLabel)}</button>`;
+    } else {
+      actionBtn = `<button type="button" class="btn btn-update-outline btn-sm" data-action="install" data-id="${escapeHtml(p.id)}" data-stop-card="1">${icon('update', 12)} ${escapeHtml(updLabel)}</button>`;
+    }
   } else if (st.installed) {
     actionBtn = `<button type="button" class="btn btn-installed btn-sm" data-action="detail" data-id="${escapeHtml(p.id)}">${icon('check', 12)} ${escapeHtml(t('详情', 'Details'))}</button>`;
   } else {
@@ -2731,8 +3092,10 @@ function renderPluginCard(p, updateById, installedByDir) {
       })
     : '';
 
+  const catTagsHtml = renderCategoryTagsHtml(p.taxonomy?.categories, { maxCount: 2, clickable: true });
+
   return `
-    <article class="plugin-card ${hasCatalogUpdate ? 'has-update' : ''} ${isParked ? 'is-parked' : ''}" style="--card-accent:${accent.a1};--card-accent-2:${accent.a2}">
+    <article class="plugin-card ${hasAnyUpdate ? 'has-update' : ''} ${isParked ? 'is-parked' : ''}" style="--card-accent:${accent.a1};--card-accent-2:${accent.a2}">
       <div class="card-head" data-action="detail" data-id="${escapeHtml(p.id)}">
         ${renderLogoHtml(p.media?.iconUrl, displayName, { isSelf })}
         <div class="card-title-wrap">
@@ -2757,6 +3120,7 @@ function renderPluginCard(p, updateById, installedByDir) {
       <p class="card-desc" data-action="detail" data-id="${escapeHtml(p.id)}">${escapeHtml(desc)}</p>
 
       <div class="badge-row" data-action="detail" data-id="${escapeHtml(p.id)}" data-detail-tab="capabilities">
+        ${catTagsHtml}
         ${renderBadgesHtml(p.capabilities, { maxCount: 3 })}
       </div>
 
@@ -2777,7 +3141,6 @@ function renderPluginCard(p, updateById, installedByDir) {
 function renderSelfUpdateBanner() {
   const su = state.updates.selfUpdate;
   if (!su || !isSelfBannerVisible()) return '';
-  const canInstall = su.installable !== false;
   const fromV = su.installedVersion || state.serverState?.plugin?.version || '?';
   const toV = su.latestVersion || '?';
 
@@ -2787,22 +3150,15 @@ function renderSelfUpdateBanner() {
         <div class="self-update-icon">${icon('sparkle', 14)}</div>
         <div class="self-update-text">
           <span class="self-update-title">${escapeHtml(t('AGY Market 有新版本可用', 'AGY Market update available'))}</span>
-          <span class="version-delta ${canInstall ? '' : 'is-upstream'}">v${escapeHtml(fromV)} → v${escapeHtml(toV)}</span>
-          ${!canInstall ? `<span class="muted" style="font-size:11px">${escapeHtml(t('上游已发布，等待目录同步', 'Upstream release awaiting catalog sync'))}</span>` : ''}
+          <span class="version-delta">v${escapeHtml(fromV)} → v${escapeHtml(toV)}</span>
         </div>
       </div>
       <div class="self-update-actions">
         ${su.changelog ? `<button type="button" class="btn btn-sm" data-action="open-self-changelog">${icon('history', 12)} ${escapeHtml(t('更新日志', 'Notes'))}</button>` : ''}
-        ${
-          canInstall
-            ? `<button type="button" class="btn btn-primary btn-sm" data-action="self-update" ${state.selfUpdateBusy ? 'disabled' : ''}>
-                ${state.selfUpdateBusy ? icon('refresh', 12, 'spin') : icon('update', 12)}
-                ${escapeHtml(state.selfUpdateBusy ? t('正在更新…', 'Updating…') : t('立即更新市场', 'Update Market'))}
-              </button>`
-            : su.releaseUrl
-              ? `<a class="btn btn-upstream btn-sm" href="${escapeHtml(su.releaseUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(t('查看发布', 'Release'))} ${icon('arrowUpRight', 12)}</a>`
-              : ''
-        }
+        <button type="button" class="btn btn-primary btn-sm" data-action="self-update" data-update-channel="${escapeHtml(su.updateChannel || '')}" data-target-version="${escapeHtml(su.latestVersion || '')}" data-target-ref="${escapeHtml(su.targetRef || '')}" ${state.selfUpdateBusy ? 'disabled' : ''}>
+          ${state.selfUpdateBusy ? icon('refresh', 12, 'spin') : icon('update', 12)}
+          ${escapeHtml(state.selfUpdateBusy ? t('正在更新…', 'Updating…') : t('立即更新市场', 'Update Market'))}
+        </button>
         <button type="button" class="icon-btn is-square" data-action="dismiss-self-banner" title="${escapeHtml(t('暂时收起', 'Dismiss'))}">${icon('close', 13)}</button>
       </div>
     </div>
@@ -2818,8 +3174,19 @@ function renderDiscoverView() {
   const installedByDir = getInstalledByDirMap();
   const installableUpds = getInstallableUpdates();
 
-  const coreOrder = ['all', 'productivity', 'ui-themes', 'developer-tools', 'mcp-integrations', 'skills-workflows'];
-  const chipKeys = Object.keys(CATEGORY_LABELS).filter(
+  const coreOrder = [
+    'all',
+    'monitoring-quota',
+    'context-cache',
+    'ui-themes',
+    'agents-reasoning',
+    'developer-tools',
+    'mcp-integrations',
+    'skills-workflows',
+    'productivity',
+  ];
+  const allKnownKeys = [...new Set([...Object.keys(CATEGORY_LABELS), ...Object.keys(catCounts)])];
+  const chipKeys = allKnownKeys.filter(
     (k) => k === 'all' || k === state.category || (catCounts[k] || 0) > 0 || (plugins.length === 0 && coreOrder.includes(k)),
   );
 
@@ -2882,7 +3249,7 @@ function renderDiscoverView() {
                 <button type="button" class="btn btn-sm" data-action="tab" data-tab="installed">${escapeHtml(t('查看详情', 'Review'))}</button>
                 <button type="button" class="btn btn-update btn-sm" data-action="update-all" ${state.batchUpdating ? 'disabled' : ''}>
                   ${state.batchUpdating ? icon('refresh', 12, 'spin') : icon('update', 12)}
-                  ${escapeHtml(state.batchUpdating ? t('更新中…', 'Updating…') : t('全部更新', 'Update All'))}
+                  ${escapeHtml(state.batchUpdating ? t('正在一键更新…', 'Updating All…') : t('一键更新', 'Update All'))}
                 </button>
               </div>
             </div>`
@@ -2953,7 +3320,10 @@ function renderFavoritesView() {
     if (entry.kind === 'catalog') {
       const p = entry.plugin;
       const desc = `${resolveCatalogDescription(p, 'zh')} ${resolveCatalogDescription(p, 'en')}`;
-      const hay = `${p.displayName || ''} ${p.canonicalName || ''} ${p.scopedName || ''} ${p.id || ''} ${desc} ${(p.taxonomy?.tags || []).join(' ')} ${(p.capabilities?.badges || []).join(' ')}`.toLowerCase();
+      const catTerms = (p.taxonomy?.categories || [])
+        .map((c) => `${c} ${CATEGORY_LABELS[c]?.zh || ''} ${CATEGORY_LABELS[c]?.en || ''}`)
+        .join(' ');
+      const hay = `${p.displayName || ''} ${p.canonicalName || ''} ${p.scopedName || ''} ${p.id || ''} ${desc} ${catTerms} ${(p.taxonomy?.tags || []).join(' ')} ${(p.capabilities?.badges || []).join(' ')}`.toLowerCase();
       return hay.includes(q);
     }
     const l = entry.loc;
@@ -3096,19 +3466,18 @@ function renderBatchResultsPanel() {
 function renderInstalledCard(loc, updById, updByDir, catById, catByDir) {
   const upd = updByDir.get(loc.dir) || (loc.receipt?.id ? updById.get(loc.receipt.id) : null);
   const catEntry = (upd && catById.get(upd.id)) || (loc.receipt?.id && catById.get(loc.receipt.id)) || catByDir.get(loc.dir) || null;
+  const isSelf = loc.dir === 'agy-market';
   const isGithubUrlTrack = loc.receipt?.track === 'github-url';
-  const isGithubUrlUpdate = Boolean(
-    upd && upd.installable !== false && !catEntry && (upd.updateChannel === 'github-url' || isGithubUrlTrack),
-  );
-  const canInstallUpdate = Boolean(upd && upd.installable !== false && (catEntry || isGithubUrlUpdate));
-  const isUpstreamOnly = Boolean(upd && upd.installable === false);
+  const isSelfUpdate = Boolean(upd?.isSelf || isSelf);
+  const isDirectGhUpdate = Boolean(upd && isDirectGithubUpdateItem(upd));
+  const isCommitUpdate = Boolean(upd && upd.updateKind === 'commit' && upd.latestCommitSha);
   const busyKey = catEntry?.id || upd?.id || loc.receipt?.id || loc.dir;
   const isBusy = Boolean(
     state.busyId === busyKey ||
       state.busyId === loc.dir ||
+      (isSelf && state.selfUpdateBusy) ||
       (state.batchUpdating && (state.batchTargetIds.includes(busyKey) || state.batchTargetIds.includes(loc.dir))),
   );
-  const isSelf = loc.dir === 'agy-market';
   const repoUrl = catEntry?.repository?.url || loc.repositoryUrl || loc.receipt?.repositoryUrl || '';
   const discussUrl = deriveDiscussionsUrl(repoUrl);
   const badgesObj = catEntry?.capabilities || loc.capabilities || loc.receipt?.grantedCapabilities || { badges: [] };
@@ -3117,7 +3486,6 @@ function renderInstalledCard(loc, updById, updByDir, catById, catByDir) {
   const isParked = !loc.enabled;
   const displayName = loc.displayName || catEntry?.displayName || loc.dir;
   const favKey = getLocalFavoriteKey(loc, catEntry);
-  const isCommitUpdate = Boolean(upd && upd.updateKind === 'commit' && upd.latestCommitSha);
 
   const canToggle =
     loc.canToggle !== undefined
@@ -3126,23 +3494,44 @@ function renderInstalledCard(loc, updById, updByDir, catById, catByDir) {
   const toggleDisabledReason =
     loc.toggleDisabledReason ||
     (isSelf ? 'self' : loc.hostDisabled ? 'host-disabled' : loc.scope !== 'global' ? loc.scope : '');
+  const canUninstall = loc.canUninstall !== false && loc.scope === 'global' && loc.dir !== 'agy-market';
+  const hasRemoteSource =
+    loc.scope === 'global' &&
+    (loc.dir === 'agy-market' || Boolean(catEntry) || Boolean(loc.repositoryUrl || loc.receipt?.repositoryUrl));
 
   let actionHtml = '';
   if (isBusy) {
     actionHtml = `<button type="button" class="btn btn-primary btn-sm" disabled>${icon('refresh', 12, 'spin')} ${escapeHtml(t('更新中…', 'Updating…'))}</button>`;
-  } else if (canInstallUpdate && catEntry) {
-    actionHtml = `<button type="button" class="btn btn-update-outline btn-sm" data-action="install" data-id="${escapeHtml(catEntry.id)}">${icon('update', 12)} ${escapeHtml(t(`更新 v${upd.latestVersion}`, `Update v${upd.latestVersion}`))}</button>`;
-  } else if (canInstallUpdate && isGithubUrlUpdate) {
-    const updTargetId = upd?.id || loc.receipt?.id || loc.dir;
+  } else if (upd) {
     const updLabel = isCommitUpdate
       ? t(`更新 ${upd.latestCommitSha}`, `Update ${upd.latestCommitSha}`)
       : t(`更新 v${upd.latestVersion}`, `Update v${upd.latestVersion}`);
-    actionHtml = `<button type="button" class="btn btn-update-outline btn-sm" data-action="update-local-github" data-id="${escapeHtml(updTargetId)}" data-dir="${escapeHtml(loc.dir)}" data-name="${escapeHtml(displayName)}" data-stop-card="1">${icon('update', 12)} ${escapeHtml(updLabel)}</button>`;
-  } else if (isUpstreamOnly && upd.releaseUrl) {
-    actionHtml = `<a class="btn btn-upstream btn-sm" href="${escapeHtml(upd.releaseUrl)}" target="_blank" rel="noopener noreferrer" data-stop-card="1" title="${escapeHtml(t('上游 GitHub 有新版，等待目录同步', 'Available upstream, awaiting catalog sync'))}">${escapeHtml(t(`上游 v${upd.latestVersion}`, `Upstream v${upd.latestVersion}`))} ${icon('arrowUpRight', 12)}</a>`;
+    if (isSelfUpdate) {
+      actionHtml = `<button type="button" class="btn btn-update-outline btn-sm" data-action="self-update" data-update-channel="${escapeHtml(upd.updateChannel || '')}" data-target-version="${escapeHtml(upd.latestVersion || '')}" data-target-ref="${escapeHtml(upd.targetRef || '')}" data-stop-card="1">${icon('update', 12)} ${escapeHtml(updLabel)}</button>`;
+    } else if (isDirectGhUpdate) {
+      const updTargetId = upd.id || catEntry?.id || loc.receipt?.id || loc.dir;
+      actionHtml = `<button type="button" class="btn btn-update-outline btn-sm" data-action="update-plugin-direct" data-id="${escapeHtml(updTargetId)}" data-dir="${escapeHtml(upd.dir || loc.dir)}" data-name="${escapeHtml(displayName)}" data-source="${escapeHtml(upd.source || '')}" data-update-channel="${escapeHtml(upd.updateChannel || '')}" data-target-ref="${escapeHtml(upd.targetRef || '')}" data-update-kind="${escapeHtml(upd.updateKind || '')}" data-track-branch="${escapeHtml(upd.trackBranch || '')}" data-repo-url="${escapeHtml(upd.repositoryUrl || repoUrl)}" data-stop-card="1">${icon('update', 12)} ${escapeHtml(updLabel)}</button>`;
+    } else if (catEntry) {
+      actionHtml = `<button type="button" class="btn btn-update-outline btn-sm" data-action="install" data-id="${escapeHtml(catEntry.id)}" data-stop-card="1">${icon('update', 12)} ${escapeHtml(updLabel)}</button>`;
+    } else {
+      const updTargetId = upd.id || loc.receipt?.id || loc.dir;
+      actionHtml = `<button type="button" class="btn btn-update-outline btn-sm" data-action="update-plugin-direct" data-id="${escapeHtml(updTargetId)}" data-dir="${escapeHtml(upd.dir || loc.dir)}" data-name="${escapeHtml(displayName)}" data-source="${escapeHtml(upd.source || '')}" data-update-channel="${escapeHtml(upd.updateChannel || '')}" data-target-ref="${escapeHtml(upd.targetRef || '')}" data-update-kind="${escapeHtml(upd.updateKind || '')}" data-track-branch="${escapeHtml(upd.trackBranch || '')}" data-repo-url="${escapeHtml(upd.repositoryUrl || repoUrl)}" data-stop-card="1">${icon('update', 12)} ${escapeHtml(updLabel)}</button>`;
+    }
+  } else if (hasRemoteSource) {
+    actionHtml = `<button type="button" class="dock-btn is-update" data-action="sync-installed-plugin" data-dir="${escapeHtml(loc.dir)}" data-id="${escapeHtml(catEntry?.id || loc.receipt?.id || loc.dir)}" data-name="${escapeHtml(displayName)}" data-stop-card="1" title="${escapeHtml(t('检查并从此插件源同步最新版本', 'Check and sync latest build in Sidebar'))}">${icon('update', 12)} <span>${escapeHtml(t('更新', 'Update'))}</span></button>`;
   } else {
-    actionHtml = `<span class="state-pill is-enabled">${icon('check', 11)} ${escapeHtml(t('最新', 'Latest'))}</span>`;
+    const noSourceTitle =
+      loc.scope === 'workspace'
+        ? t('工作区级插件由当前仓库管理', 'Workspace plugin managed by current repository')
+        : loc.scope === 'builtin'
+          ? t('内置插件由 Antigravity 宿主统一维护', 'Built-in plugin managed by Antigravity host')
+          : t('纯本地插件，未关联目录或 GitHub 仓库更新源', 'Local-only plugin with no catalog or GitHub repository update source');
+    actionHtml = `<button type="button" class="dock-btn is-update is-disabled" disabled data-stop-card="1" title="${escapeHtml(noSourceTitle)}">${icon('update', 12)} <span>${escapeHtml(t('更新', 'Update'))}</span></button>`;
   }
+
+  const uninstallBtnHtml = canUninstall
+    ? `<button type="button" class="dock-btn is-danger" data-action="prompt-uninstall" data-dir="${escapeHtml(loc.dir)}" data-name="${escapeHtml(displayName)}" data-version="${escapeHtml(loc.version || '')}" data-fav-key="${escapeHtml(favKey)}" data-stop-card="1" title="${escapeHtml(t('卸载此插件', 'Uninstall plugin'))}">${icon('trash', 12)} <span>${escapeHtml(t('卸载', 'Uninstall'))}</span></button>`
+    : '';
 
   const paneBtnHtml = renderOpenPaneButtonHtml({
     dir: loc.dir,
@@ -3152,12 +3541,12 @@ function renderInstalledCard(loc, updById, updByDir, catById, catByDir) {
 
   const versionBadgeHtml = upd
     ? isCommitUpdate
-      ? `<span class="version-delta ${isUpstreamOnly ? 'is-upstream' : ''}">v${escapeHtml(loc.version)} (${escapeHtml(upd.installedCommitSha || String(loc.receipt?.commitSha || '').slice(0, 7) || 'HEAD')} → ${escapeHtml(upd.latestCommitSha)})</span>`
-      : `<span class="version-delta ${isUpstreamOnly ? 'is-upstream' : ''}">v${escapeHtml(loc.version)} → v${escapeHtml(upd.latestVersion)}</span>`
+      ? `<span class="version-delta">v${escapeHtml(loc.version)} (${escapeHtml(upd.installedCommitSha || String(loc.receipt?.commitSha || '').slice(0, 7) || 'HEAD')} → ${escapeHtml(upd.latestCommitSha)})</span>`
+      : `<span class="version-delta">v${escapeHtml(loc.version)} → v${escapeHtml(upd.latestVersion)}</span>`
     : `<span class="version-tag">v${escapeHtml(loc.version)}</span>`;
 
   return `
-    <article class="plugin-card ${canInstallUpdate ? 'has-update' : ''} ${isParked ? 'is-parked' : ''}" style="--card-accent:${accent.a1};--card-accent-2:${accent.a2}">
+    <article class="plugin-card ${upd ? 'has-update' : ''} ${isParked ? 'is-parked' : ''}" style="--card-accent:${accent.a1};--card-accent-2:${accent.a2}">
       <div class="card-head" data-action="detail-local" data-dir="${escapeHtml(loc.dir)}">
         ${renderLogoHtml(catEntry?.media?.iconUrl, displayName, { isSelf })}
         <div class="card-title-wrap">
@@ -3202,6 +3591,7 @@ function renderInstalledCard(loc, updById, updByDir, catById, catByDir) {
         <div class="dock-right">
           ${paneBtnHtml}
           ${discussUrl ? `<a class="dock-btn" href="${escapeHtml(discussUrl)}" target="_blank" rel="noopener noreferrer" data-stop-card="1" title="GitHub Discussions">${icon('message', 12)} <span>${escapeHtml(t('讨论', 'Discuss'))}</span></a>` : ''}
+          ${uninstallBtnHtml}
           ${actionHtml}
         </div>
       </div>
@@ -3211,11 +3601,11 @@ function renderInstalledCard(loc, updById, updByDir, catById, catByDir) {
 
 function renderInstalledView() {
   const installed = state.serverState?.installed || [];
+  const globalInstalled = installed.filter((x) => x.scope === 'global');
   const { byId: updById, byDir: updByDir } = getUpdateMaps();
   const { byId: catById, byDir: catByDir } = getCatalogMaps();
   const allUpdates = getEffectiveUpdateItems();
   const installableUpds = getInstallableUpdates();
-  const upstreamOnlyCount = allUpdates.length - installableUpds.length;
   const activeCount = installed.filter((x) => x.enabled).length;
   const disabledCount = installed.filter((x) => !x.enabled).length;
   const updatableCount = installed.filter((loc) => {
@@ -3320,23 +3710,26 @@ function renderInstalledView() {
             </div>
             <div class="updates-summary-sub">
               <span>${escapeHtml(checkedLabel)}</span>
-              ${upstreamOnlyCount > 0 ? `<span>· ${escapeHtml(t(`${upstreamOnlyCount} 个上游新版待目录同步`, `${upstreamOnlyCount} upstream awaiting sync`))}</span>` : ''}
             </div>
           </div>
 
           <div class="updates-command-actions">
-            <button type="button" class="btn btn-sm" data-action="check-updates" ${state.updates.loading ? 'disabled' : ''}>
+            <button type="button" class="btn btn-sm" data-action="check-updates" ${state.updates.loading || state.batchUpdating ? 'disabled' : ''}>
               ${icon('refresh', 12, state.updates.loading ? 'spin' : '')}
               ${escapeHtml(t('检查更新', 'Check Now'))}
             </button>
             ${
-              installableUpds.length > 0
+              globalInstalled.length > 0
                 ? `<button type="button" class="btn btn-update btn-sm" data-action="update-all" ${state.batchUpdating ? 'disabled' : ''}>
                     ${state.batchUpdating ? icon('refresh', 12, 'spin') : icon('update', 12)}
                     ${escapeHtml(
                       state.batchUpdating
-                        ? t(`正在更新 (${state.batchTargetIds.length})…`, `Updating (${state.batchTargetIds.length})…`)
-                        : t(`全部更新 (${installableUpds.length})`, `Update All (${installableUpds.length})`),
+                        ? state.batchTargetIds.length > 0
+                          ? t(`正在一键更新 (${state.batchTargetIds.length})…`, `Updating All (${state.batchTargetIds.length})…`)
+                          : t('正在一键更新…', 'Updating All…')
+                        : installableUpds.length > 0
+                          ? t(`一键更新 (${installableUpds.length})`, `Update All (${installableUpds.length})`)
+                          : t('一键更新', 'Update All'),
                     )}
                   </button>`
                 : ''
@@ -3801,52 +4194,66 @@ function renderDetailDrawer() {
   const st = p.installStatus || {};
   const localItem = st.installedDir ? installedByDir.get(st.installedDir) || null : null;
   const upd = updById.get(p.id) || (st.installedDir ? updByDir.get(st.installedDir) : null);
-  const hasCatalogUpdate = Boolean((upd && upd.installable !== false) || (!upd && st.installed && st.hasUpdate));
-  const hasUpstreamOnly = Boolean(upd && upd.installable === false);
   const installedDir = st.installedDir || localItem?.dir || '';
+  const isSelf = installedDir === 'agy-market' || p.canonicalName === 'agy-market' || p.id === 'azwosile__agy-market';
+  const hasAnyUpdate = Boolean(upd || (st.installed && st.hasUpdate));
+  const isSelfUpdate = Boolean(upd?.isSelf || isSelf);
+  const isDirectGhUpdate = Boolean(upd && isDirectGithubUpdateItem(upd));
   const isGithubUrlLocal = Boolean(
     p._localOnly && (localItem?.receipt?.track === 'github-url' || p._track === 'github-url'),
   );
-  const githubTargetId = upd?.id || localItem?.receipt?.id || p.id || installedDir;
-  const canGithubUpdate = Boolean(isGithubUrlLocal && upd && upd.installable !== false);
+  const directTargetId = upd?.id || localItem?.receipt?.id || p.id || installedDir;
   const isCommitUpdate = Boolean(upd && upd.updateKind === 'commit' && upd.latestCommitSha);
   const isBusy = Boolean(
     state.busyId === p.id ||
       (installedDir && state.busyId === installedDir) ||
-      (githubTargetId && state.busyId === githubTargetId),
+      (directTargetId && state.busyId === directTargetId) ||
+      (isSelf && state.selfUpdateBusy),
   );
   const repoUrl = p.repository?.url || localItem?.repositoryUrl || localItem?.receipt?.repositoryUrl || '';
   const pluginRoot = p.repository?.pluginRoot || localItem?.receipt?.pluginRoot || '.';
   const discussUrl = deriveDiscussionsUrl(repoUrl);
   const loc = getLocale();
   const accent = resolveCardAccent(p);
-  const isSelf = installedDir === 'agy-market' || p.canonicalName === 'agy-market' || p.id === 'azwosile__agy-market';
   const isEnabled = st.installed ? Boolean(localItem ? localItem.enabled : st.enabled) : false;
   const localScope = localItem?.scope || st.scope || 'global';
-  const canRemoveFiles = Boolean(st.installed && installedDir && !isSelf && localScope === 'global');
+  const canUninstall = Boolean(
+    st.installed &&
+      installedDir &&
+      !isSelf &&
+      localScope === 'global' &&
+      localItem?.canUninstall !== false &&
+      st.canUninstall !== false,
+  );
+  const hasRemoteSource = localScope === 'global' && (isSelf || !p._localOnly || Boolean(repoUrl));
   const displayName = p.displayName || p.canonicalName;
   const favKey = p._localOnly ? getLocalFavoriteKey(localItem || { dir: installedDir, receipt: { id: p.id } }, null) : String(p.id || '');
 
   let primaryBtn = '';
   if (isBusy) {
     primaryBtn = `<button type="button" class="btn btn-primary btn-sm" disabled>${icon('refresh', 12, 'spin')} ${escapeHtml(t('处理中…', 'Working…'))}</button>`;
-  } else if (isGithubUrlLocal) {
-    if (canGithubUpdate) {
-      const ghUpdLabel = isCommitUpdate
-        ? t(`更新至 ${upd.latestCommitSha}`, `Update to ${upd.latestCommitSha}`)
-        : t(`更新至 v${upd.latestVersion}`, `Update to v${upd.latestVersion}`);
-      primaryBtn = `<button type="button" class="btn btn-update btn-sm" data-action="update-local-github" data-id="${escapeHtml(githubTargetId)}" data-dir="${escapeHtml(installedDir)}" data-name="${escapeHtml(displayName)}">${icon('update', 12)} ${escapeHtml(ghUpdLabel)}</button>`;
+  } else if (hasAnyUpdate) {
+    const targetV = upd?.latestVersion || p.version;
+    const updLabel = isCommitUpdate
+      ? t(`更新至 ${upd.latestCommitSha}`, `Update to ${upd.latestCommitSha}`)
+      : t(`更新至 v${targetV}`, `Update to v${targetV}`);
+    if (isSelfUpdate) {
+      primaryBtn = `<button type="button" class="btn btn-update btn-sm" data-action="self-update" data-update-channel="${escapeHtml(upd?.updateChannel || '')}" data-target-version="${escapeHtml(targetV)}" data-target-ref="${escapeHtml(upd?.targetRef || '')}">${icon('update', 12)} ${escapeHtml(updLabel)}</button>`;
+    } else if (isDirectGhUpdate || p._localOnly) {
+      primaryBtn = `<button type="button" class="btn btn-update btn-sm" data-action="update-plugin-direct" data-id="${escapeHtml(directTargetId)}" data-dir="${escapeHtml(upd?.dir || installedDir)}" data-name="${escapeHtml(displayName)}" data-source="${escapeHtml(upd?.source || '')}" data-update-channel="${escapeHtml(upd?.updateChannel || '')}" data-target-ref="${escapeHtml(upd?.targetRef || '')}" data-update-kind="${escapeHtml(upd?.updateKind || '')}" data-track-branch="${escapeHtml(upd?.trackBranch || '')}" data-repo-url="${escapeHtml(upd?.repositoryUrl || repoUrl)}">${icon('update', 12)} ${escapeHtml(updLabel)}</button>`;
     } else {
-      primaryBtn = `<button type="button" class="btn btn-sm" data-action="update-local-github" data-id="${escapeHtml(githubTargetId)}" data-dir="${escapeHtml(installedDir)}" data-name="${escapeHtml(displayName)}">${icon('refresh', 12)} ${escapeHtml(t('从 GitHub 重新同步', 'Re-sync from GitHub'))}</button>`;
+      primaryBtn = `<button type="button" class="btn btn-update btn-sm" data-action="install" data-id="${escapeHtml(p.id)}">${icon('update', 12)} ${escapeHtml(updLabel)}</button>`;
     }
-  } else if (p._localOnly) {
-    primaryBtn = '';
-  } else if (hasCatalogUpdate) {
-    primaryBtn = `<button type="button" class="btn btn-update btn-sm" data-action="install" data-id="${escapeHtml(p.id)}">${icon('update', 12)} ${escapeHtml(t(`更新至 v${upd?.latestVersion || p.version}`, `Update to v${upd?.latestVersion || p.version}`))}</button>`;
-  } else if (hasUpstreamOnly && upd.releaseUrl) {
-    primaryBtn = `<a class="btn btn-upstream btn-sm" href="${escapeHtml(upd.releaseUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(t(`查看上游 v${upd.latestVersion}`, `Upstream v${upd.latestVersion}`))} ${icon('arrowUpRight', 12)}</a>`;
   } else if (st.installed) {
-    primaryBtn = `<button type="button" class="btn btn-sm" data-action="install" data-id="${escapeHtml(p.id)}">${icon('refresh', 12)} ${escapeHtml(t('重新同步', 'Re-sync'))}</button>`;
+    if (isSelf) {
+      primaryBtn = `<button type="button" class="btn btn-sm" data-action="self-update">${icon('refresh', 12)} ${escapeHtml(t('检查并同步市场', 'Sync Market'))}</button>`;
+    } else if (p._localOnly) {
+      primaryBtn = hasRemoteSource
+        ? `<button type="button" class="btn btn-sm" data-action="update-plugin-direct" data-id="${escapeHtml(directTargetId)}" data-dir="${escapeHtml(installedDir)}" data-name="${escapeHtml(displayName)}" data-repo-url="${escapeHtml(repoUrl)}">${icon('refresh', 12)} ${escapeHtml(t('从 GitHub 同步更新', 'Sync from GitHub'))}</button>`
+        : '';
+    } else {
+      primaryBtn = `<button type="button" class="btn btn-sm" data-action="install" data-id="${escapeHtml(p.id)}">${icon('refresh', 12)} ${escapeHtml(t('重新同步', 'Re-sync'))}</button>`;
+    }
   } else {
     primaryBtn = `<button type="button" class="btn btn-primary btn-sm" data-action="install" data-id="${escapeHtml(p.id)}">${icon('download', 12)} ${escapeHtml(t('立即安装并启用', 'Install Now'))}</button>`;
   }
@@ -3888,8 +4295,10 @@ function renderDetailDrawer() {
           </div>`
         : '';
 
+    const drawerCatTagsHtml = renderCategoryTagsHtml(p.taxonomy?.categories, { maxCount: 0, clickable: false });
     bodyHtml = `
       <div class="badge-row">
+        ${drawerCatTagsHtml}
         ${renderBadgesHtml(p.capabilities)}
       </div>
       ${langTag}
@@ -3908,6 +4317,12 @@ function renderDetailDrawer() {
       <div class="meta-kv">
         <span class="muted">ID / Slug</span>
         <span class="mono">${escapeHtml(p.id)} (${escapeHtml(p.forceScopedInstall ? p.scopedName : p.canonicalName)})</span>
+        ${
+          Array.isArray(p.taxonomy?.categories) && p.taxonomy.categories.length > 0
+            ? `<span class="muted">${escapeHtml(t('分类', 'Categories'))}</span>
+               <span>${escapeHtml(p.taxonomy.categories.map((c) => formatCategoryLabel(c, loc)).join(' · '))}</span>`
+            : ''
+        }
         ${
           repoUrl
             ? `<span class="muted">Repository</span>
@@ -3947,12 +4362,12 @@ function renderDetailDrawer() {
       : '';
     bodyHtml = upd
       ? `
-        <div class="changelog-banner ${hasUpstreamOnly ? 'is-upstream' : ''}">
+        <div class="changelog-banner">
           <div style="display:flex;flex-direction:column;gap:3px">
             <div style="font-weight:700;font-size:12.5px">${escapeHtml(changelogTitle)}</div>
             <div class="muted" style="font-size:11.2px">${escapeHtml(
-              hasUpstreamOnly
-                ? t('来源：GitHub 上游发布（等待目录同步与 SHA-256 锁定）', 'Source: GitHub upstream (awaiting catalog SHA-256 sync)')
+              upd.updateChannel === 'github-upstream'
+                ? t('来源：GitHub 上游直连更新（Sidebar 内拉取并校验 SHA-256）', 'Source: GitHub upstream direct update (fetched & SHA-256 verified in Sidebar)')
                 : upd.updateChannel === 'github-url' || isGithubUrlLocal
                   ? t('来源：GitHub 仓库直连更新（本地 SHA-256 校验）', 'Source: GitHub repository direct update (local SHA-256 verified)')
                   : t('来源：已验证目录（SHA-256 已校验）', 'Source: Verified Catalog (SHA-256 verified)'),
@@ -4023,8 +4438,8 @@ function renderDetailDrawer() {
                 ${
                   upd
                     ? isCommitUpdate
-                      ? `<span class="version-delta ${hasUpstreamOnly ? 'is-upstream' : ''}">v${escapeHtml(upd.installedVersion || st.installedVersion || p.version)} (${escapeHtml(upd.installedCommitSha || String(p.commitSha || '').slice(0, 7) || 'HEAD')} → ${escapeHtml(upd.latestCommitSha)})</span>`
-                      : `<span class="version-delta ${hasUpstreamOnly ? 'is-upstream' : ''}">v${escapeHtml(upd.installedVersion || st.installedVersion || p.version)} → v${escapeHtml(upd.latestVersion)}</span>`
+                      ? `<span class="version-delta">v${escapeHtml(upd.installedVersion || st.installedVersion || p.version)} (${escapeHtml(upd.installedCommitSha || String(p.commitSha || '').slice(0, 7) || 'HEAD')} → ${escapeHtml(upd.latestCommitSha)})</span>`
+                      : `<span class="version-delta">v${escapeHtml(upd.installedVersion || st.installedVersion || p.version)} → v${escapeHtml(upd.latestVersion)}</span>`
                     : `<span class="version-tag">v${escapeHtml(p.version)}</span>`
                 }
                 ${isGithubUrlLocal ? `<span class="track-tag is-github-url">GitHub URL</span>` : ''}
@@ -4044,9 +4459,9 @@ function renderDetailDrawer() {
             ${repoUrl ? `<a class="btn btn-sm" href="${escapeHtml(repoUrl)}" target="_blank" rel="noopener noreferrer">GitHub ${icon('external', 11)}</a>` : ''}
             ${discussUrl ? `<a class="btn btn-sm" href="${escapeHtml(discussUrl)}" target="_blank" rel="noopener noreferrer">${icon('message', 12)} ${escapeHtml(t('讨论区', 'Discussions'))}</a>` : ''}
             ${
-              canRemoveFiles
-                ? `<button type="button" class="btn btn-danger-ghost btn-sm" data-action="prompt-remove-files" data-dir="${escapeHtml(installedDir)}" data-name="${escapeHtml(p.displayName || installedDir)}" data-version="${escapeHtml(st.installedVersion || p.version || '')}">
-                    ${icon('trash', 12)} ${escapeHtml(t('移除插件文件', 'Remove Files'))}
+              canUninstall
+                ? `<button type="button" class="btn btn-danger-ghost btn-sm" data-action="prompt-uninstall" data-dir="${escapeHtml(installedDir)}" data-name="${escapeHtml(p.displayName || installedDir)}" data-version="${escapeHtml(st.installedVersion || p.version || '')}" data-fav-key="${escapeHtml(favKey)}">
+                    ${icon('trash', 12)} ${escapeHtml(t('卸载插件', 'Uninstall'))}
                   </button>`
                 : ''
             }
@@ -4595,30 +5010,38 @@ function renderModals() {
 
   if (state.removeConfirmModal) {
     const rm = state.removeConfirmModal;
-    const isRemoving = state.removingDir === rm.dir;
+    const isRemoving = Boolean(state.removingDir && state.removingDir === rm.dir);
     html += `
-      <div class="modal-backdrop" data-action="close-modal">
-        <div class="modal-box" onclick="event.stopPropagation()">
+      <div class="modal-backdrop" ${isRemoving ? '' : 'data-action="close-modal"'}>
+        <div class="modal-box" role="dialog" aria-modal="true" aria-label="${escapeHtml(t('确认卸载插件', 'Confirm Uninstall Plugin'))}" onclick="event.stopPropagation()">
           <div class="modal-header">
             <div class="modal-title-wrap">
               <span style="color:var(--m-danger)">${icon('trash', 15)}</span>
-              <span>${escapeHtml(t('确认移除插件文件', 'Confirm Remove Plugin Files'))}</span>
+              <span>${escapeHtml(t('确认卸载插件', 'Confirm Uninstall Plugin'))}</span>
             </div>
-            <button type="button" class="icon-btn is-square" data-action="close-modal">${icon('close', 14)}</button>
+            <button type="button" class="icon-btn is-square" data-action="close-modal" ${isRemoving ? 'disabled' : ''}>${icon('close', 14)}</button>
           </div>
           <div class="modal-body">
             <p style="margin:0;line-height:1.58">${escapeHtml(
               t(
-                `即将永久删除本地插件目录 "${rm.dir}"（${rm.displayName}${rm.version ? ` v${rm.version}` : ''}）的文件。若仅需暂时关闭，建议直接使用卡片底部的「启用 / 禁用」停放仓滑块。`,
-                `This permanently deletes files for "${rm.dir}" (${rm.displayName}${rm.version ? ` v${rm.version}` : ''}). To temporarily pause a plugin without deleting it, use the Enable/Disable toggle slider instead.`,
+                `即将永久卸载本地插件目录 "${rm.dir}"（${rm.displayName}${rm.version ? ` v${rm.version}` : ''}）及其停放仓文件。若仅需暂时关闭，建议直接使用卡片底部的「启用 / 禁用」停放仓滑块。`,
+                `This permanently uninstalls "${rm.dir}" (${rm.displayName}${rm.version ? ` v${rm.version}` : ''}) from local plugins and parked storage. To temporarily pause a plugin without uninstalling it, use the Enable/Disable toggle slider instead.`,
               ),
             )}</p>
+            ${
+              rm.isFavorited
+                ? `<label class="uninstall-fav-check">
+                    <input id="uninstall-remove-favorite" type="checkbox" ${rm.removeFavorite ? 'checked' : ''} ${isRemoving ? 'disabled' : ''} />
+                    <span>${escapeHtml(t('同时从收藏夹移除', 'Also remove from Favorites'))}</span>
+                  </label>`
+                : ''
+            }
           </div>
           <div class="modal-footer">
             <button type="button" class="btn btn-sm" data-action="close-modal" ${isRemoving ? 'disabled' : ''}>${escapeHtml(t('取消', 'Cancel'))}</button>
-            <button type="button" class="btn btn-danger-solid btn-sm" data-action="confirm-remove-files" data-dir="${escapeHtml(rm.dir)}" ${isRemoving ? 'disabled' : ''}>
+            <button type="button" class="btn btn-danger-solid btn-sm" data-action="confirm-uninstall" data-dir="${escapeHtml(rm.dir)}" ${isRemoving ? 'disabled' : ''}>
               ${icon(isRemoving ? 'refresh' : 'trash', 12, isRemoving ? 'spin' : '')}
-              ${escapeHtml(isRemoving ? t('移除中…', 'Removing…') : t('确认永久移除', 'Remove Permanently'))}
+              ${escapeHtml(isRemoving ? t('卸载中…', 'Uninstalling…') : t('确认卸载', 'Uninstall'))}
             </button>
           </div>
         </div>
@@ -4628,7 +5051,6 @@ function renderModals() {
 
   if (state.selfChangelogModal && state.updates.selfUpdate) {
     const su = state.updates.selfUpdate;
-    const canInstall = su.installable !== false;
     html += `
       <div class="modal-backdrop" data-action="close-modal">
         <div class="modal-box" onclick="event.stopPropagation()">
@@ -4636,7 +5058,7 @@ function renderModals() {
             <div class="modal-title-wrap">
               ${icon('sparkle', 15)}
               <span>${escapeHtml(t('AGY Market 新版本更新日志', 'AGY Market Release Notes'))}</span>
-              <span class="version-delta ${canInstall ? '' : 'is-upstream'}">v${escapeHtml(su.installedVersion || '?')} → v${escapeHtml(su.latestVersion || '?')}</span>
+              <span class="version-delta">v${escapeHtml(su.installedVersion || '?')} → v${escapeHtml(su.latestVersion || '?')}</span>
             </div>
             <button type="button" class="icon-btn is-square" data-action="close-modal">${icon('close', 14)}</button>
           </div>
@@ -4646,11 +5068,7 @@ function renderModals() {
           <div class="modal-footer">
             ${su.releaseUrl ? `<a class="btn btn-sm" href="${escapeHtml(su.releaseUrl)}" target="_blank" rel="noopener noreferrer">GitHub Release ${icon('external', 11)}</a>` : ''}
             <button type="button" class="btn btn-sm" data-action="close-modal">${escapeHtml(t('关闭', 'Close'))}</button>
-            ${
-              canInstall
-                ? `<button type="button" class="btn btn-primary btn-sm" data-action="self-update" ${state.selfUpdateBusy ? 'disabled' : ''}>${icon('update', 12)} ${escapeHtml(t('立即更新市场', 'Update Market'))}</button>`
-                : ''
-            }
+            <button type="button" class="btn btn-primary btn-sm" data-action="self-update" data-update-channel="${escapeHtml(su.updateChannel || '')}" data-target-version="${escapeHtml(su.latestVersion || '')}" data-target-ref="${escapeHtml(su.targetRef || '')}" ${state.selfUpdateBusy ? 'disabled' : ''}>${icon(state.selfUpdateBusy ? 'refresh' : 'update', 12, state.selfUpdateBusy ? 'spin' : '')} ${escapeHtml(state.selfUpdateBusy ? t('正在更新…', 'Updating…') : t('立即更新市场', 'Update Market'))}</button>
           </div>
         </div>
       </div>
@@ -5055,6 +5473,14 @@ function bindDomEvents(root) {
     });
   }
 
+  const uninstallFavCheckEl = root.querySelector('#uninstall-remove-favorite');
+  if (uninstallFavCheckEl) {
+    uninstallFavCheckEl.addEventListener('change', (e) => {
+      if (!state.removeConfirmModal) return;
+      state.removeConfirmModal.removeFavorite = Boolean(e.target.checked);
+    });
+  }
+
   const favSearchEl = root.querySelector('#favorites-search-input');
   if (favSearchEl) {
     favSearchEl.addEventListener('input', (e) => {
@@ -5157,7 +5583,11 @@ function bindDomEvents(root) {
         state.installedFilter = 'all';
         render();
       } else if (action === 'category') {
+        e.stopPropagation();
         state.category = el.getAttribute('data-category') || 'all';
+        if (state.activeTab !== 'discover') {
+          state.activeTab = 'discover';
+        }
         render();
       } else if (action === 'clear-search') {
         state.search = '';
@@ -5214,18 +5644,27 @@ function bindDomEvents(root) {
             uri: buildSidecarPaneUri(m[1], m[2], normPath),
           });
         }
-      } else if (action === 'prompt-remove-files') {
+      } else if (action === 'prompt-uninstall' || action === 'prompt-remove-files') {
         e.stopPropagation();
         const dir = el.getAttribute('data-dir') || '';
         const displayName = el.getAttribute('data-name') || dir;
         const version = el.getAttribute('data-version') || '';
+        const favKey = el.getAttribute('data-fav-key') || '';
         if (dir && dir !== 'agy-market') {
-          state.removeConfirmModal = { dir, displayName, version };
+          state.removeConfirmModal = {
+            dir,
+            displayName,
+            version,
+            isFavorited: isPluginDirFavorited(dir, favKey),
+            removeFavorite: false,
+          };
           render();
         }
-      } else if (action === 'confirm-remove-files') {
-        const dir = el.getAttribute('data-dir') || '';
-        if (dir) void triggerRemovePluginFiles(dir);
+      } else if (action === 'confirm-uninstall' || action === 'confirm-remove-files') {
+        const dir = el.getAttribute('data-dir') || state.removeConfirmModal?.dir || '';
+        const removeFavorite = Boolean(state.removeConfirmModal?.removeFavorite);
+        const displayName = state.removeConfirmModal?.displayName || dir;
+        if (dir) void triggerUninstallPlugin(dir, { removeFavorite, displayName });
       } else if (action === 'dismiss-restart-banner') {
         state.restartBanner = null;
         render();
@@ -5238,17 +5677,29 @@ function bindDomEvents(root) {
         render();
         if (retry?.type === 'install' && retry.plugin) {
           void triggerInstall(retry.plugin, retry.opts || {});
-        } else if (retry?.type === 'update-local-github') {
-          void triggerUpdateLocalGithub({
+        } else if (retry?.type === 'update-plugin-direct' || retry?.type === 'update-local-github') {
+          void triggerDirectPluginUpdate({
             id: retry.id || '',
             dir: retry.dir || '',
             displayName: retry.displayName || '',
+            source: retry.source || '',
+            updateChannel: retry.updateChannel || '',
+            targetRef: retry.targetRef || '',
+            updateKind: retry.updateKind || '',
+            trackBranch: retry.trackBranch || '',
+            repositoryUrl: retry.repositoryUrl || '',
+            preferUpstream: Boolean(retry.preferUpstream),
             confirmEscalation: false,
           });
         } else if (retry?.type === 'update-all') {
           void triggerUpdateAll(retry.ids || null, { confirmEscalation: false });
         } else if (retry?.type === 'self-update') {
-          void triggerSelfUpdate({ confirmEscalation: false });
+          void triggerSelfUpdate({
+            confirmEscalation: false,
+            updateChannel: retry.updateChannel || '',
+            targetVersion: retry.targetVersion || '',
+            targetRef: retry.targetRef || '',
+          });
         }
       } else if (action === 'check-updates') {
         void checkUpdates(true, { silent: false });
@@ -5257,6 +5708,7 @@ function bindDomEvents(root) {
         void updatePrefs({ locale: nextLocale }, nextLocale === 'en' ? 'Switched to English' : '已切换为简体中文');
       } else if (action === 'close-modal') {
         if (state.removeConfirmModal) {
+          if (state.removingDir) return;
           state.removeConfirmModal = null;
         } else if (state.escalationModal) {
           state.escalationModal = null;
@@ -5323,13 +5775,38 @@ function bindDomEvents(root) {
           state.focusGithubUrlInput = true;
           render();
         }
-      } else if (action === 'update-local-github') {
+      } else if (action === 'update-plugin-direct' || action === 'update-local-github') {
         e.stopPropagation();
         const id = el.getAttribute('data-id') || '';
         const dir = el.getAttribute('data-dir') || '';
         const displayName = el.getAttribute('data-name') || dir || id;
+        const source = el.getAttribute('data-source') || '';
+        const updateChannel = el.getAttribute('data-update-channel') || '';
+        const targetRef = el.getAttribute('data-target-ref') || '';
+        const updateKind = el.getAttribute('data-update-kind') || '';
+        const trackBranch = el.getAttribute('data-track-branch') || '';
+        const repositoryUrl = el.getAttribute('data-repo-url') || '';
         if (id || dir) {
-          void triggerUpdateLocalGithub({ id, dir, displayName, confirmEscalation: false });
+          void triggerDirectPluginUpdate({
+            id,
+            dir,
+            displayName,
+            source,
+            updateChannel,
+            targetRef,
+            updateKind,
+            trackBranch,
+            repositoryUrl,
+            confirmEscalation: false,
+          });
+        }
+      } else if (action === 'sync-installed-plugin') {
+        e.stopPropagation();
+        const dir = el.getAttribute('data-dir') || '';
+        const id = el.getAttribute('data-id') || '';
+        const displayName = el.getAttribute('data-name') || dir || id;
+        if (dir || id) {
+          void triggerSyncInstalledPlugin({ dir, id, displayName });
         }
       } else if (action === 'detail') {
         e.stopPropagation();
@@ -5372,7 +5849,16 @@ function bindDomEvents(root) {
         state.batchResults = null;
         render();
       } else if (action === 'self-update') {
-        void triggerSelfUpdate({ confirmEscalation: false });
+        e.stopPropagation();
+        const updateChannel = el.getAttribute('data-update-channel') || '';
+        const targetVersion = el.getAttribute('data-target-version') || '';
+        const targetRef = el.getAttribute('data-target-ref') || '';
+        void triggerSelfUpdate({
+          confirmEscalation: false,
+          updateChannel,
+          targetVersion,
+          targetRef,
+        });
       } else if (action === 'open-self-changelog') {
         state.selfChangelogModal = true;
         render();
@@ -5393,15 +5879,29 @@ function bindDomEvents(root) {
         state.escalationModal = null;
         if (em.mode === 'single' && em.items[0]?.plugin) {
           void triggerInstall(em.items[0].plugin, { confirmEscalation: true });
-        } else if (em.mode === 'local-github' && em.items[0]) {
-          void triggerUpdateLocalGithub({
-            id: em.items[0].id || '',
-            dir: em.items[0].dir || '',
-            displayName: em.items[0].displayName || '',
+        } else if ((em.mode === 'direct-update' || em.mode === 'local-github') && em.items[0]) {
+          const item = em.items[0];
+          void triggerDirectPluginUpdate({
+            id: item.id || '',
+            dir: item.dir || '',
+            displayName: item.displayName || '',
+            source: item.source || '',
+            updateChannel: item.updateChannel || '',
+            targetRef: item.targetRef || '',
+            updateKind: item.updateKind || '',
+            trackBranch: item.trackBranch || '',
+            repositoryUrl: item.repositoryUrl || '',
+            preferUpstream: Boolean(item.preferUpstream),
             confirmEscalation: true,
           });
         } else if (em.mode === 'self') {
-          void triggerSelfUpdate({ confirmEscalation: true });
+          const item = em.items[0] || {};
+          void triggerSelfUpdate({
+            confirmEscalation: true,
+            updateChannel: item.updateChannel || '',
+            targetVersion: item.targetVersion && item.targetVersion !== '?' ? item.targetVersion : '',
+            targetRef: item.targetRef || '',
+          });
         } else {
           const escalatedIds = em.items.map((x) => x.id).filter(Boolean);
           void triggerUpdateAll(escalatedIds, { confirmEscalation: true });
@@ -5435,6 +5935,7 @@ window.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
     if (state.reconnecting) return;
     if (state.removeConfirmModal) {
+      if (state.removingDir) return;
       state.removeConfirmModal = null;
       render();
     } else if (state.escalationModal) {

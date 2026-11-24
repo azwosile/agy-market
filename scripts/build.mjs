@@ -3,8 +3,8 @@
 // Compiles `src/ui/{template.html,styles.css,app.mjs}` (+ imported `src/shared/*.mjs` modules)
 // into a single self-contained `sidecars/market_pane/index.html`, and optionally copies `site/` -> `docs/`.
 
-import { cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { dirname, extname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import vm from 'node:vm';
 
@@ -16,6 +16,41 @@ const appEntry = join(uiDir, 'app.mjs');
 const cssEntry = join(uiDir, 'styles.css');
 const templateEntry = join(uiDir, 'template.html');
 const outHtmlPath = join(repoRoot, 'sidecars', 'market_pane', 'index.html');
+
+const TEXT_EXTENSIONS = new Set([
+  '.html',
+  '.htm',
+  '.js',
+  '.mjs',
+  '.cjs',
+  '.css',
+  '.svg',
+  '.json',
+  '.md',
+  '.txt',
+  '.xml',
+]);
+
+export function normalizeLf(text) {
+  return String(text ?? '').replace(/\r\n?/g, '\n');
+}
+
+function copyTreeNormalizedLf(srcDir, dstDir) {
+  mkdirSync(dstDir, { recursive: true });
+  for (const entry of readdirSync(srcDir)) {
+    const srcPath = join(srcDir, entry);
+    const dstPath = join(dstDir, entry);
+    const st = statSync(srcPath);
+    if (st.isDirectory()) {
+      copyTreeNormalizedLf(srcPath, dstPath);
+    } else if (TEXT_EXTENSIONS.has(extname(entry).toLowerCase())) {
+      const content = normalizeLf(readFileSync(srcPath, 'utf8'));
+      writeFileSync(dstPath, content, 'utf8');
+    } else {
+      cpSync(srcPath, dstPath, { force: true });
+    }
+  }
+}
 
 async function tryLoadEsbuild() {
   const candidates = [
@@ -56,7 +91,7 @@ export function bundleZeroDepEsm(entryFile) {
     if (visited.has(abs)) return nsMap.get(abs);
     visited.add(abs);
 
-    let code = readFileSync(abs, 'utf8').replace(/^\uFEFF/, '');
+    let code = normalizeLf(readFileSync(abs, 'utf8').replace(/^\uFEFF/, ''));
     const nsVar = `__market_mod_${++modSeq}`;
     const exportedNames = new Set();
     const importBindings = [];
@@ -145,7 +180,7 @@ export function bundleZeroDepEsm(entryFile) {
   }
 
   visit(entryFile);
-  return `(function(){\n'use strict';\n${ordered.join('\n\n')}\n})();`;
+  return normalizeLf(`(function(){\n'use strict';\n${ordered.join('\n\n')}\n})();`);
 }
 
 export async function buildMarketSidecarHtml({ buildSiteDocs = false } = {}) {
@@ -153,7 +188,7 @@ export async function buildMarketSidecarHtml({ buildSiteDocs = false } = {}) {
     throw new Error(`Missing UI entrypoint: ${appEntry}`);
   }
 
-  const rawCss = existsSync(cssEntry) ? readFileSync(cssEntry, 'utf8') : '';
+  const rawCss = existsSync(cssEntry) ? normalizeLf(readFileSync(cssEntry, 'utf8')) : '';
   const safeCss = rawCss.replace(/<\/style>/gi, '<\\/style>');
 
   let jsBundle = '';
@@ -170,21 +205,21 @@ export async function buildMarketSidecarHtml({ buildSiteDocs = false } = {}) {
         minify: false,
         write: false,
       });
-      jsBundle = res.outputFiles[0].text;
+      jsBundle = normalizeLf(res.outputFiles[0].text);
       bundlerUsed = 'esbuild';
     } catch {
-      jsBundle = bundleZeroDepEsm(appEntry);
+      jsBundle = normalizeLf(bundleZeroDepEsm(appEntry));
       bundlerUsed = 'zero-dep-inline';
     }
   } else {
-    jsBundle = bundleZeroDepEsm(appEntry);
+    jsBundle = normalizeLf(bundleZeroDepEsm(appEntry));
   }
 
   // Verify compiled JavaScript syntax in V8 VM before writing
   new vm.Script(jsBundle, { filename: 'agy-market-ui-bundle.js' });
   const safeJs = jsBundle.replace(/<\/script>/gi, '<\\/script>');
 
-  let html = readFileSync(templateEntry, 'utf8');
+  let html = normalizeLf(readFileSync(templateEntry, 'utf8'));
   if (!html.includes('/preload.js')) {
     html = html.replace('</head>', '  <script src="/preload.js"></script>\n</head>');
   }
@@ -200,6 +235,8 @@ export async function buildMarketSidecarHtml({ buildSiteDocs = false } = {}) {
     ? html.replace('<!-- MARKET_INLINE_SCRIPT -->', () => scriptBlock)
     : html.replace('</body>', () => `${scriptBlock}\n</body>`);
 
+  html = normalizeLf(html);
+
   mkdirSync(dirname(outHtmlPath), { recursive: true });
   writeFileSync(outHtmlPath, html, 'utf8');
 
@@ -207,11 +244,10 @@ export async function buildMarketSidecarHtml({ buildSiteDocs = false } = {}) {
   const siteDir = join(repoRoot, 'site');
   if (buildSiteDocs && existsSync(siteDir)) {
     const docsDir = join(repoRoot, 'docs');
-    mkdirSync(docsDir, { recursive: true });
-    cpSync(siteDir, docsDir, { recursive: true, force: true });
+    copyTreeNormalizedLf(siteDir, docsDir);
     const logoSrc = join(repoRoot, 'assets', 'logo.svg');
     if (existsSync(logoSrc)) {
-      cpSync(logoSrc, join(docsDir, 'logo.svg'), { force: true });
+      writeFileSync(join(docsDir, 'logo.svg'), normalizeLf(readFileSync(logoSrc, 'utf8')), 'utf8');
     }
     siteCopied = true;
   }

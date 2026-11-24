@@ -1,6 +1,6 @@
 ---
 name: agy-market
-description: Open the AGY Market visual community plugin marketplace pane, search verified & experimental Antigravity plugins, preflight and install unlisted plugins directly from any GitHub URL, inspect capability badges, check updates, and surface one-click sidecar:// and customization:// management pills. Use when the user asks to browse community plugins, open AGY Market, install a plugin from a GitHub repository URL, check plugin updates, or install/manage community Antigravity plugins.
+description: Open the AGY Market visual community plugin marketplace pane, search verified & experimental Antigravity plugins across 15 categories, preflight and install unlisted plugins directly from any GitHub URL, inspect capability badges, run direct in-Sidebar updates or one-click batch updates, uninstall global community plugins safely (in Sidebar or via CLI), and surface one-click sidecar:// and customization:// management pills. Use when the user asks to browse community plugins, open AGY Market, install a plugin from a GitHub repository URL, check or apply plugin updates, uninstall a plugin, or manage community Antigravity plugins.
 ---
 
 # AGY Market · 反重力社区插件市场 (`agy-market`)
@@ -41,13 +41,31 @@ When the user provides any GitHub repository URL that is not yet indexed in the 
 
 ---
 
-## 3. Managing Installed Community Plugins (`customization://<dir>`)
+## 3. Updating & Uninstalling Installed Community Plugins
+
+### 3.1 Direct In-Sidebar Updates & One-Click Update All
+- Open `[AGY Market](sidecar://agy-market/market_pane/)` and switch to **已安装 (`Installed`)**:
+  - **Per-plugin direct update**: Every installed plugin card provides an **Update (`更新`)** button. Both catalog releases and newer GitHub upstream Release/Tag or GitHub URL builds are downloaded, inspected, and synced directly inside the Sidebar without opening external browser download pages, preserving original catalog verification metadata (`track`, `repositoryId`).
+  - **One-click batch update**: Click the permanent **一键更新 (`Update All`)** button beside **检查更新 (`Check Updates`)** to check and sequentially update all installed plugins across catalog, GitHub upstream, and GitHub URL channels (scheduling `agy-market` self-update last).
+
+### 3.2 Lock-Safe Uninstall (Sidebar & CLI)
+- **Sidebar one-click uninstall**: Every global community plugin card (excluding `agy-market`, `workspace`, and `builtin` plugins) and its Detail Drawer provide a **卸载 (`Uninstall`)** button with confirmation dialog (optionally removing the plugin from favorites). It cleans both active (`~/.gemini/config/plugins/<dir>`) and Vault-Parked (`${PLUGIN_DATA}/disabled-plugins/<dir>`) directories, unlinks symlinks without deleting target source folders, and retires Windows `EBUSY`-locked files to `.old.<ts>` while immediately removing `plugin.json`.
+- **CLI (`npx agy-market uninstall <dir>`)**:
+  ```bash
+  # Uninstall a global community plugin safely (interactive confirmation; alias: remove)
+  npx agy-market uninstall <dir>
+
+  # Non-interactive uninstall with machine-readable JSON output
+  npx agy-market uninstall <dir> --yes --json
+  ```
+
+### 3.3 Host Lifecycle Guardrails (`customization://<dir>`)
 
 Follow Antigravity's host lifecycle guardrails strictly:
 
 1. **Always key `customization://<dir>` links on the install directory `<dir>`** (e.g. `customization://agy-wallpaper-prism` or `customization://dev-team--quick-note` for scoped Track-2 installs), **never** on `plugin.json.name` when `<dir>` differs, and **never** emit `plugin://` or `plugins://` links.
-2. **Never edit `~/.gemini/config/config.json` or call restricted mutation RPCs** (`JetboxWriteState`, `DeletePlugin`, `InstallCustomization`). Give the user `[<DisplayName>](customization://<dir>)` to toggle Enable/Disable live or uninstall cleanly.
-3. If an installed plugin also provides an Auxiliary Pane Sidecar view and is enabled, surface its `sidecar://<dir>/<sidecar_folder>/` pill alongside its `customization://<dir>` link.
+2. **Never edit `~/.gemini/config/config.json` or call restricted mutation RPCs** (`JetboxWriteState`, `DeletePlugin`, `InstallCustomization`). Give the user `[<DisplayName>](customization://<dir>)` when they want to open Antigravity's native Customizations page.
+3. If an installed plugin also provides an Auxiliary Pane Sidebar view and is enabled, surface its `sidecar://<dir>/<sidecar_folder>/` pill alongside its `customization://<dir>` link.
 
 ---
 
@@ -70,9 +88,13 @@ When summarizing plugins from the AGY Market catalog, present capability badges 
 # Preflight and install an unlisted plugin directly from a GitHub URL
 npx agy-market add <github-url>
 
+# Lock-safe uninstall of an installed global plugin (alias: remove; supports --yes, --dest <plugins-dir>, --json)
+npx agy-market uninstall <dir>
+npx agy-market uninstall <dir> --yes --json
+
 # Inspect local installed plugins, market receipts, and config/data paths (read-only)
 node "<agy-market-plugin-dir>/bin/agy-market.mjs" status
 
-# Run installation diagnostics & sweep retired Windows *.old.<ts> binaries
+# Run installation diagnostics & sweep retired Windows *.old.<ts> binaries and empty shells
 node "<agy-market-plugin-dir>/bin/agy-market.mjs" doctor
 ```

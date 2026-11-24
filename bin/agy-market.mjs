@@ -6,6 +6,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { installLocalAgyMarket } from '../scripts/install-local.mjs';
 import { inspectGithubPluginUrl, installGithubPlugin } from '../src/installer/github-url.mjs';
+import { uninstallPlugin } from '../src/installer/index.mjs';
 import { sweepRetiredBinaries } from '../src/installer/sync-dir.mjs';
 import { scanLocalPluginInventory } from '../src/preflight/index.mjs';
 import {
@@ -27,6 +28,8 @@ Usage:
   npx agy-market [install] [--dest <plugins-dir>]   Install or update AGY Market into Antigravity
   npx agy-market add <github-url> [--subpath <dir>] [--isolate|--replace] [--yes] [--dest <plugins-dir>] [--mirror <prefix>] [--token <pat>] [--json]
                                                     Inspect and install a plugin directly from a GitHub URL
+  npx agy-market uninstall <dir> [--yes] [--dest <plugins-dir>] [--json]
+                                                    Uninstall a globally installed plugin safely (alias: remove)
   npx agy-market status [--json]                    List installed plugins & AGY Market status
   npx agy-market doctor                             Verify installation health & sweep retired binaries
   npx agy-market --help                             Show this help message
@@ -268,6 +271,120 @@ export async function runCli(argv = process.argv.slice(2), runtimeOpts = {}) {
     }
   }
 
+  if (sub === 'uninstall' || sub === 'remove') {
+    const targetDir = findFirstPositionalAfterSubcommand(args);
+    if (!targetDir) {
+      const msg = 'Usage: npx agy-market uninstall <dir> [--yes] [--dest <plugins-dir>] [--json]';
+      if (asJson) {
+        console.log(JSON.stringify({ ok: false, status: 'INVALID_USAGE', error: msg }, null, 2));
+      } else {
+        console.error(`✗ ${msg}`);
+      }
+      return { code: 1 };
+    }
+
+    const confirmed = args.includes('--yes') || args.includes('-y');
+    const removeFavorite = args.includes('--remove-favorite');
+    const resolvedDest = destPluginsDir ? resolve(destPluginsDir) : '';
+    const configDir =
+      runtimeOpts.configDir ||
+      (resolvedDest && basename(resolvedDest).toLowerCase() === 'plugins'
+        ? dirname(resolvedDest)
+        : resolveAntigravityConfigDir());
+    const pluginsDir = runtimeOpts.pluginsDir || resolvedDest || '';
+    const dataDir = runtimeOpts.dataDir || resolveMarketDataDir();
+    const fetchImpl = runtimeOpts.fetchImpl || fetch;
+    const nowMs = runtimeOpts.nowMs ?? Date.now();
+
+    if (targetDir === PLUGIN_ID) {
+      const msg = 'ERR_CANNOT_SELF_DELETE: Manage agy-market itself via customization://agy-market';
+      if (asJson) {
+        console.log(JSON.stringify({ ok: false, status: 'ERROR', error: msg }, null, 2));
+      } else {
+        console.error(`✗ ${msg}`);
+      }
+      return { code: 1, error: msg };
+    }
+
+    if (!confirmed) {
+      const payload = {
+        ok: false,
+        status: 'CONFIRM_REQUIRED',
+        dir: targetDir,
+        error: `Re-run with --yes to confirm permanently uninstalling "${targetDir}"`,
+      };
+      if (asJson) {
+        console.log(JSON.stringify(payload, null, 2));
+      } else {
+        console.log(`! About to permanently uninstall plugin "${targetDir}".`);
+        console.log(`  Re-run with --yes to confirm: npx agy-market uninstall ${targetDir} --yes`);
+      }
+      return { code: 2, result: payload };
+    }
+
+    try {
+      const res = await uninstallPlugin({
+        dir: targetDir,
+        configDir,
+        pluginsDir,
+        dataDir,
+        workspaceUris: runtimeOpts.workspaceUris || [],
+        builtinPluginsDir: runtimeOpts.builtinPluginsDir || '',
+        removeFavorite,
+        fetchImpl,
+        nowMs,
+        rmOverride: runtimeOpts.rmOverride || null,
+        unlinkOverride: runtimeOpts.unlinkOverride || null,
+        renameOverride: runtimeOpts.renameOverride || null,
+        linkInfoOverride: runtimeOpts.linkInfoOverride || null,
+      });
+
+      if (res.removed) {
+        const payload = {
+          ok: true,
+          status: res.locked ? 'UNINSTALLED_LOCKED' : 'UNINSTALLED',
+          dir: targetDir,
+          ...res,
+        };
+        if (asJson) {
+          console.log(JSON.stringify(payload, null, 2));
+        } else {
+          console.log(`✓ Uninstalled plugin "${targetDir}"`);
+          if (res.activation?.reasonEn) {
+            console.log(`  Note:         ${res.activation.reasonEn}`);
+          }
+          if (res.locked && res.retiredBinaries?.length) {
+            console.log(`  Retired:      ${res.retiredBinaries.length} locked file(s) scheduled for next-restart cleanup`);
+          }
+        }
+        return { code: 0, result: payload };
+      }
+
+      const failErr = res.error || `Plugin "${targetDir}" was not found in global plugins or disabled vault`;
+      const payload = {
+        ok: false,
+        status: res.locked ? 'LOCKED' : 'NOT_FOUND',
+        dir: targetDir,
+        error: failErr,
+        ...res,
+      };
+      if (asJson) {
+        console.log(JSON.stringify(payload, null, 2));
+      } else {
+        console.error(`✗ ${failErr}`);
+      }
+      return { code: 1, result: payload };
+    } catch (err) {
+      const errMsg = err?.message || String(err);
+      if (asJson) {
+        console.log(JSON.stringify({ ok: false, status: 'ERROR', error: errMsg }, null, 2));
+      } else {
+        console.error(`✗ ${errMsg}`);
+      }
+      return { code: 1, error: errMsg };
+    }
+  }
+
   if (sub === 'status') {
     const configDir = resolveAntigravityConfigDir();
     const dataDir = resolveMarketDataDir();
@@ -308,7 +425,7 @@ export async function runCli(argv = process.argv.slice(2), runtimeOpts = {}) {
     const pluginsDir = destPluginsDir ? resolve(destPluginsDir) : resolvePluginsDir();
     const dataDir = resolveMarketDataDir();
     const selfDir = join(pluginsDir, PLUGIN_ID);
-    const swept = sweepRetiredBinaries(dataDir);
+    const swept = sweepRetiredBinaries(dataDir, { pluginsDir });
     const checks = [];
 
     const nodeMajor = parseInt(process.versions.node.split('.')[0], 10);

@@ -6,7 +6,7 @@
 
 **Google Antigravity 社区插件市场**
 
-Sidebar 侧边栏界面 · GitHub 完整链接预检安装 · ⭐ 插件收藏栏 · 已安装实时搜索筛选 · 一键直开 Sidebar 侧边栏 · 卡片原生启停滑块 · 本地插件冲突检查 · 双通道中国镜像加速 · SHA-256 校验
+Sidebar 侧边栏界面 · 锁安全一键卸载 · Sidebar 上游直装与一键更新 · 15 大精准分类 · GitHub 完整链接预检安装 · ⭐ 插件收藏栏 · 已安装实时搜索筛选 · 一键直开 Sidebar 侧边栏 · 卡片原生启停滑块 · 本地插件冲突检查 · 双通道中国镜像加速 · SHA-256 校验
 
 **简体中文** · [English](./README.en.md) · **[📖 申请收录插件教程](https://github.com/azwosile/agy-market-catalog/blob/main/docs/SUBMISSION_GUIDE.md)** · [插件目录仓库](https://github.com/azwosile/agy-market-catalog) · [架构规范](./AGENTS.md)
 
@@ -20,16 +20,28 @@ Sidebar 侧边栏界面 · GitHub 完整链接预检安装 · ⭐ 插件收藏�
 
 ---
 
-## ✨ 核心特性（v1.4.0）
+## ✨ 核心特性（v1.5.0）
 
-### 1. Sidebar 侧边栏界面与导航体验
+### 1. Sidebar 侧边栏界面、15 大精准分类与导航体验
 - **原生右侧 Sidebar 侧边栏**：基于 Antigravity 原生 `AUX_PANE` 扩展视图（`sidecars/market_pane/sidecar.json`），不捆绑常驻 MCP 服务，打开即用、轻量流畅。
+- **15 大精准分类体系（含 `all` 共 16 项）**：新增 **状态与用量监控（`monitoring-quota`）**、**上下文与缓存加速（`context-cache`）**、**多代理与思考控制（`agents-reasoning`）** 等高辨识度细分品类；探索页自动按目录数据动态生成分类胶囊、支持按中英文分类名实时搜索并在卡片与详情抽屉展示分类微标签。
 - **顶部概览栏与插件卡片**：顶部可折叠概览栏实时展示「已收录插件 / 运行中 / 可更新 / 本地冲突」，顶栏内置 **`链接添加`**（粘贴任意 GitHub 链接预检安装）与 **`+ 申请收录插件`** 快捷入口；卡片样式适配暗色、亮色与半透明壁纸皮肤（如 Wallpaper Prism）。
 - **双行标题 + 一键直达 GitHub**：点击探索卡片、收藏卡片、已安装卡片或详情抽屉的**插件标题**可直接在新窗口打开对应 GitHub 仓库，点击卡片其余区域展开详情抽屉。
 - **开箱优先呈现简体中文文档**：详情抽屉请求 `/api/readme?id=...&locale=zh`，自动优先渲染目录源 `entriesZh` 或本地 `README.zh-CN.md` / `README.zh.md`，并在已安装卡片优先显示中文化简介。
 - **点击「面板」一键直开目标 Sidebar 侧边栏**：移除会被 Chromium 拦截的裸 `<a href="sidecar://...">` 链接；在宿主侧边栏内点击其他 Sidebar 插件卡片上的「面板」按钮时，直接调用宿主 `window.sidecar.ui.toggleAuxPane`（`tabType: "sidecarView"`）拉起或聚焦对应侧边栏，无需手动复制提示。
 
-### 2. ⭐ 插件收藏栏、已安装搜索筛选与更新失败告警
+### 2. 锁安全一键卸载、Sidebar 全通道直装更新与常驻「一键更新」
+- **锁安全插件卸载（Sidebar 卡片/详情抽屉 + `npx agy-market uninstall <dir>`）**：
+  - 每张可卸载全局已安装插件卡片与详情抽屉均内置 **「卸载」** 按钮（`POST /api/uninstall`，同时兼容 `/api/remove-files`），确认弹窗支持可选勾选「同时从收藏夹移除」。
+  - 统一覆盖活跃目录（`~/.gemini/config/plugins/<dir>`）与停放仓（`${PLUGIN_DATA}/disabled-plugins/<dir>`）；绝不写 `config.json` 或调用受限 RPC；遇到符号链接/NTFS Junction 仅删除链接本身绝不误删源目录；Windows 下遇到 `EBUSY` 文件锁自动 `.old.<ts>` 改名退避并立即摘除 `plugin.json`，下次启动由 `sweepRetiredBinaries` 自动清扫残留空壳目录；硬性拦截 `agy-market` 自删（`ERR_CANNOT_SELF_DELETE`）及 `workspace` / `builtin` 插件误删。
+- **Sidebar 内全通道直装更新（告别外链手动下载）**：
+  - 当检测到 GitHub 上游 Release/Tag 领先于目录版本或来源于 GitHub URL 时，`GET /api/updates` 统一标记 `installable: true`（`updateChannel: 'catalog' | 'github-upstream' | 'github-url'`），点击更新直接在 Sidebar 内完成拉取、预检与原位升级，彻底移除跳转外部浏览器的上游外链按钮。
+  - 目录认证插件通过 GitHub 上游通道直装更新时，100% 保留原有 `receipt.track`（如 `'verified'`）与 `repositoryId`，并持续执行能力增量确认门禁。
+- **每张已安装卡片配单插件「更新」按钮 + 顶栏常驻「一键更新」**：
+  - 所有具备远端更新源的已安装插件卡片均提供单插件 **「更新」** 按钮（纯本地无源插件显示置灰禁用态，接口返回 `ERR_NO_UPDATE_SOURCE`）。
+  - 「已安装」页签顶栏在 **「检查更新」** 旁常驻 **「一键更新」** 按钮：一键自动核检并按序批量更新 `catalog`、`github-upstream` 与 `github-url` 全部通道，并将 `agy-market` 自身更新严格排在最后触发重启。
+
+### 3. ⭐ 插件收藏栏、已安装搜索筛选与更新失败告警
 - **⭐ 插件收藏栏 & 独立「收藏」标签页**：
   - 每张插件卡片（探索、收藏、已安装）与详情抽屉顶部均内置 `☆` / 琥珀金 `★` 收藏按钮，点击调用 `POST /api/favorites` 原子持久化至本地 `prefs.json`（无需重复配置）。
   - 收藏任意插件后，「探索」页顶部自动浮现可折叠的 **「★ 我的收藏栏」** 快捷入口；顶部导航同步提供独立 **「★ 收藏」** 标签页（`探索 · 收藏 · 已安装 · 冲突与诊断 · 源与设置`），支持全文检索与快速启停/安装。
@@ -38,14 +50,14 @@ Sidebar 侧边栏界面 · GitHub 完整链接预检安装 · ⭐ 插件收藏�
 - **更新失败显著红色告警条（绝不静默失败）**：
   - 当单个安装/更新、批量「全部更新」或市场自更新遇到网络中断、SHA-256 校验不匹配或文件锁异常时，页面顶部立即弹出醒目的红色告警条与错误通知，完整展示失败插件与具体错误原因，并提供一键 **「重试」** 按钮。
 
-### 3. 卡片底部原生「启用 / 禁用」安全停放仓滑块（Vault Parking）
+### 4. 卡片底部原生「启用 / 禁用」安全停放仓滑块（Vault Parking）
 - **零改写 `config.json` 红线**：Antigravity 语言服务器对 `~/.gemini/config/config.json` 设有写保护。AGY Market 严守只读原则，永不改写 `config.json`，而是通过**安全停放仓（Vault Parking）**实现即时启停控制（`POST /api/toggle-plugin`）：
   - **滑向「禁用（OFF）」**：后端将 `~/.gemini/config/plugins/<dir>` 安全移入 `${PLUGIN_DATA}/disabled-plugins/<dir>`，宿主热监听约 1 秒内卸载对应 Skills / Rules / Hooks。
   - **滑向「启用（ON）」**：后端将目录完整移回 `~/.gemini/config/plugins/<dir>` 并清理可能残留的 `"disabled": true`。
   - **停放态持续可更新**：被禁用的插件仍保留在「已安装」与「探索」卡片中；对其执行版本更新时，会在 `disabled-plugins/<dir>` 内原位同步，绝不意外将其自动重新激活。
   - **防误操作锁定**：`agy-market` 自身滑块保持常亮锁定（避免在市场侧边栏内把自己停用断连）；`workspace`、`builtin` 及宿主手动禁用项显示只读锁定提示。
 
-### 4. 本地插件冲突检查与修复
+### 5. 本地插件冲突检查与修复
 顶部内置独立 **「冲突与诊断」** 标签页（`GET /api/conflicts`），对本地已安装插件执行只读静态检查，并提供一键修复（`POST /api/fix-conflict`）：
 
 | 检测项 | 严重级别 | 检测内容 | 一键修复能力 |
@@ -56,17 +68,17 @@ Sidebar 侧边栏界面 · GitHub 完整链接预检安装 · ⭐ 插件收藏�
 | `skill-shadowing` / `agent-shadowing` | 警告 | 检测已启用插件之间的 `skills/*/SKILL.md`、`agents/*.md` 与用户全局目录或内置保留名的覆盖链 | 完整展示胜出/被覆盖链路 |
 | `host-enhancement-overlap` | 警告 / 提示 | 检测多个已启用插件同时修改 `app.asar`（**警告**，需注意文件补丁叠加风险）或同时使用 `cdp` 宿主界面增强（**提示**，通常可共存） | 提示评估是否停用其一 |
 
-### 5. 按需触发的智能重启 / 重开侧边栏提示
-卡片与详情抽屉保持视觉清爽，不再堆叠静态「需重启 / 免重启」标签；**仅当安装、更新、批量更新成功或 Windows 禁用遇到文件锁时**，依据插件能力与实时句柄状态按需弹出精准提示：
+### 6. 按需触发的智能重启 / 重开侧边栏提示
+卡片与详情抽屉保持视觉清爽，不再堆叠静态「需重启 / 免重启」标签；**仅当安装、更新、批量更新、卸载完成或 Windows 禁用遇到文件锁时**，依据插件能力与实时句柄状态按需弹出精准提示：
 - **纯声明式技能 / 全局规则（`instant`）**：热加载即刻生效，免重启无打扰。
 - **含 Sidebar 侧边栏 / MCP / 钩子（`reload-pane`）**：更新或安装成功后提示重开侧边栏或刷新 MCP。
 - **含 `app.asar` / 首次配置 `cdp` / Windows 锁定退避文件（`host-restart`）**：操作完成后弹出顶部横幅提醒重启 Antigravity 生效。
 
-### 6. 内置 GitHub Discussions 社区讨论
+### 7. 内置 GitHub Discussions 社区讨论
 - 插件详情抽屉内置 **「讨论」** 标签页（`GET /api/discussions`），无需登录或 Token 即可自动探测目标仓库是否开启 GitHub Discussions，并提供一键直达讨论区与发帖入口。
 - 如在面板设置中可选填入个人 GitHub Token（仅以 `0600` 权限保存在本地 `prefs.json`，绝不写入缓存文件或日志），即可在侧边栏直接拉取并浏览该插件最新 10 条社区讨论。
 
-### 7. 双通道中国大陆镜像加速与 SHA-256 校验
+### 8. 双通道中国大陆镜像加速与 SHA-256 校验
 - **三级目录源自动解析（零内置陈旧快照）**：
   1. **自定义团队/个人源**：优先合并 `prefs.json` 中配置的静态 `index.json` 订阅源。
   2. **全球主通道（GitHub Pages + `gh-pages` Raw 回退）**：支持 `ETag`（`If-None-Match`）/ `If-Modified-Since` 条件请求，`304 Not Modified` 毫秒级复用本地缓存。
@@ -160,6 +172,10 @@ npx agy-market install
 
 # 通过任意 GitHub 完整链接预检并安装插件（支持 --subpath / --isolate / --replace / --yes / --dest / --mirror / --token / --json）
 npx agy-market add <github-url>
+
+# 锁安全卸载已安装的全局社区插件（别名 remove；支持 --yes / --dest <plugins-dir> / --json）
+npx agy-market uninstall <dir>
+npx agy-market uninstall <dir> --yes --json
 
 # 查看当前配置路径、数据目录及所有已安装插件状态（支持 --json 机器可读输出）
 npx agy-market status

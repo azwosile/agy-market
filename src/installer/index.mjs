@@ -19,8 +19,10 @@ import { join, resolve } from 'node:path';
 import {
   applyScopedIsolationRewrite,
   isDirectorySymlinkOrJunction,
+  normalizeRepoUrl,
   readHostEnabledMapReadOnly,
   resolveInstallPreflight,
+  scanLocalPluginComponents,
   scanLocalPluginInventory,
 } from '../preflight/index.mjs';
 import { classifyActivationRequirement } from '../shared/activation.mjs';
@@ -34,9 +36,12 @@ import {
 import {
   buildInstallReceipt,
   computeCapabilityEscalation,
+  loadPrefsFromDisk,
   parseJsonc,
   sanitizeNativePluginManifest,
+  savePrefsToDisk,
 } from '../shared/schemas.mjs';
+import { parseGithubRepoSlug, safeGithubCacheKey } from '../updates/index.mjs';
 import { fetchVerifiedPluginTarball } from './fetch-tarball.mjs';
 import { clearPendingJournal, writePendingJournal } from './journal.mjs';
 import { recordRetiredBinaries, sweepRetiredBinaries, syncDirectoryLockSafe } from './sync-dir.mjs';
@@ -861,64 +866,333 @@ export async function installOrUpdateCatalogPlugin({
   }
 }
 
-/**
- * Removes market-installed plugin files cleanly from active `plugins/<dir>` and/or parked `disabled-plugins/<dir>`.
- */
-export function removeMarketPluginFiles({
+function removeMarketPluginFilesInternal({
   dir,
   configDir = resolveAntigravityConfigDir(),
+  pluginsDir: explicitPluginsDir = '',
   dataDir = resolveMarketDataDir(),
+  workspaceUris = [],
+  builtinPluginsDir = '',
+  catalogCapabilities = null,
+  removeFavorite = false,
+  extraFavoriteKeys = [],
+  nowMs = Date.now(),
+  rmOverride = null,
+  unlinkOverride = null,
+  renameOverride = null,
+  linkInfoOverride = null,
+  unlinkLinkOverride = null,
 }) {
   const safeDir = assertSafePluginDir(dir);
   if (safeDir === PLUGIN_ID) {
     throw new Error('ERR_CANNOT_SELF_DELETE: Manage agy-market itself via customization://agy-market');
   }
-  const pluginsDir = resolvePluginsDir(configDir);
+  const pluginsDir = explicitPluginsDir ? resolve(explicitPluginsDir) : resolvePluginsDir(configDir);
   const disabledDir = resolveDisabledPluginsDir(dataDir);
   const activeTarget = resolve(pluginsDir, safeDir);
   const parkedTarget = resolve(disabledDir, safeDir);
 
-  const hasActive = existsSync(activeTarget);
-  const hasParked = existsSync(parkedTarget);
+  const activeLinkInfo =
+    typeof linkInfoOverride === 'function'
+      ? linkInfoOverride(pluginsDir, safeDir) || isDirectorySymlinkOrJunction(pluginsDir, safeDir)
+      : isDirectorySymlinkOrJunction(pluginsDir, safeDir);
+  const parkedLinkInfo =
+    typeof linkInfoOverride === 'function'
+      ? linkInfoOverride(disabledDir, safeDir) || isDirectorySymlinkOrJunction(disabledDir, safeDir)
+      : isDirectorySymlinkOrJunction(disabledDir, safeDir);
+
+  const hasActive = Boolean(activeLinkInfo?.lstat) || existsSync(activeTarget);
+  const hasParked = Boolean(parkedLinkInfo?.lstat) || existsSync(parkedTarget);
+
   if (!hasActive && !hasParked) {
-    return { removed: false, customizationUri: `customization://${safeDir}` };
-  }
-
-  let removedAny = false;
-  let lockedError = null;
-
-  if (hasParked) {
-    try {
-      rmSync(parkedTarget, { recursive: true, force: true });
-      removedAny = true;
-    } catch (err) {
-      lockedError = err;
-    }
-  }
-
-  if (hasActive) {
-    try {
-      const linkInfo = isDirectorySymlinkOrJunction(pluginsDir, safeDir);
-      if (linkInfo.isSymlink) {
-        removeSymlinkOrJunctionOnly(activeTarget);
-      } else {
-        rmSync(activeTarget, { recursive: true, force: true });
+    if ((Array.isArray(workspaceUris) && workspaceUris.length > 0) || builtinPluginsDir) {
+      const inv = scanLocalPluginInventory({
+        configDir,
+        pluginsDir,
+        dataDir,
+        workspaceUris,
+        builtinPluginsDir,
+        linkInfoOverride,
+      });
+      const wsMatch = inv.installed.find(
+        (item) => item.scope === 'workspace' && (item.dir === safeDir || item.name === safeDir),
+      );
+      if (wsMatch) {
+        throw new Error(
+          `ERR_CANNOT_UNINSTALL_WORKSPACE: Plugin "${safeDir}" is a workspace-scoped plugin and cannot be uninstalled from global plugins`,
+        );
       }
-      removedAny = true;
-    } catch (err) {
-      lockedError = err;
+      const builtinMatch = inv.installed.find(
+        (item) => item.scope === 'builtin' && (item.dir === safeDir || item.name === safeDir),
+      );
+      if (builtinMatch) {
+        throw new Error(
+          `ERR_CANNOT_UNINSTALL_BUILTIN: Plugin "${safeDir}" is a built-in plugin and cannot be uninstalled`,
+        );
+      }
     }
-  }
-
-  if (lockedError) {
-    sweepRetiredBinaries(dataDir);
+    const activation = classifyActivationRequirement({}, { action: 'uninstall' });
     return {
-      removed: removedAny,
-      locked: true,
-      error: lockedError?.message || String(lockedError),
-      customizationUri: `customization://${safeDir}`,
+      publicResult: {
+        removed: false,
+        locked: false,
+        retiredBinaries: [],
+        hadMcp: false,
+        restartRequired: false,
+        activation,
+        customizationUri: `customization://${safeDir}`,
+      },
+      mcpServers: [],
+      effectivePluginName: safeDir,
+      mergedCaps: {},
     };
   }
 
-  return { removed: removedAny, customizationUri: `customization://${safeDir}` };
+  // Sweep any previously retired binaries before uninstalling the target plugin
+  sweepRetiredBinaries(dataDir);
+
+  // Snapshot manifest, receipt, capabilities, MCP state, and repoSlug BEFORE removing files
+  const snapshotDir =
+    hasActive && existsSync(join(activeTarget, 'plugin.json'))
+      ? activeTarget
+      : hasParked && existsSync(join(parkedTarget, 'plugin.json'))
+        ? parkedTarget
+        : hasActive
+          ? activeTarget
+          : parkedTarget;
+
+  let manifest = null;
+  const snapshotManifestPath = join(snapshotDir, 'plugin.json');
+  if (existsSync(snapshotManifestPath)) {
+    try {
+      manifest = parseJsonc(readFileSync(snapshotManifestPath, 'utf8'));
+    } catch {
+      manifest = null;
+    }
+  }
+
+  let receipt = null;
+  const snapshotReceiptPath = join(snapshotDir, '.agy-market-receipt.json');
+  if (existsSync(snapshotReceiptPath)) {
+    try {
+      receipt = JSON.parse(readFileSync(snapshotReceiptPath, 'utf8'));
+    } catch {
+      receipt = null;
+    }
+  }
+
+  let components = null;
+  try {
+    if (existsSync(snapshotDir)) {
+      components = scanLocalPluginComponents(snapshotDir, safeDir, String(manifest?.name || safeDir), receipt);
+    }
+  } catch {
+    components = null;
+  }
+
+  const mergedCaps = mergeCapabilityProfiles(components?.capabilities || {}, catalogCapabilities || {});
+  const mcpServers = [...new Set([...(components?.mcpServerKeys || []), ...(mergedCaps.mcpServers || [])])];
+  const hadMcp = Boolean(
+    components?.hasMcp ||
+      mcpServers.length > 0 ||
+      mergedCaps.badges.includes('mcp-stdio') ||
+      mergedCaps.badges.includes('mcp-remote'),
+  );
+  const effectivePluginName = String(receipt?.effectivePluginName || manifest?.name || safeDir);
+
+  let repoSlug =
+    parseGithubRepoSlug(receipt?.repositoryUrl) ||
+    parseGithubRepoSlug(manifest?.repository) ||
+    parseGithubRepoSlug(manifest?.homepage) ||
+    null;
+  if (!repoSlug && existsSync(join(snapshotDir, 'package.json'))) {
+    try {
+      const pkg = parseJsonc(readFileSync(join(snapshotDir, 'package.json'), 'utf8'));
+      repoSlug = parseGithubRepoSlug(pkg?.repository) || parseGithubRepoSlug(pkg?.homepage) || null;
+    } catch {
+      /* ignore */
+    }
+  }
+  if (!repoSlug && receipt?.id) {
+    const idMatch = /^([A-Za-z0-9-]+)__([A-Za-z0-9_.-]+?)(?:--.*)?$/.exec(String(receipt.id).trim());
+    if (idMatch) {
+      repoSlug = parseGithubRepoSlug(normalizeRepoUrl(`https://github.com/${idMatch[1]}/${idMatch[2]}`));
+    }
+  }
+
+  const rmFn = typeof rmOverride === 'function' ? rmOverride : rmSync;
+  const unlinkFn = typeof unlinkOverride === 'function' ? unlinkOverride : unlinkSync;
+  const renameFn = typeof renameOverride === 'function' ? renameOverride : renameSync;
+  const unlinkLinkFn =
+    typeof unlinkLinkOverride === 'function' ? unlinkLinkOverride : removeSymlinkOrJunctionOnly;
+
+  function removeOneTarget(targetPath, linkInfo) {
+    if (linkInfo?.isSymlink) {
+      try {
+        unlinkLinkFn(targetPath);
+        return { removed: true, locked: false, retired: [], error: null };
+      } catch (err) {
+        if (LOCK_ERROR_CODES.has(err?.code)) {
+          const stillThere = existsSync(join(targetPath, 'plugin.json')) || existsSync(targetPath);
+          return { removed: !stillThere, locked: true, retired: [], error: stillThere ? err : null };
+        }
+        throw err;
+      }
+    }
+
+    try {
+      rmFn(targetPath, { recursive: true, force: true });
+      return { removed: true, locked: false, retired: [], error: null };
+    } catch (err) {
+      if (!LOCK_ERROR_CODES.has(err?.code)) {
+        throw err;
+      }
+      const retired = cleanupLockedPluginDir({
+        targetDir: targetPath,
+        dataDir,
+        nowMs,
+        unlinkFn,
+        renameFn,
+      });
+      const manifestGone = !existsSync(join(targetPath, 'plugin.json'));
+      return {
+        removed: manifestGone,
+        locked: true,
+        retired,
+        error: manifestGone ? null : err,
+      };
+    }
+  }
+
+  const parkedRes = hasParked ? removeOneTarget(parkedTarget, parkedLinkInfo) : null;
+  const activeRes = hasActive ? removeOneTarget(activeTarget, activeLinkInfo) : null;
+
+  const retiredBinaries = [...new Set([...(parkedRes?.retired || []), ...(activeRes?.retired || [])])];
+  const locked = Boolean(parkedRes?.locked || activeRes?.locked);
+  const lastError = activeRes?.error || parkedRes?.error || null;
+  const manifestStillPresent =
+    (hasActive && existsSync(join(activeTarget, 'plugin.json'))) ||
+    (hasParked && existsSync(join(parkedTarget, 'plugin.json')));
+  const removed =
+    !manifestStillPresent &&
+    Boolean((parkedRes ? parkedRes.removed : true) && (activeRes ? activeRes.removed : true));
+
+  // Post-removal hygiene: purge stale GitHub cache files for this repoSlug & optional favorite cleanup
+  if (removed) {
+    if (repoSlug) {
+      const ghCacheDir = join(dataDir, 'cache', 'github');
+      if (existsSync(ghCacheDir)) {
+        const cacheKey = safeGithubCacheKey(repoSlug.owner, repoSlug.repo);
+        const exactFiles = new Set([
+          `updates-${cacheKey}.json`,
+          `repo-meta-${cacheKey}.json`,
+          `discussions-gql-${cacheKey}.json`,
+        ]);
+        const branchPrefix = `branch-${cacheKey}-`;
+        try {
+          for (const fname of readdirSync(ghCacheDir)) {
+            if (exactFiles.has(fname) || (fname.startsWith(branchPrefix) && fname.endsWith('.json'))) {
+              try {
+                rmSync(join(ghCacheDir, fname), { force: true });
+              } catch {
+                /* non-fatal */
+              }
+            }
+          }
+        } catch {
+          /* non-fatal */
+        }
+      }
+    }
+
+    if (removeFavorite) {
+      try {
+        const diskPrefs = loadPrefsFromDisk(dataDir);
+        const dropSet = new Set(
+          [
+            safeDir,
+            `local:${safeDir}`,
+            receipt?.id,
+            manifest?.name,
+            manifest?.name ? `local:${manifest.name}` : '',
+            ...(Array.isArray(extraFavoriteKeys) ? extraFavoriteKeys : []),
+          ]
+            .map((v) => String(v || '').trim())
+            .filter(Boolean),
+        );
+        const prevFavs = Array.isArray(diskPrefs.favorites) ? diskPrefs.favorites : [];
+        const nextFavs = prevFavs.filter((item) => !dropSet.has(item));
+        if (nextFavs.length !== prevFavs.length) {
+          savePrefsToDisk(dataDir, { ...diskPrefs, favorites: nextFavs });
+        }
+      } catch {
+        /* non-fatal */
+      }
+    }
+  }
+
+  const activation = classifyActivationRequirement(mergedCaps, {
+    retiredBinaries,
+    lockedOnRemove: locked,
+    action: 'uninstall',
+  });
+
+  const publicResult = {
+    removed,
+    locked,
+    retiredBinaries,
+    hadMcp,
+    restartRequired: activation.level !== 'instant',
+    activation,
+    customizationUri: `customization://${safeDir}`,
+    ...(!removed && lastError ? { error: lastError?.message || String(lastError) } : {}),
+  };
+
+  return {
+    publicResult,
+    mcpServers,
+    effectivePluginName,
+    mergedCaps,
+  };
+}
+
+/**
+ * Removes installed global plugin files cleanly (lock-safe on Windows, symlink-safe on all OSes)
+ * from active `plugins/<dir>` and/or parked `disabled-plugins/<dir>` without ever touching `config.json`.
+ */
+export function removeMarketPluginFiles(options = {}) {
+  return removeMarketPluginFilesInternal(options).publicResult;
+}
+
+/**
+ * Async uninstall wrapper around `removeMarketPluginFiles` that additionally performs
+ * opportunistic `RefreshMcpServers` reload when an MCP plugin was removed.
+ */
+export async function uninstallPlugin(options = {}) {
+  const { fetchImpl = fetch, ...rest } = options || {};
+  const { publicResult, mcpServers, effectivePluginName, mergedCaps } = removeMarketPluginFilesInternal(rest);
+
+  if (publicResult.removed && publicResult.hadMcp && mcpServers.length > 0) {
+    const refreshRes = await tryOpportunisticMcpRefresh(effectivePluginName, mcpServers, fetchImpl);
+    if (refreshRes.refreshed) {
+      const activation = classifyActivationRequirement(mergedCaps, {
+        retiredBinaries: publicResult.retiredBinaries,
+        lockedOnRemove: publicResult.locked,
+        reloadRequired: false,
+        mcpRefreshed: true,
+        action: 'uninstall',
+      });
+      return {
+        ...publicResult,
+        mcpRefreshed: true,
+        restartRequired: activation.level !== 'instant',
+        activation,
+      };
+    }
+  }
+
+  return {
+    ...publicResult,
+    mcpRefreshed: false,
+  };
 }

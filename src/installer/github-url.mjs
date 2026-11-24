@@ -24,6 +24,7 @@ import {
   MAX_TARBALL_BYTES,
   PLUGIN_ID,
   SELF_CATALOG_ID,
+  SELF_REPO_URL,
   toScopedPluginName,
 } from '../shared/constants.mjs';
 import { resolveAntigravityConfigDir, resolveMarketDataDir } from '../shared/paths.mjs';
@@ -1710,9 +1711,18 @@ function loadValidStagedInspect(dataDir, inspectToken, nowMs = Date.now()) {
   }
 }
 
-function buildSyntheticPluginRecord({ inspectData, installMode = 'native', preserveReceiptId = '', preserveTrackBranch = '' }) {
+function buildSyntheticPluginRecord({
+  inspectData,
+  installMode = 'native',
+  preserveReceiptId = '',
+  preserveTrackBranch = '',
+  preserveRepositoryId = 0,
+  preserveForceScopedInstall = false,
+  preservePaths: extraPreservePaths = [],
+  includeGithubSource = true,
+}) {
   const { plugin, resolution, parsed } = inspectData;
-  const forceScopedInstall = installMode === 'isolate';
+  const forceScopedInstall = Boolean(preserveForceScopedInstall) || installMode === 'isolate';
   const trackBranch =
     preserveTrackBranch ||
     (resolution.refType === 'branch' && resolution.ref && resolution.ref !== 'HEAD'
@@ -1720,6 +1730,14 @@ function buildSyntheticPluginRecord({ inspectData, installMode = 'native', prese
       : resolution.defaultBranch || '');
   const effectiveRefType = preserveTrackBranch ? 'branch' : resolution.refType || 'branch';
   const effectiveRef = preserveTrackBranch || resolution.ref || '';
+  const effectiveRepoId =
+    Number(preserveRepositoryId) > 0 ? Number(preserveRepositoryId) : Number(resolution.repositoryId || 0);
+  const mergedPreservePaths = [
+    ...new Set([
+      ...(Array.isArray(plugin.preservePaths) ? plugin.preservePaths : []),
+      ...(Array.isArray(extraPreservePaths) ? extraPreservePaths : []),
+    ]),
+  ];
 
   return {
     id: preserveReceiptId || plugin.id,
@@ -1736,7 +1754,7 @@ function buildSyntheticPluginRecord({ inspectData, installMode = 'native', prese
     commitSha: plugin.commitSha || '',
     repository: {
       url: plugin.repoUrl,
-      repositoryId: Number(resolution.repositoryId || 0),
+      repositoryId: effectiveRepoId,
       ownerId: Number(resolution.ownerId || 0),
       stars: Number(resolution.stars || 0),
       pluginRoot: plugin.pluginRoot || '.',
@@ -1746,17 +1764,21 @@ function buildSyntheticPluginRecord({ inspectData, installMode = 'native', prese
       sha256: plugin.sha256,
       sizeBytes: plugin.sizeBytes,
       npmMirrorPkg: null,
-      preservePaths: Array.isArray(plugin.preservePaths) ? [...plugin.preservePaths] : [],
+      preservePaths: mergedPreservePaths,
     },
     capabilities: plugin.capabilities,
-    githubSource: {
-      inputUrl: parsed?.inputUrl || plugin.repoUrl,
-      kind: parsed?.kind || 'repo',
-      ref: effectiveRef,
-      refType: effectiveRefType,
-      ...(trackBranch ? { trackBranch } : {}),
-      tarballUrl: plugin.tarballUrl,
-    },
+    ...(includeGithubSource
+      ? {
+          githubSource: {
+            inputUrl: parsed?.inputUrl || plugin.repoUrl,
+            kind: parsed?.kind || 'repo',
+            ref: effectiveRef,
+            refType: effectiveRefType,
+            ...(trackBranch ? { trackBranch } : {}),
+            tarballUrl: plugin.tarballUrl,
+          },
+        }
+      : {}),
   };
 }
 
@@ -2217,6 +2239,7 @@ export async function installGithubPlugin({
   timeoutMs = DEFAULT_API_TIMEOUT_MS,
   nowMs = Date.now(),
   writeOverride = null,
+  preserveReceiptMeta = null,
   _preserveReceiptId = '',
   _preserveTrackBranch = '',
 } = {}) {
@@ -2262,9 +2285,18 @@ export async function installGithubPlugin({
     }
   }
 
+  const meta = preserveReceiptMeta && typeof preserveReceiptMeta === 'object' ? preserveReceiptMeta : null;
+  const effectivePreserveId = String(meta?.id || _preserveReceiptId || '').trim();
+  const effectiveTrack = ['verified', 'unverified', 'custom', 'github-url'].includes(meta?.track)
+    ? meta.track
+    : 'github-url';
+  const effectivePreserveRepoId = Number(meta?.repositoryId || 0);
+  const effectiveForceScopedInstall = Boolean(meta?.forceScopedInstall);
+  const extraPreservePaths = Array.isArray(meta?.preservePaths) ? meta.preservePaths : [];
+
   const effectiveMode =
     normalizedMode ||
-    (inspectRes.preflight.isForeignSelfCollision ? 'isolate' : 'native');
+    (inspectRes.preflight.isForeignSelfCollision || effectiveForceScopedInstall ? 'isolate' : 'native');
 
   const conflictStrategy =
     effectiveMode === 'isolate'
@@ -2276,13 +2308,17 @@ export async function installGithubPlugin({
   const syntheticPlugin = buildSyntheticPluginRecord({
     inspectData: { plugin: inspectRes.plugin, resolution, parsed },
     installMode: effectiveMode,
-    preserveReceiptId: _preserveReceiptId,
-    preserveTrackBranch: _preserveTrackBranch,
+    preserveReceiptId: effectivePreserveId,
+    preserveTrackBranch: effectiveTrack === 'github-url' ? _preserveTrackBranch : '',
+    preserveRepositoryId: effectivePreserveRepoId,
+    preserveForceScopedInstall: effectiveForceScopedInstall,
+    preservePaths: extraPreservePaths,
+    includeGithubSource: effectiveTrack === 'github-url',
   });
 
   const installRes = await installOrUpdateCatalogPlugin({
     plugin: syntheticPlugin,
-    track: 'github-url',
+    track: effectiveTrack,
     prefs,
     conflictStrategy,
     confirmEscalation: Boolean(confirmEscalation),
@@ -2315,13 +2351,48 @@ export async function installGithubPlugin({
   };
 }
 
+function findMatchingCatalogForLocalUpdate(loc, catalogPlugins = [], isSelf = false) {
+  const list = Array.isArray(catalogPlugins) ? catalogPlugins : [];
+  if (list.length === 0) return null;
+  const receipt = loc?.receipt || null;
+  if (receipt?.id) {
+    const recRepoId = Number(receipt.repositoryId || 0);
+    const byReceipt = list.find((p) => {
+      const pRepoId = Number(p?.repository?.repositoryId || 0);
+      if (recRepoId > 0 && pRepoId > 0) {
+        return pRepoId === recRepoId && p.id === receipt.id;
+      }
+      return p.id === receipt.id;
+    });
+    if (byReceipt) return byReceipt;
+  }
+  const locRepo = normalizeRepoUrl(receipt?.repositoryUrl || loc?.repositoryUrl || '');
+  if (locRepo) {
+    const locRoot = normalizePluginRoot(receipt?.pluginRoot || '.');
+    const byRepo = list.find((p) => {
+      const pRepo = normalizeRepoUrl(p?.repository?.url);
+      if (!pRepo || pRepo !== locRepo) return false;
+      const pRoot = normalizePluginRoot(p?.repository?.pluginRoot || '.');
+      if (receipt?.pluginRoot && pRoot !== locRoot) return false;
+      return p.canonicalName === loc?.name || p.canonicalName === loc?.dir || p.scopedName === loc?.dir;
+    });
+    if (byRepo) return byRepo;
+  }
+  if (isSelf) {
+    return list.find((p) => p.id === SELF_CATALOG_ID || p.canonicalName === PLUGIN_ID) || null;
+  }
+  return null;
+}
+
 /**
- * Resolves, stages, and updates an already-installed `track === 'github-url'` plugin from its upstream GitHub repo
- * (supporting both SemVer Release/Tag upgrades and tagless branch Commit SHA re-syncs while preserving
- * `parkedByMarket`, `scopedRewriteApplied`, `preservePaths`, and T+N capability escalation checks).
+ * Resolves, stages, and updates any globally installed plugin with a valid GitHub repository URL
+ * directly from upstream GitHub (Release tarball -> highest SemVer Tag -> default/tracked branch archive),
+ * strictly preserving original catalog receipt metadata (`track`, `id`, `repositoryId`, `scopedRewriteApplied`),
+ * `parkedByMarket`, `preservePaths`, T+N capability escalation checks, and official `agy-market` self-update guard.
  */
 export async function resolveAndStageGithubUpdate({
   loc,
+  catPlugin = null,
   updateHint = null,
   confirmEscalation = false,
   prefs = {},
@@ -2337,41 +2408,88 @@ export async function resolveAndStageGithubUpdate({
   nowMs = Date.now(),
   writeOverride = null,
 }) {
+  if (loc?.scope && loc.scope !== 'global') {
+    throw new Error(
+      `ERR_CANNOT_UPDATE_NON_GLOBAL: Plugin "${loc?.dir || ''}" has scope="${loc.scope}" and cannot be updated in-place`,
+    );
+  }
+
   const receipt = loc?.receipt || null;
-  if (!receipt || receipt.track !== 'github-url') {
-    throw new Error(`ERR_NOT_GITHUB_URL_PLUGIN: Plugin "${loc?.dir || ''}" is not managed via github-url track`);
+  const isSelf = Boolean(
+    loc?.dir === PLUGIN_ID || loc?.name === PLUGIN_ID || receipt?.id === SELF_CATALOG_ID || catPlugin?.id === SELF_CATALOG_ID,
+  );
+  const matchedCatPlugin = catPlugin || findMatchingCatalogForLocalUpdate(loc, catalogPlugins, isSelf);
+
+  const repoUrl = normalizeRepoUrl(
+    updateHint?.repositoryUrl ||
+      receipt?.repositoryUrl ||
+      matchedCatPlugin?.repository?.url ||
+      loc?.repositoryUrl ||
+      (isSelf ? SELF_REPO_URL : ''),
+  );
+  if (!repoUrl || !/^https:\/\/github\.com\/[^/]+\/[^/]+$/i.test(repoUrl)) {
+    throw new Error(
+      `ERR_NO_UPDATE_SOURCE: Plugin "${loc?.dir || ''}" lacks a valid GitHub repository URL`,
+    );
   }
 
-  const repoUrl = normalizeRepoUrl(receipt.repositoryUrl || loc.repositoryUrl);
-  if (!repoUrl) {
-    throw new Error(`ERR_MISSING_GITHUB_REPO_URL: Plugin "${loc.dir}" lacks a valid GitHub repositoryUrl in receipt`);
+  // Strictly block any non-official repository from overwriting agy-market itself
+  if (isSelf && repoUrl !== normalizeRepoUrl(SELF_REPO_URL)) {
+    throw new Error(
+      `ERR_CANNOT_REPLACE_SELF: Official "${PLUGIN_ID}" can only self-update from ${SELF_REPO_URL}`,
+    );
   }
 
-  const pluginRoot = normalizePluginRoot(receipt.pluginRoot || '.');
-  const ghSource = receipt.githubSource || {};
+  const pluginRoot = normalizePluginRoot(
+    updateHint?.pluginRoot || receipt?.pluginRoot || matchedCatPlugin?.repository?.pluginRoot || '.',
+  );
+  const ghSource = receipt?.githubSource || {};
   const preserveTrackBranch =
     updateHint?.trackBranch ||
     ghSource.trackBranch ||
     (ghSource.refType === 'branch' && ghSource.ref && ghSource.ref !== 'HEAD' ? ghSource.ref : '');
 
+  const validTracks = new Set(['verified', 'unverified', 'custom', 'github-url']);
+  const catalogTrack = matchedCatPlugin
+    ? matchedCatPlugin._track || (matchedCatPlugin.forceScopedInstall ? 'unverified' : 'verified')
+    : '';
+  const preservedTrack = validTracks.has(receipt?.track)
+    ? receipt.track
+    : catalogTrack || (isSelf ? 'verified' : 'github-url');
+  const preservedId = String(receipt?.id || matchedCatPlugin?.id || (isSelf ? SELF_CATALOG_ID : '')).trim();
+  const preservedRepoId = Number(receipt?.repositoryId || matchedCatPlugin?.repository?.repositoryId || 0);
+  const preservedForceScoped = Boolean(
+    receipt?.scopedRewriteApplied || (!receipt && matchedCatPlugin?.forceScopedInstall),
+  );
+  const preservedPaths = [
+    ...new Set([
+      ...(Array.isArray(receipt?.preservePaths) ? receipt.preservePaths : []),
+      ...(Array.isArray(matchedCatPlugin?.distribution?.preservePaths)
+        ? matchedCatPlugin.distribution.preservePaths
+        : []),
+    ]),
+  ];
+
   let targetUrl = repoUrl;
   if (updateHint?.targetRef) {
     if (updateHint.updateKind === 'commit' || FULL_SHA_RE.test(updateHint.targetRef)) {
       targetUrl = `${repoUrl}/tree/${encodeURIComponent(updateHint.targetRef)}`;
-    } else if (updateHint.updateKind === 'semver') {
+    } else {
       targetUrl = `${repoUrl}/releases/tag/${encodePathSegments(updateHint.targetRef)}`;
     }
-  } else if (ghSource.kind === 'tree' && preserveTrackBranch) {
+  } else if (receipt?.track === 'github-url' && ghSource.kind === 'tree' && preserveTrackBranch) {
     targetUrl =
       pluginRoot !== '.'
         ? `${repoUrl}/tree/${encodePathSegments(preserveTrackBranch)}/${encodePathSegments(pluginRoot)}`
         : `${repoUrl}/tree/${encodePathSegments(preserveTrackBranch)}`;
   }
 
+  const installMode = isSelf ? 'replace' : preservedForceScoped ? 'isolate' : 'native';
+
   const result = await installGithubPlugin({
     url: targetUrl,
     pluginRoot,
-    installMode: receipt.scopedRewriteApplied ? 'isolate' : 'native',
+    installMode,
     confirmEscalation: Boolean(confirmEscalation),
     prefs,
     configDir,
@@ -2385,8 +2503,15 @@ export async function resolveAndStageGithubUpdate({
     timeoutMs,
     nowMs,
     writeOverride,
-    _preserveReceiptId: receipt.id,
-    _preserveTrackBranch: preserveTrackBranch,
+    preserveReceiptMeta: {
+      id: preservedId,
+      track: preservedTrack,
+      repositoryId: preservedRepoId,
+      forceScopedInstall: preservedForceScoped,
+      preservePaths: preservedPaths,
+    },
+    _preserveReceiptId: preservedId,
+    _preserveTrackBranch: preservedTrack === 'github-url' ? preserveTrackBranch : '',
   });
 
   if (result.status === 'NOT_A_PLUGIN_REPO' || result.status === 'SECURITY_BLOCKED') {

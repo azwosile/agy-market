@@ -896,6 +896,7 @@ function buildUpdateItem({
   installedVersion,
   catPlugin,
   receipt,
+  repositoryUrl = '',
   ghSlug,
   ghLatest,
   branchHead = null,
@@ -905,8 +906,19 @@ function buildUpdateItem({
   const catalogInstallable = isCatalogPluginInstallable(catPlugin);
   const catalogHasUpdate = Boolean(catPlugin && catalogInstallable && isNewerVersion(catPlugin.version, installedVersion));
   const githubHasUpdate = Boolean(ghLatest && isNewerVersion(ghLatest.version, installedVersion));
+  const resolvedRepoUrl = normalizeRepoUrl(
+    catPlugin?.repository?.url ||
+      repositoryUrl ||
+      receipt?.repositoryUrl ||
+      (ghSlug ? ghSlug.url : '') ||
+      (isSelf ? SELF_REPO_URL : ''),
+  );
+  const resolvedPluginRoot = normalizePluginRootForUpdate(
+    receipt?.pluginRoot || catPlugin?.repository?.pluginRoot || '.',
+  );
 
-  if (catalogHasUpdate) {
+  // Scenario A: Catalog has a direct-installable update and is not behind GitHub upstream
+  if (catalogHasUpdate && (!githubHasUpdate || !isNewerVersion(ghLatest.version, catPlugin.version))) {
     const matchingGh = ghLatest && compareSemver(ghLatest.version, catPlugin.version) === 0 ? ghLatest : null;
     const explicitTag = typeof catPlugin.gitTag === 'string' ? catPlugin.gitTag.trim() : '';
     const catCommitSha = typeof catPlugin.commitSha === 'string' ? catPlugin.commitSha.trim() : '';
@@ -923,65 +935,47 @@ function buildUpdateItem({
       }
     }
     const escalation = computeCapabilityEscalation(receipt, catPlugin);
-    const item = {
+    return {
       id: catPlugin.id,
       dir,
       displayName: catPlugin.displayName || displayName,
       installedVersion,
       latestVersion: catPlugin.version,
       source: 'catalog',
+      updateChannel: 'catalog',
+      ...(resolvedRepoUrl ? { repositoryUrl: resolvedRepoUrl } : {}),
+      pluginRoot: resolvedPluginRoot,
       releaseUrl: matchingGh?.releaseUrl || fallbackUrl,
       changelog: matchingGh?.changelog || '',
       escalation,
       installable: true,
       isSelf: Boolean(isSelf),
     };
-    if (ghLatest && isNewerVersion(ghLatest.version, catPlugin.version)) {
-      item.upstreamVersion = ghLatest.version;
-      item.upstreamReleaseUrl = ghLatest.releaseUrl;
-      item.upstreamSource = ghLatest.source;
-    }
-    return item;
   }
 
+  // Scenario B: GitHub Release/SemVer Tag is newer than local (and ahead of catalog, or unlisted) -> direct-installable in Sidebar
   if (githubHasUpdate) {
-    if (isGithubUrlTrack) {
-      return {
-        id: receipt?.id || catPlugin?.id || id,
-        dir,
-        displayName: catPlugin?.displayName || displayName,
-        installedVersion,
-        latestVersion: ghLatest.version,
-        source: ghLatest.source,
-        updateChannel: 'github-url',
-        updateKind: 'semver',
-        targetRef: ghLatest.tagName,
-        pluginRoot: normalizePluginRootForUpdate(receipt?.pluginRoot || '.'),
-        releaseUrl: ghLatest.releaseUrl,
-        changelog: ghLatest.changelog || '',
-        escalation: null,
-        installable: true,
-        isSelf: false,
-      };
-    }
-
     return {
-      id: catPlugin?.id || id,
+      id: isGithubUrlTrack ? receipt?.id || catPlugin?.id || id : catPlugin?.id || receipt?.id || id,
       dir,
       displayName: catPlugin?.displayName || displayName,
       installedVersion,
       latestVersion: ghLatest.version,
       source: ghLatest.source,
+      updateChannel: isGithubUrlTrack ? 'github-url' : 'github-upstream',
+      updateKind: 'semver',
+      targetRef: ghLatest.tagName,
+      repositoryUrl: resolvedRepoUrl,
+      pluginRoot: resolvedPluginRoot,
       releaseUrl: ghLatest.releaseUrl,
       changelog: ghLatest.changelog || '',
       escalation: null,
-      installable: false,
-      note: 'available upstream, awaiting catalog sync',
+      installable: true,
       isSelf: Boolean(isSelf),
     };
   }
 
-  // Mode B: Default-branch / branch-tracked tagless `github-url` plugins (Commit SHA / version diff)
+  // Scenario C: Default-branch / branch-tracked tagless `github-url` plugins (Commit SHA / version diff)
   if (isGithubUrlTrack && branchHead?.commitSha) {
     const installedSha = String(receipt?.commitSha || '').trim().toLowerCase();
     const remoteSha = String(branchHead.commitSha || '').trim().toLowerCase();
@@ -1008,7 +1002,8 @@ function buildUpdateItem({
         updateKind: versionBumped ? 'semver' : 'commit',
         targetRef: remoteSha,
         trackBranch: branchHead.branch || receipt?.githubSource?.trackBranch || '',
-        pluginRoot: normalizePluginRootForUpdate(receipt?.pluginRoot || '.'),
+        repositoryUrl: resolvedRepoUrl,
+        pluginRoot: resolvedPluginRoot,
         releaseUrl,
         changelog: branchHead.message || '',
         escalation: null,
@@ -1138,6 +1133,7 @@ export async function checkPluginUpdates({
       installedVersion: loc.version,
       catPlugin,
       receipt: loc.receipt || null,
+      repositoryUrl: loc.repositoryUrl || '',
       ghSlug,
       ghLatest,
       branchHead,
@@ -1152,12 +1148,14 @@ export async function checkPluginUpdates({
           installedVersion: item.installedVersion,
           latestVersion: item.latestVersion,
           source: item.source,
+          updateChannel: item.updateChannel || 'catalog',
+          ...(item.updateKind ? { updateKind: item.updateKind } : {}),
+          ...(item.targetRef ? { targetRef: item.targetRef } : {}),
+          ...(item.repositoryUrl ? { repositoryUrl: item.repositoryUrl } : {}),
+          ...(item.pluginRoot ? { pluginRoot: item.pluginRoot } : {}),
           installable: item.installable,
           releaseUrl: item.releaseUrl,
           changelog: item.changelog,
-          ...(item.upstreamVersion
-            ? { upstreamVersion: item.upstreamVersion, upstreamReleaseUrl: item.upstreamReleaseUrl }
-            : {}),
         };
       }
     }
@@ -1175,6 +1173,7 @@ export async function checkPluginUpdates({
       installedVersion: currentSelfVersion,
       catPlugin: selfCat,
       receipt: null,
+      repositoryUrl: selfCat?.repository?.url || SELF_REPO_URL,
       ghSlug: selfSlug,
       ghLatest: selfGhLatest,
       isSelf: true,
@@ -1185,12 +1184,14 @@ export async function checkPluginUpdates({
         installedVersion: selfItem.installedVersion,
         latestVersion: selfItem.latestVersion,
         source: selfItem.source,
+        updateChannel: selfItem.updateChannel || 'catalog',
+        ...(selfItem.updateKind ? { updateKind: selfItem.updateKind } : {}),
+        ...(selfItem.targetRef ? { targetRef: selfItem.targetRef } : {}),
+        ...(selfItem.repositoryUrl ? { repositoryUrl: selfItem.repositoryUrl } : {}),
+        ...(selfItem.pluginRoot ? { pluginRoot: selfItem.pluginRoot } : {}),
         installable: selfItem.installable,
         releaseUrl: selfItem.releaseUrl,
         changelog: selfItem.changelog,
-        ...(selfItem.upstreamVersion
-          ? { upstreamVersion: selfItem.upstreamVersion, upstreamReleaseUrl: selfItem.upstreamReleaseUrl }
-          : {}),
       };
     }
   }

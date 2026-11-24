@@ -11,14 +11,58 @@
     'host-enhancement': '💡 宿主界面增强',
   };
 
+  const CATEGORY_LABELS = {
+    'monitoring-quota': '状态与用量监控',
+    'context-cache': '上下文与缓存加速',
+    'ui-themes': '界面美化与汉化',
+    'agents-reasoning': '多代理与思考控制',
+    'developer-tools': '开发与版本工具',
+    'mcp-integrations': '浏览器与系统 MCP',
+    'skills-workflows': '技能包与工程方法',
+    productivity: '效率与插件管理',
+    'data-science': '数据与科学计算',
+    'cloud-devops': '云原生与部署',
+    'creative-media': '设计与多媒体',
+    'writing-knowledge': '写作与知识库',
+    automation: '定时与守护任务',
+    security: '安全与审计',
+    other: '其他扩展',
+  };
+
   const CATEGORY_ACCENTS = {
+    'monitoring-quota': ['#06b6d4', '#3b82f6'],
+    'context-cache': ['#14b8a6', '#6366f1'],
     'ui-themes': ['#a855f7', '#ec4899'],
+    'agents-reasoning': ['#8b5cf6', '#f43f5e'],
     'developer-tools': ['#6366f1', '#06b6d4'],
-    productivity: ['#38bdf8', '#14b8a6'],
     'mcp-integrations': ['#f59e0b', '#f97316'],
     'skills-workflows': ['#10b981', '#34d399'],
+    productivity: ['#38bdf8', '#14b8a6'],
+    'data-science': ['#3b82f6', '#8b5cf6'],
+    'cloud-devops': ['#06b6d4', '#3b82f6'],
+    'creative-media': ['#ec4899', '#f97316'],
+    'writing-knowledge': ['#8b5cf6', '#38bdf8'],
+    automation: ['#eab308', '#10b981'],
     security: ['#f43f5e', '#f59e0b'],
+    other: ['#6366f1', '#38bdf8'],
   };
+
+  function syncCategorySelectOptions(list) {
+    const select = document.getElementById('site-category');
+    if (!select) return;
+    const existing = new Set(Array.from(select.options).map((opt) => opt.value));
+    for (const p of list) {
+      for (const rawCat of p.taxonomy?.categories || []) {
+        const catId = String(rawCat || '').trim();
+        if (!catId || existing.has(catId)) continue;
+        existing.add(catId);
+        const opt = document.createElement('option');
+        opt.value = catId;
+        opt.textContent = CATEGORY_LABELS[catId] || catId;
+        select.appendChild(opt);
+      }
+    }
+  }
 
   let plugins = [];
 
@@ -43,7 +87,10 @@
       if (cat !== 'all' && !(p.taxonomy?.categories || []).includes(cat)) return false;
       if (!q) return true;
       const desc = typeof p.description === 'object' ? `${p.description.zh || ''} ${p.description.en || ''}` : String(p.description || '');
-      return `${p.displayName || ''} ${p.canonicalName || ''} ${desc} ${(p.capabilities?.badges || []).join(' ')}`.toLowerCase().includes(q);
+      const catTerms = (p.taxonomy?.categories || [])
+        .map((c) => `${c} ${CATEGORY_LABELS[c] || ''}`)
+        .join(' ');
+      return `${p.displayName || ''} ${p.canonicalName || ''} ${desc} ${catTerms} ${(p.taxonomy?.tags || []).join(' ')} ${(p.capabilities?.badges || []).join(' ')}`.toLowerCase().includes(q);
     });
 
     const totalEl = document.getElementById('stat-total');
@@ -114,6 +161,7 @@
       }
     }
     plugins = loaded || [];
+    syncCategorySelectOptions(plugins);
     if (channelEl) channelEl.textContent = loaded ? usedChannel : '等待连接';
     renderGrid();
   }

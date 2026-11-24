@@ -14,12 +14,12 @@ const RELOAD_PANE_BADGES = new Set([
 ]);
 
 /**
- * Classifies whether installing, updating, or toggling a plugin takes effect immediately
+ * Classifies whether installing, updating, toggling, or uninstalling a plugin takes effect immediately
  * (`instant`), recommends reopening the auxiliary pane / refreshing MCP (`reload-pane`),
  * or requires restarting the Antigravity desktop client (`host-restart`).
  *
  * @param {object} capabilities - `{ badges?: string[], hostEnhancementKind?: string[], mcpServers?: string[], hookEvents?: string[] }`
- * @param {object} runtime - `{ retiredBinaries?: string[], lockedOnDisable?: boolean, reloadRequired?: boolean, mcpRefreshed?: boolean, action?: string }`
+ * @param {object} runtime - `{ retiredBinaries?: string[], lockedOnDisable?: boolean, lockedOnRemove?: boolean, reloadRequired?: boolean, mcpRefreshed?: boolean, action?: string }`
  * @returns {{ level: 'instant' | 'reload-pane' | 'host-restart', badgeZh: string, badgeEn: string, reasonZh: string, reasonEn: string }}
  */
 export function classifyActivationRequirement(capabilities = {}, runtime = {}) {
@@ -33,14 +33,38 @@ export function classifyActivationRequirement(capabilities = {}, runtime = {}) {
       : [],
   );
 
+  const isUninstall = rt.action === 'uninstall' || rt.action === 'remove';
   const hasAsar = hostKinds.has('app-asar');
   const hasCdp = hostKinds.has('cdp');
   const hasGenericHostEnhancement = badges.has('host-enhancement') && !hasAsar && !hasCdp;
   const hasRetiredBinaries = Array.isArray(rt.retiredBinaries) && rt.retiredBinaries.length > 0;
   const lockedOnDisable = rt.lockedOnDisable === true;
+  const lockedOnRemove = rt.lockedOnRemove === true;
 
   // 1. Host Restart Required (`host-restart`)
-  if (hasAsar || hasCdp || hasGenericHostEnhancement || hasRetiredBinaries || lockedOnDisable) {
+  if (hasAsar || hasCdp || hasGenericHostEnhancement || hasRetiredBinaries || lockedOnDisable || lockedOnRemove) {
+    if (isUninstall) {
+      const detailZh = [];
+      const detailEn = [];
+      if (hasAsar || hasCdp || hasGenericHostEnhancement) {
+        detailZh.push('宿主补丁');
+        detailEn.push('host patches');
+      }
+      if (lockedOnRemove || hasRetiredBinaries) {
+        detailZh.push('锁定文件');
+        detailEn.push('locked files');
+      }
+      const targetZh = detailZh.length ? detailZh.join('或') : '宿主补丁或锁定文件';
+      const targetEn = detailEn.length ? detailEn.join(' or ') : 'host patches or locked files';
+      return {
+        level: 'host-restart',
+        badgeZh: '🚀 需重启释放',
+        badgeEn: '🚀 Restart Required',
+        reasonZh: `已卸载插件：请重启客户端以彻底释放${targetZh}`,
+        reasonEn: `Plugin uninstalled: restart Antigravity to fully release ${targetEn}`,
+      };
+    }
+
     const reasonsZh = [];
     const reasonsEn = [];
 
@@ -58,7 +82,7 @@ export function classifyActivationRequirement(capabilities = {}, runtime = {}) {
       reasonsEn.push('Host UI enhancement requires restarting Antigravity to take effect');
     }
 
-    if (lockedOnDisable) {
+    if (lockedOnDisable || lockedOnRemove) {
       reasonsZh.push('Windows 后台进程占用句柄需重启释放');
       reasonsEn.push('Windows background process holds open file handles; restart Antigravity to release');
     } else if (hasRetiredBinaries) {
@@ -94,6 +118,31 @@ export function classifyActivationRequirement(capabilities = {}, runtime = {}) {
     !hasHooks;
 
   if (rt.reloadRequired === true || ((hasBackgroundBadge || hasMcp || hasHooks) && !mcpAlreadyHotRefreshed)) {
+    if (isUninstall) {
+      let reasonZh = '已卸载插件：建议关闭已打开的目标侧边栏或刷新 MCP';
+      let reasonEn = 'Plugin uninstalled: close any open target Sidebar pane or refresh MCP servers';
+      if (hasSidecar && hasMcp) {
+        reasonZh = '已卸载插件：建议关闭已打开的目标侧边栏并刷新 MCP';
+        reasonEn = 'Plugin uninstalled: close any open target Sidebar pane and refresh MCP servers';
+      } else if (hasSidecar && !hasHooks) {
+        reasonZh = '已卸载插件：建议关闭已打开的目标侧边栏';
+        reasonEn = 'Plugin uninstalled: close any open target Sidebar pane';
+      } else if (hasMcp && !hasSidecar && !hasHooks) {
+        reasonZh = '已卸载插件：建议刷新 MCP 服务以释放已移除的工具';
+        reasonEn = 'Plugin uninstalled: refresh MCP servers to release removed tools';
+      } else if (hasHooks && !hasSidecar && !hasMcp) {
+        reasonZh = '已卸载插件：建议开启新会话或重开侧边栏以释放生命周期钩子';
+        reasonEn = 'Plugin uninstalled: start a new session or reopen Sidebar to release lifecycle hooks';
+      }
+      return {
+        level: 'reload-pane',
+        badgeZh: '🔄 建议关闭面板',
+        badgeEn: '🔄 Reload Pane',
+        reasonZh,
+        reasonEn,
+      };
+    }
+
     const partsZh = [];
     const partsEn = [];
     if (hasSidecar) {
@@ -126,6 +175,16 @@ export function classifyActivationRequirement(capabilities = {}, runtime = {}) {
   }
 
   // 3. Instant Activation (`instant`)
+  if (isUninstall) {
+    return {
+      level: 'instant',
+      badgeZh: '⚡ 已即时卸载',
+      badgeEn: '⚡ Uninstalled Instantly',
+      reasonZh: '已即时卸载',
+      reasonEn: 'Uninstalled immediately',
+    };
+  }
+
   if (badges.has('global-rules')) {
     return {
       level: 'instant',

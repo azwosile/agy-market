@@ -14,12 +14,14 @@ import {
   readdirSync,
   readFileSync,
   renameSync,
+  rmdirSync,
   rmSync,
   statSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
-import { dirname, join, posix, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, posix, relative, resolve } from 'node:path';
+import { PLUGIN_ID } from '../shared/constants.mjs';
 
 const LOCK_ERROR_CODES = new Set(['EBUSY', 'EPERM', 'EACCES']);
 const RETIRED_BINARY_RE = /\.old\.\d{10,}$/;
@@ -95,29 +97,166 @@ export function recordRetiredBinaries(dataDir, newPaths = []) {
   return merged;
 }
 
+function isStrictlyInsideDir(parentDir, childPath) {
+  if (!parentDir || !childPath) return false;
+  const rel = relative(parentDir, childPath);
+  return Boolean(rel && !rel.startsWith('..') && !isAbsolute(rel));
+}
+
+function resolveRetiredCleanupBounds(absOldPath, { absPluginsDir = '', absDisabledDir = '' } = {}) {
+  for (const containerDir of [absPluginsDir, absDisabledDir]) {
+    if (containerDir && isStrictlyInsideDir(containerDir, absOldPath)) {
+      const rel = relative(containerDir, absOldPath);
+      const topDirName = rel.split(/[\\/]/)[0];
+      if (topDirName) {
+        return { containerDir, pluginRootDir: join(containerDir, topDirName), topDirName };
+      }
+    }
+  }
+
+  let cur = dirname(absOldPath);
+  for (let depth = 0; depth < 8; depth++) {
+    const base = basename(cur).toLowerCase();
+    if (base === 'plugins' || base === 'disabled-plugins') {
+      const rel = relative(cur, absOldPath);
+      const topDirName = rel.split(/[\\/]/)[0];
+      if (topDirName && !topDirName.startsWith('..')) {
+        return { containerDir: cur, pluginRootDir: join(cur, topDirName), topDirName };
+      }
+      return null;
+    }
+    const parent = dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+  return null;
+}
+
+function pruneEmptyRetiredParentDirs(absOldPath, bounds) {
+  if (!bounds || !bounds.topDirName || bounds.topDirName === PLUGIN_ID) return 0;
+  if (existsSync(join(bounds.pluginRootDir, 'plugin.json'))) return 0;
+
+  let removedDirs = 0;
+  let cur = dirname(absOldPath);
+  while (cur === bounds.pluginRootDir || isStrictlyInsideDir(bounds.pluginRootDir, cur)) {
+    if (existsSync(join(bounds.pluginRootDir, 'plugin.json'))) break;
+    if (existsSync(cur)) {
+      try {
+        const lst = lstatSync(cur);
+        if (!lst.isDirectory() || lst.isSymbolicLink()) break;
+        if (readdirSync(cur).length > 0) break;
+        rmdirSync(cur);
+        removedDirs++;
+      } catch {
+        break;
+      }
+    }
+    if (cur === bounds.pluginRootDir) break;
+    const parent = dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+  return removedDirs;
+}
+
+function isCompletelyEmptyDirTree(dirPath) {
+  let lst;
+  try {
+    lst = lstatSync(dirPath);
+  } catch {
+    return false;
+  }
+  if (!lst.isDirectory() || lst.isSymbolicLink()) return false;
+  let entries;
+  try {
+    entries = readdirSync(dirPath);
+  } catch {
+    return false;
+  }
+  for (const name of entries) {
+    const sub = join(dirPath, name);
+    let subLst;
+    try {
+      subLst = lstatSync(sub);
+    } catch {
+      return false;
+    }
+    if (!subLst.isDirectory() || subLst.isSymbolicLink()) return false;
+    if (!isCompletelyEmptyDirTree(sub)) return false;
+  }
+  return true;
+}
+
+function removeEmptyDirTreeBottomUp(dirPath) {
+  let count = 0;
+  for (const name of readdirSync(dirPath)) {
+    count += removeEmptyDirTreeBottomUp(join(dirPath, name));
+  }
+  rmdirSync(dirPath);
+  return count + 1;
+}
+
 /**
- * Sweeps `retired-binaries.json` and deletes any `*.old.<ts>` file whose Windows handle has closed.
+ * Sweeps `retired-binaries.json`, deletes any `*.old.<ts>` file whose Windows handle has closed,
+ * and safely prunes empty leftover plugin directories (strictly skipping `agy-market`, directories
+ * that still contain `plugin.json`, symlinks, and any directory with remaining files).
  */
-export function sweepRetiredBinaries(dataDir) {
+export function sweepRetiredBinaries(dataDir, { pluginsDir = '' } = {}) {
+  const absPluginsDir = pluginsDir ? resolve(pluginsDir) : '';
+  const absDisabledDir = dataDir ? resolve(dataDir, 'disabled-plugins') : '';
   const list = readRetiredBinariesList(dataDir);
-  if (list.length === 0) return { removed: 0, remaining: 0 };
 
   const remaining = [];
   let removed = 0;
-  for (const oldPath of list) {
-    if (!existsSync(oldPath)) {
-      removed++;
-      continue;
+  let removedDirs = 0;
+
+  if (list.length > 0) {
+    for (const oldPath of list) {
+      const absOld = resolve(oldPath);
+      if (!existsSync(absOld)) {
+        removed++;
+        removedDirs += pruneEmptyRetiredParentDirs(
+          absOld,
+          resolveRetiredCleanupBounds(absOld, { absPluginsDir, absDisabledDir }),
+        );
+        continue;
+      }
+      try {
+        unlinkSync(absOld);
+        removed++;
+        removedDirs += pruneEmptyRetiredParentDirs(
+          absOld,
+          resolveRetiredCleanupBounds(absOld, { absPluginsDir, absDisabledDir }),
+        );
+      } catch {
+        remaining.push(oldPath);
+      }
     }
+    writeRetiredBinariesList(dataDir, remaining);
+  }
+
+  if (absPluginsDir && existsSync(absPluginsDir)) {
     try {
-      unlinkSync(oldPath);
-      removed++;
+      for (const entry of readdirSync(absPluginsDir)) {
+        if (entry === PLUGIN_ID) continue;
+        const cand = join(absPluginsDir, entry);
+        try {
+          const lst = lstatSync(cand);
+          if (!lst.isDirectory() || lst.isSymbolicLink()) continue;
+          if (existsSync(join(cand, 'plugin.json'))) continue;
+          if (isCompletelyEmptyDirTree(cand)) {
+            removedDirs += removeEmptyDirTreeBottomUp(cand);
+          }
+        } catch {
+          /* ignore locked or inaccessible directory */
+        }
+      }
     } catch {
-      remaining.push(oldPath);
+      /* ignore unreadable pluginsDir */
     }
   }
-  writeRetiredBinariesList(dataDir, remaining);
-  return { removed, remaining: remaining.length };
+
+  return { removed, remaining: remaining.length, removedDirs };
 }
 
 function listAllRelFiles(rootDir) {

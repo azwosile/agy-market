@@ -682,6 +682,16 @@ function scanSinglePluginFolder(
   }
   const canToggle = scope === 'global' && dirName !== PLUGIN_ID && !hostDisabled;
 
+  const uninstallDisabledReason =
+    dirName === PLUGIN_ID
+      ? 'self'
+      : scope === 'workspace'
+        ? 'workspace'
+        : scope === 'builtin'
+          ? 'builtin'
+          : '';
+  const canUninstall = scope === 'global' && dirName !== PLUGIN_ID;
+
   const activation = classifyActivationRequirement(components.capabilities);
 
   return {
@@ -702,6 +712,8 @@ function scanSinglePluginFolder(
     hostDisabled,
     canToggle,
     toggleDisabledReason,
+    canUninstall,
+    uninstallDisabledReason,
     hasMcp: components.hasMcp,
     mcpServerKeys: components.mcpServerKeys,
     hasHooks: components.hasHooks,

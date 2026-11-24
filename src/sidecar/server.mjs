@@ -16,13 +16,13 @@ import {
 import {
   fixLocalConflict,
   installOrUpdateCatalogPlugin,
-  removeMarketPluginFiles,
   toggleInstalledPlugin,
+  uninstallPlugin,
 } from '../installer/index.mjs';
 import { recoverInterruptedJournal } from '../installer/journal.mjs';
 import { sweepRetiredBinaries } from '../installer/sync-dir.mjs';
 import { scanLocalConflicts } from '../preflight/conflicts.mjs';
-import { resolveInstallPreflight, scanLocalPluginInventory } from '../preflight/index.mjs';
+import { normalizeRepoUrl, resolveInstallPreflight, scanLocalPluginInventory } from '../preflight/index.mjs';
 import { resolveMarketCatalog } from '../registry/index.mjs';
 import { classifyActivationRequirement } from '../shared/activation.mjs';
 import {
@@ -32,6 +32,7 @@ import {
   PLUGIN_ID,
   PLUGIN_VERSION,
   SELF_CATALOG_ID,
+  SELF_REPO_URL,
   SIDECAR_URI,
 } from '../shared/constants.mjs';
 import {
@@ -303,6 +304,7 @@ export async function createMarketSidecarServer(options = {}) {
   const pluginsDir = resolvePluginsDir(configDir);
   const dataDir = resolveMarketDataDir(options.dataDir || '');
   const disabledPluginsDir = resolveDisabledPluginsDir(dataDir);
+  const builtinPluginsDir = options.builtinPluginsDir || '';
   const indexHtmlPath = options.indexHtmlPath || DEFAULT_INDEX_HTML_PATH;
   const fetchImpl = options.fetchImpl || fetch;
   const mirrors = options.mirrors || undefined;
@@ -347,7 +349,7 @@ export async function createMarketSidecarServer(options = {}) {
   const listenPort = options.port !== undefined ? Number(options.port) : Number.isFinite(envPort) ? envPort : 0;
 
   // Sweep retired Windows binaries & expired GitHub URL inspect staging immediately on boot
-  sweepRetiredBinaries(dataDir);
+  sweepRetiredBinaries(dataDir, { pluginsDir });
   sweepExpiredInspectStaging(dataDir, nowFn());
 
   // Schedule 8s boot crash-recovery check for `pending-journal.json`
@@ -397,18 +399,70 @@ export async function createMarketSidecarServer(options = {}) {
     return lastCatalog;
   }
 
-  function findCatalogCapabilitiesForDir(dirName) {
+  function findCatalogEntryForDir(dirName) {
     const plugins = lastCatalog?.plugins || [];
-    const matched = plugins.find(
-      (p) => (!p.forceScopedInstall && p.canonicalName === dirName) || p.scopedName === dirName || p.id === dirName,
+    return (
+      plugins.find(
+        (p) => (!p.forceScopedInstall && p.canonicalName === dirName) || p.scopedName === dirName || p.id === dirName,
+      ) || null
     );
-    return matched?.capabilities || null;
+  }
+
+  function findCatalogCapabilitiesForDir(dirName) {
+    return findCatalogEntryForDir(dirName)?.capabilities || null;
+  }
+
+  function findCatalogEntryForLocal(loc, catalogPlugins = []) {
+    if (!loc) return null;
+    const list = Array.isArray(catalogPlugins) ? catalogPlugins : [];
+    if (loc.receipt?.id) {
+      const recRepoId = Number(loc.receipt.repositoryId || 0);
+      const byReceipt = list.find((p) => {
+        const pRepoId = Number(p?.repository?.repositoryId || 0);
+        if (recRepoId > 0 && pRepoId > 0) {
+          return pRepoId === recRepoId && p.id === loc.receipt.id;
+        }
+        return p.id === loc.receipt.id;
+      });
+      if (byReceipt) return byReceipt;
+    }
+    const locRepo = normalizeRepoUrl(loc.receipt?.repositoryUrl || loc.repositoryUrl || '');
+    if (locRepo) {
+      const byRepo = list.find((p) => {
+        const pRepo = normalizeRepoUrl(p?.repository?.url);
+        return (
+          pRepo &&
+          pRepo === locRepo &&
+          (p.canonicalName === loc.name || p.canonicalName === loc.dir || p.scopedName === loc.dir)
+        );
+      });
+      if (byRepo) return byRepo;
+    }
+    if (loc.dir === PLUGIN_ID || loc.name === PLUGIN_ID) {
+      return list.find((p) => p.id === SELF_CATALOG_ID || p.canonicalName === PLUGIN_ID) || null;
+    }
+    return (
+      list.find(
+        (p) => (!p.forceScopedInstall && p.canonicalName === loc.dir) || p.scopedName === loc.dir || p.id === loc.dir,
+      ) || null
+    );
+  }
+
+  function getValidGithubRepoUrl(rawUrl) {
+    const norm = normalizeRepoUrl(rawUrl);
+    return /^https:\/\/github\.com\/[^/]+\/[^/]+$/i.test(norm) ? norm : '';
   }
 
   async function buildEnrichedState({ forceCatalogRefresh = false, workspaceUris = [] } = {}) {
     await ensureCatalogLoaded({ forceCatalogRefresh, includeReadmes: false });
 
-    const inventory = scanLocalPluginInventory({ configDir, dataDir, workspaceUris, linkInfoOverride });
+    const inventory = scanLocalPluginInventory({
+      configDir,
+      dataDir,
+      workspaceUris,
+      builtinPluginsDir,
+      linkInfoOverride,
+    });
     const updatesAvailable = [];
     const catalogPlugins = lastCatalog.plugins || [];
 
@@ -476,6 +530,8 @@ export async function createMarketSidecarServer(options = {}) {
           hostDisabled: localMatch ? Boolean(localMatch.hostDisabled) : false,
           canToggle: localMatch ? Boolean(localMatch.canToggle) : false,
           toggleDisabledReason: localMatch ? localMatch.toggleDisabledReason || '' : '',
+          canUninstall: localMatch ? Boolean(localMatch.canUninstall) : false,
+          uninstallDisabledReason: localMatch ? localMatch.uninstallDisabledReason || '' : '',
           scope: localMatch?.scope || null,
           hasUpdate,
           customizationUri: localMatch?.customizationUri || null,
@@ -583,7 +639,7 @@ export async function createMarketSidecarServer(options = {}) {
       if (!lastCatalog) {
         await ensureCatalogLoaded({ forceCatalogRefresh: false, includeReadmes: false }).catch(() => null);
       }
-      const inventory = scanLocalPluginInventory({ configDir, dataDir, workspaceUris, linkInfoOverride });
+      const inventory = scanLocalPluginInventory({ configDir, dataDir, workspaceUris, builtinPluginsDir, linkInfoOverride });
       const report = scanLocalConflicts({
         inventory,
         configDir,
@@ -610,7 +666,7 @@ export async function createMarketSidecarServer(options = {}) {
       const generation = updateCheckGeneration;
       const runCheck = async () => {
         await ensureCatalogLoaded({ forceCatalogRefresh: force, includeReadmes: false });
-        const inventory = scanLocalPluginInventory({ configDir, dataDir, workspaceUris, linkInfoOverride });
+        const inventory = scanLocalPluginInventory({ configDir, dataDir, workspaceUris, builtinPluginsDir, linkInfoOverride });
         return checkPluginUpdates({
           catalog: lastCatalog,
           inventory,
@@ -1051,97 +1107,226 @@ export async function createMarketSidecarServer(options = {}) {
         const targetDir = String(body.dir || '').trim();
         const workspaceUris = parseWorkspaceUrisInput(body.workspaceUris);
         if (!lastCatalog) {
-          await buildEnrichedState({ forceCatalogRefresh: false });
+          await buildEnrichedState({ forceCatalogRefresh: false, workspaceUris });
         }
-        const forceGithubUrlUpdate =
-          pathname === '/api/update' && (body.source === 'github-url' || body.updateChannel === 'github-url');
-        const plugin = forceGithubUrlUpdate
-          ? null
-          : body.plugin && typeof body.plugin === 'object'
-            ? body.plugin
-            : (lastCatalog?.plugins || []).find((p) => p.id === targetId);
+        const catalogPlugins = lastCatalog?.plugins || [];
 
-        if (!plugin && pathname === '/api/update') {
-          const inventory = scanLocalPluginInventory({ configDir, dataDir, workspaceUris, linkInfoOverride });
-          const localGithubPlugin = inventory.installed.find(
-            (loc) =>
-              loc.scope === 'global' &&
-              loc.receipt?.track === 'github-url' &&
-              ((targetDir && loc.dir === targetDir) ||
-                (targetId && (loc.receipt?.id === targetId || loc.dir === targetId))),
-          );
-
-          if (localGithubPlugin) {
-            const updateHint =
-              body.updateHint && typeof body.updateHint === 'object'
-                ? body.updateHint
-                : body.targetRef
-                  ? {
-                      targetRef: String(body.targetRef),
-                      updateKind: String(body.updateKind || ''),
-                      trackBranch: String(body.trackBranch || ''),
-                    }
-                  : null;
-            const rawResult = await resolveAndStageGithubUpdate({
-              loc: localGithubPlugin,
-              updateHint,
-              confirmEscalation: Boolean(body.confirmEscalation),
-              prefs,
-              configDir,
-              dataDir,
-              workspaceUris,
-              catalogPlugins: lastCatalog?.plugins || [],
-              fetchImpl,
-              githubApiBaseUrl,
-              nowMs: nowFn(),
-            });
-            const { _internal, ...result } = rawResult;
-            invalidateUpdateCheckState();
-            const state = await buildEnrichedState({ forceCatalogRefresh: false, workspaceUris });
-            sendJson(res, 200, { ...result, state });
+        if (pathname === '/api/install') {
+          const plugin =
+            body.plugin && typeof body.plugin === 'object'
+              ? body.plugin
+              : catalogPlugins.find((p) => p.id === targetId);
+          if (!plugin) {
+            sendJson(res, 404, { ok: false, error: `Plugin "${targetId || targetDir}" not found in active catalog` });
             return;
           }
+          const result = await installOrUpdateCatalogPlugin({
+            plugin,
+            track: plugin._track || (plugin.forceScopedInstall ? 'unverified' : 'verified'),
+            prefs,
+            conflictStrategy: body.conflictStrategy || 'prompt',
+            confirmEscalation: Boolean(body.confirmEscalation),
+            configDir,
+            dataDir,
+            workspaceUris,
+            builtinPluginsDir,
+            fetchImpl,
+          });
+          invalidateUpdateCheckState();
+          const state = await buildEnrichedState({ forceCatalogRefresh: false, workspaceUris });
+          const willRestart = Boolean(result.ok && (result.isSelfUpdate || targetDir === PLUGIN_ID));
+          sendJson(
+            res,
+            200,
+            { ...result, ...(willRestart ? { willRestart: true } : {}), state },
+            willRestart ? () => onSelfRestart() : null,
+          );
+          return;
         }
 
-        if (!plugin) {
+        // POST /api/update
+        const reqChannel = String(body.updateChannel || '').trim();
+        const reqSource = String(body.source || '').trim();
+        const preferUpstream = Boolean(
+          body.preferUpstream ||
+            reqChannel === 'github-upstream' ||
+            reqChannel === 'github-url' ||
+            reqSource === 'github-url',
+        );
+
+        const explicitPlugin = body.plugin && typeof body.plugin === 'object' ? body.plugin : null;
+        const catPlugin =
+          explicitPlugin ||
+          catalogPlugins.find(
+            (p) =>
+              (targetId && p.id === targetId) ||
+              (targetDir && ((!p.forceScopedInstall && p.canonicalName === targetDir) || p.scopedName === targetDir)),
+          ) ||
+          null;
+
+        // (i) Direct catalog update / re-sync when catalog package is installable and upstream wasn't explicitly requested
+        if (!preferUpstream && catPlugin && isCatalogPluginInstallable(catPlugin)) {
+          const result = await installOrUpdateCatalogPlugin({
+            plugin: catPlugin,
+            track: catPlugin._track || (catPlugin.forceScopedInstall ? 'unverified' : 'verified'),
+            prefs,
+            conflictStrategy: body.conflictStrategy || (isSelfPluginCandidate(catPlugin, targetDir) ? 'replace' : 'prompt'),
+            confirmEscalation: Boolean(body.confirmEscalation),
+            configDir,
+            dataDir,
+            workspaceUris,
+            builtinPluginsDir,
+            fetchImpl,
+          });
+          invalidateUpdateCheckState();
+          const state = await buildEnrichedState({ forceCatalogRefresh: false, workspaceUris });
+          const willRestart = Boolean(result.ok && (result.isSelfUpdate || targetDir === PLUGIN_ID));
+          sendJson(
+            res,
+            200,
+            { ...result, ...(willRestart ? { willRestart: true } : {}), state },
+            willRestart ? () => onSelfRestart() : null,
+          );
+          return;
+        }
+
+        // (ii) Direct GitHub upstream / github-url update or on-demand re-sync
+        const inventory = scanLocalPluginInventory({
+          configDir,
+          dataDir,
+          workspaceUris,
+          builtinPluginsDir,
+          linkInfoOverride,
+        });
+        const localPlugin =
+          inventory.installed.find(
+            (loc) =>
+              loc.scope === 'global' &&
+              ((targetDir && loc.dir === targetDir) ||
+                (targetId && (loc.receipt?.id === targetId || loc.dir === targetId || loc.name === targetId)) ||
+                (catPlugin &&
+                  (loc.receipt?.id === catPlugin.id ||
+                    loc.dir === catPlugin.canonicalName ||
+                    loc.dir === catPlugin.scopedName))),
+          ) || null;
+
+        if (!localPlugin) {
+          const nonGlobal = inventory.installed.find(
+            (loc) =>
+              loc.scope !== 'global' &&
+              ((targetDir && loc.dir === targetDir) || (targetId && (loc.dir === targetId || loc.name === targetId))),
+          );
+          if (nonGlobal) {
+            sendJson(res, 400, {
+              ok: false,
+              status: 'NON_GLOBAL_PLUGIN',
+              error: `ERR_CANNOT_UPDATE_NON_GLOBAL: Plugin "${nonGlobal.dir}" has scope="${nonGlobal.scope}" and cannot be updated in-place`,
+            });
+            return;
+          }
           sendJson(res, 404, { ok: false, error: `Plugin "${targetId || targetDir}" not found in active catalog` });
           return;
         }
 
-        const result = await installOrUpdateCatalogPlugin({
-          plugin,
-          track: plugin._track || (plugin.forceScopedInstall ? 'unverified' : 'verified'),
-          prefs,
-          conflictStrategy: body.conflictStrategy || 'prompt',
+        const matchedCat = catPlugin || findCatalogEntryForLocal(localPlugin, catalogPlugins);
+        const updateHint =
+          body.updateHint && typeof body.updateHint === 'object'
+            ? body.updateHint
+            : body.targetRef || body.repositoryUrl || body.pluginRoot || body.trackBranch || body.updateKind
+              ? {
+                  ...(body.targetRef ? { targetRef: String(body.targetRef) } : {}),
+                  ...(body.updateKind ? { updateKind: String(body.updateKind) } : {}),
+                  ...(body.trackBranch ? { trackBranch: String(body.trackBranch) } : {}),
+                  ...(body.repositoryUrl ? { repositoryUrl: String(body.repositoryUrl) } : {}),
+                  ...(body.pluginRoot ? { pluginRoot: String(body.pluginRoot) } : {}),
+                }
+              : null;
+
+        const isSelfLocal =
+          localPlugin.dir === PLUGIN_ID ||
+          localPlugin.name === PLUGIN_ID ||
+          localPlugin.receipt?.id === SELF_CATALOG_ID;
+        const candidateRepoUrl = getValidGithubRepoUrl(
+          updateHint?.repositoryUrl ||
+            localPlugin.receipt?.repositoryUrl ||
+            matchedCat?.repository?.url ||
+            localPlugin.repositoryUrl ||
+            (isSelfLocal ? SELF_REPO_URL : ''),
+        );
+
+        if (!candidateRepoUrl) {
+          sendJson(res, 400, {
+            ok: false,
+            status: 'NO_UPDATE_SOURCE',
+            error: `ERR_NO_UPDATE_SOURCE: Plugin "${localPlugin.dir}" has neither an installable catalog entry nor a GitHub repository URL`,
+          });
+          return;
+        }
+
+        const rawResult = await resolveAndStageGithubUpdate({
+          loc: localPlugin,
+          catPlugin: matchedCat,
+          updateHint,
           confirmEscalation: Boolean(body.confirmEscalation),
+          prefs,
           configDir,
           dataDir,
           workspaceUris,
+          builtinPluginsDir,
+          catalogPlugins,
           fetchImpl,
+          githubApiBaseUrl,
+          nowMs: nowFn(),
         });
-
+        const { _internal, ...result } = rawResult;
         invalidateUpdateCheckState();
-        const state = await buildEnrichedState({
-          forceCatalogRefresh: false,
-          workspaceUris,
-        });
-        sendJson(res, 200, { ...result, state });
-
-        if (result.ok && result.isSelfUpdate) {
-          onSelfRestart();
-        }
+        const state = await buildEnrichedState({ forceCatalogRefresh: false, workspaceUris });
+        const willRestart = Boolean(
+          result.ok && (result.isSelfUpdate || localPlugin.dir === PLUGIN_ID || targetDir === PLUGIN_ID),
+        );
+        sendJson(
+          res,
+          200,
+          { ...result, ...(willRestart ? { willRestart: true } : {}), state },
+          willRestart ? () => onSelfRestart() : null,
+        );
         return;
       }
 
       if (pathname === '/api/update-all') {
-        const workspaceUris = Array.isArray(body.workspaceUris) ? body.workspaceUris : [];
+        const workspaceUris = parseWorkspaceUrisInput(body.workspaceUris);
         const confirmEscalation = Boolean(body.confirmEscalation);
-        await ensureCatalogLoaded({ forceCatalogRefresh: false, includeReadmes: false });
-        const inventory = scanLocalPluginInventory({ configDir, dataDir, workspaceUris, linkInfoOverride });
+        const forceCheck = Boolean(body.forceCheck);
+        await ensureCatalogLoaded({ forceCatalogRefresh: forceCheck, includeReadmes: false });
+        const inventory = scanLocalPluginInventory({
+          configDir,
+          dataDir,
+          workspaceUris,
+          builtinPluginsDir,
+          linkInfoOverride,
+        });
         const catalogPlugins = lastCatalog?.plugins || [];
-        const githubUrlInstalled = inventory.installed.filter(
-          (loc) => loc.scope === 'global' && loc.receipt?.track === 'github-url',
-        );
+        const globalInstalled = inventory.installed.filter((loc) => loc.scope === 'global');
+
+        const updateReport = await checkPluginUpdates({
+          catalog: lastCatalog,
+          inventory,
+          dataDir,
+          prefs,
+          force: forceCheck,
+          fetchImpl,
+          nowMs: nowFn(),
+          ...(updateCheckTtlMs !== undefined ? { ttlMs: updateCheckTtlMs } : {}),
+          currentSelfVersion,
+          githubApiBaseUrl,
+        });
+
+        const updById = new Map();
+        const updByDir = new Map();
+        for (const upd of updateReport.items || []) {
+          if (upd?.id && !updById.has(upd.id)) updById.set(upd.id, upd);
+          if (upd?.dir && !updByDir.has(upd.dir)) updByDir.set(upd.dir, upd);
+        }
 
         const queue = [];
         if (Array.isArray(body.ids)) {
@@ -1150,88 +1335,129 @@ export async function createMarketSidecarServer(options = {}) {
             const reqId = String(rawId || '').trim();
             if (!reqId || seenReqIds.has(reqId)) continue;
             seenReqIds.add(reqId);
+
+            const upd = updById.get(reqId) || updByDir.get(reqId) || null;
             const plugin = catalogPlugins.find((p) => p.id === reqId || p.canonicalName === reqId) || null;
-            if (!plugin) {
-              const ghLoc =
-                githubUrlInstalled.find((loc) => loc.receipt?.id === reqId || loc.dir === reqId) || null;
-              if (ghLoc) {
+            const localLoc =
+              globalInstalled.find(
+                (loc) =>
+                  loc.receipt?.id === reqId ||
+                  loc.dir === reqId ||
+                  loc.name === reqId ||
+                  (plugin && (loc.dir === plugin.canonicalName || loc.dir === plugin.scopedName)),
+              ) || null;
+            const isSelf = Boolean(upd?.isSelf || isSelfPluginCandidate(plugin, localLoc?.dir || reqId));
+
+            // Prefer GitHub direct update when update check found a newer github-upstream / github-url build
+            if (upd && (upd.updateChannel === 'github-upstream' || upd.updateChannel === 'github-url') && localLoc) {
+              queue.push({
+                id: upd.id || plugin?.id || localLoc.receipt?.id || localLoc.dir,
+                dir: localLoc.dir,
+                githubLoc: localLoc,
+                catPlugin: plugin,
+                updateHint: upd,
+                isSelf,
+              });
+              continue;
+            }
+
+            if (plugin && isCatalogPluginInstallable(plugin)) {
+              const preflight = resolveInstallPreflight(plugin, inventory, { conflictStrategy: 'prompt' });
+              const localDir = preflight.existingInstall?.dir || localLoc?.dir || plugin.canonicalName;
+              queue.push({
+                id: plugin.id,
+                dir: localDir,
+                plugin,
+                isSelf: isSelfPluginCandidate(plugin, localDir),
+              });
+              continue;
+            }
+
+            if (localLoc) {
+              const candidateRepoUrl = getValidGithubRepoUrl(
+                upd?.repositoryUrl ||
+                  localLoc.receipt?.repositoryUrl ||
+                  plugin?.repository?.url ||
+                  localLoc.repositoryUrl ||
+                  (isSelf ? SELF_REPO_URL : ''),
+              );
+              if (candidateRepoUrl) {
                 queue.push({
-                  id: ghLoc.receipt.id,
-                  dir: ghLoc.dir,
-                  githubUrlLoc: ghLoc,
-                  updateHint: null,
-                  isSelf: false,
+                  id: upd?.id || plugin?.id || localLoc.receipt?.id || localLoc.dir,
+                  dir: localLoc.dir,
+                  githubLoc: localLoc,
+                  catPlugin: plugin,
+                  updateHint: upd,
+                  isSelf,
+                });
+                continue;
+              }
+              if (plugin) {
+                queue.push({
+                  id: plugin.id,
+                  dir: localLoc.dir,
+                  plugin,
+                  notInstallable: true,
+                  isSelf,
                 });
                 continue;
               }
               queue.push({
                 id: reqId,
-                missing: true,
-                isSelf: reqId === SELF_CATALOG_ID || reqId === PLUGIN_ID,
+                dir: localLoc.dir,
+                displayName: localLoc.displayName || localLoc.dir,
+                noUpdateSource: true,
+                isSelf: false,
               });
               continue;
             }
-            const preflight = resolveInstallPreflight(plugin, inventory, { conflictStrategy: 'prompt' });
-            const localDir = preflight.existingInstall?.dir || plugin.canonicalName;
-            const isSelf = isSelfPluginCandidate(plugin, localDir);
-            if (!isCatalogPluginInstallable(plugin)) {
+
+            if (plugin) {
               queue.push({
                 id: plugin.id,
-                dir: localDir,
+                dir: plugin.canonicalName,
                 plugin,
                 notInstallable: true,
                 isSelf,
               });
               continue;
             }
+
             queue.push({
-              id: plugin.id,
-              dir: localDir,
-              plugin,
-              isSelf,
+              id: reqId,
+              missing: true,
+              isSelf: reqId === SELF_CATALOG_ID || reqId === PLUGIN_ID,
             });
           }
         } else {
           const queuedDirs = new Set();
-          for (const plugin of catalogPlugins) {
-            if (!isCatalogPluginInstallable(plugin)) continue;
-            const preflight = resolveInstallPreflight(plugin, inventory, { conflictStrategy: 'prompt' });
-            const localMatch = preflight.action === 'update' ? preflight.existingInstall : null;
-            if (!localMatch || !isNewerVersion(plugin.version, localMatch.version)) continue;
-            queuedDirs.add(localMatch.dir);
-            queue.push({
-              id: plugin.id,
-              dir: localMatch.dir,
-              plugin,
-              isSelf: isSelfPluginCandidate(plugin, localMatch.dir),
-            });
-          }
+          for (const upd of updateReport.items || []) {
+            if (!upd?.installable || queuedDirs.has(upd.dir)) continue;
+            const localLoc = globalInstalled.find((loc) => loc.dir === upd.dir) || null;
+            const catPlugin =
+              catalogPlugins.find((p) => p.id === upd.id) || findCatalogEntryForLocal(localLoc, catalogPlugins);
+            const isSelf = Boolean(upd.isSelf || isSelfPluginCandidate(catPlugin, upd.dir));
 
-          const remainingGhLocs = githubUrlInstalled.filter((loc) => !queuedDirs.has(loc.dir));
-          if (remainingGhLocs.length > 0) {
-            const ghCheck = await checkPluginUpdates({
-              catalog: lastCatalog,
-              inventory,
-              dataDir,
-              prefs,
-              force: false,
-              fetchImpl,
-              nowMs: nowFn(),
-              ...(updateCheckTtlMs !== undefined ? { ttlMs: updateCheckTtlMs } : {}),
-              currentSelfVersion,
-              githubApiBaseUrl,
-            });
-            for (const upd of ghCheck.items || []) {
-              if (!upd.installable || upd.updateChannel !== 'github-url' || queuedDirs.has(upd.dir)) continue;
-              const ghLoc = remainingGhLocs.find((loc) => loc.dir === upd.dir) || null;
-              if (!ghLoc) continue;
-              queuedDirs.add(ghLoc.dir);
+            if ((upd.updateChannel === 'catalog' || upd.source === 'catalog') && catPlugin && isCatalogPluginInstallable(catPlugin)) {
+              queuedDirs.add(upd.dir);
               queue.push({
-                id: ghLoc.receipt.id,
-                dir: ghLoc.dir,
-                githubUrlLoc: ghLoc,
+                id: catPlugin.id,
+                dir: upd.dir,
+                plugin: catPlugin,
+                isSelf,
+              });
+              continue;
+            }
+
+            if (localLoc && (upd.updateChannel === 'github-upstream' || upd.updateChannel === 'github-url')) {
+              queuedDirs.add(localLoc.dir);
+              queue.push({
+                id: upd.id || catPlugin?.id || localLoc.receipt?.id || localLoc.dir,
+                dir: localLoc.dir,
+                githubLoc: localLoc,
+                catPlugin,
                 updateHint: upd,
-                isSelf: false,
+                isSelf,
               });
             }
           }
@@ -1256,6 +1482,17 @@ export async function createMarketSidecarServer(options = {}) {
             });
             continue;
           }
+          if (item.noUpdateSource) {
+            results.push({
+              id: item.id,
+              dir: item.dir,
+              displayName: item.displayName || item.dir,
+              ok: false,
+              status: 'NO_UPDATE_SOURCE',
+              error: `ERR_NO_UPDATE_SOURCE: Plugin "${item.dir}" has neither an installable catalog entry nor a GitHub repository URL`,
+            });
+            continue;
+          }
           if (item.notInstallable) {
             results.push({
               id: item.id,
@@ -1268,26 +1505,32 @@ export async function createMarketSidecarServer(options = {}) {
             continue;
           }
 
-          if (item.githubUrlLoc) {
-            const ghLoc = item.githubUrlLoc;
+          if (item.githubLoc) {
+            const ghLoc = item.githubLoc;
             try {
               const out = await resolveAndStageGithubUpdate({
                 loc: ghLoc,
+                catPlugin: item.catPlugin || null,
                 updateHint: item.updateHint || null,
                 confirmEscalation,
                 prefs,
                 configDir,
                 dataDir,
                 workspaceUris,
+                builtinPluginsDir,
                 catalogPlugins,
                 fetchImpl,
                 githubApiBaseUrl,
                 nowMs: nowFn(),
               });
+              const isSelfDone = Boolean(out.ok && (out.isSelfUpdate || item.isSelf || ghLoc.dir === PLUGIN_ID));
+              if (isSelfDone) {
+                didSelfUpdate = true;
+              }
               results.push({
                 id: item.id,
                 dir: out.installedDir || ghLoc.dir,
-                displayName: ghLoc.displayName || ghLoc.name || ghLoc.dir,
+                displayName: item.catPlugin?.displayName || ghLoc.displayName || ghLoc.name || ghLoc.dir,
                 ok: Boolean(out.ok),
                 status: out.status || (out.ok ? 'INSTALLED' : 'ERROR'),
                 ...(out.error ? { error: out.error } : {}),
@@ -1297,6 +1540,7 @@ export async function createMarketSidecarServer(options = {}) {
                 ...(out.targetVersion ? { targetVersion: out.targetVersion } : {}),
                 ...(out.escalation ? { escalation: out.escalation } : {}),
                 ...(out.conflict ? { conflict: out.conflict } : {}),
+                ...(isSelfDone ? { isSelfUpdate: true } : {}),
                 ...(out.parkedByMarket !== undefined ? { parkedByMarket: out.parkedByMarket } : {}),
                 ...(out.reloadRequired !== undefined ? { reloadRequired: out.reloadRequired } : {}),
                 ...(out.restartRequired !== undefined ? { restartRequired: out.restartRequired } : {}),
@@ -1308,7 +1552,7 @@ export async function createMarketSidecarServer(options = {}) {
               results.push({
                 id: item.id,
                 dir: ghLoc.dir,
-                displayName: ghLoc.displayName || ghLoc.name || ghLoc.dir,
+                displayName: item.catPlugin?.displayName || ghLoc.displayName || ghLoc.name || ghLoc.dir,
                 ok: false,
                 status: 'ERROR',
                 error: err?.message || String(err),
@@ -1328,6 +1572,7 @@ export async function createMarketSidecarServer(options = {}) {
               configDir,
               dataDir,
               workspaceUris,
+              builtinPluginsDir,
               fetchImpl,
             });
 
@@ -1388,65 +1633,128 @@ export async function createMarketSidecarServer(options = {}) {
       }
 
       if (pathname === '/api/self-update') {
-        const workspaceUris = Array.isArray(body.workspaceUris) ? body.workspaceUris : [];
+        const workspaceUris = parseWorkspaceUrisInput(body.workspaceUris);
         const forceRefresh = Boolean(body.force);
+        const reqChannel = String(body.updateChannel || '').trim();
+        const targetVersion = String(body.targetVersion || '').trim();
+        const targetRef = String(body.targetRef || '').trim();
+
         await ensureCatalogLoaded({ forceCatalogRefresh: forceRefresh, includeReadmes: false });
         let selfPlugin =
           (lastCatalog?.plugins || []).find((p) => p.id === SELF_CATALOG_ID || p.canonicalName === PLUGIN_ID) || null;
 
         if (!selfPlugin && !forceRefresh) {
-          await ensureCatalogLoaded({ forceCatalogRefresh: true, includeReadmes: false });
+          await ensureCatalogLoaded({ forceCatalogRefresh: true, includeReadmes: false }).catch(() => null);
           selfPlugin =
             (lastCatalog?.plugins || []).find((p) => p.id === SELF_CATALOG_ID || p.canonicalName === PLUGIN_ID) || null;
         }
 
-        if (!selfPlugin) {
-          sendJson(res, 404, {
-            ok: false,
-            status: 'NOT_FOUND',
-            error: `Self plugin "${SELF_CATALOG_ID}" not found in active catalog`,
-          });
-          return;
-        }
+        const catalogCanDirectSelf = Boolean(selfPlugin && isCatalogPluginInstallable(selfPlugin));
+        const catalogBehindTarget = Boolean(
+          targetVersion && selfPlugin?.version && isNewerVersion(targetVersion, selfPlugin.version),
+        );
+        const useGithubUpstreamSelf =
+          reqChannel === 'github-upstream' || !catalogCanDirectSelf || catalogBehindTarget;
 
-        if (!isCatalogPluginInstallable(selfPlugin)) {
-          sendJson(res, 400, {
-            ok: false,
-            status: 'NOT_INSTALLABLE',
-            error: `Self plugin "${selfPlugin.id}" lacks a verified catalog tarball/sha256`,
+        let result;
+        if (useGithubUpstreamSelf) {
+          const inventory = scanLocalPluginInventory({
+            configDir,
+            dataDir,
+            workspaceUris,
+            builtinPluginsDir,
+            linkInfoOverride,
           });
-          return;
+          const existingSelf =
+            inventory.installed.find(
+              (loc) => loc.scope === 'global' && (loc.dir === PLUGIN_ID || loc.name === PLUGIN_ID),
+            ) || {
+              dir: PLUGIN_ID,
+              name: PLUGIN_ID,
+              scope: 'global',
+              displayName: PLUGIN_DISPLAY_NAME,
+              version: currentSelfVersion,
+              repositoryUrl: SELF_REPO_URL,
+              receipt: null,
+            };
+          const rawResult = await resolveAndStageGithubUpdate({
+            loc: existingSelf,
+            catPlugin: selfPlugin,
+            updateHint: {
+              repositoryUrl: SELF_REPO_URL,
+              pluginRoot: '.',
+              ...(targetRef ? { targetRef, updateKind: 'semver' } : {}),
+            },
+            confirmEscalation: Boolean(body.confirmEscalation),
+            prefs,
+            configDir,
+            dataDir,
+            workspaceUris,
+            builtinPluginsDir,
+            catalogPlugins: lastCatalog?.plugins || [],
+            fetchImpl,
+            githubApiBaseUrl,
+            nowMs: nowFn(),
+          });
+          const { _internal, ...publicRes } = rawResult;
+          result = publicRes;
+        } else {
+          result = await installOrUpdateCatalogPlugin({
+            plugin: selfPlugin,
+            track: selfPlugin._track || 'verified',
+            prefs,
+            conflictStrategy: 'replace',
+            confirmEscalation: Boolean(body.confirmEscalation),
+            configDir,
+            dataDir,
+            workspaceUris,
+            builtinPluginsDir,
+            fetchImpl,
+          });
         }
-
-        const result = await installOrUpdateCatalogPlugin({
-          plugin: selfPlugin,
-          track: selfPlugin._track || 'verified',
-          prefs,
-          conflictStrategy: 'replace',
-          confirmEscalation: Boolean(body.confirmEscalation),
-          configDir,
-          dataDir,
-          workspaceUris,
-          fetchImpl,
-        });
 
         invalidateUpdateCheckState();
         const state = await buildEnrichedState({ forceCatalogRefresh: false, workspaceUris });
-        const willRestart = Boolean(result.ok && result.isSelfUpdate);
-        sendJson(res, 200, { ...result, willRestart, state }, willRestart ? () => onSelfRestart() : null);
+        const willRestart = Boolean(result.ok && (result.isSelfUpdate || result.installedDir === PLUGIN_ID));
+        sendJson(
+          res,
+          200,
+          { ...result, ...(willRestart ? { isSelfUpdate: true } : {}), willRestart, state },
+          willRestart ? () => onSelfRestart() : null,
+        );
         return;
       }
 
-      if (pathname === '/api/remove-files') {
+      if (pathname === '/api/uninstall' || pathname === '/api/remove-files') {
         const workspaceUris = parseWorkspaceUrisInput(body.workspaceUris);
-        const out = removeMarketPluginFiles({
-          dir: body.dir,
+        const targetDir = String(body.dir || '').trim();
+        if (!lastCatalog) {
+          await ensureCatalogLoaded({ forceCatalogRefresh: false, includeReadmes: false }).catch(() => null);
+        }
+        const matchedCat = findCatalogEntryForDir(targetDir);
+        const out = await uninstallPlugin({
+          dir: targetDir,
           configDir,
           dataDir,
+          workspaceUris,
+          builtinPluginsDir,
+          catalogCapabilities: matchedCat?.capabilities || null,
+          removeFavorite: Boolean(body.removeFavorite),
+          extraFavoriteKeys: matchedCat?.id ? [matchedCat.id] : [],
+          nowMs: nowFn(),
+          rmOverride,
+          unlinkOverride,
+          renameOverride,
+          linkInfoOverride,
+          unlinkLinkOverride,
+          fetchImpl,
         });
+        if (body.removeFavorite) {
+          prefs = loadPrefsFromDisk(dataDir);
+        }
         invalidateUpdateCheckState();
         const state = await buildEnrichedState({ forceCatalogRefresh: false, workspaceUris });
-        sendJson(res, 200, { ok: true, ...out, state });
+        sendJson(res, 200, { ok: true, ...out, conflictsSummary: state.conflictsSummary, state });
         return;
       }
     }

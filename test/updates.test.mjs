@@ -357,15 +357,18 @@ test('GET /api/updates detects catalog updates, GitHub-only releases/tags awaiti
 
       const beta = byDir.get('beta-plug');
       assert.equal(beta.source, 'github-release');
-      assert.equal(beta.installable, false);
+      assert.equal(beta.updateChannel, 'github-upstream');
+      assert.equal(beta.installable, true);
+      assert.equal(beta.targetRef, 'v1.3.0');
       assert.equal(beta.latestVersion, '1.3.0');
       assert.equal(beta.releaseUrl, 'https://github.com/bob/beta-plug/releases/tag/v1.3.0');
       assert.equal(beta.changelog, 'Upstream v1.3.0 release notes');
-      assert.match(beta.note, /awaiting catalog sync/i);
 
       const gamma = byDir.get('gamma-plug');
       assert.equal(gamma.source, 'github-tag');
-      assert.equal(gamma.installable, false);
+      assert.equal(gamma.updateChannel, 'github-upstream');
+      assert.equal(gamma.installable, true);
+      assert.equal(gamma.targetRef, 'v1.0.5');
       assert.equal(gamma.installedVersion, '0.9.0');
       assert.equal(gamma.latestVersion, '1.0.5');
       assert.equal(gamma.releaseUrl, 'https://github.com/carol/gamma-plug/releases/tag/v1.0.5');
@@ -1349,14 +1352,15 @@ test('GET /api/updates detects selfUpdate without local plugins/agy-market dir, 
       assert.equal(upd.statusCode, 200);
       const uJson = upd.json();
 
-      // ahead-plug is catalog-installable at 1.2.0 AND exposes upstreamVersion 1.3.0
+      // ahead-plug GitHub upstream 1.3.0 leads catalog 1.2.0 -> direct-installable via github-upstream
       const ahead = uJson.items.find((x) => x.id === 'alice__ahead-plug');
       assert.ok(ahead);
-      assert.equal(ahead.source, 'catalog');
+      assert.equal(ahead.source, 'github-release');
+      assert.equal(ahead.updateChannel, 'github-upstream');
       assert.equal(ahead.installable, true);
-      assert.equal(ahead.latestVersion, '1.2.0');
-      assert.equal(ahead.upstreamVersion, '1.3.0');
-      assert.equal(ahead.upstreamReleaseUrl, 'https://github.com/alice/ahead-plug/releases/tag/v1.3.0');
+      assert.equal(ahead.latestVersion, '1.3.0');
+      assert.equal(ahead.targetRef, 'v1.3.0');
+      assert.equal(ahead.releaseUrl, 'https://github.com/alice/ahead-plug/releases/tag/v1.3.0');
 
       // selfUpdate detected via currentSelfVersion even when plugins/agy-market isn't on disk
       assert.ok(uJson.selfUpdate);
@@ -1449,7 +1453,9 @@ test('Zero-quota HEAD /releases/latest redirect fallback on 403 rate limit and s
       const item = d1.items.find((x) => x.dir === 'redir-plug');
       assert.ok(item);
       assert.equal(item.source, 'github-release');
-      assert.equal(item.installable, false);
+      assert.equal(item.updateChannel, 'github-upstream');
+      assert.equal(item.installable, true);
+      assert.equal(item.targetRef, 'v1.6.0');
       assert.equal(item.latestVersion, '1.6.0');
       assert.equal(item.releaseUrl, 'https://github.com/alice/redir-plug/releases/tag/v1.6.0');
     } finally {

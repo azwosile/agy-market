@@ -6,7 +6,7 @@ export const SELF_REPO_URL = 'https://github.com/azwosile/agy-market';
 export const SUBMIT_PLUGIN_GUIDE_URL =
   'https://github.com/azwosile/agy-market-catalog/blob/main/docs/SUBMISSION_GUIDE.md';
 export const PLUGIN_DISPLAY_NAME = 'AGY Market · 反重力插件市场';
-export const PLUGIN_VERSION = '1.4.0';
+export const PLUGIN_VERSION = '1.5.0';
 export const SIDECAR_ID = 'market_pane';
 export const SIDECAR_URI = 'sidecar://agy-market/market_pane/';
 export const CUSTOMIZATION_URI = 'customization://agy-market';
@@ -117,11 +117,14 @@ export const CAPABILITY_BADGE_SPECS = Object.freeze({
 
 export const CATEGORY_LABELS = Object.freeze({
   all: { zh: '全部插件', en: 'All Plugins' },
-  productivity: { zh: '效率与工作流', en: 'Productivity' },
-  'ui-themes': { zh: '界面与主题美化', en: 'UI & Themes' },
-  'developer-tools': { zh: '开发者工具', en: 'Developer Tools' },
-  'mcp-integrations': { zh: 'MCP 服务集成', en: 'MCP Integrations' },
-  'skills-workflows': { zh: '技能与自动化', en: 'Skills & Workflows' },
+  'monitoring-quota': { zh: '状态与用量监控', en: 'Telemetry & Quota' },
+  'context-cache': { zh: '上下文与缓存加速', en: 'Context & Cache Boost' },
+  'ui-themes': { zh: '界面美化与汉化', en: 'UI, Themes & i18n' },
+  'agents-reasoning': { zh: '多代理与思考控制', en: 'Agents & Reasoning' },
+  'developer-tools': { zh: '开发与版本工具', en: 'Git & DevTools' },
+  'mcp-integrations': { zh: '浏览器与系统 MCP', en: 'Browser & System MCP' },
+  'skills-workflows': { zh: '技能包与工程方法', en: 'Skills & Frameworks' },
+  productivity: { zh: '效率与插件管理', en: 'Workspace & Market' },
   'data-science': { zh: '数据与科学计算', en: 'Data & Science' },
   'cloud-devops': { zh: '云原生与部署', en: 'Cloud & DevOps' },
   'creative-media': { zh: '设计与多媒体', en: 'Creative & Media' },

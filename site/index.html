@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>AGY Market v1.4.0 — Google Antigravity 社区插件市场</title>
+  <title>AGY Market v1.5.0 — Google Antigravity 社区插件市场</title>
   <link rel="stylesheet" href="./styles.css" />
 </head>
 <body>
@@ -14,20 +14,21 @@
     <div class="hero-inner">
       <div class="hero-badge">
         <span class="badge-dot" aria-hidden="true"></span>
-        <span>v1.4.0 · Sidebar 侧边栏 · GitHub 链接预检安装 · SHA-256 校验</span>
+        <span>v1.5.0 · Sidebar 侧边栏 · 一键更新与卸载 · GitHub 链接预检安装 · SHA-256 校验</span>
       </div>
       <h1>AGY Market · 反重力插件市场</h1>
       <p class="hero-lead">
-        在 Google Antigravity 右侧 Sidebar 侧边栏内浏览、收藏、安装与启停社区插件（支持 Markdown 技能、Python / Rust / Go / Node MCP 服务与侧边栏扩展），支持粘贴任意 GitHub 完整链接预检安装（兼容子目录 / Monorepo / 分支提交）或运行 <code>npx agy-market add &lt;github-url&gt;</code>，并提供本地冲突检查与国内双通道镜像加速。
+        在 Google Antigravity 右侧 Sidebar 侧边栏内浏览、收藏、安装、直装更新、卸载与启停社区插件（支持 Markdown 纯声明式技能、Python / Rust / Go / Node MCP 服务与侧边栏扩展），支持粘贴任意 GitHub 完整链接预检安装（兼容子目录 / Monorepo / 分支提交）或运行 <code>npx agy-market add &lt;github-url&gt;</code>，并提供本地冲突检查与国内双通道镜像加速。
       </p>
 
       <div class="feature-pills" aria-label="核心特性">
+        <span class="feat-pill">⬆ Sidebar 内直装更新、单插件同步与顶栏一键更新全部</span>
+        <span class="feat-pill">🗑 锁安全插件卸载（支持停放仓与收藏同步清理）</span>
         <span class="feat-pill">🔗 粘贴任意 GitHub 完整链接预检安装（子目录 / Monorepo / 分支提交）</span>
         <span class="feat-pill">✦ 深浅主题自适应侧边栏</span>
         <span class="feat-pill">★ 插件收藏栏与快捷置顶</span>
         <span class="feat-pill">⇄ 卡片底部原生启停滑块</span>
         <span class="feat-pill">🛡 本地插件冲突检查</span>
-        <span class="feat-pill">🔍 已安装插件实时搜索筛选</span>
       </div>
 
       <div class="hero-cta-row">
@@ -84,12 +85,21 @@
       <input id="site-search" type="search" placeholder="搜索社区插件名称、能力徽章、MCP 或分类标签…" />
       <select id="site-category" aria-label="插件分类">
         <option value="all">全部分类</option>
-        <option value="productivity">效率与工作流</option>
-        <option value="ui-themes">界面与主题美化</option>
-        <option value="developer-tools">开发者工具</option>
-        <option value="mcp-integrations">MCP 服务集成</option>
-        <option value="skills-workflows">技能与自动化</option>
+        <option value="monitoring-quota">状态与用量监控</option>
+        <option value="context-cache">上下文与缓存加速</option>
+        <option value="ui-themes">界面美化与汉化</option>
+        <option value="agents-reasoning">多代理与思考控制</option>
+        <option value="developer-tools">开发与版本工具</option>
+        <option value="mcp-integrations">浏览器与系统 MCP</option>
+        <option value="skills-workflows">技能包与工程方法</option>
+        <option value="productivity">效率与插件管理</option>
+        <option value="data-science">数据与科学计算</option>
+        <option value="cloud-devops">云原生与部署</option>
+        <option value="creative-media">设计与多媒体</option>
+        <option value="writing-knowledge">写作与知识库</option>
+        <option value="automation">定时与守护任务</option>
         <option value="security">安全与审计</option>
+        <option value="other">其他扩展</option>
       </select>
       <input id="site-feed-url" type="url" value="https://azwosile.github.io/agy-market-catalog/index.json" title="目录 index.json 地址" />
       <button type="button" id="site-load-btn" class="load-btn">同步目录</button>

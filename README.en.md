@@ -6,7 +6,7 @@
 
 **Community Plugin Marketplace for Google Antigravity**
 
-Sidebar Panel UI · GitHub URL Preflight Installer · ⭐ Pinned Favorites Shelf & Tab · Live Installed Search & Filters · One-Click Sidebar Launcher · Native Vault-Parking Toggle Sliders · Local Conflict Checks · Dual-Mirror China Acceleration · SHA-256 Verified Installs
+Sidebar Panel UI · Lock-Safe One-Click Uninstall · Direct In-Sidebar Upstream & Batch Updates · 15 Precision Categories · GitHub URL Preflight Installer · ⭐ Pinned Favorites Shelf & Tab · Live Installed Search & Filters · One-Click Sidebar Launcher · Native Vault-Parking Toggle Sliders · Local Conflict Checks · Dual-Mirror China Acceleration · SHA-256 Verified Installs
 
 [简体中文](./README.md) · **English** · **[📖 Submit a Plugin Guide](https://github.com/azwosile/agy-market-catalog/blob/main/docs/SUBMISSION_GUIDE.md)** · [Plugin Catalog](https://github.com/azwosile/agy-market-catalog) · [Architecture Spec](./AGENTS.md)
 
@@ -20,16 +20,28 @@ Sidebar Panel UI · GitHub URL Preflight Installer · ⭐ Pinned Favorites Shelf
 
 ---
 
-## ✨ Highlights (v1.4.0)
+## ✨ Highlights (v1.5.0)
 
-### 1. Sidebar Panel UI & Navigation
+### 1. Sidebar Panel UI, 15 Precision Categories & Navigation
 - **Native Right Sidebar Panel**: Runs inside Antigravity's native `AUX_PANE` extension view (`sidecars/market_pane/sidecar.json`) with no bundled MCP servers, keeping the panel lightweight and responsive.
+- **15 Precision Plugin Categories (16 Keys Including `all`)**: Adds **`monitoring-quota`** (*Telemetry & Quota*), **`context-cache`** (*Context & Cache Boost*), and **`agents-reasoning`** (*Agents & Reasoning*) alongside the existing 12 taxonomy buckets. Discover dynamically renders filter pills for all active categories, indexes localized category names in search, and displays category tags on cards and Detail Drawers.
 - **Overview Strip & Plugin Cards**: Collapsible top overview strip displays catalog stats (*Indexed / Active / Updates / Local Conflicts*) alongside quick **`Add URL`** (`链接添加`) and **`+ Submit Plugin`** actions. Card styles adapt across Dark, Light, and translucent wallpaper skins (such as Wallpaper Prism).
 - **2-Line Titles + Clickable GitHub Links**: Clicking any **plugin title** in cards or the Detail Drawer opens its GitHub repository directly in a new window, while clicking the card body opens the Detail Drawer.
 - **Multilingual README Drawer**: Queries `/api/readme?id=...&locale=zh|en`, preferring localized `entriesZh` / `entriesEn` from the catalog (or local `README.zh-CN.md` / `README.zh.md` for installed plugins) and rendering localized descriptions on installed cards.
 - **Direct One-Click Sidebar Launcher**: Replaces raw `<a href="sidecar://...">` links blocked inside isolated iframes. Inside the host panel, clicking a sibling plugin's **Panel** button invokes host `window.sidecar.ui.toggleAuxPane` (`tabType: "sidecarView"`) directly to open or focus its Sidebar panel—no manual copy prompts.
 
-### 2. ⭐ Favorites Shelf & Tab, Installed Search/Filters & Update Error Alerts
+### 2. Lock-Safe Uninstall, Direct In-Sidebar Updates & Permanent Update All
+- **Lock-Safe Plugin Uninstall (Sidebar Card/Drawer + `npx agy-market uninstall <dir>`)**:
+  - Every removable global plugin card and Detail Drawer exposes an **Uninstall** (`卸载`) button backed by `POST /api/uninstall` (with `POST /api/remove-files` compatibility) and a confirmation modal with an optional *Also remove from favorites* checkbox.
+  - Handles both active (`~/.gemini/config/plugins/<dir>`) and Vault-Parked (`${PLUGIN_DATA}/disabled-plugins/<dir>`) directories; never writes `config.json` or calls restricted RPCs; unlinks symlinks/NTFS junctions without touching target source directories; retires Windows `EBUSY`-locked binaries to `.old.<ts>` while immediately deleting `plugin.json` (with `sweepRetiredBinaries` later removing empty orphan shells); strictly blocks self-deletion of `agy-market` (`ERR_CANNOT_SELF_DELETE`) as well as `workspace` and `builtin` plugins.
+- **Direct In-Sidebar Updates Across All Channels (Zero External Download Redirects)**:
+  - Whenever an upstream GitHub Release/Tag leads the catalog or comes from a GitHub URL install, `GET /api/updates` returns `installable: true` (`updateChannel: 'catalog' | 'github-upstream' | 'github-url'`), eliminating external browser download redirects.
+  - Upgrading a verified catalog plugin directly from GitHub upstream preserves its original `receipt.track` (`'verified'`) and `repositoryId` while still enforcing capability-escalation confirmation.
+- **Per-Card `Update` Button & Permanent Top-Bar `Update All`**:
+  - Every installed plugin card with a catalog or GitHub source provides a per-plugin **Update** button (pure local plugins without a remote source render a disabled button and return `ERR_NO_UPDATE_SOURCE` on API calls).
+  - The **Installed** tab header permanently displays **Update All** beside **Check Updates**: clicking it checks for updates when needed and sequentially upgrades `catalog`, `github-upstream`, and `github-url` plugins (always scheduling `agy-market` self-update last to trigger clean restart).
+
+### 3. ⭐ Favorites Shelf & Tab, Installed Search/Filters & Update Error Alerts
 - **⭐ Pinned Favorites Shelf & Dedicated Favorites Tab**:
   - Every plugin card (Discover, Favorites, Installed) and the Detail Drawer header feature a tactile star button (`☆` / glowing amber `★`) backed by `POST /api/favorites` persisted atomically in `prefs.json`.
   - When 1 or more plugins are starred, a collapsible **Pinned Favorites Shelf (`★ Favorites`)** appears above the Discover grid, complemented by a dedicated **`★ Favorites`** top navigation tab (`Discover · Favorites · Installed · Conflicts & Diagnostics · Sources & Settings`).
@@ -38,14 +50,14 @@ Sidebar Panel UI · GitHub URL Preflight Installer · ⭐ Pinned Favorites Shelf
 - **High-Visibility Update Error Alert Banner (Zero Silent Failures)**:
   - Whenever an install/update, batch **Update All**, or self-update fails due to network errors, SHA-256 mismatch, or permissions, a dismissible red error banner and error toast surface the affected plugin, exact failure reason, and a one-click **Retry** button.
 
-### 3. Native Card-Footer Enable / Disable Slider (Vault Parking)
+### 4. Native Card-Footer Enable / Disable Slider (Vault Parking)
 - **Zero Writes to `config.json`**: Antigravity's Language Server write-protects `~/.gemini/config/config.json`. AGY Market reads `config.json` strictly read-only and powers live toggling via **Vault Parking** (`POST /api/toggle-plugin`):
   - **Toggle OFF (Disable)**: Moves `~/.gemini/config/plugins/<dir>` cleanly into `${PLUGIN_DATA}/disabled-plugins/<dir>`. Host hot-watch unloads its Skills / Rules / Hooks within ~1 second.
   - **Toggle ON (Enable)**: Moves the folder back into `~/.gemini/config/plugins/<dir>` and removes any stale `"disabled": true` flag.
   - **Update While Parked**: Disabled plugins remain visible in *Installed* and *Discover* tabs and update in-place inside `disabled-plugins/<dir>` without accidentally reactivating them.
   - **Safe Locking**: `agy-market` itself stays locked ON to prevent disconnecting its own panel; `workspace`, `builtin`, and host-disabled plugins show clear read-only lock states.
 
-### 4. Local Plugin Conflict Checks & Fixes
+### 5. Local Plugin Conflict Checks & Fixes
 Dedicated **Conflicts & Diagnostics** tab (`GET /api/conflicts`) with read-only static conflict checks and one-click fixes (`POST /api/fix-conflict`):
 
 | Check | Severity | What It Detects | Quick Action |
@@ -56,17 +68,17 @@ Dedicated **Conflicts & Diagnostics** tab (`GET /api/conflicts`) with read-only 
 | `skill-shadowing` / `agent-shadowing` | Warning | Overlapping `skills/*/SKILL.md` or `agents/*.md` across active plugins, `~/.gemini/config/skills/*`, and built-in reserved names | Shows full override chain |
 | `host-enhancement-overlap` | Warning / Info | Two or more active plugins modifying `app.asar` (**Warning**, patch overlap risk) or using `cdp` UI enhancements (**Info**, generally compatible) | Advisory to review or disable duplicate |
 
-### 5. Action-Triggered Restart & Reload Prompts
-Cards and the Detail Drawer stay clutter-free without static restart chips. Activation prompts appear **only after an install, update, batch update succeeds** (or when a Windows disable retires a locked binary):
+### 6. Action-Triggered Restart & Reload Prompts
+Cards and the Detail Drawer stay clutter-free without static restart chips. Activation prompts appear **only after an install, update, batch update, or uninstall completes** (or when a Windows disable/uninstall retires a locked binary):
 - **Declarative Skills / Global Rules (`instant`)**: Hot-reloads immediately with no restart required.
 - **Sidebar Panel / MCP / Hooks (`reload-pane`)**: Prompts to reopen the Sidebar panel or refresh MCP after update/install completes.
 - **`app.asar` / First-Time `cdp` / Retired Locked Binaries (`host-restart`)**: Displays a clear banner reminding you to restart Antigravity for changes to take full effect.
 
-### 6. Built-In GitHub Discussions Integration
+### 7. Built-In GitHub Discussions Integration
 - Every plugin Detail Drawer includes a **Discussions** tab (`GET /api/discussions`) that detects whether Discussions are enabled on the repository without needing a token and provides direct links to browse or start a thread.
 - Optionally configuring a personal GitHub Token in Settings (stored locally in `prefs.json` with `0600` permissions; never logged or persisted in caches) loads the latest 10 repository discussions directly inside the Sidebar panel.
 
-### 7. Dual-Mirror China Acceleration & SHA-256 Verified Installs
+### 8. Dual-Mirror China Acceleration & SHA-256 Verified Installs
 - **Three-Tier Live Catalog Resolution (No Stale Bundled Snapshot)**:
   1. **Custom Feeds**: User/team static `index.json` URLs configured in `prefs.json` take highest priority.
   2. **Primary Channel (GitHub Pages + `gh-pages` Raw Fallback)**: Conditional `ETag` (`If-None-Match`) / `If-Modified-Since` requests achieve `<50ms` `304 Not Modified` cache hits.
@@ -157,6 +169,10 @@ npx agy-market install
 
 # Preflight and install a plugin from any GitHub URL (--subpath, --isolate, --replace, --yes, --dest, --mirror, --token, --json)
 npx agy-market add <github-url>
+
+# Lock-safe uninstall of an installed global plugin (alias: remove; supports --yes, --dest <plugins-dir>, --json)
+npx agy-market uninstall <dir>
+npx agy-market uninstall <dir> --yes --json
 
 # List local installed plugins, config/data paths & market receipts (--json supported)
 npx agy-market status
