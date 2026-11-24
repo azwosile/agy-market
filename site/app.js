@@ -2,13 +2,13 @@
   'use strict';
 
   const BADGE_LABELS = {
-    'declarative-only': '⚡ 纯声明式 · 免重启',
+    'declarative-only': '🌿 纯声明式技能',
     'global-rules': '🔵 常驻规则',
-    'sidecar-ui': '🟣 Sidecar 面板 · 0 Token',
+    'sidecar-ui': '🟣 Sidebar 侧边栏',
     'mcp-stdio': '🟠 本地 MCP 进程',
     'mcp-remote': '🌐 远程 MCP 服务',
     'lifecycle-hooks': '🔶 生命周期钩子',
-    'host-enhancement': '🚀 宿主界面增强（需重启）',
+    'host-enhancement': '💡 宿主界面增强',
   };
 
   const CATEGORY_ACCENTS = {
@@ -126,17 +126,52 @@
     });
   });
 
+  function execCommandCopyFallback(text) {
+    const ta = document.createElement('textarea');
+    ta.value = String(text || '');
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.top = '-9999px';
+    ta.style.left = '-9999px';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    try {
+      ta.setSelectionRange(0, ta.value.length);
+    } catch {
+      /* ignore */
+    }
+    let ok = false;
+    try {
+      ok = document.execCommand('copy');
+    } catch {
+      ok = false;
+    } finally {
+      ta.remove();
+    }
+    return ok;
+  }
+
   document.getElementById('copy-boot-btn').addEventListener('click', async () => {
     const text = document.getElementById('boot-cmd-text').textContent || '';
-    try {
-      await navigator.clipboard.writeText(text);
+    let copied = false;
+    if (navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(text);
+        copied = true;
+      } catch {
+        copied = execCommandCopyFallback(text);
+      }
+    } else {
+      copied = execCommandCopyFallback(text);
+    }
+    if (copied) {
       const btn = document.getElementById('copy-boot-btn');
       btn.textContent = '已复制 ✓';
       setTimeout(() => {
         btn.textContent = '复制命令';
       }, 1800);
-    } catch {
-      /* ignore */
     }
   });
 

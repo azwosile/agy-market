@@ -1,5 +1,5 @@
 /* ==========================================================================
-   AGY Market v1.2 — Aurora Prism Optical Glass Stylesheet (`src/ui/styles.css`)
+   AGY Market v1.3 — Aurora Prism Optical Glass Stylesheet (`src/ui/styles.css`)
    Zero external dependencies. Crafted for Dark Obsidian, Light Alabaster, and
    translucent Wallpaper Prism host surfaces via host CSS variable inheritance.
    ========================================================================== */
@@ -551,8 +551,23 @@ body,
   }
 }
 
+@keyframes agy-star-pop {
+  0% {
+    transform: scale(1);
+  }
+  40% {
+    transform: scale(1.28);
+  }
+  75% {
+    transform: scale(0.94);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
 /* ==========================================================================
-   Aurora Prism Header & 4-Tab Segmented Navigation
+   Aurora Prism Header & 5-Tab Segmented Navigation
    ========================================================================== */
 
 .app-header {
@@ -725,6 +740,16 @@ body,
   color: var(--m-text-2);
 }
 
+.nav-count.is-fav {
+  background: var(--m-warn-soft);
+  color: var(--m-warn);
+  border: 1px solid var(--m-warn-border);
+}
+
+.nav-pill .fav-nav-ico {
+  color: var(--m-warn);
+}
+
 .nav-update-badge {
   display: inline-flex;
   align-items: center;
@@ -834,6 +859,170 @@ body,
   border-color: var(--m-sky-border);
   background: var(--m-sky-soft);
   color: var(--m-sky);
+}
+
+/* Sleek Accent-Bordered "+ 申请收录插件" CTA */
+.submit-plugin-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  height: 30px;
+  padding: 0 11px;
+  border-radius: var(--m-r-sm);
+  border: 1px solid var(--m-accent-border);
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--m-accent-soft) 115%, transparent),
+    color-mix(in srgb, var(--m-sky-soft) 95%, transparent)
+  );
+  color: var(--m-accent-bright);
+  text-decoration: none;
+  font-family: inherit;
+  font-size: 11.5px;
+  font-weight: 660;
+  white-space: nowrap;
+  cursor: pointer;
+  box-shadow:
+    inset 0 1px 0 var(--m-specular),
+    0 2px 10px -4px rgba(99, 102, 241, 0.36);
+  transition:
+    background var(--m-dur-fast) var(--m-ease-out),
+    border-color var(--m-dur-fast) var(--m-ease-out),
+    color var(--m-dur-fast) var(--m-ease-out),
+    box-shadow var(--m-dur-fast) var(--m-ease-out),
+    transform var(--m-dur-fast) var(--m-ease-out);
+}
+
+.submit-plugin-btn:hover {
+  background: linear-gradient(135deg, #6366f1 0%, #7c3aed 58%, #0284c7 100%);
+  border-color: rgba(199, 210, 254, 0.72);
+  color: #ffffff;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.3),
+    0 4px 16px -3px rgba(99, 102, 241, 0.55);
+}
+
+.submit-plugin-btn:active {
+  transform: scale(0.97);
+}
+
+/* ==========================================================================
+   Prominent Red Glass Error Alert Banner (Install / Update / Self-Update Fail)
+   ========================================================================== */
+
+.error-alert-banner {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px 14px;
+  padding: 11px 16px 11px 19px;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--m-danger-border);
+  background:
+    linear-gradient(
+      92deg,
+      rgba(244, 63, 94, 0.22) 0%,
+      rgba(225, 29, 72, 0.14) 55%,
+      rgba(159, 18, 57, 0.08) 100%
+    ),
+    var(--m-chrome-bg);
+  backdrop-filter: blur(18px) saturate(145%);
+  -webkit-backdrop-filter: blur(18px) saturate(145%);
+  box-shadow:
+    inset 0 1px 0 rgba(251, 113, 133, 0.28),
+    0 6px 20px -10px rgba(225, 29, 72, 0.45);
+  animation: agy-toast-in 210ms var(--m-ease-out);
+  z-index: 23;
+}
+
+.error-alert-banner::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 3.5px;
+  background: linear-gradient(180deg, #fb7185, #e11d48);
+}
+
+.error-alert-main {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  min-width: 0;
+  flex: 1;
+}
+
+.error-alert-icon {
+  width: 28px;
+  height: 28px;
+  border-radius: 9px;
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  background: linear-gradient(135deg, #f43f5e, #be123c);
+  color: #ffffff;
+  box-shadow: 0 4px 12px rgba(244, 63, 94, 0.4);
+}
+
+.error-alert-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  flex: 1;
+}
+
+.error-alert-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.6px;
+  font-weight: 740;
+  color: var(--m-danger);
+}
+
+.error-alert-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.error-alert-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 11.7px;
+  line-height: 1.45;
+  color: var(--m-text);
+}
+
+.error-plugin-chip {
+  font-family: var(--m-mono);
+  font-size: 10.4px;
+  font-weight: 650;
+  padding: 1px 7px;
+  border-radius: var(--m-r-pill);
+  background: var(--m-danger-soft);
+  border: 1px solid var(--m-danger-border);
+  color: var(--m-danger);
+  white-space: nowrap;
+}
+
+.error-alert-detail {
+  color: var(--m-text-2);
+  word-break: break-word;
+}
+
+.error-alert-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
 }
 
 /* ==========================================================================
@@ -1485,6 +1674,344 @@ body,
   font-size: 10px;
   opacity: 0.78;
   font-variant-numeric: tabular-nums;
+}
+
+/* Installed View Status Filter Pills */
+.status-chip {
+  border: 1px solid var(--m-hairline);
+  background: var(--m-ctl-bg);
+  color: var(--m-muted);
+  padding: 4.5px 11px;
+  border-radius: var(--m-r-pill);
+  font-family: inherit;
+  font-size: 11.5px;
+  font-weight: 560;
+  cursor: pointer;
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  transition: all var(--m-dur-fast) var(--m-ease-out);
+}
+
+.status-chip:hover {
+  background: var(--m-ctl-hover);
+  color: var(--m-text);
+}
+
+.status-chip.active {
+  background: linear-gradient(135deg, var(--m-accent-soft), var(--m-sky-soft));
+  border-color: var(--m-accent-border);
+  color: var(--m-accent-bright);
+  font-weight: 660;
+  box-shadow: inset 0 1px 0 var(--m-specular);
+}
+
+.status-chip.active.is-enabled-filter {
+  background: var(--m-ok-soft);
+  border-color: var(--m-ok-border);
+  color: var(--m-ok);
+}
+
+.status-chip.active.is-disabled-filter {
+  background: var(--b-subtle-bg);
+  border-color: var(--m-hairline-strong);
+  color: var(--m-text);
+}
+
+.status-chip.active.is-updatable-filter {
+  background: var(--m-sky-soft);
+  border-color: var(--m-sky-border);
+  color: var(--m-sky);
+}
+
+/* ==========================================================================
+   Collapsible Pinned Favorites Shelf (`★ 我的收藏栏`)
+   ========================================================================== */
+
+.fav-shelf {
+  position: relative;
+  border-radius: var(--m-r-lg);
+  padding: 12px 14px;
+  margin-bottom: 14px;
+  overflow: hidden;
+  background:
+    radial-gradient(320px 150px at 0% 0%, rgba(245, 158, 11, 0.16), transparent 72%),
+    radial-gradient(280px 140px at 100% 100%, rgba(99, 102, 241, 0.12), transparent 70%),
+    var(--m-sheen),
+    var(--m-card-bg);
+  border: 1px solid color-mix(in srgb, var(--m-warn-border) 68%, var(--m-hairline));
+  box-shadow: inset 0 1px 0 var(--m-specular), var(--m-shadow-card);
+  backdrop-filter: blur(16px) saturate(145%);
+  -webkit-backdrop-filter: blur(16px) saturate(145%);
+}
+
+.fav-shelf.is-collapsed {
+  padding: 8.5px 13px;
+}
+
+.fav-shelf-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.fav-shelf-title-group {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.fav-shelf-star {
+  color: #f59e0b;
+  display: inline-flex;
+  align-items: center;
+  filter: drop-shadow(0 0 6px rgba(245, 158, 11, 0.45));
+}
+
+.fav-shelf-title {
+  font-size: 12.6px;
+  font-weight: 740;
+  color: var(--m-text);
+  letter-spacing: -0.01em;
+}
+
+.fav-shelf-count {
+  font-size: 10.4px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  padding: 1px 7px;
+  border-radius: var(--m-r-pill);
+  background: var(--m-warn-soft);
+  color: var(--m-warn);
+  border: 1px solid var(--m-warn-border);
+}
+
+.fav-shelf-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.fav-shelf-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(295px, 1fr));
+  gap: 9px;
+  margin-top: 10px;
+}
+
+.fav-shelf-item {
+  --card-accent: #f59e0b;
+  --card-accent-2: #6366f1;
+
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 11px;
+  background: color-mix(in srgb, var(--m-inset-bg) 78%, rgba(255, 255, 255, 0.03));
+  border: 1px solid var(--m-hairline);
+  box-shadow: inset 0 1px 0 var(--m-specular);
+  cursor: pointer;
+  min-width: 0;
+  transition:
+    transform var(--m-dur-fast) var(--m-ease-out),
+    border-color var(--m-dur-fast) var(--m-ease-out),
+    background var(--m-dur-fast) var(--m-ease-out);
+}
+
+.fav-shelf-item:hover {
+  transform: translateY(-1px);
+  border-color: color-mix(in srgb, var(--m-warn-border) 75%, var(--card-accent));
+  background: var(--m-card-bg-hover);
+}
+
+.fav-shelf-item-left {
+  display: flex;
+  align-items: center;
+  gap: 8.5px;
+  min-width: 0;
+  flex: 1;
+}
+
+.fav-mini-logo {
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  background: linear-gradient(
+    140deg,
+    color-mix(in srgb, var(--card-accent) 36%, rgba(255, 255, 255, 0.08)) 0%,
+    color-mix(in srgb, var(--card-accent-2) 22%, rgba(15, 23, 42, 0.25)) 100%
+  );
+  border: 1px solid color-mix(in srgb, var(--card-accent) 35%, var(--m-hairline-strong));
+  display: grid;
+  place-items: center;
+  font-size: 12px;
+  font-weight: 760;
+  color: var(--m-text);
+  flex-shrink: 0;
+  position: relative;
+  overflow: hidden;
+}
+
+.fav-mini-logo img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  background: var(--m-surface-raw);
+}
+
+.fav-mini-logo svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.fav-shelf-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5px;
+  min-width: 0;
+}
+
+.fav-shelf-name {
+  font-size: 11.8px;
+  font-weight: 680;
+  color: var(--m-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.fav-shelf-meta {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10.3px;
+  color: var(--m-muted);
+  font-family: var(--m-mono);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.fav-shelf-item-right {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.fav-shelf-compact-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+
+.fav-mini-pill {
+  border: 1px solid var(--m-hairline);
+  background: var(--m-ctl-bg);
+  color: var(--m-text-2);
+  padding: 2px 8.5px;
+  border-radius: var(--m-r-pill);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: all var(--m-dur-fast) var(--m-ease-out);
+}
+
+.fav-mini-pill:hover {
+  border-color: var(--m-warn-border);
+  background: var(--m-warn-soft);
+  color: var(--m-text);
+}
+
+/* Tactile Favorite Star Button on Cards & Detail Drawer */
+.card-title-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+}
+
+.fav-btn {
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border-radius: 8px;
+  border: 1px solid var(--m-hairline);
+  background: var(--m-ctl-bg);
+  color: var(--m-muted);
+  display: inline-grid;
+  place-items: center;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition:
+    background var(--m-dur-fast) var(--m-ease-out),
+    border-color var(--m-dur-fast) var(--m-ease-out),
+    color var(--m-dur-fast) var(--m-ease-out),
+    box-shadow var(--m-dur-fast) var(--m-ease-out),
+    transform var(--m-dur-fast) var(--m-ease-out);
+}
+
+.fav-btn:hover {
+  background: var(--m-warn-soft);
+  border-color: var(--m-warn-border);
+  color: #f59e0b;
+}
+
+.fav-btn:active {
+  transform: scale(0.9);
+}
+
+.fav-btn.is-favorited {
+  background: linear-gradient(135deg, rgba(245, 158, 11, 0.22), rgba(251, 191, 36, 0.14));
+  border-color: rgba(251, 191, 36, 0.5);
+  color: #fbbf24;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.2),
+    0 0 12px -2px rgba(245, 158, 11, 0.45);
+  animation: agy-star-pop 280ms var(--m-ease-spring);
+}
+
+html[data-theme="light"] .fav-btn.is-favorited {
+  color: #d97706;
+}
+
+.fav-btn.is-drawer {
+  width: 30px;
+  height: 30px;
+  border-radius: var(--m-r-sm);
+}
+
+.fav-btn.is-mini {
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+}
+
+.drawer-header-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
 }
 
 /* ==========================================================================
@@ -2164,8 +2691,8 @@ body,
   border-color: var(--m-hairline);
 }
 
-/* Activation Requirement Pill (`⚡ 免重启` / `🔄 需重开面板` / `🚀 需重启生效`) */
-.act-badge {
+/* Post-Update Batch Result Pill (rendered ONLY after an update succeeds) */
+.batch-act-pill {
   font-size: 10.2px;
   font-weight: 650;
   padding: 2.5px 8px;
@@ -2178,19 +2705,13 @@ body,
   border: 1px solid transparent;
 }
 
-.act-badge.is-instant {
-  background: rgba(16, 185, 129, 0.11);
-  color: var(--m-ok);
-  border-color: rgba(52, 211, 153, 0.25);
-}
-
-.act-badge.is-reload-pane {
+.batch-act-pill.is-reload-pane {
   background: var(--m-sky-soft);
   color: var(--m-sky);
   border-color: var(--m-sky-border);
 }
 
-.act-badge.is-host-restart {
+.batch-act-pill.is-host-restart {
   background: linear-gradient(135deg, rgba(245, 158, 11, 0.16), rgba(168, 85, 247, 0.16));
   color: var(--m-warn);
   border-color: var(--m-warn-border);
@@ -3642,7 +4163,7 @@ body,
 }
 
 /* ==========================================================================
-   Toast Bar (With Copyable Sidecar Pill Support — Zero Dead Links!)
+   Toast Bar (Clean Concise Feedback Notifications)
    ========================================================================== */
 
 .toast-bar {
@@ -3668,16 +4189,50 @@ body,
   font-size: 12.2px;
 }
 
-.toast-bar.tone-error {
+.toast-bar.tone-error,
+.toast-bar.tone-danger {
   border-color: var(--m-danger-border);
+  background:
+    linear-gradient(92deg, rgba(244, 63, 94, 0.18) 0%, rgba(225, 29, 72, 0.08) 100%),
+    var(--m-sheet-bg);
+  box-shadow:
+    inset 0 1px 0 rgba(251, 113, 133, 0.25),
+    0 12px 32px -10px rgba(225, 29, 72, 0.45);
+}
+
+.toast-bar.tone-error .toast-lead-ico,
+.toast-bar.tone-danger .toast-lead-ico {
+  color: var(--m-danger);
 }
 
 .toast-bar.tone-ok {
   border-color: var(--m-ok-border);
 }
 
+.toast-bar.tone-ok .toast-lead-ico {
+  color: var(--m-ok);
+}
+
 .toast-bar.tone-warn {
   border-color: var(--m-warn-border);
+}
+
+.toast-bar.tone-warn .toast-lead-ico {
+  color: var(--m-warn);
+}
+
+.toast-lead-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-weight: 600;
+}
+
+.toast-lead-ico {
+  color: var(--m-accent-bright);
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
 }
 
 .toast-copy {
@@ -3870,10 +4425,10 @@ body,
 }
 
 /* ==========================================================================
-   Container-Query Responsive Breakpoints (Sidecar Panel Width Aware)
+   Container-Query Responsive Breakpoints (Sidebar Panel Width Aware)
    ========================================================================== */
 
-@container market (max-width: 740px) {
+@container market (max-width: 880px) {
   .app-header {
     padding: 9px 12px;
     gap: 8px;
@@ -3901,9 +4456,14 @@ body,
   }
 }
 
-@container market (max-width: 500px) {
+@container market (max-width: 520px) {
   .brand-meta-pill {
     display: none;
+  }
+
+  .submit-plugin-btn {
+    padding: 0 8px;
+    font-size: 11px;
   }
 
   .nav-pill {
@@ -3929,14 +4489,20 @@ body,
     gap: 11px;
   }
 
-  .self-update-banner,
-  .restart-notice-banner {
-    flex-direction: column;
-    align-items: stretch;
-    padding: 9px 11px;
+  .fav-shelf-grid {
+    grid-template-columns: minmax(0, 1fr);
   }
 
-  .self-update-actions {
+  .self-update-banner,
+  .restart-notice-banner,
+  .error-alert-banner {
+    flex-direction: column;
+    align-items: stretch;
+    padding: 9px 11px 9px 14px;
+  }
+
+  .self-update-actions,
+  .error-alert-actions {
     justify-content: flex-end;
   }
 

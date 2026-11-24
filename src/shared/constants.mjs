@@ -3,13 +3,16 @@
 export const PLUGIN_ID = 'agy-market';
 export const SELF_CATALOG_ID = 'azwosile__agy-market';
 export const SELF_REPO_URL = 'https://github.com/azwosile/agy-market';
+export const SUBMIT_PLUGIN_GUIDE_URL =
+  'https://github.com/azwosile/agy-market-catalog/blob/main/docs/SUBMISSION_GUIDE.md';
 export const PLUGIN_DISPLAY_NAME = 'AGY Market · 反重力插件市场';
-export const PLUGIN_VERSION = '1.2.0';
+export const PLUGIN_VERSION = '1.3.0';
 export const SIDECAR_ID = 'market_pane';
 export const SIDECAR_URI = 'sidecar://agy-market/market_pane/';
 export const CUSTOMIZATION_URI = 'customization://agy-market';
 
 export const MAX_TARBALL_BYTES = 100 * 1024 * 1024; // 100 MB
+export const MAX_FAVORITES = 500;
 export const PRIMARY_CATALOG_BASE_URL = 'https://azwosile.github.io/agy-market-catalog';
 export const RAW_GH_PAGES_CATALOG_BASE_URL = 'https://raw.githubusercontent.com/azwosile/agy-market-catalog/gh-pages';
 export const PRIMARY_FETCH_TIMEOUT_MS = 3500;
@@ -51,8 +54,8 @@ export const CAPABILITY_BADGE_SPECS = Object.freeze({
     id: 'declarative-only',
     tone: 'green',
     icon: '🟢',
-    zh: '纯声明式 · 0进程',
-    en: 'Declarative · 0 Process',
+    zh: '纯声明式技能',
+    en: 'Declarative Skill',
     descZh: '仅包含声明式 SKILL.md 或 Subagent，无后台常驻进程或钩子。',
     descEn: 'Pure declarative skills/subagents with zero background processes or hooks.',
   },
@@ -69,10 +72,10 @@ export const CAPABILITY_BADGE_SPECS = Object.freeze({
     id: 'sidecar-ui',
     tone: 'purple',
     icon: '🟣',
-    zh: 'Sidecar 面板 · 0 Token',
-    en: 'Sidecar Pane · 0 Token',
-    descZh: '在右侧辅助面板渲染独立 Web 界面，空闲时不消耗对话 Token。',
-    descEn: 'Renders a visual auxiliary Sidecar web pane with zero idle LLM token cost.',
+    zh: 'Sidebar 侧边栏',
+    en: 'Sidebar Panel',
+    descZh: '在右侧 Sidebar 辅助栏提供可视化交互界面。',
+    descEn: 'Provides a visual interactive panel in the right Sidebar.',
   },
   'mcp-stdio': {
     id: 'mcp-stdio',
@@ -137,6 +140,7 @@ export const DEFAULT_PREFS = Object.freeze({
   githubReleaseMirrorPrefix: '',
   githubToken: '',
   customFeeds: [],
+  favorites: [],
 });
 
 export function formatBadgeLabel(badgeId, capabilities = {}, locale = 'zh') {

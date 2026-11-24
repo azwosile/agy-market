@@ -1,7 +1,7 @@
 // Localhost 127.0.0.1 Sidecar HTTP Router, X-Sidecar-Token CSRF Guard & State Persistence (`src/sidecar/server.mjs`).
 
 import { randomBytes, timingSafeEqual } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { dirname, join, resolve } from 'node:path';
 import { Readable } from 'node:stream';
@@ -22,6 +22,7 @@ import { classifyActivationRequirement } from '../shared/activation.mjs';
 import {
   CUSTOMIZATION_URI,
   DEFAULT_PREFS,
+  MAX_FAVORITES,
   PLUGIN_DISPLAY_NAME,
   PLUGIN_ID,
   PLUGIN_VERSION,
@@ -34,9 +35,10 @@ import {
   resolveMarketDataDir,
   resolvePluginsDir,
 } from '../shared/paths.mjs';
-import { computeCapabilityEscalation, sanitizePrefs, toPublicPrefs } from '../shared/schemas.mjs';
+import { computeCapabilityEscalation, sanitizeFavorites, sanitizePrefs, toPublicPrefs } from '../shared/schemas.mjs';
 import { isNewerVersion } from '../shared/semver.mjs';
 import { checkPluginUpdates, isCatalogPluginInstallable } from '../updates/index.mjs';
+import { openSiblingSidecarPane } from './open-pane.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, '..', '..');
@@ -96,12 +98,14 @@ const PRELOAD_SHIM_JS = `(function() {
   function createUiFallback() {
     return {
       toggleAuxPane: function(payload) {
+        var posted = false;
         try {
           if (window.parent && window.parent !== window) {
             window.parent.postMessage({ type: 'toggle-aux-pane', payload: payload || {} }, '*');
+            posted = true;
           }
         } catch (_) {}
-        return Promise.resolve({ ok: false, fallback: true });
+        return Promise.resolve({ ok: false, fallback: true, posted: posted });
       }
     };
   }
@@ -224,13 +228,17 @@ function loadPrefsFromDisk(dataDir) {
 function savePrefsToDisk(dataDir, nextPrefs) {
   mkdirSync(dataDir, { recursive: true });
   const clean = sanitizePrefs(nextPrefs);
-  const tmpPath = join(dataDir, `prefs.json.${process.pid}.tmp`);
+  const tmpPath = join(dataDir, `prefs.json.${process.pid}.${Date.now()}.tmp`);
   const dstPath = join(dataDir, 'prefs.json');
   const writeOpts = clean.githubToken ? { encoding: 'utf8', mode: 0o600 } : { encoding: 'utf8' };
   const serialized = `${JSON.stringify(clean, null, 2)}\n`;
   writeFileSync(tmpPath, serialized, writeOpts);
-  writeFileSync(dstPath, serialized, writeOpts);
-  rmSync(tmpPath, { force: true });
+  try {
+    renameSync(tmpPath, dstPath);
+  } catch {
+    writeFileSync(dstPath, serialized, writeOpts);
+    rmSync(tmpPath, { force: true });
+  }
   return clean;
 }
 
@@ -299,6 +307,9 @@ export async function createMarketSidecarServer(options = {}) {
   const unlinkOverride = options.unlinkOverride || null;
   const linkInfoOverride = options.linkInfoOverride || null;
   const unlinkLinkOverride = options.unlinkLinkOverride || null;
+  const openPaneOptions = options.openPaneOptions || null;
+  const openPaneImpl =
+    typeof options.openPaneImpl === 'function' ? options.openPaneImpl : openSiblingSidecarPane;
   const onSelfRestart =
     typeof options.onSelfRestart === 'function'
       ? options.onSelfRestart
@@ -811,6 +822,9 @@ export async function createMarketSidecarServer(options = {}) {
         } else if (!Object.prototype.hasOwnProperty.call(body, 'githubToken')) {
           merged.githubToken = prefs.githubToken || '';
         }
+        if (!Object.prototype.hasOwnProperty.call(body, 'favorites')) {
+          merged.favorites = Array.isArray(prefs.favorites) ? [...prefs.favorites] : [];
+        }
         prefs = savePrefsToDisk(dataDir, merged);
         invalidateUpdateCheckState();
         const state = await buildEnrichedState({
@@ -818,6 +832,67 @@ export async function createMarketSidecarServer(options = {}) {
           workspaceUris: Array.isArray(body.workspaceUris) ? body.workspaceUris : [],
         });
         sendJson(res, 200, state);
+        return;
+      }
+
+      if (pathname === '/api/favorites') {
+        const key = typeof body.key === 'string' ? body.key.trim() : '';
+        if (!key || key.length > 200) {
+          sendJson(res, 400, { ok: false, error: 'ERR_INVALID_FAVORITE_KEY: Non-empty string "key" is required' });
+          return;
+        }
+        const current = sanitizeFavorites(prefs.favorites);
+        const exists = current.includes(key);
+        const targetState = typeof body.favorite === 'boolean' ? body.favorite : !exists;
+        let nextFavorites;
+        if (targetState) {
+          if (exists) {
+            nextFavorites = current;
+          } else {
+            const trimmed = current.length >= MAX_FAVORITES ? current.slice(-(MAX_FAVORITES - 1)) : current;
+            nextFavorites = [...trimmed, key];
+          }
+        } else {
+          nextFavorites = current.filter((item) => item !== key);
+        }
+        prefs = savePrefsToDisk(dataDir, { ...prefs, favorites: nextFavorites });
+        const persisted = prefs.favorites || [];
+        sendJson(res, 200, {
+          ok: true,
+          key,
+          isFavorite: persisted.includes(key),
+          favorites: persisted,
+        });
+        return;
+      }
+
+      if (pathname === '/api/open-pane') {
+        const dir = typeof body.dir === 'string' ? body.dir.trim() : '';
+        const sidecarFolder =
+          typeof body.sidecarFolder === 'string'
+            ? body.sidecarFolder.trim()
+            : typeof body.folder === 'string'
+              ? body.folder.trim()
+              : '';
+        const viewPath =
+          typeof body.viewPath === 'string'
+            ? body.viewPath.trim()
+            : typeof body.path === 'string'
+              ? body.path.trim()
+              : '/';
+        const title = typeof body.title === 'string' ? body.title.trim() : '';
+        const uri = typeof body.uri === 'string' ? body.uri.trim() : '';
+
+        if (!dir && !uri) {
+          sendJson(res, 400, { ok: false, error: 'ERR_OPEN_PANE_INVALID: Requires non-empty "dir" or "uri"' });
+          return;
+        }
+
+        const result = await openPaneImpl(
+          { dir, sidecarFolder, viewPath, title, uri },
+          openPaneOptions || {},
+        );
+        sendJson(res, 200, result);
         return;
       }
 

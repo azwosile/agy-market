@@ -1,4 +1,4 @@
-// Visual AGY Market v1.2 Aurora Prism Sidecar Application (`src/ui/app.mjs`).
+// Visual AGY Market v1.3 Aurora Prism Sidebar Application (`src/ui/app.mjs`).
 // Zero external dependencies; bundled into `sidecars/market_pane/index.html` by `scripts/build.mjs`.
 
 import {
@@ -11,6 +11,9 @@ import { escapeHtml, renderSafeMarkdown } from './markdown.mjs';
 
 const SELF_OFFER_DISMISSED_KEY = 'agy-market-self-offer-dismissed';
 const HERO_COLLAPSED_KEY = 'agy-market-hero-collapsed';
+const FAVS_SHELF_COLLAPSED_KEY = 'agy-market-favs-shelf-collapsed';
+const SUBMIT_PLUGIN_GUIDE_URL =
+  'https://github.com/azwosile/agy-market-catalog/blob/main/docs/SUBMISSION_GUIDE.md';
 const ASAR_LABEL = ['app', 'asar'].join('.');
 
 function readStorage(key, fallback = '') {
@@ -93,11 +96,22 @@ const state = {
   togglingDir: '',
   fixingKey: '',
   removingDir: '',
-  activeTab: 'discover', // 'discover' | 'installed' | 'conflicts' | 'sources'
+  activeTab: 'discover', // 'discover' | 'favorites' | 'installed' | 'conflicts' | 'sources'
   search: '',
   category: 'all',
   sortBy: 'stars', // 'stars' | 'updated' | 'name'
   heroCollapsed: readStorage(HERO_COLLAPSED_KEY, '0') === '1',
+
+  // Favorites state (synced with `prefs.favorites` via `POST /api/favorites`)
+  favorites: [],
+  favoritesShelfCollapsed: readStorage(FAVS_SHELF_COLLAPSED_KEY, '0') === '1',
+  favoritesSearch: '',
+  favoritesSortBy: 'added', // 'added' | 'stars' | 'name'
+
+  // Installed view live search & status filter
+  installedSearch: '',
+  installedFilter: 'all', // 'all' | 'enabled' | 'disabled' | 'updatable'
+
   serverState: null,
   workspaceUris: [],
 
@@ -124,8 +138,11 @@ const state = {
     error: '',
   },
 
-  // Dismissible Smart Restart / Reload Notice Banner
-  restartNotice: null, // null | { level: 'host-restart'|'reload-pane', plugins: string[], reasons: string[] }
+  // Dismissible Smart Restart / Reload Banner (shown ONLY after a successful update/install or locked binary)
+  restartBanner: null, // null | { level: 'host-restart'|'reload-pane', plugins: string[], reasons: string[] }
+
+  // Prominent Red Error Alert Banner (shown whenever install / update / update-all / self-update fails)
+  errorBanner: null, // null | { title, items: [{ pluginName, message }], retryAction }
 
   // Batch update state (`POST /api/update-all`)
   batchUpdating: false,
@@ -149,8 +166,8 @@ const state = {
   escalationModal: null,
   removeConfirmModal: null, // null | { dir, displayName, version }
 
-  // Feedback toast (zero dead protocol links — supports 1-click copy chat pill!)
-  toast: null, // null | { message, subtext?, copyText?, copyLabel?, tone }
+  // Clean Feedback Toast
+  toast: null, // null | { message, subtext?, tone }
   copiedKey: '',
   focusTokenField: false,
 };
@@ -216,8 +233,8 @@ function isSafeHttpUrl(url) {
   return /^https?:\/\/[^\s]+$/i.test(s);
 }
 
-function showToast(message, { subtext = '', copyText = '', copyLabel = '', tone = 'info', durationMs = 6500 } = {}) {
-  state.toast = { message, subtext, copyText, copyLabel, tone };
+function showToast(message, { subtext = '', tone = 'info', durationMs = 5000 } = {}) {
+  state.toast = { message, subtext, tone };
   render();
   if (toastTimer) clearTimeout(toastTimer);
   toastTimer = setTimeout(() => {
@@ -226,6 +243,58 @@ function showToast(message, { subtext = '', copyText = '', copyLabel = '', tone 
       render();
     }
   }, durationMs);
+}
+
+function setErrorBanner({ title = '', items = [], retryAction = null } = {}) {
+  const cleanItems = (Array.isArray(items) ? items : [])
+    .filter((it) => it && (it.message || it.pluginName))
+    .map((it) => ({
+      pluginName: String(it.pluginName || '').trim(),
+      message: String(it.message || '').trim() || t('未知错误', 'Unknown error'),
+    }));
+  state.errorBanner = {
+    title: title || t('操作未能完成', 'Operation Failed'),
+    items: cleanItems,
+    retryAction: retryAction || null,
+  };
+}
+
+function syncFavoritesFromServerState() {
+  const favs = state.serverState?.prefs?.favorites;
+  if (Array.isArray(favs)) {
+    state.favorites = [...new Set(favs.map((x) => String(x || '').trim()).filter(Boolean))];
+  }
+}
+
+function getLocalFavoriteKey(loc, catEntry = null) {
+  if (catEntry?.id) return String(catEntry.id);
+  if (loc?.receipt?.id) return String(loc.receipt.id);
+  return loc?.dir ? `local:${loc.dir}` : '';
+}
+
+function isFavoritedKey(key) {
+  return Boolean(key && state.favorites.includes(key));
+}
+
+function getUiBadgeSpec(badgeId) {
+  const base = CAPABILITY_BADGE_SPECS[badgeId] || { tone: 'subtle', descZh: badgeId, descEn: badgeId };
+  if (badgeId === 'sidecar-ui') {
+    return {
+      ...base,
+      zh: 'Sidebar 侧边栏',
+      en: 'Sidebar Panel',
+      descZh: '在右侧 Sidebar 辅助栏提供可视化交互界面。',
+      descEn: 'Provides a visual interactive panel in the right Sidebar.',
+    };
+  }
+  if (badgeId === 'declarative-only') {
+    return {
+      ...base,
+      zh: '纯声明式技能',
+      en: 'Declarative Skill',
+    };
+  }
+  return base;
 }
 
 function formatRelativeTime(isoStr) {
@@ -247,6 +316,8 @@ function formatRelativeTime(isoStr) {
 }
 
 function cleanBadgeText(badgeId, capabilities = {}) {
+  if (badgeId === 'sidecar-ui') return t('Sidebar 侧边栏', 'Sidebar Panel');
+  if (badgeId === 'declarative-only') return t('纯声明式技能', 'Declarative Skill');
   const raw = formatBadgeLabel(badgeId, capabilities, getLocale());
   return String(raw || badgeId).replace(/^[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\uFE0F\s]+/u, '').trim();
 }
@@ -284,18 +355,14 @@ function resolveActivationInfo(sourceObj, capabilitiesFallback = {}) {
   if (hostKinds.includes('app-asar')) {
     return {
       level: 'host-restart',
-      badgeZh: '🚀 需重启生效',
-      badgeEn: '🚀 Restart Required',
-      reasonZh: `包含 ${ASAR_LABEL} 界面补丁，需重启 Antigravity 客户端后生效`,
+      reasonZh: `包含 ${ASAR_LABEL} 界面补丁，更新后需重启 Antigravity 客户端生效`,
       reasonEn: `Includes ${ASAR_LABEL} UI patch; restart Antigravity to take effect`,
     };
   }
   if (hostKinds.includes('cdp') || badges.includes('host-enhancement')) {
     return {
       level: 'host-restart',
-      badgeZh: '🚀 需重启生效',
-      badgeEn: '🚀 Restart Required',
-      reasonZh: '包含全窗口 CDP 皮肤增强，需带调试端口重启 Antigravity 客户端生效',
+      reasonZh: '包含全窗口 CDP 皮肤增强，更新后需带调试端口重启 Antigravity 客户端生效',
       reasonEn: 'Uses CDP workbench skin; restart Antigravity with debug port to apply',
     };
   }
@@ -307,22 +374,18 @@ function resolveActivationInfo(sourceObj, capabilitiesFallback = {}) {
   ) {
     return {
       level: 'reload-pane',
-      badgeZh: '🔄 需重开面板',
-      badgeEn: '🔄 Reload Pane',
-      reasonZh: '包含 Sidecar 面板、MCP 进程或生命周期钩子，建议重开面板或刷新 MCP 连接',
-      reasonEn: 'Includes Sidecar pane, MCP server, or hooks; reload pane or refresh MCP',
+      reasonZh: '包含 Sidebar 侧边栏、MCP 进程或生命周期钩子，更新后建议重开侧边栏或刷新 MCP 连接',
+      reasonEn: 'Includes Sidebar panel, MCP server, or hooks; reopen Sidebar or refresh MCP',
     };
   }
   return {
     level: 'instant',
-    badgeZh: '⚡ 免重启',
-    badgeEn: '⚡ Instant',
-    reasonZh: '纯声明式技能或规则，免重启即刻热生效',
-    reasonEn: 'Pure declarative skills/rules — active immediately without restart',
+    reasonZh: '纯声明式技能或规则，安装更新后即刻生效',
+    reasonEn: 'Pure declarative skills/rules — active immediately after update',
   };
 }
 
-function maybeTriggerRestartNotice({
+function maybeTriggerRestartBanner({
   pluginName = '',
   restartRequired = false,
   reloadRequired = false,
@@ -345,7 +408,7 @@ function maybeTriggerRestartNotice({
       reason =
         (getLocale() === 'en' ? activation?.reasonEn : activation?.reasonZh) ||
         t(
-          `该插件涉及 ${ASAR_LABEL} 界面补丁或 CDP 调试端口宿主增强，需重启 Antigravity 客户端生效。`,
+          `该插件涉及 ${ASAR_LABEL} 界面补丁或 CDP 调试端口宿主增强，请重启 Antigravity 客户端生效。`,
           `This plugin modifies ${ASAR_LABEL} or CDP host enhancements; restart Antigravity to apply.`,
         );
     }
@@ -354,19 +417,20 @@ function maybeTriggerRestartNotice({
     reason =
       (getLocale() === 'en' ? activation?.reasonEn : activation?.reasonZh) ||
       t(
-        '该插件包含 Sidecar 面板、MCP 服务或钩子，建议重开对应辅助面板或刷新 MCP 列表。',
-        'This plugin includes a Sidecar pane, MCP server, or hooks; reopen pane or refresh MCP.',
+        '该插件包含 Sidebar 侧边栏、MCP 服务或钩子，建议重开对应侧边栏或刷新 MCP 列表。',
+        'This plugin includes a Sidebar panel, MCP server, or hooks; reopen Sidebar or refresh MCP.',
       );
   }
 
-  if (!level) return;
+  if (!level) return null;
 
-  const existing = state.restartNotice;
+  const existing = state.restartBanner;
   const nextLevel =
     existing?.level === 'host-restart' || level === 'host-restart' ? 'host-restart' : 'reload-pane';
   const plugins = [...new Set([...(existing?.plugins || []), ...(pluginName ? [pluginName] : [])])];
   const reasons = [...new Set([...(existing?.reasons || []), ...(reason ? [reason] : [])])];
-  state.restartNotice = { level: nextLevel, plugins, reasons };
+  state.restartBanner = { level: nextLevel, plugins, reasons };
+  return { level, reason };
 }
 
 function resolveInstalledDescription(loc, catEntry) {
@@ -575,9 +639,10 @@ async function loadState(forceRefresh = false) {
         : '';
       state.serverState = await apiFetch(`/api/state${qs}`);
     }
+    syncFavoritesFromServerState();
     syncDetailPluginReference();
   } catch (err) {
-    showToast(`${t('加载失败', 'Load failed')}: ${err?.message || String(err)}`, { tone: 'error' });
+    showToast(`${t('加载失败', 'Load failed')}: ${err?.message || String(err)}`, { tone: 'danger' });
   } finally {
     state.loading = false;
     render();
@@ -644,6 +709,7 @@ async function triggerFixConflict({ type, targetDir, suggestedDir = '' }) {
 
     if (res.state) {
       state.serverState = res.state;
+      syncFavoritesFromServerState();
       syncDetailPluginReference();
     }
     if (res.conflicts) {
@@ -662,17 +728,19 @@ async function triggerFixConflict({ type, targetDir, suggestedDir = '' }) {
         (getLocale() === 'en' ? res.messageEn : res.messageZh) ||
         t(`已修复冲突：${targetDir}${res.newDir ? ` → ${res.newDir}` : ''}`, `Fixed conflict: ${targetDir}`);
       showToast(msg, { tone: 'ok' });
-      maybeTriggerRestartNotice({
-        pluginName: res.newDir || targetDir,
-        restartRequired: Boolean(res.restartRequired),
-        reloadRequired: Boolean(res.reloadRequired),
-        activation: res.activation || null,
-      });
+      if (res.restartRequired || res.reloadRequired) {
+        maybeTriggerRestartBanner({
+          pluginName: res.newDir || targetDir,
+          restartRequired: Boolean(res.restartRequired),
+          reloadRequired: Boolean(res.reloadRequired),
+          activation: res.activation || null,
+        });
+      }
     } else {
-      showToast(res.error || t('冲突修复失败', 'Conflict fix failed'), { tone: 'error' });
+      showToast(res.error || t('冲突修复失败', 'Conflict fix failed'), { tone: 'danger' });
     }
   } catch (err) {
-    showToast(`${t('冲突修复失败', 'Conflict fix failed')}: ${err?.message || String(err)}`, { tone: 'error' });
+    showToast(`${t('冲突修复失败', 'Conflict fix failed')}: ${err?.message || String(err)}`, { tone: 'danger' });
   } finally {
     state.fixingKey = '';
     render();
@@ -695,6 +763,7 @@ async function triggerTogglePlugin(dir, nextEnabled) {
 
     if (res.state) {
       state.serverState = res.state;
+      syncFavoritesFromServerState();
       syncDetailPluginReference();
     }
     if (res.conflictsSummary && state.serverState) {
@@ -708,26 +777,31 @@ async function triggerTogglePlugin(dir, nextEnabled) {
       const label = nextEnabled
         ? t(`已启用插件「${dir}」`, `Enabled "${dir}"`)
         : t(`已将「${dir}」移入停放仓并禁用`, `Parked & disabled "${dir}"`);
-      const act = res.activation || null;
-      maybeTriggerRestartNotice({
-        pluginName: dir,
-        restartRequired: Boolean(res.restartRequired || res.lockedOnDisable),
-        reloadRequired: Boolean(res.reloadRequired),
-        retiredBinaries: res.retiredBinaries || [],
-        lockedOnDisable: Boolean(res.lockedOnDisable),
-        activation: act,
-      });
+      const hasLockedOrRetired =
+        Boolean(res.lockedOnDisable) ||
+        (Array.isArray(res.retiredBinaries) && res.retiredBinaries.length > 0);
+      if (hasLockedOrRetired) {
+        maybeTriggerRestartBanner({
+          pluginName: dir,
+          restartRequired: true,
+          retiredBinaries: res.retiredBinaries || [],
+          lockedOnDisable: Boolean(res.lockedOnDisable),
+          activation: res.activation || null,
+        });
+      }
       showToast(label, {
-        subtext: nextEnabled
-          ? t('宿主热监听将在约 1 秒内加载其技能与面板', 'Antigravity hot-watcher will activate skills/panes shortly')
-          : t('仍保留在列表中支持版本检测与一键恢复', 'Kept in Installed list for update checks & 1-click re-enable'),
+        subtext: hasLockedOrRetired
+          ? t('检测到后台进程占用句柄，重启 Antigravity 后即可彻底释放', 'Background handle lock detected; restart Antigravity to release')
+          : nextEnabled
+            ? t('宿主热监听将在约 1 秒内加载其技能与侧边栏', 'Antigravity hot-watcher will activate skills/Sidebar shortly')
+            : t('仍保留在列表中支持版本检测与一键恢复', 'Kept in Installed list for update checks & 1-click re-enable'),
         tone: 'ok',
       });
     } else {
-      showToast(res.error || t('启停切换失败', 'Failed to toggle plugin'), { tone: 'error' });
+      showToast(res.error || t('启停切换失败', 'Failed to toggle plugin'), { tone: 'danger' });
     }
   } catch (err) {
-    showToast(`${t('启停切换失败', 'Toggle failed')}: ${err?.message || String(err)}`, { tone: 'error' });
+    showToast(`${t('启停切换失败', 'Toggle failed')}: ${err?.message || String(err)}`, { tone: 'danger' });
   } finally {
     state.togglingDir = '';
     render();
@@ -745,6 +819,7 @@ async function triggerRemovePluginFiles(dir) {
     });
     if (res.state) {
       state.serverState = res.state;
+      syncFavoritesFromServerState();
     }
     state.removeConfirmModal = null;
     if (state.detailPlugin?.installStatus?.installedDir === dir) {
@@ -760,53 +835,137 @@ async function triggerRemovePluginFiles(dir) {
     showToast(t(`已移除插件文件：${dir}`, `Removed plugin files: ${dir}`), { tone: 'ok' });
     void checkUpdates(false, { silent: true });
   } catch (err) {
-    showToast(`${t('移除失败', 'Remove failed')}: ${err?.message || String(err)}`, { tone: 'error' });
+    showToast(`${t('移除失败', 'Remove failed')}: ${err?.message || String(err)}`, { tone: 'danger' });
   } finally {
     state.removingDir = '';
     render();
   }
 }
 
+async function toggleFavorite(key, displayName = '') {
+  const cleanKey = String(key || '').trim();
+  if (!cleanKey) return;
+  const prev = [...state.favorites];
+  const wasFav = prev.includes(cleanKey);
+  const next = wasFav ? prev.filter((k) => k !== cleanKey) : [cleanKey, ...prev];
+
+  // Optimistic UI update
+  state.favorites = next;
+  if (state.serverState?.prefs) {
+    state.serverState.prefs.favorites = next;
+  }
+  render();
+
+  try {
+    const res = await apiFetch('/api/favorites', {
+      method: 'POST',
+      body: { key: cleanKey, favorite: !wasFav },
+    });
+    if (Array.isArray(res?.favorites)) {
+      state.favorites = [...new Set(res.favorites.map((x) => String(x || '').trim()).filter(Boolean))];
+      if (state.serverState?.prefs) {
+        state.serverState.prefs.favorites = state.favorites;
+      }
+      render();
+    }
+    if (displayName) {
+      showToast(
+        !wasFav
+          ? t(`已收藏「${displayName}」`, `Favorited "${displayName}"`)
+          : t(`已取消收藏「${displayName}」`, `Removed "${displayName}" from Favorites`),
+        { tone: 'ok', durationMs: 2200 },
+      );
+    }
+  } catch (err) {
+    // Rollback optimistic update on persistence failure
+    state.favorites = prev;
+    if (state.serverState?.prefs) {
+      state.serverState.prefs.favorites = prev;
+    }
+    showToast(`${t('收藏状态保存失败', 'Failed to save favorite')}: ${err?.message || String(err)}`, {
+      tone: 'danger',
+      durationMs: 5000,
+    });
+  }
+}
+
 async function openSiblingSidecarPane({ dir, folder, viewPath, title, uri }) {
   const cleanFolder = folder || '';
   const normPath = viewPath ? (viewPath.startsWith('/') ? viewPath : `/${viewPath}`) : '/';
-  const sidecarId = cleanFolder ? `${dir}/${cleanFolder}` : dir;
-  const pillText = `[${t('打开', 'Open')} ${title}](${uri})`;
+  const paneUri = uri || `sidecar://${dir}/${cleanFolder}/${normPath.replace(/^\/+/, '')}`;
+  const safeTitle = title || dir;
+  const togglePayload = {
+    tabType: 'sidecarView',
+    uri: paneUri,
+  };
 
-  let bridgeCalled = false;
-  let bridgeNativeOk = false;
+  let bridgeDelivered = false;
+  const inHostIframe = Boolean(window.parent && window.parent !== window);
   try {
     if (typeof window.sidecar?.ui?.toggleAuxPane === 'function') {
-      bridgeCalled = true;
-      const result = await window.sidecar.ui.toggleAuxPane({
-        tabType: 'sidecar',
-        sidecarId,
-        path: normPath,
-      });
-      if (result && result.ok === true && !result.fallback) {
-        bridgeNativeOk = true;
+      const result = await window.sidecar.ui.toggleAuxPane(togglePayload);
+      if (
+        result === true ||
+        result?.ok === true ||
+        result?.posted === true ||
+        (result === undefined && inHostIframe)
+      ) {
+        bridgeDelivered = true;
       }
     }
   } catch {
-    /* fallback toast always guides user */
+    /* continue to backend /api/open-pane */
+  }
+
+  let serverOpened = false;
+  if (!bridgeDelivered) {
+    try {
+      const res = await apiFetch('/api/open-pane', {
+        method: 'POST',
+        body: {
+          dir,
+          sidecarFolder: cleanFolder,
+          viewPath: normPath,
+          title: safeTitle,
+          uri: paneUri,
+        },
+      });
+      if (res?.opened === true) {
+        serverOpened = true;
+      } else if (res?.preloadPayload && typeof window.sidecar?.ui?.toggleAuxPane === 'function') {
+        try {
+          const retryRes = await window.sidecar.ui.toggleAuxPane(res.preloadPayload);
+          if (
+            retryRes === true ||
+            retryRes?.ok === true ||
+            retryRes?.posted === true ||
+            (retryRes === undefined && inHostIframe)
+          ) {
+            bridgeDelivered = true;
+          }
+        } catch {
+          /* ignore */
+        }
+      }
+    } catch {
+      /* graceful 1-line guidance fallback */
+    }
+  }
+
+  if (bridgeDelivered || serverOpened) {
+    showToast(t(`已打开「${safeTitle}」侧边栏`, `Opened "${safeTitle}" Sidebar`), {
+      tone: 'ok',
+      durationMs: 2500,
+    });
+    return;
   }
 
   showToast(
-    bridgeNativeOk
-      ? t(`已唤起「${title}」辅助面板`, `Opened "${title}" sidecar pane`)
-      : bridgeCalled
-        ? t(`已向宿主发送打开「${title}」面板请求`, `Requested host to open "${title}" pane`)
-        : t(`请从顶部「+ → Plugins」或聊天药丸打开「${title}」`, `Open "${title}" via "+ → Plugins" or chat pill`),
-    {
-      subtext: t(
-        '若隔离面板未自动弹出，可一键复制聊天药丸粘贴发送，或在顶栏 + → Plugins 中打开。',
-        'If the host did not pop open the pane, copy the chat pill below or use + → Plugins.',
-      ),
-      copyText: pillText,
-      copyLabel: t('复制聊天药丸', 'Copy Chat Pill'),
-      tone: 'info',
-      durationMs: 9000,
-    },
+    t(
+      `请在右上角「+ → Plugins → ${safeTitle}」中打开侧边栏`,
+      `Open "${safeTitle}" via "+ → Plugins → ${safeTitle}" in the top-right`,
+    ),
+    { tone: 'info', durationMs: 4500 },
   );
 }
 
@@ -856,10 +1015,13 @@ async function checkUpdates(force = false, { silent = true } = {}) {
 }
 
 async function triggerInstall(plugin, { conflictStrategy = 'prompt', confirmEscalation = false } = {}) {
+  const isUpdate = Boolean(plugin.installStatus?.installed);
+  const pluginName = plugin.displayName || plugin.canonicalName || plugin.id;
   state.busyId = plugin.id;
+  state.errorBanner = null;
   render();
   try {
-    const endpoint = plugin.installStatus?.installed ? '/api/update' : '/api/install';
+    const endpoint = isUpdate ? '/api/update' : '/api/install';
     const res = await apiFetch(endpoint, {
       method: 'POST',
       body: {
@@ -873,6 +1035,7 @@ async function triggerInstall(plugin, { conflictStrategy = 'prompt', confirmEsca
 
     if (res.state) {
       state.serverState = res.state;
+      syncFavoritesFromServerState();
       syncDetailPluginReference();
     }
 
@@ -893,7 +1056,7 @@ async function triggerInstall(plugin, { conflictStrategy = 'prompt', confirmEsca
           {
             plugin,
             id: plugin.id,
-            displayName: plugin.displayName || plugin.canonicalName || plugin.id,
+            displayName: pluginName,
             installedVersion: res.installedVersion || plugin.installStatus?.installedVersion || '?',
             targetVersion: res.targetVersion || plugin.version || '?',
             escalation: res.escalation || { addedBadges: [], addedRemoteDomains: [], addedHookEvents: [] },
@@ -906,13 +1069,14 @@ async function triggerInstall(plugin, { conflictStrategy = 'prompt', confirmEsca
     if (res.ok) {
       state.conflictModal = null;
       state.escalationModal = null;
+      state.errorBanner = null;
       if (res.isSelfUpdate || res.willRestart) {
         startReconnectPolling(res.version || plugin.version || '');
         return;
       }
 
       const act = res.activation || resolveActivationInfo(plugin);
-      maybeTriggerRestartNotice({
+      const restartInfo = maybeTriggerRestartBanner({
         pluginName: plugin.displayName || res.installedDir || plugin.canonicalName,
         restartRequired: Boolean(res.restartRequired),
         reloadRequired: Boolean(res.reloadRequired),
@@ -921,23 +1085,39 @@ async function triggerInstall(plugin, { conflictStrategy = 'prompt', confirmEsca
       });
 
       const noteSuffix = res.compatibilityNotes?.length ? ` (${res.compatibilityNotes[0]})` : '';
-      const paneUri = res.sidecarPane?.uri || '';
-      const paneTitle = res.sidecarPane?.title || plugin.displayName || res.installedDir;
       showToast(
-        `${t('安装 / 更新已完成', 'Installed & synced')}: ${res.installedDir} v${res.version}${noteSuffix}`,
+        `${t(isUpdate ? '更新已完成' : '安装已完成', isUpdate ? 'Updated' : 'Installed')}: ${res.installedDir} v${res.version}${noteSuffix}`,
         {
-          copyText: paneUri && res.installedDir !== 'agy-market' ? `[${t('打开', 'Open')} ${paneTitle}](${paneUri})` : '',
-          copyLabel: paneUri && res.installedDir !== 'agy-market' ? t('复制面板药丸', 'Copy Pane Pill') : '',
+          subtext: restartInfo?.reason || '',
           tone: 'ok',
+          durationMs: restartInfo ? 6500 : 4500,
         },
       );
       void checkUpdates(false, { silent: true });
       if (state.conflicts.loaded) void loadConflicts({ silent: true });
     } else {
-      showToast(res.error || t('安装未完成', 'Install did not complete'), { tone: 'error' });
+      const errMsg = res.error || res.status || t('安装或更新未能完成', 'Install or update did not complete');
+      setErrorBanner({
+        title: t(isUpdate ? '插件更新失败' : '插件安装失败', isUpdate ? 'Plugin Update Failed' : 'Plugin Install Failed'),
+        items: [{ pluginName, message: errMsg }],
+        retryAction: { type: 'install', plugin, opts: { conflictStrategy, confirmEscalation } },
+      });
+      showToast(
+        `${t(isUpdate ? '更新失败' : '安装失败', isUpdate ? 'Update failed' : 'Install failed')} (${pluginName}): ${errMsg}`,
+        { tone: 'danger', durationMs: 8000 },
+      );
     }
   } catch (err) {
-    showToast(`${t('安装失败', 'Install error')}: ${err?.message || String(err)}`, { tone: 'error' });
+    const errMsg = err?.message || String(err);
+    setErrorBanner({
+      title: t(isUpdate ? '插件更新失败' : '插件安装失败', isUpdate ? 'Plugin Update Failed' : 'Plugin Install Failed'),
+      items: [{ pluginName, message: errMsg }],
+      retryAction: { type: 'install', plugin, opts: { conflictStrategy, confirmEscalation } },
+    });
+    showToast(
+      `${t(isUpdate ? '更新失败' : '安装失败', isUpdate ? 'Update failed' : 'Install failed')} (${pluginName}): ${errMsg}`,
+      { tone: 'danger', durationMs: 8000 },
+    );
   } finally {
     state.busyId = '';
     render();
@@ -954,6 +1134,7 @@ async function triggerUpdateAll(ids = null, { confirmEscalation = false } = {}) 
 
   state.batchUpdating = true;
   state.batchTargetIds = targetIds;
+  state.errorBanner = null;
   render();
 
   try {
@@ -968,6 +1149,7 @@ async function triggerUpdateAll(ids = null, { confirmEscalation = false } = {}) 
 
     if (res.state) {
       state.serverState = res.state;
+      syncFavoritesFromServerState();
       syncDetailPluginReference();
     }
 
@@ -982,7 +1164,7 @@ async function triggerUpdateAll(ids = null, { confirmEscalation = false } = {}) 
 
     for (const r of results) {
       if (r.ok) {
-        maybeTriggerRestartNotice({
+        maybeTriggerRestartBanner({
           pluginName: r.displayName || r.installedDir || r.id,
           restartRequired: Boolean(r.restartRequired),
           reloadRequired: Boolean(r.reloadRequired),
@@ -1016,10 +1198,32 @@ async function triggerUpdateAll(ids = null, { confirmEscalation = false } = {}) 
     }
 
     const okCount = results.filter((r) => r.ok).length;
-    const failCount = results.filter((r) => !r.ok && r.status !== 'CAPABILITY_ESCALATION_CONFIRM_REQUIRED').length;
+    const failedItems = results.filter((r) => !r.ok && r.status !== 'CAPABILITY_ESCALATION_CONFIRM_REQUIRED');
+    const failCount = failedItems.length;
     const selfUpdated = Boolean(
       res.willRestart || results.some((r) => r.ok && (r.isSelfUpdate || r.installedDir === 'agy-market' || r.id === 'azwosile__agy-market')),
     );
+
+    if (failCount > 0) {
+      setErrorBanner({
+        title: t(
+          `批量更新失败：${failCount} 个插件未能完成更新`,
+          `Batch update failed: ${failCount} plugin(s) did not complete`,
+        ),
+        items: failedItems.map((r) => ({
+          pluginName: r.displayName || r.installedDir || r.dir || r.id,
+          message: r.error || r.status || t('更新失败', 'Update failed'),
+        })),
+        retryAction: { type: 'update-all', ids: failedItems.map((r) => r.id).filter(Boolean) },
+      });
+    } else if (res.ok === false && results.length === 0) {
+      const errMsg = res.error || t('批量更新请求返回异常', 'Batch update returned an error');
+      setErrorBanner({
+        title: t('批量更新失败', 'Batch Update Failed'),
+        items: [{ pluginName: t('批量更新队列', 'Batch Update Queue'), message: errMsg }],
+        retryAction: { type: 'update-all', ids: targetIds },
+      });
+    }
 
     if (selfUpdated) {
       const selfItem = results.find((r) => r.isSelfUpdate || r.installedDir === 'agy-market' || r.id === 'azwosile__agy-market');
@@ -1027,8 +1231,21 @@ async function triggerUpdateAll(ids = null, { confirmEscalation = false } = {}) 
       return;
     }
 
-    if (failCount === 0 && escalated.length === 0) {
-      showToast(t(`全部更新完成（共 ${okCount} 个插件）`, `Updated ${okCount} plugin(s) successfully`), { tone: 'ok' });
+    if (failCount > 0) {
+      const firstFail = failedItems[0];
+      const firstReason = firstFail.error || firstFail.status || t('更新失败', 'Update failed');
+      showToast(
+        t(
+          `批量更新失败（${okCount} 成功，${failCount} 失败）：${firstFail.displayName || firstFail.id} — ${firstReason}`,
+          `Batch update failed (${okCount} ok, ${failCount} failed): ${firstFail.displayName || firstFail.id} — ${firstReason}`,
+        ),
+        { tone: 'danger', durationMs: 8000 },
+      );
+    } else if (res.ok === false && results.length === 0) {
+      showToast(`${t('批量更新失败', 'Batch update failed')}: ${res.error || t('请求异常', 'Request error')}`, {
+        tone: 'danger',
+        durationMs: 8000,
+      });
     } else if (escalated.length > 0) {
       showToast(
         t(
@@ -1037,16 +1254,19 @@ async function triggerUpdateAll(ids = null, { confirmEscalation = false } = {}) 
         ),
       );
     } else {
-      showToast(
-        t(`批量更新结束：${okCount} 成功，${failCount} 失败`, `Batch update finished: ${okCount} succeeded, ${failCount} failed`),
-        { tone: 'error' },
-      );
+      showToast(t(`全部更新完成（共 ${okCount} 个插件）`, `Updated ${okCount} plugin(s) successfully`), { tone: 'ok' });
     }
 
     void checkUpdates(false, { silent: true });
     if (state.conflicts.loaded) void loadConflicts({ silent: true });
   } catch (err) {
-    showToast(`${t('批量更新失败', 'Batch update error')}: ${err?.message || String(err)}`, { tone: 'error' });
+    const errMsg = err?.message || String(err);
+    setErrorBanner({
+      title: t('批量更新失败', 'Batch Update Failed'),
+      items: [{ pluginName: t('批量更新队列', 'Batch Update Queue'), message: errMsg }],
+      retryAction: { type: 'update-all', ids: targetIds },
+    });
+    showToast(`${t('批量更新失败', 'Batch update error')}: ${errMsg}`, { tone: 'danger', durationMs: 8000 });
   } finally {
     state.batchUpdating = false;
     state.batchTargetIds = [];
@@ -1056,6 +1276,7 @@ async function triggerUpdateAll(ids = null, { confirmEscalation = false } = {}) 
 
 async function triggerSelfUpdate({ confirmEscalation = false } = {}) {
   state.selfUpdateBusy = true;
+  state.errorBanner = null;
   render();
   try {
     const body = confirmEscalation ? { confirmEscalation: true } : {};
@@ -1066,6 +1287,7 @@ async function triggerSelfUpdate({ confirmEscalation = false } = {}) {
 
     if (res.state) {
       state.serverState = res.state;
+      syncFavoritesFromServerState();
     }
 
     if (res.status === 'CAPABILITY_ESCALATION_CONFIRM_REQUIRED') {
@@ -1088,12 +1310,25 @@ async function triggerSelfUpdate({ confirmEscalation = false } = {}) {
     if (res.ok || res.willRestart) {
       state.escalationModal = null;
       state.selfChangelogModal = false;
+      state.errorBanner = null;
       startReconnectPolling(res.version || state.updates.selfUpdate?.latestVersion || '');
     } else {
-      showToast(res.error || t('插件市场自更新未完成', 'Self-update did not complete'), { tone: 'error' });
+      const errMsg = res.error || res.status || t('插件市场自更新未完成', 'Self-update did not complete');
+      setErrorBanner({
+        title: t('AGY Market 自更新失败', 'AGY Market Self-Update Failed'),
+        items: [{ pluginName: 'AGY Market', message: errMsg }],
+        retryAction: { type: 'self-update' },
+      });
+      showToast(`${t('市场更新失败', 'Self-update failed')}: ${errMsg}`, { tone: 'danger', durationMs: 8000 });
     }
   } catch (err) {
-    showToast(`${t('市场更新失败', 'Self-update failed')}: ${err?.message || String(err)}`, { tone: 'error' });
+    const errMsg = err?.message || String(err);
+    setErrorBanner({
+      title: t('AGY Market 自更新失败', 'AGY Market Self-Update Failed'),
+      items: [{ pluginName: 'AGY Market', message: errMsg }],
+      retryAction: { type: 'self-update' },
+    });
+    showToast(`${t('市场更新失败', 'Self-update failed')}: ${errMsg}`, { tone: 'danger', durationMs: 8000 });
   } finally {
     state.selfUpdateBusy = false;
     render();
@@ -1142,11 +1377,22 @@ function startReconnectPolling(targetVersion = '') {
           const versionBehind = Boolean(
             targetVersion && data?.version && String(data.version) !== String(targetVersion),
           );
+          if (versionBehind) {
+            maybeTriggerRestartBanner({
+              pluginName: 'AGY Market',
+              reloadRequired: true,
+              activation: {
+                level: 'reload-pane',
+                reasonZh: 'AGY Market 已完成自更新，若界面未切换新版本请重开侧边栏。',
+                reasonEn: 'AGY Market updated; reopen Sidebar if UI has not switched to the new version.',
+              },
+            });
+          }
           showToast(
             versionBehind
               ? t(
-                  `服务已恢复 (v${data.version})，若界面未切换请刷新面板`,
-                  `Reconnected (v${data.version}); reload pane if UI did not refresh`,
+                  `服务已恢复 (v${data.version})，若界面未切换请重开侧边栏`,
+                  `Reconnected (v${data.version}); reopen Sidebar if UI did not refresh`,
                 )
               : t(
                   `AGY Market 已重启并恢复服务${data?.version ? ` (v${data.version})` : ''}`,
@@ -1263,6 +1509,7 @@ async function updatePrefs(patch, successMsg = '') {
       method: 'POST',
       body: { ...patch, workspaceUris: state.workspaceUris },
     });
+    syncFavoritesFromServerState();
     syncDetailPluginReference();
     if ('githubToken' in patch || 'clearGithubToken' in patch) {
       state.discussionsCache = {};
@@ -1275,30 +1522,59 @@ async function updatePrefs(patch, successMsg = '') {
       void checkUpdates(true, { silent: true });
     }
   } catch (err) {
-    showToast(`${t('保存失败', 'Save error')}: ${err?.message || String(err)}`, { tone: 'error' });
+    showToast(`${t('保存失败', 'Save error')}: ${err?.message || String(err)}`, { tone: 'danger' });
   } finally {
     state.loading = false;
     render();
   }
 }
 
-async function copyText(text, key, toastMsg = '') {
+function execCommandCopyFallback(text) {
+  const ta = document.createElement('textarea');
+  ta.value = String(text ?? '');
+  ta.setAttribute('readonly', '');
+  ta.style.position = 'fixed';
+  ta.style.top = '-9999px';
+  ta.style.left = '-9999px';
+  ta.style.opacity = '0';
+  ta.style.pointerEvents = 'none';
+  document.body.appendChild(ta);
+  ta.focus();
+  ta.select();
   try {
-    if (navigator.clipboard?.writeText) {
-      await navigator.clipboard.writeText(text);
-    } else {
-      const ta = document.createElement('textarea');
-      ta.value = text;
-      ta.style.position = 'fixed';
-      ta.style.opacity = '0';
-      document.body.appendChild(ta);
-      ta.select();
-      document.execCommand('copy');
-      ta.remove();
+    ta.setSelectionRange(0, ta.value.length);
+  } catch {
+    /* ignore */
+  }
+  let ok = false;
+  try {
+    ok = document.execCommand('copy');
+  } catch {
+    ok = false;
+  } finally {
+    ta.remove();
+  }
+  return ok;
+}
+
+async function copyText(text, key, toastMsg = '') {
+  const str = String(text ?? '');
+  let copied = false;
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(str);
+      copied = true;
+    } catch {
+      copied = execCommandCopyFallback(str);
     }
+  } else {
+    copied = execCommandCopyFallback(str);
+  }
+
+  if (copied) {
     state.copiedKey = key;
     if (toastMsg) {
-      showToast(toastMsg, { tone: 'ok', durationMs: 3200 });
+      showToast(toastMsg, { tone: 'ok', durationMs: 2800 });
     } else {
       render();
     }
@@ -1308,9 +1584,8 @@ async function copyText(text, key, toastMsg = '') {
         render();
       }
     }, 1800);
-  } catch {
-    showToast(t('复制失败，请手动选中复制', 'Copy failed'), { tone: 'error' });
   }
+  return copied;
 }
 
 // ==========================================================================
@@ -1327,7 +1602,7 @@ function renderBadgesHtml(capabilities = {}, { maxCount = 0 } = {}) {
 
   const html = visible
     .map((id) => {
-      const spec = CAPABILITY_BADGE_SPECS[id] || { tone: 'subtle', descZh: id, descEn: id };
+      const spec = getUiBadgeSpec(id);
       const label = cleanBadgeText(id, capabilities);
       const tip = loc === 'en' ? spec.descEn : spec.descZh;
       return `<span class="cap-badge tone-${escapeHtml(spec.tone)}" title="${escapeHtml(tip)}">${badgeIcon(id, 11)}<span>${escapeHtml(label)}</span></span>`;
@@ -1341,17 +1616,26 @@ function renderBadgesHtml(capabilities = {}, { maxCount = 0 } = {}) {
   return html;
 }
 
-function renderActivationBadgeHtml(activation) {
-  if (!activation || !activation.level) return '';
-  const loc = getLocale();
-  const tip = (loc === 'en' ? activation.reasonEn : activation.reasonZh) || '';
-  if (activation.level === 'host-restart') {
-    return `<span class="act-badge is-host-restart" title="${escapeHtml(tip)}">${icon('rocket', 10)} <span>${escapeHtml(t('需重启生效', 'Restart App'))}</span></span>`;
-  }
-  if (activation.level === 'reload-pane') {
-    return `<span class="act-badge is-reload-pane" title="${escapeHtml(tip)}">${icon('refresh', 10)} <span>${escapeHtml(t('需重开面板', 'Reload Pane'))}</span></span>`;
-  }
-  return `<span class="act-badge is-instant" title="${escapeHtml(tip)}">${icon('zap', 10)} <span>${escapeHtml(t('免重启', 'Instant'))}</span></span>`;
+function renderFavoriteButtonHtml({ key, displayName = '', sizeClass = '' }) {
+  if (!key) return '';
+  const fav = isFavoritedKey(key);
+  const icoSize = sizeClass === 'is-mini' ? 11 : sizeClass === 'is-drawer' ? 14 : 13;
+  const label = fav
+    ? t(`取消收藏「${displayName || key}」`, `Remove "${displayName || key}" from Favorites`)
+    : t(`收藏「${displayName || key}」`, `Add "${displayName || key}" to Favorites`);
+  return `
+    <button
+      type="button"
+      class="fav-btn ${fav ? 'is-favorited' : ''} ${sizeClass}"
+      data-action="toggle-favorite"
+      data-fav-key="${escapeHtml(key)}"
+      data-fav-name="${escapeHtml(displayName || '')}"
+      data-stop-card="1"
+      aria-pressed="${fav ? 'true' : 'false'}"
+      aria-label="${escapeHtml(label)}"
+      title="${escapeHtml(label)}"
+    >${icon(fav ? 'starFilled' : 'star', icoSize)}</button>
+  `;
 }
 
 function renderLogoHtml(iconUrl, name, { sizeClass = '', isSelf = false } = {}) {
@@ -1402,7 +1686,7 @@ function renderOpenPaneButtonHtml({ dir, sidecarPane, enabled, btnClass = 'dock-
   if (!dir || dir === 'agy-market' || !enabled || !sidecarPane?.uri) return '';
   const target = parseSidecarPaneTarget(dir, sidecarPane);
   if (!target) return '';
-  return `<button type="button" class="${btnClass}" data-action="open-pane" data-dir="${escapeHtml(target.dir)}" data-folder="${escapeHtml(target.folder)}" data-path="${escapeHtml(target.viewPath)}" data-title="${escapeHtml(target.title)}" data-uri="${escapeHtml(target.uri)}" title="${escapeHtml(t(`打开「${target.title}」辅助面板`, `Open "${target.title}" Sidecar pane`))}">${icon('panel', 12)} <span>${escapeHtml(label || t('面板', 'Pane'))}</span></button>`;
+  return `<button type="button" class="${btnClass}" data-action="open-pane" data-dir="${escapeHtml(target.dir)}" data-folder="${escapeHtml(target.folder)}" data-path="${escapeHtml(target.viewPath)}" data-title="${escapeHtml(target.title)}" data-uri="${escapeHtml(target.uri)}" data-stop-card="1" title="${escapeHtml(t(`打开「${target.title}」Sidebar 侧边栏`, `Open "${target.title}" Sidebar`))}">${icon('panel', 12)} <span>${escapeHtml(label || t('面板', 'Pane'))}</span></button>`;
 }
 
 function renderToggleSliderHtml({ dir, enabled, canToggle, toggleDisabledReason }) {
@@ -1534,23 +1818,70 @@ function renderSkeletonGrid(count = 4) {
 }
 
 // ==========================================================================
-// Aurora Spotlight Hero Strip & Smart Restart Notice Banner
+// Prominent Error Alert Banner, Smart Restart Banner & Aurora Spotlight Hero
 // ==========================================================================
 
-function renderRestartNoticeBanner() {
-  const rn = state.restartNotice;
+function renderErrorAlertBanner() {
+  const eb = state.errorBanner;
+  if (!eb) return '';
+  const items = Array.isArray(eb.items) ? eb.items : [];
+  const hasRetry = Boolean(eb.retryAction);
+
+  return `
+    <div class="error-alert-banner" role="alert" aria-live="assertive" data-agy-error-banner="1">
+      <div class="error-alert-main">
+        <div class="error-alert-icon">${icon('alertTriangle', 14)}</div>
+        <div class="error-alert-copy">
+          <div class="error-alert-title">
+            <span>${escapeHtml(eb.title)}</span>
+          </div>
+          ${
+            items.length
+              ? `<div class="error-alert-list">
+                  ${items
+                    .map(
+                      (it) => `
+                    <div class="error-alert-item">
+                      ${it.pluginName ? `<span class="error-plugin-chip">${escapeHtml(it.pluginName)}</span>` : ''}
+                      <span class="error-alert-detail">${escapeHtml(it.message)}</span>
+                    </div>
+                  `,
+                    )
+                    .join('')}
+                </div>`
+              : ''
+          }
+        </div>
+      </div>
+      <div class="error-alert-actions">
+        ${
+          hasRetry
+            ? `<button type="button" class="btn btn-danger-solid btn-sm" data-action="retry-error-banner">
+                ${icon('refresh', 12)}
+                <span>${escapeHtml(t('重试', 'Retry'))}</span>
+              </button>`
+            : ''
+        }
+        <button type="button" class="icon-btn is-square" data-action="dismiss-error-banner" title="${escapeHtml(t('关闭错误提示', 'Dismiss alert'))}">${icon('close', 13)}</button>
+      </div>
+    </div>
+  `;
+}
+
+function renderRestartBanner() {
+  const rn = state.restartBanner;
   if (!rn) return '';
   const isHostRestart = rn.level === 'host-restart';
   return `
-    <div class="restart-notice-banner ${isHostRestart ? 'is-host-restart' : 'is-reload-pane'}" role="status" aria-live="polite">
+    <div class="restart-notice-banner ${isHostRestart ? 'is-host-restart' : 'is-reload-pane'}" role="status" aria-live="polite" data-agy-restart-banner="1">
       <div class="restart-notice-main">
         <div class="restart-notice-icon">${icon(isHostRestart ? 'rocket' : 'refresh', 14)}</div>
         <div class="restart-notice-copy">
           <div class="restart-notice-title">
             <span>${escapeHtml(
               isHostRestart
-                ? t('需重启 Antigravity 客户端后生效', 'Restart Antigravity to apply changes')
-                : t('建议重开目标面板或刷新 MCP 生效', 'Reopen sidecar pane or refresh MCP'),
+                ? t('更新已就绪：请重启 Antigravity 客户端以生效', 'Update applied: restart Antigravity to take effect')
+                : t('更新已就绪：建议重开目标侧边栏或刷新 MCP 生效', 'Update applied: reopen Sidebar or refresh MCP'),
             )}</span>
             ${rn.plugins.length ? `<span class="restart-notice-tags">${rn.plugins.map((n) => `<span class="restart-plugin-chip">${escapeHtml(n)}</span>`).join('')}</span>` : ''}
           </div>
@@ -1558,7 +1889,7 @@ function renderRestartNoticeBanner() {
         </div>
       </div>
       <div class="self-update-actions">
-        <button type="button" class="icon-btn is-square" data-action="dismiss-restart-notice" title="${escapeHtml(t('知道了，收起提示', 'Dismiss notice'))}">${icon('close', 13)}</button>
+        <button type="button" class="icon-btn is-square" data-action="dismiss-restart-banner" title="${escapeHtml(t('知道了，收起提示', 'Dismiss notice'))}">${icon('close', 13)}</button>
       </div>
     </div>
   `;
@@ -1603,7 +1934,7 @@ function renderAuroraHeroStrip() {
       <div class="aurora-hero-inner">
         <div class="aurora-hero-top">
           <div class="aurora-hero-brand">
-            <span class="aurora-kicker">${icon('sparkle', 11)} ${escapeHtml(t('AURORA PRISM · 零 TOKEN 插件工坊', 'AURORA PRISM · ZERO-TOKEN ECOSYSTEM'))}</span>
+            <span class="aurora-kicker">${icon('sparkle', 11)} ${escapeHtml(t('AURORA PRISM · 反重力精选插件工坊', 'AURORA PRISM · ANTIGRAVITY PLUGIN STUDIO'))}</span>
             <h1 class="aurora-hero-title">${escapeHtml(t('探索、启停与守护你的 Antigravity 插件生态', 'Discover, toggle, and safeguard your Antigravity plugins'))}</h1>
             <p class="aurora-hero-sub">${escapeHtml(t('SHA-256 防篡改校验 · 停放仓无损滑块启停 · 5 层静态冲突健康雷达', 'SHA-256 verified mirrors · Vault-parking live toggles · 5-layer conflict health radar'))}</p>
           </div>
@@ -1651,6 +1982,184 @@ function renderAuroraHeroStrip() {
 }
 
 // ==========================================================================
+// Favorites Resolution, Collapsible Pinned Favorites Shelf & Favorites Tab
+// ==========================================================================
+
+function resolveFavoriteEntries() {
+  const { byId: catById, byDir: catByDir } = getCatalogMaps();
+  const installedByDir = getInstalledByDirMap();
+  const resolved = [];
+  const seen = new Set();
+
+  for (const rawKey of state.favorites) {
+    const key = String(rawKey || '').trim();
+    if (!key || seen.has(key)) continue;
+
+    if (catById.has(key)) {
+      seen.add(key);
+      const plugin = catById.get(key);
+      const st = plugin.installStatus || {};
+      const localItem = st.installedDir ? installedByDir.get(st.installedDir) || null : null;
+      resolved.push({ key, kind: 'catalog', plugin, localItem });
+      continue;
+    }
+
+    if (key.startsWith('local:')) {
+      const dir = key.slice('local:'.length);
+      const loc = installedByDir.get(dir);
+      if (loc) {
+        seen.add(key);
+        const catEntry = (loc.receipt?.id && catById.get(loc.receipt.id)) || catByDir.get(loc.dir) || null;
+        resolved.push({ key, kind: 'local', loc, catEntry });
+      }
+      continue;
+    }
+
+    const fallbackLoc =
+      (state.serverState?.installed || []).find((x) => x.receipt?.id === key || x.dir === key) || null;
+    if (fallbackLoc) {
+      seen.add(key);
+      const catEntry = catById.get(key) || catByDir.get(fallbackLoc.dir) || null;
+      if (catEntry) {
+        resolved.push({ key, kind: 'catalog', plugin: catEntry, localItem: fallbackLoc });
+      } else {
+        resolved.push({ key, kind: 'local', loc: fallbackLoc, catEntry: null });
+      }
+    }
+  }
+
+  return resolved;
+}
+
+function renderFavoritesShelf() {
+  const favEntries = resolveFavoriteEntries();
+  if (favEntries.length === 0) return '';
+
+  const { byId: updById, byDir: updByDir } = getUpdateMaps();
+
+  if (state.favoritesShelfCollapsed) {
+    return `
+      <section class="fav-shelf is-collapsed" aria-label="${escapeHtml(t('我的收藏栏', 'My Favorites'))}">
+        <div class="fav-shelf-head">
+          <div class="fav-shelf-title-group">
+            <span class="fav-shelf-star">${icon('starFilled', 13)}</span>
+            <span class="fav-shelf-title">${escapeHtml(t('我的收藏栏', 'My Favorites'))}</span>
+            <span class="fav-shelf-count">${favEntries.length}</span>
+            <div class="fav-shelf-compact-chips">
+              ${favEntries
+                .slice(0, 5)
+                .map((entry) => {
+                  const name =
+                    entry.kind === 'catalog'
+                      ? entry.plugin.displayName || entry.plugin.canonicalName
+                      : entry.loc.displayName || entry.loc.dir;
+                  const detailAttr =
+                    entry.kind === 'catalog'
+                      ? `data-action="detail" data-id="${escapeHtml(entry.plugin.id)}"`
+                      : `data-action="detail-local" data-dir="${escapeHtml(entry.loc.dir)}"`;
+                  return `<button type="button" class="fav-mini-pill" ${detailAttr} title="${escapeHtml(name)}">${escapeHtml(name)}</button>`;
+                })
+                .join('')}
+            </div>
+          </div>
+          <div class="fav-shelf-actions">
+            <button type="button" class="ghost-link" data-action="tab" data-tab="favorites">${escapeHtml(t('全部收藏 ›', 'All ›'))}</button>
+            <button type="button" class="hero-collapse-btn" data-action="toggle-favs-shelf" title="${escapeHtml(t('展开收藏栏', 'Expand favorites shelf'))}">
+              ${icon('chevronDown', 12)} <span>${escapeHtml(t('展开', 'Expand'))}</span>
+            </button>
+          </div>
+        </div>
+      </section>
+    `;
+  }
+
+  return `
+    <section class="fav-shelf" aria-label="${escapeHtml(t('我的收藏栏', 'My Favorites'))}">
+      <div class="fav-shelf-head">
+        <div class="fav-shelf-title-group">
+          <span class="fav-shelf-star">${icon('starFilled', 13)}</span>
+          <span class="fav-shelf-title">${escapeHtml(t('我的收藏栏', 'My Favorites'))}</span>
+          <span class="fav-shelf-count">${favEntries.length}</span>
+        </div>
+        <div class="fav-shelf-actions">
+          <button type="button" class="ghost-link" data-action="tab" data-tab="favorites">${escapeHtml(t('管理全部 ›', 'Manage All ›'))}</button>
+          <button type="button" class="hero-collapse-btn" data-action="toggle-favs-shelf" title="${escapeHtml(t('收起收藏栏', 'Collapse favorites shelf'))}">
+            ${icon('chevronUp', 12)} <span>${escapeHtml(t('收起', 'Compact'))}</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="fav-shelf-grid">
+        ${favEntries
+          .map((entry) => {
+            const isCat = entry.kind === 'catalog';
+            const p = isCat ? entry.plugin : entry.catEntry;
+            const loc = isCat ? entry.localItem : entry.loc;
+            const displayName = (isCat ? p.displayName || p.canonicalName : loc.displayName || loc.dir) || entry.key;
+            const version = loc?.version || p?.version || '0.0.0';
+            const dir = loc?.dir || p?.installStatus?.installedDir || '';
+            const isSelf = dir === 'agy-market' || p?.id === 'azwosile__agy-market';
+            const isEnabled = Boolean(loc ? loc.enabled : p?.installStatus?.enabled);
+            const sidecarPane = loc?.sidecarPane || p?.installStatus?.sidecarPane || null;
+            const upd = (p && updById.get(p.id)) || (dir ? updByDir.get(dir) : null);
+            const hasUpdate = Boolean((upd && upd.installable !== false) || (!upd && p?.installStatus?.hasUpdate));
+            const accent = resolveCardAccent(loc || p, p);
+            const iconUrl = p?.media?.iconUrl || '';
+            const monogram = String(displayName).trim().charAt(0).toUpperCase() || 'P';
+
+            let quickActionHtml = '';
+            if (loc && isEnabled && sidecarPane?.uri && !isSelf) {
+              quickActionHtml = renderOpenPaneButtonHtml({
+                dir,
+                sidecarPane,
+                enabled: true,
+                btnClass: 'dock-btn is-pane',
+                label: t('面板', 'Pane'),
+              });
+            } else if (hasUpdate && p) {
+              quickActionHtml = `<button type="button" class="btn btn-update-outline btn-sm" data-action="install" data-id="${escapeHtml(p.id)}" data-stop-card="1">${icon('update', 11)} ${escapeHtml(t('更新', 'Update'))}</button>`;
+            } else if (!loc && p) {
+              quickActionHtml = `<button type="button" class="btn btn-primary btn-sm" data-action="install" data-id="${escapeHtml(p.id)}" data-stop-card="1">${icon('download', 11)} ${escapeHtml(t('安装', 'Install'))}</button>`;
+            }
+
+            const detailAttrs = isCat
+              ? `data-action="detail" data-id="${escapeHtml(p.id)}"`
+              : `data-action="detail-local" data-dir="${escapeHtml(loc.dir)}"`;
+
+            return `
+              <div class="fav-shelf-item" style="--card-accent:${accent.a1};--card-accent-2:${accent.a2}" ${detailAttrs}>
+                <div class="fav-shelf-item-left">
+                  <div class="fav-mini-logo">
+                    ${
+                      iconUrl
+                        ? `<span aria-hidden="true">${escapeHtml(monogram)}</span><img src="${escapeHtml(iconUrl)}" alt="" loading="lazy" onerror="this.style.display='none'" />`
+                        : isSelf
+                          ? BRAND_LOGO_SVG
+                          : `<span aria-hidden="true">${escapeHtml(monogram)}</span>`
+                    }
+                  </div>
+                  <div class="fav-shelf-copy">
+                    <span class="fav-shelf-name" title="${escapeHtml(displayName)}">${escapeHtml(displayName)}</span>
+                    <span class="fav-shelf-meta">
+                      <span>v${escapeHtml(version)}</span>
+                      ${hasUpdate ? `<span style="color:var(--m-sky);font-weight:700">↑ v${escapeHtml(upd?.latestVersion || p?.version || '')}</span>` : loc ? `<span style="color:${isEnabled ? 'var(--m-ok)' : 'var(--m-muted)'}">${escapeHtml(isEnabled ? t('已启用', 'Active') : t('已停用', 'Parked'))}</span>` : ''}
+                    </span>
+                  </div>
+                </div>
+                <div class="fav-shelf-item-right">
+                  ${quickActionHtml}
+                  ${renderFavoriteButtonHtml({ key: entry.key, displayName, sizeClass: 'is-mini' })}
+                </div>
+              </div>
+            `;
+          })
+          .join('')}
+      </div>
+    </section>
+  `;
+}
+
+// ==========================================================================
 // Discover Card & Discover View
 // ==========================================================================
 
@@ -1676,7 +2185,8 @@ function renderPluginCard(p, updateById, installedByDir) {
   const isParked = Boolean(st.installed && !isEnabled);
   const canToggle = localItem ? localItem.canToggle : st.canToggle;
   const toggleDisabledReason = localItem ? localItem.toggleDisabledReason : st.toggleDisabledReason;
-  const activation = resolveActivationInfo(p);
+  const favKey = String(p.id || '');
+  const displayName = p.displayName || p.canonicalName;
 
   let versionChip = `<span class="version-tag">v${escapeHtml(p.version)}</span>`;
   if (upd && st.installed) {
@@ -1728,11 +2238,14 @@ function renderPluginCard(p, updateById, installedByDir) {
   return `
     <article class="plugin-card ${hasCatalogUpdate ? 'has-update' : ''} ${isParked ? 'is-parked' : ''}" style="--card-accent:${accent.a1};--card-accent-2:${accent.a2}">
       <div class="card-head" data-action="detail" data-id="${escapeHtml(p.id)}">
-        ${renderLogoHtml(p.media?.iconUrl, p.displayName || p.canonicalName, { isSelf })}
+        ${renderLogoHtml(p.media?.iconUrl, displayName, { isSelf })}
         <div class="card-title-wrap">
           <div class="card-title-row">
-            ${renderCardTitleHtml(p.displayName || p.canonicalName, repoUrl)}
-            ${versionChip}
+            ${renderCardTitleHtml(displayName, repoUrl)}
+            <div class="card-title-right">
+              ${versionChip}
+              ${renderFavoriteButtonHtml({ key: favKey, displayName })}
+            </div>
           </div>
           <div class="card-meta">
             <span class="card-slug" title="${escapeHtml(effectiveSlug)}">${escapeHtml(effectiveSlug)}</span>
@@ -1748,8 +2261,7 @@ function renderPluginCard(p, updateById, installedByDir) {
       <p class="card-desc" data-action="detail" data-id="${escapeHtml(p.id)}">${escapeHtml(desc)}</p>
 
       <div class="badge-row" data-action="detail" data-id="${escapeHtml(p.id)}" data-detail-tab="capabilities">
-        ${renderBadgesHtml(p.capabilities, { maxCount: 2 })}
-        ${renderActivationBadgeHtml(activation)}
+        ${renderBadgesHtml(p.capabilities, { maxCount: 3 })}
       </div>
 
       <div class="card-dock">
@@ -1881,6 +2393,8 @@ function renderDiscoverView() {
           : ''
       }
 
+      ${renderFavoritesShelf()}
+
       ${
         state.loading && !plugins.length
           ? renderSkeletonGrid(4)
@@ -1892,13 +2406,114 @@ function renderDiscoverView() {
                 <div class="empty-sub">${escapeHtml(
                   state.search || state.category !== 'all'
                     ? t('尝试更换搜索关键词或重置分类筛选。', 'Try another search query or reset your category filter.')
-                    : t('可在「源与设置」配置自定义目录源，或前往 agy-market-catalog 提交社区插件 PR。', 'Configure a custom feed in Sources or submit a YAML PR in agy-market-catalog.'),
+                    : t('可在「源与设置」配置自定义目录源，或点击右上角「+ 申请收录插件」提交社区插件。', 'Configure a custom feed in Sources or click "+ Submit Plugin" in the top bar.'),
                 )}</div>
                 ${
                   state.search || state.category !== 'all'
                     ? `<button type="button" class="btn btn-sm" data-action="reset-filters">${escapeHtml(t('重置筛选条件', 'Reset Filters'))}</button>`
                     : ''
                 }
+              </div>`
+      }
+    </div>
+  `;
+}
+
+// ==========================================================================
+// Favorites Tab View (`★ 收藏`)
+// ==========================================================================
+
+function renderFavoritesView() {
+  const loc = getLocale();
+  const allFavs = resolveFavoriteEntries();
+  const { byId: updById, byDir: updByDir } = getUpdateMaps();
+  const { byId: catById, byDir: catByDir } = getCatalogMaps();
+  const installedByDir = getInstalledByDirMap();
+  const q = state.favoritesSearch.trim().toLowerCase();
+
+  let filtered = allFavs.filter((entry) => {
+    if (!q) return true;
+    if (entry.kind === 'catalog') {
+      const p = entry.plugin;
+      const desc =
+        typeof p.description === 'object'
+          ? `${p.description.zh || ''} ${p.description.en || ''}`
+          : String(p.description || '');
+      const hay = `${p.displayName || ''} ${p.canonicalName || ''} ${p.scopedName || ''} ${p.id || ''} ${desc} ${(p.taxonomy?.tags || []).join(' ')} ${(p.capabilities?.badges || []).join(' ')}`.toLowerCase();
+      return hay.includes(q);
+    }
+    const l = entry.loc;
+    const desc = resolveInstalledDescription(l, entry.catEntry);
+    const hay = `${l.displayName || ''} ${l.name || ''} ${l.dir || ''} ${desc} ${l.description || ''}`.toLowerCase();
+    return hay.includes(q);
+  });
+
+  if (state.favoritesSortBy === 'stars') {
+    filtered = [...filtered].sort((a, b) => {
+      const sa = Number(a.plugin?.repository?.stars || a.catEntry?.repository?.stars || 0);
+      const sb = Number(b.plugin?.repository?.stars || b.catEntry?.repository?.stars || 0);
+      return sb - sa;
+    });
+  } else if (state.favoritesSortBy === 'name') {
+    filtered = [...filtered].sort((a, b) => {
+      const na = a.kind === 'catalog' ? a.plugin.displayName || a.plugin.canonicalName : a.loc.displayName || a.loc.dir;
+      const nb = b.kind === 'catalog' ? b.plugin.displayName || b.plugin.canonicalName : b.loc.displayName || b.loc.dir;
+      return String(na).localeCompare(String(nb), loc);
+    });
+  }
+
+  return `
+    <div class="filter-bar">
+      <div class="filter-row-top">
+        <div class="search-box">
+          ${icon('search', 14, 'search-ico')}
+          <input
+            id="favorites-search-input"
+            class="search-input"
+            type="text"
+            autocomplete="off"
+            placeholder="${escapeHtml(t('搜索已收藏插件名称、简介或标签…', 'Search favorited plugins by name, description, or tags…'))}"
+            value="${escapeHtml(state.favoritesSearch)}"
+          />
+          ${
+            state.favoritesSearch
+              ? `<button type="button" class="search-clear" data-action="clear-favorites-search" title="${escapeHtml(t('清空搜索', 'Clear search'))}">${icon('close', 11)}</button>`
+              : `<span class="search-kbd" aria-hidden="true">/</span>`
+          }
+        </div>
+
+        <select id="favorites-sort-select" class="select-input" aria-label="${escapeHtml(t('排序方式', 'Sort by'))}">
+          <option value="added" ${state.favoritesSortBy === 'added' ? 'selected' : ''}>${escapeHtml(t('按收藏顺序', 'Recently Starred'))}</option>
+          <option value="stars" ${state.favoritesSortBy === 'stars' ? 'selected' : ''}>${escapeHtml(t('按星标排序', 'Most Stars'))}</option>
+          <option value="name" ${state.favoritesSortBy === 'name' ? 'selected' : ''}>${escapeHtml(t('按名称排序', 'Name A–Z'))}</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="main-scroll">
+      ${
+        allFavs.length === 0
+          ? `<div class="empty-state">
+              <div class="empty-icon" style="background:var(--m-warn-soft);border-color:var(--m-warn-border);color:var(--m-warn)">${icon('starFilled', 22)}</div>
+              <div class="empty-title">${escapeHtml(t('还没有收藏的插件', 'No favorited plugins yet'))}</div>
+              <div class="empty-sub">${escapeHtml(t('点击任意插件卡片或详情页右上角的 ☆ 即可收藏，收藏后的插件将同时置顶在「探索」页收藏栏与本页面中。', 'Click ☆ on any plugin card or detail drawer to star it. Favorites also appear pinned on top of Discover.'))}</div>
+              <button type="button" class="btn btn-primary btn-sm" data-action="tab" data-tab="discover">${icon('compass', 12)} ${escapeHtml(t('去探索插件市场', 'Browse Discover'))}</button>
+            </div>`
+          : filtered.length === 0
+            ? `<div class="empty-state">
+                <div class="empty-icon">${icon('search', 20)}</div>
+                <div class="empty-title">${escapeHtml(t('未找到匹配的收藏插件', 'No matching favorites'))}</div>
+                <div class="empty-sub">${escapeHtml(t('尝试更换关键词或清空搜索条件。', 'Try a different keyword or clear the search input.'))}</div>
+                <button type="button" class="btn btn-sm" data-action="clear-favorites-search">${escapeHtml(t('清空搜索', 'Clear Search'))}</button>
+              </div>`
+            : `<div class="cards-grid">
+                ${filtered
+                  .map((entry) =>
+                    entry.kind === 'catalog'
+                      ? renderPluginCard(entry.plugin, updById, installedByDir)
+                      : renderInstalledCard(entry.loc, updById, updByDir, catById, catByDir),
+                  )
+                  .join('')}
               </div>`
       }
     </div>
@@ -1952,7 +2567,7 @@ function renderBatchResultsPanel() {
                 <span class="batch-row-msg" title="${escapeHtml(statusMsg)}">${escapeHtml(statusMsg)}</span>
               </div>
               <div class="batch-row-right">
-                ${r.restartRequired ? `<span class="act-badge is-host-restart">${icon('rocket', 10)} ${escapeHtml(t('需重启', 'Restart'))}</span>` : r.reloadRequired ? `<span class="act-badge is-reload-pane">${icon('refresh', 10)} ${escapeHtml(t('需重开面板', 'Reload'))}</span>` : ''}
+                ${r.ok && r.restartRequired ? `<span class="batch-act-pill is-host-restart">${icon('rocket', 10)} ${escapeHtml(t('请重启客户端', 'Restart App'))}</span>` : r.ok && r.reloadRequired ? `<span class="batch-act-pill is-reload-pane">${icon('refresh', 10)} ${escapeHtml(t('建议重开侧边栏', 'Reopen Sidebar'))}</span>` : ''}
                 ${openPaneBtn}
                 ${!r.ok && !isEscalated ? `<button type="button" class="btn btn-sm" data-action="retry-batch-one" data-id="${escapeHtml(r.id)}">${escapeHtml(t('重试', 'Retry'))}</button>` : ''}
               </div>
@@ -1964,6 +2579,105 @@ function renderBatchResultsPanel() {
   `;
 }
 
+function renderInstalledCard(loc, updById, updByDir, catById, catByDir) {
+  const upd = updByDir.get(loc.dir) || (loc.receipt?.id ? updById.get(loc.receipt.id) : null);
+  const catEntry = (upd && catById.get(upd.id)) || (loc.receipt?.id && catById.get(loc.receipt.id)) || catByDir.get(loc.dir) || null;
+  const canCatalogUpdate = Boolean(upd && upd.installable !== false && catEntry);
+  const isUpstreamOnly = Boolean(upd && upd.installable === false);
+  const isBusy = Boolean(
+    catEntry && (state.busyId === catEntry.id || (state.batchUpdating && state.batchTargetIds.includes(catEntry.id))),
+  );
+  const isSelf = loc.dir === 'agy-market';
+  const repoUrl = catEntry?.repository?.url || loc.repositoryUrl || '';
+  const discussUrl = deriveDiscussionsUrl(repoUrl);
+  const badgesObj = catEntry?.capabilities || loc.receipt?.grantedCapabilities || { badges: [] };
+  const accent = resolveCardAccent(loc, catEntry);
+  const localizedDesc = resolveInstalledDescription(loc, catEntry);
+  const isParked = !loc.enabled;
+  const displayName = loc.displayName || catEntry?.displayName || loc.dir;
+  const favKey = getLocalFavoriteKey(loc, catEntry);
+
+  const canToggle =
+    loc.canToggle !== undefined
+      ? loc.canToggle
+      : loc.scope === 'global' && !isSelf && !loc.hostDisabled;
+  const toggleDisabledReason =
+    loc.toggleDisabledReason ||
+    (isSelf ? 'self' : loc.hostDisabled ? 'host-disabled' : loc.scope !== 'global' ? loc.scope : '');
+
+  let actionHtml = '';
+  if (isBusy) {
+    actionHtml = `<button type="button" class="btn btn-primary btn-sm" disabled>${icon('refresh', 12, 'spin')} ${escapeHtml(t('更新中…', 'Updating…'))}</button>`;
+  } else if (canCatalogUpdate) {
+    actionHtml = `<button type="button" class="btn btn-update-outline btn-sm" data-action="install" data-id="${escapeHtml(catEntry.id)}">${icon('update', 12)} ${escapeHtml(t(`更新 v${upd.latestVersion}`, `Update v${upd.latestVersion}`))}</button>`;
+  } else if (isUpstreamOnly && upd.releaseUrl) {
+    actionHtml = `<a class="btn btn-upstream btn-sm" href="${escapeHtml(upd.releaseUrl)}" target="_blank" rel="noopener noreferrer" data-stop-card="1" title="${escapeHtml(t('上游 GitHub 有新版，等待目录同步', 'Available upstream, awaiting catalog sync'))}">${escapeHtml(t(`上游 v${upd.latestVersion}`, `Upstream v${upd.latestVersion}`))} ${icon('arrowUpRight', 12)}</a>`;
+  } else {
+    actionHtml = `<span class="state-pill is-enabled">${icon('check', 11)} ${escapeHtml(t('最新', 'Latest'))}</span>`;
+  }
+
+  const paneBtnHtml = renderOpenPaneButtonHtml({
+    dir: loc.dir,
+    sidecarPane: loc.sidecarPane,
+    enabled: loc.enabled,
+  });
+
+  return `
+    <article class="plugin-card ${canCatalogUpdate ? 'has-update' : ''} ${isParked ? 'is-parked' : ''}" style="--card-accent:${accent.a1};--card-accent-2:${accent.a2}">
+      <div class="card-head" data-action="detail-local" data-dir="${escapeHtml(loc.dir)}">
+        ${renderLogoHtml(catEntry?.media?.iconUrl, displayName, { isSelf })}
+        <div class="card-title-wrap">
+          <div class="card-title-row">
+            ${renderCardTitleHtml(displayName, repoUrl)}
+            <div class="card-title-right">
+              ${
+                upd
+                  ? `<span class="version-delta ${isUpstreamOnly ? 'is-upstream' : ''}">v${escapeHtml(loc.version)} → v${escapeHtml(upd.latestVersion)}</span>`
+                  : `<span class="version-tag">v${escapeHtml(loc.version)}</span>`
+              }
+              ${renderFavoriteButtonHtml({ key: favKey, displayName })}
+            </div>
+          </div>
+          <div class="card-meta">
+            <span class="card-slug" title="${escapeHtml(loc.dir)}">${escapeHtml(loc.dir)}</span>
+            <span class="meta-sep">·</span>
+            ${
+              isSelf
+                ? `<span class="self-running-pill">${icon('sparkle', 10)} ${escapeHtml(t('当前面板', 'Active Pane'))}</span>`
+                : loc.parkedByMarket
+                  ? `<span class="state-pill is-parked-tag">${escapeHtml(t('停放仓待机', 'Parked'))}</span>`
+                  : `<span class="state-pill ${loc.enabled ? 'is-enabled' : 'is-disabled'}">${escapeHtml(loc.enabled ? t('已启用', 'Enabled') : t('已停用', 'Disabled'))}</span>`
+            }
+            ${upd?.changelog ? `<span class="meta-sep">·</span><button type="button" class="notes-link" data-action="detail-local" data-dir="${escapeHtml(loc.dir)}" data-detail-tab="changelog">${escapeHtml(t('更新内容 ›', 'Notes ›'))}</button>` : `<span class="meta-sep">·</span><span>${escapeHtml(loc.scope || 'global')}</span>`}
+          </div>
+        </div>
+      </div>
+
+      <p class="card-desc" data-action="detail-local" data-dir="${escapeHtml(loc.dir)}">${escapeHtml(localizedDesc)}</p>
+
+      <div class="badge-row" data-action="detail-local" data-dir="${escapeHtml(loc.dir)}" data-detail-tab="capabilities">
+        ${badgesObj?.badges?.length ? renderBadgesHtml(badgesObj, { maxCount: 3 }) : ''}
+      </div>
+
+      <div class="card-dock">
+        <div class="dock-left">
+          ${renderToggleSliderHtml({
+            dir: loc.dir,
+            enabled: loc.enabled,
+            canToggle,
+            toggleDisabledReason,
+          })}
+        </div>
+        <div class="dock-right">
+          ${paneBtnHtml}
+          ${discussUrl ? `<a class="dock-btn" href="${escapeHtml(discussUrl)}" target="_blank" rel="noopener noreferrer" data-stop-card="1" title="GitHub Discussions">${icon('message', 12)} <span>${escapeHtml(t('讨论', 'Discuss'))}</span></a>` : ''}
+          ${actionHtml}
+        </div>
+      </div>
+    </article>
+  `;
+}
+
 function renderInstalledView() {
   const installed = state.serverState?.installed || [];
   const { byId: updById, byDir: updByDir } = getUpdateMaps();
@@ -1972,7 +2686,13 @@ function renderInstalledView() {
   const installableUpds = getInstallableUpdates();
   const upstreamOnlyCount = allUpdates.length - installableUpds.length;
   const activeCount = installed.filter((x) => x.enabled).length;
-  const parkedCount = installed.filter((x) => x.parkedByMarket || !x.enabled).length;
+  const disabledCount = installed.filter((x) => !x.enabled).length;
+  const updatableCount = installed.filter((loc) => {
+    const upd = updByDir.get(loc.dir) || (loc.receipt?.id ? updById.get(loc.receipt.id) : null);
+    const catEntry = (upd && catById.get(upd.id)) || (loc.receipt?.id && catById.get(loc.receipt.id)) || catByDir.get(loc.dir) || null;
+    return Boolean(upd || catEntry?.installStatus?.hasUpdate);
+  }).length;
+
   const checkedLabel = state.updates.checkedAt
     ? t(`上次检查：${formatRelativeTime(state.updates.checkedAt)}`, `Last checked ${formatRelativeTime(state.updates.checkedAt)}`)
     : t('正在自动检查远程更新…', 'Checking remote updates…');
@@ -1990,7 +2710,68 @@ function renderInstalledView() {
     return String(a.displayName || a.dir).localeCompare(String(b.displayName || b.dir));
   });
 
+  const q = state.installedSearch.trim().toLowerCase();
+  const filteredInstalled = sortedInstalled.filter((loc) => {
+    const upd = updByDir.get(loc.dir) || (loc.receipt?.id ? updById.get(loc.receipt.id) : null);
+    const catEntry = (upd && catById.get(upd.id)) || (loc.receipt?.id && catById.get(loc.receipt.id)) || catByDir.get(loc.dir) || null;
+    const hasUpd = Boolean(upd || catEntry?.installStatus?.hasUpdate);
+
+    if (state.installedFilter === 'enabled' && !loc.enabled) return false;
+    if (state.installedFilter === 'disabled' && loc.enabled) return false;
+    if (state.installedFilter === 'updatable' && !hasUpd) return false;
+
+    if (!q) return true;
+    const localizedDesc = resolveInstalledDescription(loc, catEntry);
+    const catDescObj = catEntry && typeof catEntry.description === 'object' ? catEntry.description : null;
+    const badges = (catEntry?.capabilities?.badges || loc.receipt?.grantedCapabilities?.badges || []).join(' ');
+    const hay = `${loc.displayName || ''} ${catEntry?.displayName || ''} ${loc.name || ''} ${loc.dir || ''} ${localizedDesc} ${loc.description || ''} ${catDescObj?.zh || ''} ${catDescObj?.en || ''} ${loc.scope || ''} ${badges}`.toLowerCase();
+    return hay.includes(q);
+  });
+
+  const filterChips = [
+    { key: 'all', label: t('全部', 'All'), count: installed.length, extraCls: '' },
+    { key: 'enabled', label: t('已启用', 'Enabled'), count: activeCount, extraCls: 'is-enabled-filter' },
+    { key: 'disabled', label: t('已禁用', 'Disabled'), count: disabledCount, extraCls: 'is-disabled-filter' },
+    { key: 'updatable', label: t('可更新', 'Updatable'), count: updatableCount, extraCls: 'is-updatable-filter' },
+  ];
+
   return `
+    <div class="filter-bar">
+      <div class="filter-row-top">
+        <div class="search-box">
+          ${icon('search', 14, 'search-ico')}
+          <input
+            id="installed-search-input"
+            class="search-input"
+            type="text"
+            autocomplete="off"
+            placeholder="${escapeHtml(t('搜索已安装插件名称、目录名或简介…', 'Search installed plugins by name, directory, or description…'))}"
+            value="${escapeHtml(state.installedSearch)}"
+          />
+          ${
+            state.installedSearch
+              ? `<button type="button" class="search-clear" data-action="clear-installed-search" title="${escapeHtml(t('清空搜索', 'Clear search'))}">${icon('close', 11)}</button>`
+              : `<span class="search-kbd" aria-hidden="true">/</span>`
+          }
+        </div>
+      </div>
+
+      <div class="chip-strip" role="tablist" aria-label="${escapeHtml(t('已安装状态筛选', 'Installed status filters'))}">
+        ${filterChips
+          .map(
+            (chip) => `
+            <button
+              type="button"
+              class="status-chip ${chip.extraCls} ${state.installedFilter === chip.key ? 'active' : ''}"
+              data-action="installed-filter"
+              data-filter="${chip.key}"
+            >${escapeHtml(chip.label)}<span class="cat-chip-n">${chip.count}</span></button>
+          `,
+          )
+          .join('')}
+      </div>
+    </div>
+
     <div class="main-scroll">
       <section class="updates-command-bar ${allUpdates.length > 0 ? 'has-updates' : ''}">
         <div class="updates-command-top">
@@ -2002,7 +2783,7 @@ function renderInstalledView() {
                   ? t('正在检测插件更新…', 'Checking for plugin updates…')
                   : allUpdates.length > 0
                     ? t(`发现 ${allUpdates.length} 个插件更新`, `${allUpdates.length} plugin update(s) available`)
-                    : t(`已安装 ${installed.length} 个插件（${activeCount} 运行中${parkedCount > 0 ? ` · ${parkedCount} 已停放` : ''}）`, `${installed.length} installed (${activeCount} active${parkedCount > 0 ? ` · ${parkedCount} parked` : ''})`),
+                    : t(`已安装 ${installed.length} 个插件（${activeCount} 运行中${disabledCount > 0 ? ` · ${disabledCount} 已停用` : ''}）`, `${installed.length} installed (${activeCount} active${disabledCount > 0 ? ` · ${disabledCount} disabled` : ''})`),
               )}</span>
             </div>
             <div class="updates-summary-sub">
@@ -2048,112 +2829,23 @@ function renderInstalledView() {
       ${
         state.loading && installed.length === 0
           ? renderSkeletonGrid(3)
-          : sortedInstalled.length === 0
+          : installed.length === 0
             ? `<div class="empty-state">
                 <div class="empty-icon">${icon('package', 20)}</div>
                 <div class="empty-title">${escapeHtml(t('尚未检测到已安装的插件', 'No local plugins detected yet'))}</div>
                 <div class="empty-sub">${escapeHtml(t('前往「探索」标签浏览并一键安装社区插件。', 'Browse the Discover tab to install community plugins with one click.'))}</div>
                 <button type="button" class="btn btn-primary btn-sm" data-action="tab" data-tab="discover">${escapeHtml(t('探索插件市场', 'Explore Market'))}</button>
               </div>`
-            : `<div class="cards-grid">
-                ${sortedInstalled
-                  .map((loc) => {
-                    const upd = updByDir.get(loc.dir) || (loc.receipt?.id ? updById.get(loc.receipt.id) : null);
-                    const catEntry = (upd && catById.get(upd.id)) || (loc.receipt?.id && catById.get(loc.receipt.id)) || catByDir.get(loc.dir) || null;
-                    const canCatalogUpdate = Boolean(upd && upd.installable !== false && catEntry);
-                    const isUpstreamOnly = Boolean(upd && upd.installable === false);
-                    const isBusy = Boolean(
-                      catEntry && (state.busyId === catEntry.id || (state.batchUpdating && state.batchTargetIds.includes(catEntry.id))),
-                    );
-                    const isSelf = loc.dir === 'agy-market';
-                    const repoUrl = catEntry?.repository?.url || loc.repositoryUrl || '';
-                    const discussUrl = deriveDiscussionsUrl(repoUrl);
-                    const badgesObj = catEntry?.capabilities || loc.receipt?.grantedCapabilities || { badges: [] };
-                    const activation = resolveActivationInfo(loc.activation ? loc : catEntry || loc, badgesObj);
-                    const accent = resolveCardAccent(loc, catEntry);
-                    const localizedDesc = resolveInstalledDescription(loc, catEntry);
-                    const isParked = !loc.enabled;
-
-                    const canToggle =
-                      loc.canToggle !== undefined
-                        ? loc.canToggle
-                        : loc.scope === 'global' && !isSelf && !loc.hostDisabled;
-                    const toggleDisabledReason =
-                      loc.toggleDisabledReason ||
-                      (isSelf ? 'self' : loc.hostDisabled ? 'host-disabled' : loc.scope !== 'global' ? loc.scope : '');
-
-                    let actionHtml = '';
-                    if (isBusy) {
-                      actionHtml = `<button type="button" class="btn btn-primary btn-sm" disabled>${icon('refresh', 12, 'spin')} ${escapeHtml(t('更新中…', 'Updating…'))}</button>`;
-                    } else if (canCatalogUpdate) {
-                      actionHtml = `<button type="button" class="btn btn-update-outline btn-sm" data-action="install" data-id="${escapeHtml(catEntry.id)}">${icon('update', 12)} ${escapeHtml(t(`更新 v${upd.latestVersion}`, `Update v${upd.latestVersion}`))}</button>`;
-                    } else if (isUpstreamOnly && upd.releaseUrl) {
-                      actionHtml = `<a class="btn btn-upstream btn-sm" href="${escapeHtml(upd.releaseUrl)}" target="_blank" rel="noopener noreferrer" data-stop-card="1" title="${escapeHtml(t('上游 GitHub 有新版，等待目录同步', 'Available upstream, awaiting catalog sync'))}">${escapeHtml(t(`上游 v${upd.latestVersion}`, `Upstream v${upd.latestVersion}`))} ${icon('arrowUpRight', 12)}</a>`;
-                    } else {
-                      actionHtml = `<span class="state-pill is-enabled">${icon('check', 11)} ${escapeHtml(t('最新', 'Latest'))}</span>`;
-                    }
-
-                    const paneBtnHtml = renderOpenPaneButtonHtml({
-                      dir: loc.dir,
-                      sidecarPane: loc.sidecarPane,
-                      enabled: loc.enabled,
-                    });
-
-                    return `
-                      <article class="plugin-card ${canCatalogUpdate ? 'has-update' : ''} ${isParked ? 'is-parked' : ''}" style="--card-accent:${accent.a1};--card-accent-2:${accent.a2}">
-                        <div class="card-head" data-action="detail-local" data-dir="${escapeHtml(loc.dir)}">
-                          ${renderLogoHtml(catEntry?.media?.iconUrl, loc.displayName, { isSelf })}
-                          <div class="card-title-wrap">
-                            <div class="card-title-row">
-                              ${renderCardTitleHtml(loc.displayName || catEntry?.displayName || loc.dir, repoUrl)}
-                              ${
-                                upd
-                                  ? `<span class="version-delta ${isUpstreamOnly ? 'is-upstream' : ''}">v${escapeHtml(loc.version)} → v${escapeHtml(upd.latestVersion)}</span>`
-                                  : `<span class="version-tag">v${escapeHtml(loc.version)}</span>`
-                              }
-                            </div>
-                            <div class="card-meta">
-                              <span class="card-slug" title="${escapeHtml(loc.dir)}">${escapeHtml(loc.dir)}</span>
-                              <span class="meta-sep">·</span>
-                              ${
-                                isSelf
-                                  ? `<span class="self-running-pill">${icon('sparkle', 10)} ${escapeHtml(t('当前面板', 'Active Pane'))}</span>`
-                                  : loc.parkedByMarket
-                                    ? `<span class="state-pill is-parked-tag">${escapeHtml(t('停放仓待机', 'Parked'))}</span>`
-                                    : `<span class="state-pill ${loc.enabled ? 'is-enabled' : 'is-disabled'}">${escapeHtml(loc.enabled ? t('已启用', 'Enabled') : t('已停用', 'Disabled'))}</span>`
-                              }
-                              ${upd?.changelog ? `<span class="meta-sep">·</span><button type="button" class="notes-link" data-action="detail-local" data-dir="${escapeHtml(loc.dir)}" data-detail-tab="changelog">${escapeHtml(t('更新内容 ›', 'Notes ›'))}</button>` : `<span class="meta-sep">·</span><span>${escapeHtml(loc.scope || 'global')}</span>`}
-                            </div>
-                          </div>
-                        </div>
-
-                        <p class="card-desc" data-action="detail-local" data-dir="${escapeHtml(loc.dir)}">${escapeHtml(localizedDesc)}</p>
-
-                        <div class="badge-row" data-action="detail-local" data-dir="${escapeHtml(loc.dir)}" data-detail-tab="capabilities">
-                          ${badgesObj?.badges?.length ? renderBadgesHtml(badgesObj, { maxCount: 2 }) : ''}
-                          ${renderActivationBadgeHtml(activation)}
-                        </div>
-
-                        <div class="card-dock">
-                          <div class="dock-left">
-                            ${renderToggleSliderHtml({
-                              dir: loc.dir,
-                              enabled: loc.enabled,
-                              canToggle,
-                              toggleDisabledReason,
-                            })}
-                          </div>
-                          <div class="dock-right">
-                            ${paneBtnHtml}
-                            ${discussUrl ? `<a class="dock-btn" href="${escapeHtml(discussUrl)}" target="_blank" rel="noopener noreferrer" data-stop-card="1" title="GitHub Discussions">${icon('message', 12)} <span>${escapeHtml(t('讨论', 'Discuss'))}</span></a>` : ''}
-                            ${actionHtml}
-                          </div>
-                        </div>
-                      </article>
-                    `;
-                  })
-                  .join('')}
-              </div>`
+            : filteredInstalled.length === 0
+              ? `<div class="empty-state">
+                  <div class="empty-icon">${icon('search', 20)}</div>
+                  <div class="empty-title">${escapeHtml(t('当前筛选条件下暂无已安装插件', 'No installed plugins match your filter'))}</div>
+                  <div class="empty-sub">${escapeHtml(t('尝试更换搜索关键词或切换上方状态筛选胶囊。', 'Try another search query or reset the status filter pill above.'))}</div>
+                  <button type="button" class="btn btn-sm" data-action="reset-installed-filters">${escapeHtml(t('重置筛选条件', 'Reset Filters'))}</button>
+                </div>`
+              : `<div class="cards-grid">
+                  ${filteredInstalled.map((loc) => renderInstalledCard(loc, updById, updByDir, catById, catByDir)).join('')}
+                </div>`
       }
     </div>
   `;
@@ -2436,7 +3128,7 @@ function renderSourcesView() {
             </div>
             <div class="telemetry-cell">
               <span class="telemetry-k">${escapeHtml(t('客户端版本', 'Client Version'))}</span>
-              <span class="telemetry-v">v${escapeHtml(state.serverState?.plugin?.version || '1.2.0')}</span>
+              <span class="telemetry-v">v${escapeHtml(state.serverState?.plugin?.version || '1.3.0')}</span>
             </div>
             <div class="telemetry-cell">
               <span class="telemetry-k">${escapeHtml(t('更新检查', 'Update Check'))}</span>
@@ -2452,7 +3144,7 @@ function renderSourcesView() {
               ${hasToken ? icon('lock', 10) : ''} ${escapeHtml(hasToken ? t('已安全保存', 'Saved Locally') : t('未配置', 'Not Set'))}
             </span>
           </div>
-          <p class="field-hint">${escapeHtml(t('仅保存在本机 Sidecar 数据目录中，绝不回显或打印日志。配置后可解锁插件详情内联 GitHub Discussions 列表，并将更新检测额度从每小时 60 次提升至 5,000 次。', 'Stored locally only and never echoed or logged. Unlocks inline GitHub Discussions threads in plugin details and raises update-check rate limits from 60/hr to 5,000/hr.'))}</p>
+          <p class="field-hint">${escapeHtml(t('仅保存在本机插件数据目录中，绝不回显或打印日志。配置后可解锁插件详情内联 GitHub Discussions 列表，并将更新检测额度从每小时 60 次提升至 5,000 次。', 'Stored locally only and never echoed or logged. Unlocks inline GitHub Discussions threads in plugin details and raises update-check rate limits from 60/hr to 5,000/hr.'))}</p>
           <div class="token-row">
             <input
               id="github-token-input"
@@ -2643,7 +3335,8 @@ function renderDetailDrawer() {
   const isEnabled = st.installed ? Boolean(localItem ? localItem.enabled : st.enabled) : false;
   const localScope = localItem?.scope || st.scope || 'global';
   const canRemoveFiles = Boolean(st.installed && installedDir && !isSelf && localScope === 'global');
-  const activation = resolveActivationInfo(p, localItem?.capabilities || p.capabilities);
+  const displayName = p.displayName || p.canonicalName;
+  const favKey = p._localOnly ? getLocalFavoriteKey(localItem || { dir: installedDir, receipt: { id: p.id } }, null) : String(p.id || '');
 
   let primaryBtn = '';
   if (p._localOnly) {
@@ -2700,7 +3393,6 @@ function renderDetailDrawer() {
     bodyHtml = `
       <div class="badge-row">
         ${renderBadgesHtml(p.capabilities)}
-        ${renderActivationBadgeHtml(activation)}
       </div>
       ${langTag}
       <div class="md-body">
@@ -2771,16 +3463,12 @@ function renderDetailDrawer() {
     const cap = p.capabilities || {};
     const badges = Array.isArray(cap.badges) ? cap.badges : [];
     bodyHtml = `
-      <div class="cap-detail-card" style="border-color:${activation.level === 'host-restart' ? 'var(--m-warn-border)' : activation.level === 'reload-pane' ? 'var(--m-sky-border)' : 'var(--m-ok-border)'}">
-        <div>${renderActivationBadgeHtml(activation)}</div>
-        <p class="cap-detail-desc">${escapeHtml((loc === 'en' ? activation.reasonEn : activation.reasonZh) || '')}</p>
-      </div>
       <div class="cap-detail-list">
         ${
           badges.length
             ? badges
                 .map((id) => {
-                  const spec = CAPABILITY_BADGE_SPECS[id] || { tone: 'subtle', descZh: id, descEn: id };
+                  const spec = getUiBadgeSpec(id);
                   const label = cleanBadgeText(id, cap);
                   const desc = loc === 'en' ? spec.descEn : spec.descZh;
                   return `
@@ -2829,7 +3517,10 @@ function renderDetailDrawer() {
                 ${Number(p.repository?.stars || 0) > 0 ? `<span class="meta-star">${icon('star', 11)} ${Number(p.repository.stars)}</span>` : ''}
               </div>
             </div>
-            <button type="button" class="icon-btn is-square" data-action="close-modal" title="${escapeHtml(t('关闭 (Esc)', 'Close (Esc)'))}">${icon('close', 14)}</button>
+            <div class="drawer-header-actions">
+              ${renderFavoriteButtonHtml({ key: favKey, displayName, sizeClass: 'is-drawer' })}
+              <button type="button" class="icon-btn is-square" data-action="close-modal" title="${escapeHtml(t('关闭 (Esc)', 'Close (Esc)'))}">${icon('close', 14)}</button>
+            </div>
           </div>
 
           <div class="drawer-cta-bar">
@@ -2857,7 +3548,7 @@ function renderDetailDrawer() {
             ${upd ? '<span class="status-dot is-pulse"></span>' : ''}
           </button>
           <button type="button" class="drawer-tab ${state.detailTab === 'capabilities' ? 'active' : ''}" data-action="detail-tab" data-tab="capabilities">
-            ${icon('shield', 12)} ${escapeHtml(t('能力与生效', 'Capabilities'))}
+            ${icon('shield', 12)} ${escapeHtml(t('能力声明', 'Capabilities'))}
           </button>
           <button type="button" class="drawer-tab ${state.detailTab === 'discuss' ? 'active' : ''}" data-action="detail-tab" data-tab="discuss">
             ${icon('message', 12)} ${escapeHtml(t('讨论', 'Discuss'))}
@@ -3079,12 +3770,13 @@ function render() {
   const prevDrawerScroll = root.querySelector('#market-drawer-body')?.scrollTop ?? 0;
 
   const catalogCount = state.serverState?.catalog?.plugins?.length || 0;
+  const favCount = resolveFavoriteEntries().length;
   const installedCount = state.serverState?.installed?.length || 0;
   const updatesCount = getEffectiveUpdateItems().length;
   const conflictSummary = getConflictsSummary();
   const curLocale = getLocale();
   const channelLabel = state.serverState?.catalog?.channelUsed || '';
-  const clientVer = state.serverState?.plugin?.version || '1.2.0';
+  const clientVer = state.serverState?.plugin?.version || '1.3.0';
   const showSelfOffer = isSelfBannerVisible();
   const hasDismissedSelfUpdate = Boolean(state.updates.selfUpdate && !showSelfOffer);
   const showInstalledDot = updatesCount > 0 || showSelfOffer;
@@ -3096,9 +3788,20 @@ function render() {
 
   let viewHtml = '';
   if (state.activeTab === 'discover') viewHtml = renderDiscoverView();
+  else if (state.activeTab === 'favorites') viewHtml = renderFavoritesView();
   else if (state.activeTab === 'installed') viewHtml = renderInstalledView();
   else if (state.activeTab === 'conflicts') viewHtml = renderConflictsView();
   else viewHtml = renderSourcesView();
+
+  const toastTone = state.toast?.tone || 'info';
+  const toastIco =
+    toastTone === 'danger' || toastTone === 'error'
+      ? icon('alertTriangle', 14, 'toast-lead-ico')
+      : toastTone === 'ok'
+        ? icon('checkCircle', 14, 'toast-lead-ico')
+        : toastTone === 'warn'
+          ? icon('alertCircle', 14, 'toast-lead-ico')
+          : icon('info', 14, 'toast-lead-ico');
 
   root.innerHTML = `
     <div class="market-shell" data-stuck="${state.scrolledStuck ? 'true' : 'false'}">
@@ -3107,7 +3810,7 @@ function render() {
           <div class="brand-mark">${BRAND_LOGO_SVG}</div>
           <div class="brand-copy">
             <span class="brand-title">AGY Market</span>
-            <span class="brand-meta-pill" title="${escapeHtml(channelLabel ? `${t('目录通道', 'Channel')}: ${channelLabel}` : t('极光棱镜 · 零 Token 辅助面板', 'Aurora Prism · Zero-Token Sidecar'))}">
+            <span class="brand-meta-pill" title="${escapeHtml(channelLabel ? `${t('目录通道', 'Channel')}: ${channelLabel}` : t('极光棱镜 · Sidebar 侧边栏', 'Aurora Prism · Sidebar Panel'))}">
               <span class="status-dot ${state.updates.rateLimited ? 'is-warn' : state.updates.loading ? 'is-pulse' : ''}"></span>
               <span>v${escapeHtml(clientVer)}</span>
             </span>
@@ -3119,6 +3822,11 @@ function render() {
             ${icon('compass', 13)}
             <span>${escapeHtml(t('探索', 'Discover'))}</span>
             <span class="nav-count">${catalogCount}</span>
+          </button>
+          <button type="button" class="nav-pill ${state.activeTab === 'favorites' ? 'active' : ''}" data-action="tab" data-tab="favorites" role="tab" aria-selected="${state.activeTab === 'favorites'}">
+            ${icon(favCount > 0 ? 'starFilled' : 'star', 13, favCount > 0 ? 'fav-nav-ico' : '')}
+            <span>${escapeHtml(t('收藏', 'Favorites'))}</span>
+            <span class="nav-count ${favCount > 0 ? 'is-fav' : ''}">${favCount}</span>
           </button>
           <button type="button" class="nav-pill ${state.activeTab === 'installed' ? 'active' : ''}" data-action="tab" data-tab="installed" role="tab" aria-selected="${state.activeTab === 'installed'}">
             ${icon('package', 13)}
@@ -3139,6 +3847,16 @@ function render() {
         </nav>
 
         <div class="header-actions">
+          <a
+            class="submit-plugin-btn"
+            href="${escapeHtml(SUBMIT_PLUGIN_GUIDE_URL)}"
+            target="_blank"
+            rel="noopener noreferrer"
+            title="${escapeHtml(t('查看社区插件投稿与自动收录指南', 'Read the plugin submission & auto-listing guide'))}"
+          >
+            ${icon('plus', 12)}
+            <span>${escapeHtml(t('申请收录插件', 'Submit Plugin'))}</span>
+          </a>
           ${
             hasDismissedSelfUpdate
               ? `<button type="button" class="icon-btn has-alert" data-action="restore-self-banner" title="${escapeHtml(t('AGY Market 有新版本可用', 'AGY Market update available'))}">${icon('sparkle', 13)} <span>v${escapeHtml(state.updates.selfUpdate.latestVersion)}</span></button>`
@@ -3151,8 +3869,9 @@ function render() {
         </div>
       </header>
 
+      ${renderErrorAlertBanner()}
       ${renderSelfUpdateBanner()}
-      ${renderRestartNoticeBanner()}
+      ${renderRestartBanner()}
 
       ${viewHtml}
 
@@ -3160,20 +3879,12 @@ function render() {
 
       ${
         state.toast
-          ? `<div class="toast-bar tone-${escapeHtml(state.toast.tone || 'info')}" role="status">
+          ? `<div class="toast-bar tone-${escapeHtml(toastTone)}" role="${toastTone === 'danger' || toastTone === 'error' ? 'alert' : 'status'}">
               <div class="toast-copy">
-                <span>${escapeHtml(state.toast.message)}</span>
+                <span class="toast-lead-row">${toastIco}<span>${escapeHtml(state.toast.message)}</span></span>
                 ${state.toast.subtext ? `<span class="toast-sub">${escapeHtml(state.toast.subtext)}</span>` : ''}
               </div>
               <div class="toast-actions">
-                ${
-                  state.toast.copyText
-                    ? `<button type="button" class="pill-link" data-action="copy-text" data-copy-key="toast-pill" data-copy-val="${escapeHtml(state.toast.copyText)}">
-                        ${icon(state.copiedKey === 'toast-pill' ? 'check' : 'copy', 11)}
-                        <span>${escapeHtml(state.copiedKey === 'toast-pill' ? t('已复制', 'Copied') : state.toast.copyLabel || t('复制药丸', 'Copy Pill'))}</span>
-                      </button>`
-                    : ''
-                }
                 <button type="button" class="icon-btn is-square" data-action="dismiss-toast" title="${escapeHtml(t('关闭', 'Dismiss'))}">${icon('close', 12)}</button>
               </div>
             </div>`
@@ -3260,6 +3971,30 @@ function bindDomEvents(root) {
     });
   }
 
+  const favSearchEl = root.querySelector('#favorites-search-input');
+  if (favSearchEl) {
+    favSearchEl.addEventListener('input', (e) => {
+      state.favoritesSearch = e.target.value;
+      render();
+    });
+  }
+
+  const favSortEl = root.querySelector('#favorites-sort-select');
+  if (favSortEl) {
+    favSortEl.addEventListener('change', (e) => {
+      state.favoritesSortBy = e.target.value;
+      render();
+    });
+  }
+
+  const instSearchEl = root.querySelector('#installed-search-input');
+  if (instSearchEl) {
+    instSearchEl.addEventListener('input', (e) => {
+      state.installedSearch = e.target.value;
+      render();
+    });
+  }
+
   const sortEl = root.querySelector('#market-sort-select');
   if (sortEl) {
     sortEl.addEventListener('change', (e) => {
@@ -3315,6 +4050,28 @@ function bindDomEvents(root) {
         state.heroCollapsed = !state.heroCollapsed;
         writeStorage(HERO_COLLAPSED_KEY, state.heroCollapsed ? '1' : '0');
         render();
+      } else if (action === 'toggle-favs-shelf') {
+        state.favoritesShelfCollapsed = !state.favoritesShelfCollapsed;
+        writeStorage(FAVS_SHELF_COLLAPSED_KEY, state.favoritesShelfCollapsed ? '1' : '0');
+        render();
+      } else if (action === 'toggle-favorite') {
+        e.stopPropagation();
+        const key = el.getAttribute('data-fav-key') || '';
+        const name = el.getAttribute('data-fav-name') || '';
+        if (key) void toggleFavorite(key, name);
+      } else if (action === 'clear-favorites-search') {
+        state.favoritesSearch = '';
+        render();
+      } else if (action === 'installed-filter') {
+        state.installedFilter = el.getAttribute('data-filter') || 'all';
+        render();
+      } else if (action === 'clear-installed-search') {
+        state.installedSearch = '';
+        render();
+      } else if (action === 'reset-installed-filters') {
+        state.installedSearch = '';
+        state.installedFilter = 'all';
+        render();
       } else if (action === 'category') {
         state.category = el.getAttribute('data-category') || 'all';
         render();
@@ -3358,12 +4115,19 @@ function bindDomEvents(root) {
         if (dir) {
           void openSiblingSidecarPane({ dir, folder, viewPath, title, uri });
         }
-      } else if (action === 'copy-uri-pill') {
+      } else if (action === 'open-uri-pane') {
         e.stopPropagation();
         const uri = el.getAttribute('data-uri') || '';
         const label = el.getAttribute('data-label') || uri;
-        if (uri) {
-          void copyText(`[${label}](${uri})`, `md-pill-${uri}`, t(`已复制聊天药丸 [${label}](${uri})`, `Copied chat pill [${label}](${uri})`));
+        const m = /^sidecar:\/\/([^/]+)\/([^/]+)(\/.*)?$/i.exec(uri);
+        if (m) {
+          void openSiblingSidecarPane({
+            dir: m[1],
+            folder: m[2],
+            viewPath: m[3] || '/',
+            title: label,
+            uri,
+          });
         }
       } else if (action === 'prompt-remove-files') {
         e.stopPropagation();
@@ -3377,9 +4141,23 @@ function bindDomEvents(root) {
       } else if (action === 'confirm-remove-files') {
         const dir = el.getAttribute('data-dir') || '';
         if (dir) void triggerRemovePluginFiles(dir);
-      } else if (action === 'dismiss-restart-notice') {
-        state.restartNotice = null;
+      } else if (action === 'dismiss-restart-banner') {
+        state.restartBanner = null;
         render();
+      } else if (action === 'dismiss-error-banner') {
+        state.errorBanner = null;
+        render();
+      } else if (action === 'retry-error-banner') {
+        const retry = state.errorBanner?.retryAction;
+        state.errorBanner = null;
+        render();
+        if (retry?.type === 'install' && retry.plugin) {
+          void triggerInstall(retry.plugin, retry.opts || {});
+        } else if (retry?.type === 'update-all') {
+          void triggerUpdateAll(retry.ids || null, { confirmEscalation: false });
+        } else if (retry?.type === 'self-update') {
+          void triggerSelfUpdate({ confirmEscalation: false });
+        }
       } else if (action === 'check-updates') {
         void checkUpdates(true, { silent: false });
       } else if (action === 'toggle-locale') {
@@ -3513,7 +4291,10 @@ window.addEventListener('keydown', (e) => {
   } else if (e.key === '/' && !e.ctrlKey && !e.metaKey && !e.altKey) {
     const tag = (document.activeElement?.tagName || '').toLowerCase();
     if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
-    const searchEl = document.getElementById('market-search-input');
+    const searchEl =
+      document.getElementById('market-search-input') ||
+      document.getElementById('favorites-search-input') ||
+      document.getElementById('installed-search-input');
     if (searchEl) {
       e.preventDefault();
       searchEl.focus();

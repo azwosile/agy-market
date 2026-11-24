@@ -1,6 +1,6 @@
 /* ==========================================================================
-   AGY Market v1.2 — Aurora Prism Static Showcase Stylesheet (`site/styles.css`)
-   Zero external dependencies. Mirrors the Sidecar Aurora Prism optical glass design.
+   AGY Market v1.3 — Aurora Prism Static Showcase Stylesheet (`site/styles.css`)
+   Zero external dependencies. Mirrors the Sidebar Aurora Prism optical glass design.
    ========================================================================== */
 
 :root {
@@ -138,6 +138,60 @@ h1 {
   background: rgba(255, 255, 255, 0.055);
   border: 1px solid var(--border);
   box-shadow: inset 0 1px 0 var(--specular);
+}
+
+.hero-cta-row {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 10px;
+  margin: 0 auto 24px;
+}
+
+.submit-guide-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 8.5px 16px;
+  border-radius: 10px;
+  border: 1px solid rgba(129, 140, 248, 0.55);
+  background: linear-gradient(135deg, rgba(99, 102, 241, 0.24), rgba(56, 189, 248, 0.18));
+  color: #e0e7ff;
+  text-decoration: none;
+  font-size: 13px;
+  font-weight: 680;
+  box-shadow: inset 0 1px 0 var(--specular), 0 4px 16px -4px rgba(99, 102, 241, 0.48);
+  transition: all 160ms ease;
+}
+
+.submit-guide-btn:hover {
+  background: linear-gradient(135deg, #6366f1 0%, #7c3aed 56%, #0284c7 100%);
+  border-color: rgba(199, 210, 254, 0.78);
+  color: #ffffff;
+  transform: translateY(-1px);
+}
+
+.repo-ghost-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 8.5px 15px;
+  border-radius: 10px;
+  border: 1px solid var(--border-strong);
+  background: rgba(255, 255, 255, 0.055);
+  color: var(--text-2);
+  text-decoration: none;
+  font-size: 13px;
+  font-weight: 620;
+  box-shadow: inset 0 1px 0 var(--specular);
+  transition: all 160ms ease;
+}
+
+.repo-ghost-btn:hover {
+  background: rgba(255, 255, 255, 0.11);
+  color: var(--text);
 }
 
 .bootstrap-box {

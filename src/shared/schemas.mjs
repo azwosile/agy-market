@@ -1,6 +1,6 @@
 // JSONC parser, manifest purity sanitizer, receipt schema & capability-escalation diff (`src/shared/schemas.mjs`).
 
-import { DEFAULT_PREFS, PLUGIN_JSON_ALLOWED_KEYS, PRIVILEGE_ESCALATION_BADGES } from './constants.mjs';
+import { DEFAULT_PREFS, MAX_FAVORITES, PLUGIN_JSON_ALLOWED_KEYS, PRIVILEGE_ESCALATION_BADGES } from './constants.mjs';
 
 export function parseJsonc(rawText) {
   const src = String(rawText || '').replace(/^\uFEFF/, '');
@@ -88,6 +88,21 @@ export function sanitizeNativePluginManifest(rawManifest) {
   return clean;
 }
 
+export function sanitizeFavorites(rawFavorites) {
+  if (!Array.isArray(rawFavorites)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const entry of rawFavorites) {
+    if (typeof entry !== 'string') continue;
+    const key = entry.trim();
+    if (!key || key.length > 200 || seen.has(key)) continue;
+    seen.add(key);
+    out.push(key);
+    if (out.length >= MAX_FAVORITES) break;
+  }
+  return out;
+}
+
 export function sanitizePrefs(input = {}) {
   const src = input && typeof input === 'object' ? input : {};
   const locale = src.locale === 'en' ? 'en' : 'zh';
@@ -102,6 +117,7 @@ export function sanitizePrefs(input = {}) {
   const customFeeds = Array.isArray(src.customFeeds)
     ? [...new Set(src.customFeeds.map((u) => String(u || '').trim()).filter((u) => /^https?:\/\/|^file:\/\//i.test(u)))]
     : [];
+  const favorites = sanitizeFavorites(src.favorites);
 
   return {
     schemaVersion: 1,
@@ -112,6 +128,7 @@ export function sanitizePrefs(input = {}) {
     githubReleaseMirrorPrefix,
     githubToken,
     customFeeds,
+    favorites,
   };
 }
 
