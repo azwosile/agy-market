@@ -1,12 +1,18 @@
 // Localhost 127.0.0.1 Sidecar HTTP Router, X-Sidecar-Token CSRF Guard & State Persistence (`src/sidecar/server.mjs`).
 
 import { randomBytes, timingSafeEqual } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { dirname, join, resolve } from 'node:path';
 import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { fetchPluginDiscussions } from '../discussions/index.mjs';
+import {
+  inspectGithubPluginUrl,
+  installGithubPlugin,
+  resolveAndStageGithubUpdate,
+  sweepExpiredInspectStaging,
+} from '../installer/github-url.mjs';
 import {
   fixLocalConflict,
   installOrUpdateCatalogPlugin,
@@ -21,7 +27,6 @@ import { resolveMarketCatalog } from '../registry/index.mjs';
 import { classifyActivationRequirement } from '../shared/activation.mjs';
 import {
   CUSTOMIZATION_URI,
-  DEFAULT_PREFS,
   MAX_FAVORITES,
   PLUGIN_DISPLAY_NAME,
   PLUGIN_ID,
@@ -35,7 +40,13 @@ import {
   resolveMarketDataDir,
   resolvePluginsDir,
 } from '../shared/paths.mjs';
-import { computeCapabilityEscalation, sanitizeFavorites, sanitizePrefs, toPublicPrefs } from '../shared/schemas.mjs';
+import {
+  computeCapabilityEscalation,
+  loadPrefsFromDisk,
+  sanitizeFavorites,
+  savePrefsToDisk,
+  toPublicPrefs,
+} from '../shared/schemas.mjs';
 import { isNewerVersion } from '../shared/semver.mjs';
 import { checkPluginUpdates, isCatalogPluginInstallable } from '../updates/index.mjs';
 import { openSiblingSidecarPane } from './open-pane.mjs';
@@ -97,15 +108,12 @@ const PRELOAD_SHIM_JS = `(function() {
 
   function createUiFallback() {
     return {
-      toggleAuxPane: function(payload) {
-        var posted = false;
+      toggleAuxPane: function(request) {
         try {
           if (window.parent && window.parent !== window) {
-            window.parent.postMessage({ type: 'toggle-aux-pane', payload: payload || {} }, '*');
-            posted = true;
+            window.parent.postMessage({ type: 'toggle-aux-pane', payload: request || {} }, '*');
           }
         } catch (_) {}
-        return Promise.resolve({ ok: false, fallback: true, posted: posted });
       }
     };
   }
@@ -153,6 +161,7 @@ function isAllowedOriginHeader(originHeader) {
   if (!originHeader || originHeader === 'null') return true; // isolated host iframe or same-origin non-CORS
   const orig = String(originHeader).trim().toLowerCase();
   if (orig.startsWith('vscode-webview://')) return true;
+  if (orig.startsWith('plugin://')) return true;
   try {
     const u = new URL(orig);
     return (
@@ -164,13 +173,39 @@ function isAllowedOriginHeader(originHeader) {
   }
 }
 
-function injectBootIntoHtml(rawHtml, token, conversationId = '') {
-  const bootScript = `<script>window.__SIDECAR_BOOT__=${JSON.stringify({ token, conversationId })};</script>`;
-  let html = rawHtml.includes('</head>') ? rawHtml.replace('</head>', `${bootScript}\n</head>`) : `${bootScript}\n${rawHtml}`;
-  if (token) {
-    html = html.replace(/src=(["'])\/preload\.js\1/g, `src=$1/preload.js?token=${encodeURIComponent(token)}$1`);
+function injectBootIntoHtml(rawHtml, token, conversationId = '', { preloadToken = token } = {}) {
+  const bootPayload = JSON.stringify({ token, conversationId }).replace(/</g, '\\u003c');
+  const bootScript = `<script>window.__SIDECAR_BOOT__=${bootPayload};</script>`;
+  const preloadTagRe = /<script\b[^>]*\bsrc=(["'])\/preload\.js\1[^>]*>/i;
+  let html;
+  if (preloadTagRe.test(rawHtml)) {
+    html = rawHtml.replace(preloadTagRe, (match) => `${bootScript}\n  ${match}`);
+  } else if (rawHtml.includes('</head>')) {
+    html = rawHtml.replace('</head>', `${bootScript}\n</head>`);
+  } else {
+    html = `${bootScript}\n${rawHtml}`;
+  }
+  const effectivePreloadToken = typeof preloadToken === 'string' ? preloadToken.trim() : '';
+  if (effectivePreloadToken) {
+    html = html.replace(
+      /src=(["'])\/preload\.js\1/g,
+      `src=$1/preload.js?token=${encodeURIComponent(effectivePreloadToken)}$1`,
+    );
   }
   return html;
+}
+
+function parseWorkspaceUrisInput(raw) {
+  if (Array.isArray(raw)) {
+    return raw.filter((v) => typeof v === 'string' && v.trim().length > 0);
+  }
+  if (typeof raw === 'string' && raw.trim()) {
+    return raw
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+  return [];
 }
 
 function sendJson(res, status, payload, onFlushed = null) {
@@ -213,33 +248,6 @@ function readJsonBody(req, maxBytes = MAX_JSON_BODY) {
     });
     req.on('error', rejectPromise);
   });
-}
-
-function loadPrefsFromDisk(dataDir) {
-  const prefsPath = join(dataDir, 'prefs.json');
-  if (!existsSync(prefsPath)) return sanitizePrefs(DEFAULT_PREFS);
-  try {
-    return sanitizePrefs(JSON.parse(readFileSync(prefsPath, 'utf8')));
-  } catch {
-    return sanitizePrefs(DEFAULT_PREFS);
-  }
-}
-
-function savePrefsToDisk(dataDir, nextPrefs) {
-  mkdirSync(dataDir, { recursive: true });
-  const clean = sanitizePrefs(nextPrefs);
-  const tmpPath = join(dataDir, `prefs.json.${process.pid}.${Date.now()}.tmp`);
-  const dstPath = join(dataDir, 'prefs.json');
-  const writeOpts = clean.githubToken ? { encoding: 'utf8', mode: 0o600 } : { encoding: 'utf8' };
-  const serialized = `${JSON.stringify(clean, null, 2)}\n`;
-  writeFileSync(tmpPath, serialized, writeOpts);
-  try {
-    renameSync(tmpPath, dstPath);
-  } catch {
-    writeFileSync(dstPath, serialized, writeOpts);
-    rmSync(tmpPath, { force: true });
-  }
-  return clean;
 }
 
 function isSelfPluginCandidate(plugin, installedDir = '') {
@@ -338,8 +346,9 @@ export async function createMarketSidecarServer(options = {}) {
   );
   const listenPort = options.port !== undefined ? Number(options.port) : Number.isFinite(envPort) ? envPort : 0;
 
-  // Sweep retired Windows binaries immediately on boot
+  // Sweep retired Windows binaries & expired GitHub URL inspect staging immediately on boot
   sweepRetiredBinaries(dataDir);
+  sweepExpiredInspectStaging(dataDir, nowFn());
 
   // Schedule 8s boot crash-recovery check for `pending-journal.json`
   const recoveryDelayMs = options.recoveryDelayMs ?? 8000;
@@ -391,7 +400,7 @@ export async function createMarketSidecarServer(options = {}) {
   function findCatalogCapabilitiesForDir(dirName) {
     const plugins = lastCatalog?.plugins || [];
     const matched = plugins.find(
-      (p) => p.canonicalName === dirName || p.scopedName === dirName || p.id === dirName,
+      (p) => (!p.forceScopedInstall && p.canonicalName === dirName) || p.scopedName === dirName || p.id === dirName,
     );
     return matched?.capabilities || null;
   }
@@ -408,7 +417,7 @@ export async function createMarketSidecarServer(options = {}) {
     const catalogByDir = new Map();
     for (const cp of catalogPlugins) {
       if (cp?.id) catalogById.set(cp.id, cp);
-      if (cp?.canonicalName) catalogByDir.set(cp.canonicalName, cp);
+      if (cp?.canonicalName && !cp?.forceScopedInstall) catalogByDir.set(cp.canonicalName, cp);
       if (cp?.scopedName) catalogByDir.set(cp.scopedName, cp);
     }
 
@@ -541,11 +550,21 @@ export async function createMarketSidecarServer(options = {}) {
         ? readFileSync(indexHtmlPath, 'utf8')
         : '<!doctype html><html><body><div id="app">Run node scripts/build.mjs to build AGY Market UI.</div></body></html>';
       const convId = urlObj.searchParams.get('conversationId') || '';
+      const reqQueryToken = String(urlObj.searchParams.get('token') || '').trim();
+      const reqHeaderToken =
+        typeof req.headers['x-sidecar-token'] === 'string' ? req.headers['x-sidecar-token'].trim() : '';
+      const verifiedReqToken =
+        [reqQueryToken, reqHeaderToken].find(
+          (tk) => tk && validTokens.some((expected) => safeCompareTokens(tk, expected)),
+        ) || '';
+      const hostToken = hostEnvToken || verifiedReqToken || '';
+      const bootToken = hostToken || generatedSideToken;
+      const preloadToken = hostToken || (!hostEnvToken ? generatedSideToken : '');
       res.writeHead(200, {
         'Content-Type': 'text/html; charset=utf-8',
         'Cache-Control': 'no-store',
       });
-      res.end(injectBootIntoHtml(rawHtml, generatedSideToken, convId));
+      res.end(injectBootIntoHtml(rawHtml, bootToken, convId, { preloadToken }));
       return;
     }
 
@@ -975,18 +994,117 @@ export async function createMarketSidecarServer(options = {}) {
         return;
       }
 
+      if (pathname === '/api/github/inspect') {
+        const workspaceUris = parseWorkspaceUrisInput(body.workspaceUris);
+        if (!lastCatalog) {
+          await ensureCatalogLoaded({ forceCatalogRefresh: false, includeReadmes: false }).catch(() => null);
+        }
+        const rawInspect = await inspectGithubPluginUrl({
+          url: typeof body.url === 'string' ? body.url : '',
+          inspectToken: typeof body.inspectToken === 'string' ? body.inspectToken.trim() : '',
+          pluginRoot: typeof body.pluginRoot === 'string' ? body.pluginRoot.trim() : '',
+          prefs,
+          configDir,
+          dataDir,
+          workspaceUris,
+          catalogPlugins: lastCatalog?.plugins || [],
+          fetchImpl,
+          githubApiBaseUrl,
+          nowMs: nowFn(),
+        });
+        const { _internal, ...publicInspect } = rawInspect;
+        sendJson(res, 200, publicInspect);
+        return;
+      }
+
+      if (pathname === '/api/github/install') {
+        const workspaceUris = parseWorkspaceUrisInput(body.workspaceUris);
+        if (!lastCatalog) {
+          await ensureCatalogLoaded({ forceCatalogRefresh: false, includeReadmes: false }).catch(() => null);
+        }
+        const rawResult = await installGithubPlugin({
+          inspectToken: typeof body.inspectToken === 'string' ? body.inspectToken.trim() : '',
+          url: typeof body.url === 'string' ? body.url : '',
+          pluginRoot: typeof body.pluginRoot === 'string' ? body.pluginRoot.trim() : '',
+          installMode: typeof body.installMode === 'string' ? body.installMode.trim() : '',
+          confirmEscalation: Boolean(body.confirmEscalation),
+          prefs,
+          configDir,
+          dataDir,
+          workspaceUris,
+          catalogPlugins: lastCatalog?.plugins || [],
+          fetchImpl,
+          githubApiBaseUrl,
+          nowMs: nowFn(),
+        });
+        const { _internal, ...result } = rawResult;
+        if (result.ok) {
+          invalidateUpdateCheckState();
+        }
+        const state = await buildEnrichedState({ forceCatalogRefresh: false, workspaceUris });
+        sendJson(res, 200, { ...result, state });
+        return;
+      }
+
       if (pathname === '/api/install' || pathname === '/api/update') {
         const targetId = String(body.id || '').trim();
+        const targetDir = String(body.dir || '').trim();
+        const workspaceUris = parseWorkspaceUrisInput(body.workspaceUris);
         if (!lastCatalog) {
           await buildEnrichedState({ forceCatalogRefresh: false });
         }
-        const plugin =
-          body.plugin && typeof body.plugin === 'object'
+        const forceGithubUrlUpdate =
+          pathname === '/api/update' && (body.source === 'github-url' || body.updateChannel === 'github-url');
+        const plugin = forceGithubUrlUpdate
+          ? null
+          : body.plugin && typeof body.plugin === 'object'
             ? body.plugin
             : (lastCatalog?.plugins || []).find((p) => p.id === targetId);
 
+        if (!plugin && pathname === '/api/update') {
+          const inventory = scanLocalPluginInventory({ configDir, dataDir, workspaceUris, linkInfoOverride });
+          const localGithubPlugin = inventory.installed.find(
+            (loc) =>
+              loc.scope === 'global' &&
+              loc.receipt?.track === 'github-url' &&
+              ((targetDir && loc.dir === targetDir) ||
+                (targetId && (loc.receipt?.id === targetId || loc.dir === targetId))),
+          );
+
+          if (localGithubPlugin) {
+            const updateHint =
+              body.updateHint && typeof body.updateHint === 'object'
+                ? body.updateHint
+                : body.targetRef
+                  ? {
+                      targetRef: String(body.targetRef),
+                      updateKind: String(body.updateKind || ''),
+                      trackBranch: String(body.trackBranch || ''),
+                    }
+                  : null;
+            const rawResult = await resolveAndStageGithubUpdate({
+              loc: localGithubPlugin,
+              updateHint,
+              confirmEscalation: Boolean(body.confirmEscalation),
+              prefs,
+              configDir,
+              dataDir,
+              workspaceUris,
+              catalogPlugins: lastCatalog?.plugins || [],
+              fetchImpl,
+              githubApiBaseUrl,
+              nowMs: nowFn(),
+            });
+            const { _internal, ...result } = rawResult;
+            invalidateUpdateCheckState();
+            const state = await buildEnrichedState({ forceCatalogRefresh: false, workspaceUris });
+            sendJson(res, 200, { ...result, state });
+            return;
+          }
+        }
+
         if (!plugin) {
-          sendJson(res, 404, { ok: false, error: `Plugin "${targetId}" not found in active catalog` });
+          sendJson(res, 404, { ok: false, error: `Plugin "${targetId || targetDir}" not found in active catalog` });
           return;
         }
 
@@ -998,14 +1116,14 @@ export async function createMarketSidecarServer(options = {}) {
           confirmEscalation: Boolean(body.confirmEscalation),
           configDir,
           dataDir,
-          workspaceUris: Array.isArray(body.workspaceUris) ? body.workspaceUris : [],
+          workspaceUris,
           fetchImpl,
         });
 
         invalidateUpdateCheckState();
         const state = await buildEnrichedState({
           forceCatalogRefresh: false,
-          workspaceUris: Array.isArray(body.workspaceUris) ? body.workspaceUris : [],
+          workspaceUris,
         });
         sendJson(res, 200, { ...result, state });
 
@@ -1021,6 +1139,9 @@ export async function createMarketSidecarServer(options = {}) {
         await ensureCatalogLoaded({ forceCatalogRefresh: false, includeReadmes: false });
         const inventory = scanLocalPluginInventory({ configDir, dataDir, workspaceUris, linkInfoOverride });
         const catalogPlugins = lastCatalog?.plugins || [];
+        const githubUrlInstalled = inventory.installed.filter(
+          (loc) => loc.scope === 'global' && loc.receipt?.track === 'github-url',
+        );
 
         const queue = [];
         if (Array.isArray(body.ids)) {
@@ -1031,6 +1152,18 @@ export async function createMarketSidecarServer(options = {}) {
             seenReqIds.add(reqId);
             const plugin = catalogPlugins.find((p) => p.id === reqId || p.canonicalName === reqId) || null;
             if (!plugin) {
+              const ghLoc =
+                githubUrlInstalled.find((loc) => loc.receipt?.id === reqId || loc.dir === reqId) || null;
+              if (ghLoc) {
+                queue.push({
+                  id: ghLoc.receipt.id,
+                  dir: ghLoc.dir,
+                  githubUrlLoc: ghLoc,
+                  updateHint: null,
+                  isSelf: false,
+                });
+                continue;
+              }
               queue.push({
                 id: reqId,
                 missing: true,
@@ -1059,17 +1192,48 @@ export async function createMarketSidecarServer(options = {}) {
             });
           }
         } else {
+          const queuedDirs = new Set();
           for (const plugin of catalogPlugins) {
             if (!isCatalogPluginInstallable(plugin)) continue;
             const preflight = resolveInstallPreflight(plugin, inventory, { conflictStrategy: 'prompt' });
             const localMatch = preflight.action === 'update' ? preflight.existingInstall : null;
             if (!localMatch || !isNewerVersion(plugin.version, localMatch.version)) continue;
+            queuedDirs.add(localMatch.dir);
             queue.push({
               id: plugin.id,
               dir: localMatch.dir,
               plugin,
               isSelf: isSelfPluginCandidate(plugin, localMatch.dir),
             });
+          }
+
+          const remainingGhLocs = githubUrlInstalled.filter((loc) => !queuedDirs.has(loc.dir));
+          if (remainingGhLocs.length > 0) {
+            const ghCheck = await checkPluginUpdates({
+              catalog: lastCatalog,
+              inventory,
+              dataDir,
+              prefs,
+              force: false,
+              fetchImpl,
+              nowMs: nowFn(),
+              ...(updateCheckTtlMs !== undefined ? { ttlMs: updateCheckTtlMs } : {}),
+              currentSelfVersion,
+              githubApiBaseUrl,
+            });
+            for (const upd of ghCheck.items || []) {
+              if (!upd.installable || upd.updateChannel !== 'github-url' || queuedDirs.has(upd.dir)) continue;
+              const ghLoc = remainingGhLocs.find((loc) => loc.dir === upd.dir) || null;
+              if (!ghLoc) continue;
+              queuedDirs.add(ghLoc.dir);
+              queue.push({
+                id: ghLoc.receipt.id,
+                dir: ghLoc.dir,
+                githubUrlLoc: ghLoc,
+                updateHint: upd,
+                isSelf: false,
+              });
+            }
           }
         }
 
@@ -1101,6 +1265,55 @@ export async function createMarketSidecarServer(options = {}) {
               status: 'NOT_INSTALLABLE',
               error: `Plugin "${item.id}" lacks a verified catalog tarball/sha256`,
             });
+            continue;
+          }
+
+          if (item.githubUrlLoc) {
+            const ghLoc = item.githubUrlLoc;
+            try {
+              const out = await resolveAndStageGithubUpdate({
+                loc: ghLoc,
+                updateHint: item.updateHint || null,
+                confirmEscalation,
+                prefs,
+                configDir,
+                dataDir,
+                workspaceUris,
+                catalogPlugins,
+                fetchImpl,
+                githubApiBaseUrl,
+                nowMs: nowFn(),
+              });
+              results.push({
+                id: item.id,
+                dir: out.installedDir || ghLoc.dir,
+                displayName: ghLoc.displayName || ghLoc.name || ghLoc.dir,
+                ok: Boolean(out.ok),
+                status: out.status || (out.ok ? 'INSTALLED' : 'ERROR'),
+                ...(out.error ? { error: out.error } : {}),
+                ...(out.installedDir ? { installedDir: out.installedDir } : {}),
+                ...(out.version ? { version: out.version } : {}),
+                ...(out.installedVersion ? { installedVersion: out.installedVersion } : {}),
+                ...(out.targetVersion ? { targetVersion: out.targetVersion } : {}),
+                ...(out.escalation ? { escalation: out.escalation } : {}),
+                ...(out.conflict ? { conflict: out.conflict } : {}),
+                ...(out.parkedByMarket !== undefined ? { parkedByMarket: out.parkedByMarket } : {}),
+                ...(out.reloadRequired !== undefined ? { reloadRequired: out.reloadRequired } : {}),
+                ...(out.restartRequired !== undefined ? { restartRequired: out.restartRequired } : {}),
+                ...(out.activation ? { activation: out.activation } : {}),
+                ...(out.customizationUri ? { customizationUri: out.customizationUri } : {}),
+                ...(out.sidecarPane !== undefined ? { sidecarPane: out.sidecarPane } : {}),
+              });
+            } catch (err) {
+              results.push({
+                id: item.id,
+                dir: ghLoc.dir,
+                displayName: ghLoc.displayName || ghLoc.name || ghLoc.dir,
+                ok: false,
+                status: 'ERROR',
+                error: err?.message || String(err),
+              });
+            }
             continue;
           }
 
@@ -1225,13 +1438,14 @@ export async function createMarketSidecarServer(options = {}) {
       }
 
       if (pathname === '/api/remove-files') {
+        const workspaceUris = parseWorkspaceUrisInput(body.workspaceUris);
         const out = removeMarketPluginFiles({
           dir: body.dir,
           configDir,
           dataDir,
         });
         invalidateUpdateCheckState();
-        const state = await buildEnrichedState({ forceCatalogRefresh: false });
+        const state = await buildEnrichedState({ forceCatalogRefresh: false, workspaceUris });
         sendJson(res, 200, { ok: true, ...out, state });
         return;
       }

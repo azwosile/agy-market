@@ -47,11 +47,19 @@ export function normalizeOpenPaneRequest(input = {}) {
   }
 
   const sidecarId = dir && sidecarFolder ? `${dir}/${sidecarFolder}` : dir || sidecarFolder;
-  const uri = /^sidecar:\/\//i.test(rawUri)
-    ? rawUri
-    : sidecarId
-      ? `sidecar://${sidecarId}/${viewPathNoLead}`
-      : '';
+  let uri = '';
+  if (/^sidecar:\/\//i.test(rawUri)) {
+    const afterScheme = rawUri.replace(/^sidecar:\/\//i, '');
+    const qIdx = afterScheme.search(/[?#]/);
+    const pathPart = qIdx === -1 ? afterScheme : afterScheme.slice(0, qIdx);
+    const suffix = qIdx === -1 ? '' : afterScheme.slice(qIdx);
+    const collapsed = pathPart.replace(/\/{2,}/g, '/');
+    const segs = collapsed.split('/');
+    const normalizedPath = segs.length === 2 && segs[0] && segs[1] ? `${collapsed}/` : collapsed;
+    uri = `sidecar://${normalizedPath}${suffix}`;
+  } else if (sidecarId) {
+    uri = `sidecar://${sidecarId}/${viewPathNoLead}`;
+  }
   const title =
     (typeof src.title === 'string' && src.title.trim()) ||
     sidecarFolder ||

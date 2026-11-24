@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>AGY Market v1.3 — 极光棱镜 · Google Antigravity 社区可视化插件市场</title>
+  <title>AGY Market v1.4.0 — Google Antigravity 社区插件市场</title>
   <link rel="stylesheet" href="./styles.css" />
 </head>
 <body>
@@ -14,18 +14,19 @@
     <div class="hero-inner">
       <div class="hero-badge">
         <span class="badge-dot" aria-hidden="true"></span>
-        <span>v1.3 Aurora Prism · Sidebar 侧边栏 · SHA-256 强校验 · 全语言生态</span>
+        <span>v1.4.0 · Sidebar 侧边栏 · GitHub 链接预检安装 · SHA-256 校验</span>
       </div>
       <h1>AGY Market · 反重力插件市场</h1>
       <p class="hero-lead">
-        在 Google Antigravity 右侧 Sidebar 侧边栏内以极光棱镜玻璃美学一键浏览、收藏、安装与停放仓即时启停社区插件（Markdown 技能、Python / Rust / Go / Node MCP 服务与 Sidebar 侧边栏扩展），内置 5 层冲突雷达与国内双通道镜像加速。
+        在 Google Antigravity 右侧 Sidebar 侧边栏内浏览、收藏、安装与启停社区插件（支持 Markdown 技能、Python / Rust / Go / Node MCP 服务与侧边栏扩展），支持粘贴任意 GitHub 完整链接预检安装（兼容子目录 / Monorepo / 分支提交）或运行 <code>npx agy-market add &lt;github-url&gt;</code>，并提供本地冲突检查与国内双通道镜像加速。
       </p>
 
       <div class="feature-pills" aria-label="核心特性">
-        <span class="feat-pill">✦ 极光棱镜高定 UI</span>
+        <span class="feat-pill">🔗 粘贴任意 GitHub 完整链接预检安装（子目录 / Monorepo / 分支提交）</span>
+        <span class="feat-pill">✦ 深浅主题自适应侧边栏</span>
         <span class="feat-pill">★ 插件收藏栏与快捷置顶</span>
         <span class="feat-pill">⇄ 卡片底部原生启停滑块</span>
-        <span class="feat-pill">🛡 5 层插件冲突健康雷达</span>
+        <span class="feat-pill">🛡 本地插件冲突检查</span>
         <span class="feat-pill">🔍 已安装插件实时搜索筛选</span>
       </div>
 
@@ -49,6 +50,7 @@
           <button type="button" class="boot-tab active" data-cmd="npx agy-market@latest">npx 一行安装</button>
           <button type="button" class="boot-tab" data-cmd="irm https://raw.githubusercontent.com/azwosile/agy-market/main/scripts/install.ps1 | iex">Windows PowerShell（零 npm）</button>
           <button type="button" class="boot-tab" data-cmd="curl -fsSL https://raw.githubusercontent.com/azwosile/agy-market/main/scripts/install.sh | sh">macOS / Linux Shell</button>
+          <button type="button" class="boot-tab" data-cmd="npx agy-market add &lt;github-url&gt;">GitHub 链接添加（npx agy-market add）</button>
         </div>
         <div class="boot-code-row">
           <code id="boot-cmd-text">npx agy-market@latest</code>
@@ -70,7 +72,7 @@
       </div>
       <div class="stat-pill">
         <span class="stat-k">启停控制</span>
-        <strong class="stat-v">停放仓无损滑块（免改 config.json）</strong>
+        <strong class="stat-v">滑块即时启停（不改写 config.json）</strong>
       </div>
       <div class="stat-pill">
         <span class="stat-k">目录通道</span>

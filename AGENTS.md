@@ -105,9 +105,9 @@ When installing or updating a plugin `P`:
 ### 5.1 True One-Click Immediate Activation (Track 1 & Track 2)
 - Clicking **Install** in either **Track 1 (Verified)** or **Track 2 (Experimental Topic Discovery, once the user flips on the Track-2 toggle)** installs the plugin **enabled immediately**—do NOT inject `"disabled": true` into `plugin.json`.
 - **Transparent Pre-Install Badges**: Every card and detail header displays `capabilities.badges` right next to the **Install** button:
-  - `🟢 纯声明式 · 0进程` (`declarative-only`)
+  - `🟢 纯声明式技能` (`declarative-only`, `Declarative Skill`)
   - `🔵 常驻规则 (~N tok)` (`global-rules`)
-  - `🟣 Sidecar 面板 · 0 Token` (`sidecar-ui`)
+  - `🟣 Sidebar 侧边栏` (`sidecar-ui`, `Sidebar Panel`)
   - `🟠 本地 MCP 进程` (`mcp-stdio`) / `🌐 远程 MCP 服务` (`mcp-remote`)
   - `🔶 生命周期钩子 (Hooks)` (`lifecycle-hooks`)
   - **`💡 宿主界面增强` (`host-enhancement`)**: Gentle, non-alarmist informational badge for plugins using CDP or `app.asar` enhancements (such as `agy-wallpaper-prism` or `gemini-neko-cockpit`). Never show scary red malware banners for `host-enhancement`.

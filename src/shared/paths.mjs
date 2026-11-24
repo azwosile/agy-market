@@ -1,5 +1,6 @@
 // Node-only filesystem path helpers for Antigravity host directories (`src/shared/paths.mjs`).
 
+import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -20,7 +21,13 @@ export function resolveMarketDataDir(explicitDataDir = '') {
   if (process.env.AGY_MARKET_DATA_DIR) return resolve(process.env.AGY_MARKET_DATA_DIR);
   if (process.env.ANTIGRAVITY_EXECUTABLE_DATA_DIR) return resolve(process.env.ANTIGRAVITY_EXECUTABLE_DATA_DIR);
   if (process.env.PLUGIN_DATA) return resolve(process.env.PLUGIN_DATA);
-  return join(homedir(), '.gemini', 'sidecar_data', PLUGIN_ID, SIDECAR_ID, 'data');
+  const home = homedir();
+  const antigravityRoot = join(home, '.gemini', 'antigravity');
+  const hostSidecarDataDir = join(antigravityRoot, 'sidecar_data', PLUGIN_ID, SIDECAR_ID, 'data');
+  if (existsSync(hostSidecarDataDir) || existsSync(antigravityRoot)) {
+    return hostSidecarDataDir;
+  }
+  return join(home, '.gemini', 'sidecar_data', PLUGIN_ID, SIDECAR_ID, 'data');
 }
 
 export function resolveDisabledPluginsDir(explicitDataDir = '') {

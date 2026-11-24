@@ -81,9 +81,11 @@ export function validateSafeRelPath(rawPath) {
 }
 
 /**
- * Parses a `.tar.gz` / `.tgz` buffer into an in-memory `Map<string, Buffer>`.
+ * Parses a `.tar.gz` / `.tgz` buffer into `{ files, globalPax, strippedTopDir }`.
+ * Exposes POSIX PAX global header attributes (e.g. `globalPax.comment` containing 40-hex commitSha
+ * from `git archive` / GitHub `codeload`) and the stripped single top-level directory name.
  */
-export function parseTarGzToMap(
+export function parseTarGzWithMeta(
   compressedBuf,
   { maxUncompressedBytes = MAX_TARBALL_BYTES, stripSingleTopDir = true } = {},
 ) {
@@ -160,6 +162,7 @@ export function parseTarGzToMap(
     rawFiles.set(safe, Buffer.from(payload));
   }
 
+  let strippedTopDir = '';
   if (stripSingleTopDir && !rawFiles.has('plugin.json') && rawFiles.size > 0) {
     const roots = new Set();
     let allNested = true;
@@ -173,15 +176,26 @@ export function parseTarGzToMap(
     }
     if (allNested && roots.size === 1) {
       const [onlyRoot] = roots;
+      strippedTopDir = onlyRoot;
       const unwrapped = new Map();
       for (const [p, buf] of rawFiles.entries()) {
         unwrapped.set(p.slice(onlyRoot.length + 1), buf);
       }
-      return unwrapped;
+      return { files: unwrapped, globalPax, strippedTopDir };
     }
   }
 
-  return rawFiles;
+  return { files: rawFiles, globalPax, strippedTopDir };
+}
+
+/**
+ * Parses a `.tar.gz` / `.tgz` buffer into an in-memory `Map<string, Buffer>`.
+ */
+export function parseTarGzToMap(
+  compressedBuf,
+  { maxUncompressedBytes = MAX_TARBALL_BYTES, stripSingleTopDir = true } = {},
+) {
+  return parseTarGzWithMeta(compressedBuf, { maxUncompressedBytes, stripSingleTopDir }).files;
 }
 
 /**

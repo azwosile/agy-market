@@ -112,7 +112,7 @@ cp -R "$BUNDLE_DIR/." "$TARGET_DIR/"
 
 INSTALLED_VER="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$TARGET_DIR/plugin.json" | head -n 1)"
 if [ -z "$INSTALLED_VER" ]; then
-  INSTALLED_VER="1.3.0"
+  INSTALLED_VER="1.4.0"
 fi
 
 NOW_ISO="$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "2026-11-23T00:00:00Z")"

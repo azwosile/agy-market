@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { gzipSync } from 'node:zlib';
 
 import { compileCatalogArtifacts } from '../../agy-market-catalog/scripts/build-catalog.mjs';
 import { evaluateSubmission } from '../../agy-market-catalog/scripts/check-submission.mjs';
@@ -29,7 +30,7 @@ import {
 import { resolveInstallPreflight, scanLocalPluginInventory } from '../src/preflight/index.mjs';
 import { resolveMarketCatalog } from '../src/registry/index.mjs';
 import { scrubChildProcessEnv } from '../src/shared/constants.mjs';
-import { sanitizeNativePluginManifest } from '../src/shared/schemas.mjs';
+import { buildInstallReceipt, sanitizeNativePluginManifest } from '../src/shared/schemas.mjs';
 import { createMarketSidecarServer } from '../src/sidecar/server.mjs';
 
 const CLEAN_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><rect x="16" y="16" width="96" height="96" rx="20" fill="#6366f1"/></svg>`;
@@ -779,11 +780,52 @@ test('POSIX PAX multi-record UTF-8 byte-length parser & Windows NTFS extraction 
   }
 });
 
-test('fetchVerifiedPluginTarball falls back to commit-pinned GitHub archive only when mutable tag archive drifts', async () => {
+function buildTarGzWithGlobalPax(entries, { globalPaxComment = '' } = {}) {
+  const chunks = [];
+  const makeHeader = (name, size, typeFlag = '0') => {
+    const h = Buffer.alloc(512, 0);
+    h.write(name, 0, Math.min(100, Buffer.byteLength(name)), 'utf8');
+    h.write('0000644\0', 100, 8, 'ascii');
+    h.write('0000000\0', 108, 8, 'ascii');
+    h.write('0000000\0', 116, 8, 'ascii');
+    h.write(`${size.toString(8).padStart(11, '0')}\0`, 124, 12, 'ascii');
+    h.write('00000000000\0', 136, 12, 'ascii');
+    h.fill(0x20, 148, 156);
+    h.write(typeFlag, 156, 1, 'ascii');
+    h.write('ustar\0', 257, 6, 'ascii');
+    h.write('00', 263, 2, 'ascii');
+    let sum = 0;
+    for (let i = 0; i < 512; i += 1) sum += h[i];
+    h.write(`${sum.toString(8).padStart(6, '0')}\0 `, 148, 8, 'ascii');
+    return h;
+  };
+  const pushPadded = (buf) => {
+    chunks.push(buf);
+    const rem = buf.length % 512;
+    if (rem !== 0) chunks.push(Buffer.alloc(512 - rem, 0));
+  };
+  if (globalPaxComment) {
+    const paxPayload = encodePaxRecord('comment', globalPaxComment);
+    chunks.push(makeHeader('pax_global_header', paxPayload.length, 'g'));
+    pushPadded(paxPayload);
+  }
+  for (const [relPath, content] of Object.entries(entries)) {
+    const buf = Buffer.isBuffer(content) ? content : Buffer.from(String(content), 'utf8');
+    chunks.push(makeHeader(relPath, buf.length, '0'));
+    pushPadded(buf);
+  }
+  chunks.push(Buffer.alloc(1024, 0));
+  return gzipSync(Buffer.concat(chunks), { level: 6 });
+}
+
+test('fetchVerifiedPluginTarball hardens commit-pinned GitHub archive fallback with PAX commitSha & digest verification', async () => {
   const commitSha = 'eb55259f0e17ec75794e7a3fad411a177eb94bb7';
+  const otherCommitSha = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+
+  // Strict URL validation & lowercase commitSha normalization
   assert.equal(
     resolveMutableTagCommitFallbackUrl({
-      commitSha,
+      commitSha: commitSha.toUpperCase(),
       distribution: { tarballUrl: 'https://github.com/zou172866/agy-dart/archive/refs/tags/v1.7.0.tar.gz' },
     }),
     `https://github.com/zou172866/agy-dart/archive/${commitSha}.tar.gz`,
@@ -802,27 +844,71 @@ test('fetchVerifiedPluginTarball falls back to commit-pinned GitHub archive only
     }),
     null,
   );
+  for (const badUrl of [
+    'https://github.com/evil/repo?x=1/archive/refs/tags/v1.0.0.tar.gz',
+    'https://github.com/evil/repo#frag/archive/refs/tags/v1.0.0.tar.gz',
+    'https://github.com/../repo/archive/refs/tags/v1.0.0.tar.gz',
+    'https://github.com/evil/../archive/refs/tags/v1.0.0.tar.gz',
+    'https://github.com/evil/./archive/refs/tags/v1.0.0.tar.gz',
+    'https://github.com/-bad/repo/archive/refs/tags/v1.0.0.tar.gz',
+  ]) {
+    assert.equal(
+      resolveMutableTagCommitFallbackUrl({ commitSha, distribution: { tarballUrl: badUrl } }),
+      null,
+      `Must reject malformed fallback source URL: ${badUrl}`,
+    );
+  }
 
   const stageRoot = mkdtempSync(join(tmpdir(), 'agy-commit-fb-'));
   try {
-    const expectedOldPayload = Buffer.from('original-tag-archive-bytes');
-    const driftedTagPayload = Buffer.from('retagged-archive-bytes');
-    const commitPayload = Buffer.from('immutable-commit-archive-bytes');
-    const expectedSha = createHash('sha256').update(expectedOldPayload).digest('hex');
+    const manifestJson = JSON.stringify({ name: 'agy-dart', version: '1.7.0' });
+    const expectedOldPayload = createDeterministicTarGz({
+      'agy-dart-1.7.0/plugin.json': manifestJson,
+      'agy-dart-1.7.0/README.md': '# original tag archive',
+    });
+    const driftedTagPayload = createDeterministicTarGz({
+      'agy-dart-1.7.0/plugin.json': manifestJson,
+      'agy-dart-1.7.0/README.md': '# drifted tag archive',
+    });
+    const validCommitPayload = buildTarGzWithGlobalPax(
+      {
+        [`agy-dart-${commitSha}/plugin.json`]: manifestJson,
+        [`agy-dart-${commitSha}/README.md`]: '# immutable commit archive',
+      },
+      { globalPaxComment: commitSha },
+    );
+    const forgedNoPaxPayload = createDeterministicTarGz({
+      [`agy-dart-${commitSha}/plugin.json`]: manifestJson,
+      [`agy-dart-${commitSha}/README.md`]: '# forged archive missing PAX comment',
+    });
+    const forgedWrongPaxPayload = buildTarGzWithGlobalPax(
+      {
+        [`agy-dart-${commitSha}/plugin.json`]: manifestJson,
+        [`agy-dart-${commitSha}/README.md`]: '# forged archive wrong PAX comment',
+      },
+      { globalPaxComment: otherCommitSha },
+    );
 
+    const expectedSha = createHash('sha256').update(expectedOldPayload).digest('hex');
+    const validCommitSha256 = createHash('sha256').update(validCommitPayload).digest('hex');
+
+    // 1. Tag drift (INTEGRITY_SHA256_MISMATCH on direct github.com) -> valid PAX commit fallback succeeds & forwards auth header
     const requestedUrls = [];
-    const mockFetch = async (url) => {
-      requestedUrls.push(String(url));
-      if (String(url).includes('/archive/refs/tags/')) {
+    const seenAuthHeaders = {};
+    const mockFetchDrift = async (url, init = {}) => {
+      const sUrl = String(url);
+      requestedUrls.push(sUrl);
+      seenAuthHeaders[sUrl] = init?.headers?.Authorization || '';
+      if (sUrl.includes('/archive/refs/tags/')) {
         return new Response(driftedTagPayload, { status: 200 });
       }
-      if (String(url).includes(`/archive/${commitSha}.tar.gz`)) {
-        return new Response(commitPayload, { status: 200 });
+      if (sUrl.includes(`/archive/${commitSha}.tar.gz`)) {
+        return new Response(validCommitPayload, { status: 200 });
       }
       return new Response('not found', { status: 404 });
     };
 
-    const result = await fetchVerifiedPluginTarball({
+    const driftResult = await fetchVerifiedPluginTarball({
       plugin: {
         id: 'zou172866__agy-dart',
         version: '1.7.0',
@@ -834,17 +920,177 @@ test('fetchVerifiedPluginTarball falls back to commit-pinned GitHub archive only
       },
       stagingDir: join(stageRoot, 'stage-1'),
       stagingArchivePath: join(stageRoot, 'stage-1', 'archive.tar.gz'),
-      fetchImpl: mockFetch,
+      prefs: { githubToken: 'mock-fallback-auth-token' },
+      fetchImpl: mockFetchDrift,
     });
 
-    assert.equal(result.channelUsed, 'github-commit-fallback');
-    assert.equal(result.urlUsed, `https://github.com/zou172866/agy-dart/archive/${commitSha}.tar.gz`);
+    assert.equal(driftResult.channelUsed, 'github-commit-fallback');
+    assert.equal(driftResult.urlUsed, `https://github.com/zou172866/agy-dart/archive/${commitSha}.tar.gz`);
+    assert.equal(driftResult.sha256, validCommitSha256);
     assert.deepEqual(requestedUrls, [
       'https://github.com/zou172866/agy-dart/archive/refs/tags/v1.7.0.tar.gz',
       `https://github.com/zou172866/agy-dart/archive/${commitSha}.tar.gz`,
     ]);
+    assert.equal(
+      seenAuthHeaders[`https://github.com/zou172866/agy-dart/archive/${commitSha}.tar.gz`],
+      'Bearer mock-fallback-auth-token',
+    );
 
-    // Release assets must STILL strictly fail on SHA-256 mismatch (never fall back)
+    // 2. Tag deleted (HTTP 404 on direct github.com) -> valid PAX commit fallback succeeds & returns real sha256
+    const notFoundResult = await fetchVerifiedPluginTarball({
+      plugin: {
+        id: 'zou172866__agy-dart',
+        version: '1.7.0',
+        commitSha,
+        distribution: {
+          tarballUrl: 'https://github.com/zou172866/agy-dart/archive/refs/tags/v1.7.0.tar.gz',
+          sha256: expectedSha,
+        },
+      },
+      stagingDir: join(stageRoot, 'stage-404'),
+      stagingArchivePath: join(stageRoot, 'stage-404', 'archive.tar.gz'),
+      fetchImpl: async (url) => {
+        if (String(url).includes('/archive/refs/tags/')) {
+          return new Response('Not Found', { status: 404 });
+        }
+        if (String(url).includes(`/archive/${commitSha}.tar.gz`)) {
+          return new Response(validCommitPayload, { status: 200 });
+        }
+        return new Response('Not Found', { status: 404 });
+      },
+    });
+    assert.equal(notFoundResult.channelUsed, 'github-commit-fallback');
+    assert.equal(notFoundResult.sha256, validCommitSha256);
+
+    // 3. Forged fallback archive WITHOUT PAX comment MUST be rejected & staging archive deleted
+    const forgedStageNoPax = join(stageRoot, 'stage-forged-no-pax');
+    const forgedArchiveNoPax = join(forgedStageNoPax, 'archive.tar.gz');
+    await assert.rejects(
+      fetchVerifiedPluginTarball({
+        plugin: {
+          id: 'zou172866__agy-dart',
+          version: '1.7.0',
+          commitSha,
+          distribution: {
+            tarballUrl: 'https://github.com/zou172866/agy-dart/archive/refs/tags/v1.7.0.tar.gz',
+            sha256: expectedSha,
+          },
+        },
+        stagingDir: forgedStageNoPax,
+        stagingArchivePath: forgedArchiveNoPax,
+        fetchImpl: async (url) => {
+          if (String(url).includes('/archive/refs/tags/')) {
+            return new Response('Not Found', { status: 404 });
+          }
+          return new Response(forgedNoPaxPayload, { status: 200 });
+        },
+      }),
+      /INTEGRITY_SHA256_MISMATCH/,
+    );
+    assert.equal(existsSync(forgedArchiveNoPax), false, 'Forged archive without PAX comment must be deleted');
+    assert.equal(existsSync(forgedStageNoPax), false, 'Staging dir must be cleaned up on rejection');
+
+    // 4. Forged fallback archive WITH WRONG PAX comment MUST be rejected & staging archive deleted
+    const forgedStageWrongPax = join(stageRoot, 'stage-forged-wrong-pax');
+    const forgedArchiveWrongPax = join(forgedStageWrongPax, 'archive.tar.gz');
+    await assert.rejects(
+      fetchVerifiedPluginTarball({
+        plugin: {
+          id: 'zou172866__agy-dart',
+          version: '1.7.0',
+          commitSha,
+          distribution: {
+            tarballUrl: 'https://github.com/zou172866/agy-dart/archive/refs/tags/v1.7.0.tar.gz',
+            sha256: expectedSha,
+          },
+        },
+        stagingDir: forgedStageWrongPax,
+        stagingArchivePath: forgedArchiveWrongPax,
+        fetchImpl: async (url) => {
+          if (String(url).includes('/archive/refs/tags/')) {
+            return new Response(driftedTagPayload, { status: 200 });
+          }
+          return new Response(forgedWrongPaxPayload, { status: 200 });
+        },
+      }),
+      /INTEGRITY_SHA256_MISMATCH/,
+    );
+    assert.equal(existsSync(forgedArchiveWrongPax), false, 'Forged archive with wrong PAX comment must be deleted');
+
+    // 5. Explicit commitFallbackSha256 lock: matching digest succeeds, mismatched digest fails & cleans up
+    const pinnedRes = await fetchVerifiedPluginTarball({
+      plugin: {
+        id: 'zou172866__agy-dart',
+        version: '1.7.0',
+        commitSha,
+        distribution: {
+          tarballUrl: 'https://github.com/zou172866/agy-dart/archive/refs/tags/v1.7.0.tar.gz',
+          sha256: expectedSha,
+          commitFallbackSha256: validCommitSha256,
+        },
+      },
+      stagingDir: join(stageRoot, 'stage-pinned-ok'),
+      stagingArchivePath: join(stageRoot, 'stage-pinned-ok', 'archive.tar.gz'),
+      fetchImpl: mockFetchDrift,
+    });
+    assert.equal(pinnedRes.channelUsed, 'github-commit-fallback');
+    assert.equal(pinnedRes.sha256, validCommitSha256);
+
+    const pinnedFailArchive = join(stageRoot, 'stage-pinned-fail', 'archive.tar.gz');
+    await assert.rejects(
+      fetchVerifiedPluginTarball({
+        plugin: {
+          id: 'zou172866__agy-dart',
+          version: '1.7.0',
+          commitSha,
+          distribution: {
+            tarballUrl: 'https://github.com/zou172866/agy-dart/archive/refs/tags/v1.7.0.tar.gz',
+            sha256: expectedSha,
+            commitFallbackSha256: 'f'.repeat(64),
+          },
+        },
+        stagingDir: join(stageRoot, 'stage-pinned-fail'),
+        stagingArchivePath: pinnedFailArchive,
+        fetchImpl: mockFetchDrift,
+      }),
+      /INTEGRITY_SHA256_MISMATCH/,
+    );
+    assert.equal(existsSync(pinnedFailArchive), false);
+
+    // 6. Third-party mirror mismatch + direct 500 must NOT trigger commit fallback
+    const mirrorOnlyUrls = [];
+    await assert.rejects(
+      fetchVerifiedPluginTarball({
+        plugin: {
+          id: 'zou172866__agy-dart',
+          version: '1.7.0',
+          commitSha,
+          distribution: {
+            tarballUrl: 'https://github.com/zou172866/agy-dart/archive/refs/tags/v1.7.0.tar.gz',
+            sha256: expectedSha,
+          },
+        },
+        stagingDir: join(stageRoot, 'stage-mirror-only'),
+        stagingArchivePath: join(stageRoot, 'stage-mirror-only', 'archive.tar.gz'),
+        prefs: { githubReleaseMirrorPrefix: 'https://mirror.example.invalid' },
+        fetchImpl: async (url) => {
+          const sUrl = String(url);
+          mirrorOnlyUrls.push(sUrl);
+          if (sUrl.startsWith('https://mirror.example.invalid/')) {
+            return new Response(driftedTagPayload, { status: 200 });
+          }
+          return new Response('Upstream error', { status: 500 });
+        },
+      }),
+      /INTEGRITY_SHA256_MISMATCH/,
+    );
+    assert.equal(
+      mirrorOnlyUrls.some((u) => u.includes(`/archive/${commitSha}.tar.gz`)),
+      false,
+      'Mirror-only mismatch must never trigger commit fallback when direct github.com did not report drift/404',
+    );
+
+    // 7. Release assets must STILL strictly fail on SHA-256 mismatch (never fall back)
     await assert.rejects(
       fetchVerifiedPluginTarball({
         plugin: {
@@ -862,6 +1108,51 @@ test('fetchVerifiedPluginTarball falls back to commit-pinned GitHub archive only
       }),
       /INTEGRITY_SHA256_MISMATCH/,
     );
+
+    // 8. Receipt fidelity: buildInstallReceipt & installOrUpdateCatalogPlugin record actual fallback sha256
+    const fallbackReceipt = buildInstallReceipt({
+      plugin: {
+        id: 'zou172866__agy-dart',
+        version: '1.7.0',
+        commitSha,
+        distribution: { sha256: expectedSha },
+      },
+      installedDir: 'agy-dart',
+      effectivePluginName: 'agy-dart',
+      actualSha256: validCommitSha256,
+    });
+    assert.equal(fallbackReceipt.sha256, validCommitSha256);
+
+    const wsInstall = makeTempWorkspace('agy-fallback-receipt-');
+    try {
+      const installRes = await installOrUpdateCatalogPlugin({
+        plugin: {
+          id: 'zou172866__agy-dart',
+          canonicalName: 'agy-dart',
+          displayName: 'AGY Dart',
+          version: '1.7.0',
+          commitSha,
+          repository: { repositoryId: 987654321, url: 'https://github.com/zou172866/agy-dart', pluginRoot: '.' },
+          distribution: {
+            tarballUrl: 'https://github.com/zou172866/agy-dart/archive/refs/tags/v1.7.0.tar.gz',
+            sha256: expectedSha,
+          },
+          capabilities: { badges: [], mcpRemoteDomains: [], hookEvents: [] },
+        },
+        configDir: wsInstall.configDir,
+        dataDir: wsInstall.dataDir,
+        fetchImpl: mockFetchDrift,
+      });
+      assert.equal(installRes.ok, true);
+      assert.equal(installRes.channelUsed, 'github-commit-fallback');
+      assert.equal(installRes.receipt.sha256, validCommitSha256);
+      const writtenReceipt = JSON.parse(
+        readFileSync(join(wsInstall.pluginsDir, 'agy-dart', '.agy-market-receipt.json'), 'utf8'),
+      );
+      assert.equal(writtenReceipt.sha256, validCommitSha256);
+    } finally {
+      wsInstall.cleanup();
+    }
   } finally {
     rmSync(stageRoot, { recursive: true, force: true });
   }

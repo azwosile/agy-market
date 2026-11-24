@@ -921,32 +921,106 @@ test('GET /preload.js provides window.sidecar.ui.toggleAuxPane fallback without 
         return { win, posted };
       };
 
-      // Case 1: !window.sidecar -> attaches ui.toggleAuxPane fallback
+      // Case 1: !window.sidecar -> attaches ui.toggleAuxPane fallback (synchronous undefined return matching host preload)
       const s1 = makeSandbox(undefined);
       assert.equal(typeof s1.win.sidecar.ui?.toggleAuxPane, 'function');
-      const r1 = await s1.win.sidecar.ui.toggleAuxPane({ tabType: 'sidecar', sidecarId: 'foo/bar', path: '/' });
-      assert.equal(r1.ok, false);
-      assert.equal(r1.fallback, true);
+      const r1 = s1.win.sidecar.ui.toggleAuxPane({ tabType: 'sidecarView', uri: 'sidecar://foo/bar/' });
+      assert.equal(r1, undefined);
       assert.equal(s1.posted.length, 1);
-      assert.equal(s1.posted[0].msg.type, 'toggle-aux-pane');
-      assert.equal(s1.posted[0].msg.payload.sidecarId, 'foo/bar');
+      assert.deepEqual(structuredClone(s1.posted[0].msg), {
+        type: 'toggle-aux-pane',
+        payload: { tabType: 'sidecarView', uri: 'sidecar://foo/bar/' },
+      });
+      assert.equal(s1.posted[0].targetOrigin, '*');
 
       // Case 2: window.sidecar exists without .ui -> attaches ui.toggleAuxPane fallback
       const s2 = makeSandbox({ fetch: async () => ({ ok: true }) });
       assert.equal(typeof s2.win.sidecar.ui?.toggleAuxPane, 'function');
-      const r2 = await s2.win.sidecar.ui.toggleAuxPane({ sidecarId: 'a/b' });
-      assert.equal(r2.ok, false);
-      assert.equal(r2.fallback, true);
+      const r2 = s2.win.sidecar.ui.toggleAuxPane({ tabType: 'sidecarView', uri: 'sidecar://a/b/' });
+      assert.equal(r2, undefined);
+      assert.equal(s2.posted.length, 1);
+      assert.deepEqual(structuredClone(s2.posted[0].msg), {
+        type: 'toggle-aux-pane',
+        payload: { tabType: 'sidecarView', uri: 'sidecar://a/b/' },
+      });
 
       // Case 3: host already provides window.sidecar.ui.toggleAuxPane -> MUST NOT clobber!
       const hostToggle = async (payload) => ({ ok: true, hostHandled: true, payload });
       const s3 = makeSandbox({ fetch: async () => ({ ok: true }), ui: { toggleAuxPane: hostToggle } });
       assert.equal(s3.win.sidecar.ui.toggleAuxPane, hostToggle);
-      const r3 = await s3.win.sidecar.ui.toggleAuxPane({ sidecarId: 'native/pane' });
+      const r3 = await s3.win.sidecar.ui.toggleAuxPane({ tabType: 'sidecarView', uri: 'sidecar://native/pane/' });
       assert.equal(r3.hostHandled, true);
+      assert.equal(s3.posted.length, 0);
     } finally {
       await srv.close();
     }
+  } finally {
+    ws.cleanup();
+  }
+});
+
+test('Comment stripping avoids app-asar false positive on CDP plugins and real app-asar overlap has winner=null, shadowed=[], affectedPlugins[2]', () => {
+  const ws = makeTempWorkspace('agy-asar-comment-');
+  try {
+    // Simulated agy-wallpaper-prism: only mentions app-asar inside comments, uses real CDP flag in code
+    writePluginTree(ws.pluginsDir, 'agy-wallpaper-prism', {
+      'plugin.json': { name: 'agy-wallpaper-prism', displayName: 'Wallpaper Prism', version: '2.0.0' },
+      'bridge.mjs': [
+        `// Zero writes (never touches ${ASAR_TOKEN})`,
+        `/* Documentation block: does not modify ${ASAR_TOKEN} */`,
+        `const arg = '${CDP_FLAG}';`,
+        `export const kind = 'cdp';`,
+      ].join('\n'),
+      'launch.ps1': `# Never writes to ${ASAR_TOKEN}\nWrite-Output "cdp"\n`,
+    });
+
+    // One real app-asar modifier plugin
+    writePluginTree(ws.pluginsDir, 'real-asar-one', {
+      'plugin.json': { name: 'real-asar-one', displayName: 'Real Asar One', version: '1.0.0' },
+      'patch.mjs': `const target = '${ASAR_TOKEN}';\nexport default target;\n`,
+    });
+
+    const inv1 = scanLocalPluginInventory({ configDir: ws.configDir, dataDir: ws.dataDir });
+    const prismInv = inv1.installed.find((p) => p.dir === 'agy-wallpaper-prism');
+    const asarOneInv = inv1.installed.find((p) => p.dir === 'real-asar-one');
+    assert.ok(prismInv);
+    assert.ok(asarOneInv);
+    assert.deepEqual(prismInv.hostEnhancementKind, ['cdp']);
+    assert.deepEqual(asarOneInv.hostEnhancementKind, ['app-asar']);
+
+    const conf1 = scanLocalConflicts({
+      inventory: inv1,
+      configDir: ws.configDir,
+      dataDir: ws.dataDir,
+    });
+    assert.equal(
+      conf1.items.some((i) => i.id === 'host-enhancement-overlap:app-asar'),
+      false,
+      'Comment-only app-asar mention in CDP plugin must not trigger host-enhancement-overlap:app-asar',
+    );
+
+    // Add a second real app-asar modifier plugin -> overlap warning must report winner=null, shadowed=[], affectedPlugins.length=2
+    writePluginTree(ws.pluginsDir, 'real-asar-two', {
+      'plugin.json': { name: 'real-asar-two', displayName: 'Real Asar Two', version: '1.0.0' },
+      'patch.mjs': `const target = '${ASAR_TOKEN}';\nexport default target;\n`,
+    });
+
+    const inv2 = scanLocalPluginInventory({ configDir: ws.configDir, dataDir: ws.dataDir });
+    const conf2 = scanLocalConflicts({
+      inventory: inv2,
+      configDir: ws.configDir,
+      dataDir: ws.dataDir,
+    });
+    const asarOverlap = conf2.items.find((i) => i.id === 'host-enhancement-overlap:app-asar');
+    assert.ok(asarOverlap, 'Two real app-asar plugins must emit host-enhancement-overlap:app-asar');
+    assert.equal(asarOverlap.severity, 'warning');
+    assert.equal(asarOverlap.winner, null);
+    assert.deepEqual(asarOverlap.shadowed, []);
+    assert.equal(asarOverlap.affectedPlugins.length, 2);
+    assert.deepEqual(
+      asarOverlap.affectedPlugins.map((p) => p.dir).sort(),
+      ['real-asar-one', 'real-asar-two'],
+    );
   } finally {
     ws.cleanup();
   }

@@ -299,9 +299,24 @@ export async function resolveMarketCatalog({
     }
   }
 
-  // Merge Custom Feeds with highest priority on matching `repositoryId` or `id`
+  const normalizePluginRoot = (rawRoot) => {
+    const s = String(rawRoot || '.')
+      .trim()
+      .replace(/\\/g, '/')
+      .replace(/^\.\/+/, '')
+      .replace(/\/+$/, '');
+    return s || '.';
+  };
+
+  const makeRepoRootKey = (plugin) => {
+    const repoId = Number(plugin?.repository?.repositoryId || 0);
+    if (repoId <= 0) return '';
+    return `${repoId}:${normalizePluginRoot(plugin?.repository?.pluginRoot)}`;
+  };
+
+  // Merge Custom Feeds with highest priority on matching `(repositoryId, pluginRoot)` or `id`
   const mergedPlugins = [];
-  const seenRepoIds = new Set();
+  const seenRepoRoots = new Set();
   const seenIds = new Set();
 
   for (let i = 0; i < cleanPrefs.customFeeds.length; i++) {
@@ -309,9 +324,9 @@ export async function resolveMarketCatalog({
     try {
       const custom = await fetchSingleCustomFeed(feedUrl, i, cacheDir, fetchImpl);
       for (const p of custom.plugins) {
-        const repoId = Number(p?.repository?.repositoryId || 0);
-        if ((repoId > 0 && seenRepoIds.has(repoId)) || seenIds.has(p.id)) continue;
-        if (repoId > 0) seenRepoIds.add(repoId);
+        const repoRootKey = makeRepoRootKey(p);
+        if ((repoRootKey && seenRepoRoots.has(repoRootKey)) || seenIds.has(p.id)) continue;
+        if (repoRootKey) seenRepoRoots.add(repoRootKey);
         seenIds.add(p.id);
         mergedPlugins.push({ ...p, _track: 'custom', _feedUrl: feedUrl });
       }
@@ -339,9 +354,9 @@ export async function resolveMarketCatalog({
 
   for (const rawP of verifiedFeed?.plugins || []) {
     const p = normalizePluginMedia(rawP);
-    const repoId = Number(p?.repository?.repositoryId || 0);
-    if ((repoId > 0 && seenRepoIds.has(repoId)) || seenIds.has(p.id)) continue;
-    if (repoId > 0) seenRepoIds.add(repoId);
+    const repoRootKey = makeRepoRootKey(p);
+    if ((repoRootKey && seenRepoRoots.has(repoRootKey)) || seenIds.has(p.id)) continue;
+    if (repoRootKey) seenRepoRoots.add(repoRootKey);
     seenIds.add(p.id);
     mergedPlugins.push({ ...p, _track: 'verified' });
   }
@@ -349,9 +364,9 @@ export async function resolveMarketCatalog({
   if (cleanPrefs.enableExperimentalTrack2) {
     for (const rawP of unverifiedFeed?.plugins || []) {
       const p = normalizePluginMedia(rawP);
-      const repoId = Number(p?.repository?.repositoryId || 0);
-      if ((repoId > 0 && seenRepoIds.has(repoId)) || seenIds.has(p.id)) continue;
-      if (repoId > 0) seenRepoIds.add(repoId);
+      const repoRootKey = makeRepoRootKey(p);
+      if ((repoRootKey && seenRepoRoots.has(repoRootKey)) || seenIds.has(p.id)) continue;
+      if (repoRootKey) seenRepoRoots.add(repoRootKey);
       seenIds.add(p.id);
       mergedPlugins.push({
         ...p,

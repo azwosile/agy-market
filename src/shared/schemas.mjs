@@ -1,5 +1,7 @@
-// JSONC parser, manifest purity sanitizer, receipt schema & capability-escalation diff (`src/shared/schemas.mjs`).
+// JSONC parser, manifest purity sanitizer, prefs store, receipt schema & capability-escalation diff (`src/shared/schemas.mjs`).
 
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { DEFAULT_PREFS, MAX_FAVORITES, PLUGIN_JSON_ALLOWED_KEYS, PRIVILEGE_ESCALATION_BADGES } from './constants.mjs';
 
 export function parseJsonc(rawText) {
@@ -178,6 +180,39 @@ export function computeCapabilityEscalation(existingReceipt, incomingPlugin) {
   };
 }
 
+/**
+ * Loads user preferences from `${dataDir}/prefs.json` with safe schema defaults.
+ */
+export function loadPrefsFromDisk(dataDir) {
+  const prefsPath = join(dataDir, 'prefs.json');
+  if (!existsSync(prefsPath)) return sanitizePrefs(DEFAULT_PREFS);
+  try {
+    return sanitizePrefs(JSON.parse(readFileSync(prefsPath, 'utf8')));
+  } catch {
+    return sanitizePrefs(DEFAULT_PREFS);
+  }
+}
+
+/**
+ * Atomically saves sanitized user preferences to `${dataDir}/prefs.json` (mode 0600 when `githubToken` is set).
+ */
+export function savePrefsToDisk(dataDir, nextPrefs) {
+  mkdirSync(dataDir, { recursive: true });
+  const clean = sanitizePrefs(nextPrefs);
+  const tmpPath = join(dataDir, `prefs.json.${process.pid}.${Date.now()}.tmp`);
+  const dstPath = join(dataDir, 'prefs.json');
+  const writeOpts = clean.githubToken ? { encoding: 'utf8', mode: 0o600 } : { encoding: 'utf8' };
+  const serialized = `${JSON.stringify(clean, null, 2)}\n`;
+  writeFileSync(tmpPath, serialized, writeOpts);
+  try {
+    renameSync(tmpPath, dstPath);
+  } catch {
+    writeFileSync(dstPath, serialized, writeOpts);
+    rmSync(tmpPath, { force: true });
+  }
+  return clean;
+}
+
 export function buildInstallReceipt({
   plugin,
   track = 'verified',
@@ -185,9 +220,30 @@ export function buildInstallReceipt({
   effectivePluginName,
   scopedRewriteApplied = false,
   previousInstalledAt = null,
+  actualSha256 = '',
   nowIso = new Date().toISOString(),
 }) {
   const cap = plugin?.capabilities || {};
+  const hasExplicitGitTag = Boolean(plugin && Object.prototype.hasOwnProperty.call(plugin, 'gitTag'));
+  const rawGitTag = hasExplicitGitTag
+    ? plugin.gitTag
+    : track === 'github-url'
+      ? null
+      : plugin?.version
+        ? `v${plugin.version}`
+        : null;
+  const gitTag = typeof rawGitTag === 'string' && rawGitTag.trim() ? rawGitTag.trim() : null;
+  const commitSha = typeof plugin?.commitSha === 'string' ? plugin.commitSha.trim() : '';
+  const repositoryUrl = typeof plugin?.repository?.url === 'string' ? plugin.repository.url.trim() : '';
+  const rawPluginRoot = typeof plugin?.repository?.pluginRoot === 'string' ? plugin.repository.pluginRoot.trim() : '.';
+  const pluginRoot = rawPluginRoot.replace(/\\/g, '/').replace(/^\.\/+/, '').replace(/\/+$/, '') || '.';
+  const githubSource =
+    plugin?.githubSource && typeof plugin.githubSource === 'object' ? { ...plugin.githubSource } : null;
+  const cleanActualSha256 = typeof actualSha256 === 'string' ? actualSha256.trim().toLowerCase() : '';
+  const resolvedSha256 = /^[0-9a-f]{64}$/.test(cleanActualSha256)
+    ? cleanActualSha256
+    : plugin.distribution?.sha256 || '';
+
   return {
     schemaVersion: 1,
     id: plugin.id,
@@ -197,8 +253,12 @@ export function buildInstallReceipt({
     effectivePluginName,
     scopedRewriteApplied: Boolean(scopedRewriteApplied),
     installedVersion: plugin.version,
-    gitTag: plugin.gitTag || `v${plugin.version}`,
-    sha256: plugin.distribution?.sha256 || '',
+    gitTag,
+    ...(commitSha ? { commitSha } : {}),
+    ...(repositoryUrl ? { repositoryUrl } : {}),
+    pluginRoot,
+    ...(githubSource ? { githubSource } : {}),
+    sha256: resolvedSha256,
     preservePaths: Array.isArray(plugin.distribution?.preservePaths) ? [...plugin.distribution.preservePaths] : [],
     grantedCapabilities: {
       badges: Array.isArray(cap.badges) ? [...cap.badges] : [],

@@ -1,8 +1,8 @@
 {
   "name": "agy-market",
   "displayName": "AGY Market · 反重力插件市场",
-  "description": "Visual community plugin marketplace for Google Antigravity — browse, search, inspect capability badges, and one-click install language-agnostic plugins from a zero-token Sidecar pane.",
-  "version": "1.3.0",
+  "description": "Community plugin marketplace for Google Antigravity — browse, search, inspect capability badges, and install language-agnostic plugins from the right Sidebar panel.",
+  "version": "1.4.0",
   "logo": "assets/logo.svg",
   "author": {
     "name": "azwosile",

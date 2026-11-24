@@ -1,9 +1,10 @@
-// Visual AGY Market v1.3 Aurora Prism Sidebar Application (`src/ui/app.mjs`).
+// Visual AGY Market Sidebar Application (`src/ui/app.mjs`).
 // Zero external dependencies; bundled into `sidecars/market_pane/index.html` by `scripts/build.mjs`.
 
 import {
   CAPABILITY_BADGE_SPECS,
   CATEGORY_LABELS,
+  PLUGIN_VERSION,
   formatBadgeLabel,
 } from '../shared/constants.mjs';
 import { BRAND_LOGO_SVG, badgeIcon, icon } from './icons.mjs';
@@ -15,6 +16,19 @@ const FAVS_SHELF_COLLAPSED_KEY = 'agy-market-favs-shelf-collapsed';
 const SUBMIT_PLUGIN_GUIDE_URL =
   'https://github.com/azwosile/agy-market-catalog/blob/main/docs/SUBMISSION_GUIDE.md';
 const ASAR_LABEL = ['app', 'asar'].join('.');
+const SELF_FALLBACK_DESC = Object.freeze({
+  zh: 'Google Antigravity 社区插件市场侧边栏，支持镜像下载校验、本地冲突检查与一键安装更新。',
+  en: 'Community plugin marketplace Sidebar panel & CLI for Google Antigravity with SHA-256 archive verification, conflict checks, and one-click updates.',
+});
+const STALE_SELF_DESC_RE = new RegExp(
+  [
+    ['\u96f6', '\\s*', 'token'].join(''),
+    ['0', '\\s*', 'token'].join(''),
+    ['zero', '-', 'token'].join(''),
+    '\u9632\u7be1\u6539',
+  ].join('|'),
+  'i',
+);
 
 function readStorage(key, fallback = '') {
   try {
@@ -53,27 +67,27 @@ const CATEGORY_ACCENTS = Object.freeze({
 
 const CONFLICT_LAYER_META = Object.freeze({
   'duplicate-plugin-name': {
-    zh: '同名插件吞没',
+    zh: '同名插件冲突',
     en: 'Duplicate Plugin Name',
-    descZh: '检测跨作用域相同 plugin.json.name 导致的静默丢弃',
-    descEn: 'Detects duplicate plugin.json.name silently dropped by host',
+    descZh: '检测跨作用域相同 plugin.json.name 导致的加载冲突',
+    descEn: 'Detects duplicate plugin.json.name across scopes',
   },
   'windows-symlink-ignored': {
     zh: 'Windows 符号链接失效',
     en: 'Windows Symlink Ignored',
     descZh: '检测被 Antigravity 宿主跳过的 Junction / 符号链接目录',
-    descEn: 'Detects NTFS symlinks/junctions skipped by GetAllPlugins',
+    descEn: 'Detects NTFS symlinks/junctions skipped by Antigravity on Windows',
   },
   'mcp-collision': {
-    zh: 'MCP 服务命名碰撞',
+    zh: 'MCP 服务名冲突',
     en: 'MCP Server Collision',
-    descZh: '检测插件与全局 mcp_config.json 间重名或裸通用服务名',
+    descZh: '检测插件与全局 mcp_config.json 间重名或通用服务名',
     descEn: 'Detects overlapping or generic bare MCP server keys',
   },
   'skill-shadowing': {
     zh: 'Skill 技能覆盖',
     en: 'Skill Shadowing',
-    descZh: '检测多插件或全局 skills/ 中同名 SKILL.md 覆盖链',
+    descZh: '检测多插件或全局 skills/ 中同名 SKILL.md 重名覆盖',
     descEn: 'Detects duplicate SKILL.md names shadowing across plugins',
   },
   'agent-shadowing': {
@@ -130,7 +144,7 @@ const state = {
   selfChangelogModal: false,
   scrolledStuck: false,
 
-  // 5-Layer Conflict Radar state (`GET /api/conflicts`)
+  // Local conflict check state (`GET /api/conflicts`)
   conflicts: {
     loading: false,
     loaded: false,
@@ -162,6 +176,7 @@ const state = {
   discussionsCache: {},
 
   // Modals
+  githubUrlModal: null, // null | { phase, url, inspectToken, selectedPluginRoot, installMode, confirmEscalation, inspectResult, subpathCandidates, error }
   conflictModal: null,
   escalationModal: null,
   removeConfirmModal: null, // null | { dir, displayName, version }
@@ -170,12 +185,14 @@ const state = {
   toast: null, // null | { message, subtext?, tone }
   copiedKey: '',
   focusTokenField: false,
+  focusGithubUrlInput: false,
 };
 
 let toastTimer = null;
 let reconnectTimer = null;
 let updatesRequestSeq = 0;
 let readmeRequestSeq = 0;
+let githubInspectSeq = 0;
 let lastForcedUpdatesAt = 0;
 
 function isSelfBannerVisible() {
@@ -362,8 +379,8 @@ function resolveActivationInfo(sourceObj, capabilitiesFallback = {}) {
   if (hostKinds.includes('cdp') || badges.includes('host-enhancement')) {
     return {
       level: 'host-restart',
-      reasonZh: '包含全窗口 CDP 皮肤增强，更新后需带调试端口重启 Antigravity 客户端生效',
-      reasonEn: 'Uses CDP workbench skin; restart Antigravity with debug port to apply',
+      reasonZh: '包含 CDP 界面增强，更新后需带调试端口重启 Antigravity 客户端生效',
+      reasonEn: 'Uses CDP UI enhancement; restart Antigravity with debug port to apply',
     };
   }
   if (
@@ -433,6 +450,31 @@ function maybeTriggerRestartBanner({
   return { level, reason };
 }
 
+function isSelfPluginIdentity(pluginOrCat, loc = null) {
+  return Boolean(
+    pluginOrCat?.id === 'azwosile__agy-market' ||
+      pluginOrCat?.canonicalName === 'agy-market' ||
+      pluginOrCat?.installStatus?.installedDir === 'agy-market' ||
+      loc?.dir === 'agy-market',
+  );
+}
+
+function sanitizeSelfDescription(text, locale = getLocale()) {
+  const s = String(text || '').trim();
+  if (s && STALE_SELF_DESC_RE.test(s)) {
+    return locale === 'en' ? SELF_FALLBACK_DESC.en : SELF_FALLBACK_DESC.zh;
+  }
+  return s;
+}
+
+function resolveCatalogDescription(plugin, locale = getLocale()) {
+  const rawDesc =
+    typeof plugin?.description === 'object'
+      ? plugin.description[locale] || plugin.description.zh || plugin.description.en || ''
+      : String(plugin?.description || '');
+  return isSelfPluginIdentity(plugin) ? sanitizeSelfDescription(rawDesc, locale) : rawDesc;
+}
+
 function resolveInstalledDescription(loc, catEntry) {
   const locale = getLocale();
   const catDescObj = catEntry && typeof catEntry.description === 'object' ? catEntry.description : null;
@@ -444,15 +486,17 @@ function resolveInstalledDescription(loc, catEntry) {
       : '';
   const locDesc = String(loc?.description || '').trim();
 
+  let resolved = '';
   if (locale === 'zh') {
-    if (catZh) return catZh;
-    if (locDesc && hasCjk(locDesc)) return locDesc;
-    if (locDesc) return locDesc;
-    return catEn;
+    if (catZh) resolved = catZh;
+    else if (locDesc && hasCjk(locDesc)) resolved = locDesc;
+    else if (locDesc) resolved = locDesc;
+    else resolved = catEn;
+  } else {
+    resolved = catEn || locDesc || catZh;
   }
-  if (catEn) return catEn;
-  if (locDesc) return locDesc;
-  return catZh;
+
+  return isSelfPluginIdentity(catEntry, loc) ? sanitizeSelfDescription(resolved, locale) : resolved;
 }
 
 function getEffectiveUpdateItems() {
@@ -511,9 +555,9 @@ function getInstalledByDirMap() {
 }
 
 function getConflictsSummary() {
-  const fromRadar = state.conflicts.data?.summary;
+  const fromScan = state.conflicts.data?.summary;
   const fromState = state.serverState?.conflictsSummary;
-  const s = fromRadar || fromState;
+  const s = fromScan || fromState;
   const installedCount = state.serverState?.installed?.length || 0;
   if (s && typeof s === 'object') {
     return {
@@ -527,16 +571,17 @@ function getConflictsSummary() {
   return { total: 0, critical: 0, warning: 0, info: 0, healthyCount: installedCount };
 }
 
-function computeHealthScore(summary) {
-  if (!summary || summary.total === 0) return 100;
-  const penalty = summary.critical * 28 + summary.warning * 10 + summary.info * 3;
-  return Math.max(12, Math.min(99, 100 - penalty));
-}
-
 function buildLocalDetailModel(loc, catEntry) {
   if (catEntry) {
     return {
       ...catEntry,
+      commitSha: catEntry.commitSha || loc.receipt?.commitSha || '',
+      repository: {
+        ...(catEntry.repository || {}),
+        url: catEntry.repository?.url || loc.repositoryUrl || loc.receipt?.repositoryUrl || '',
+        pluginRoot: catEntry.repository?.pluginRoot || loc.receipt?.pluginRoot || '.',
+      },
+      capabilities: catEntry.capabilities || loc.capabilities || loc.receipt?.grantedCapabilities || { badges: [] },
       activation: catEntry.activation || loc.activation,
       installStatus: {
         ...(catEntry.installStatus || {}),
@@ -552,6 +597,7 @@ function buildLocalDetailModel(loc, catEntry) {
           (loc.dir === 'agy-market' ? 'self' : loc.hostDisabled ? 'host-disabled' : loc.scope !== 'global' ? loc.scope : ''),
         sidecarPane: loc.sidecarPane || catEntry.installStatus?.sidecarPane || null,
       },
+      _track: loc.receipt?.track || catEntry._track || 'verified',
     };
   }
   return {
@@ -560,12 +606,13 @@ function buildLocalDetailModel(loc, catEntry) {
     scopedName: loc.dir,
     forceScopedInstall: false,
     displayName: loc.displayName || loc.name || loc.dir,
-    description: loc.description || '',
+    description: isSelfPluginIdentity(null, loc) ? sanitizeSelfDescription(loc.description || '') : loc.description || '',
     version: loc.version || '0.0.0',
     gitTag: loc.receipt?.gitTag || '',
-    commitSha: '',
+    commitSha: loc.receipt?.commitSha || '',
     repository: {
-      url: loc.repositoryUrl || '',
+      url: loc.repositoryUrl || loc.receipt?.repositoryUrl || '',
+      pluginRoot: loc.receipt?.pluginRoot || '.',
       stars: 0,
     },
     distribution: {
@@ -578,7 +625,7 @@ function buildLocalDetailModel(loc, catEntry) {
       categories: [],
       tags: [],
     },
-    capabilities: loc.receipt?.grantedCapabilities || { badges: [] },
+    capabilities: loc.capabilities || loc.receipt?.grantedCapabilities || { badges: [] },
     activation: loc.activation || null,
     installStatus: {
       installed: true,
@@ -595,6 +642,7 @@ function buildLocalDetailModel(loc, catEntry) {
       hasUpdate: false,
       sidecarPane: loc.sidecarPane || null,
     },
+    _track: loc.receipt?.track || 'local',
     _localOnly: true,
   };
 }
@@ -672,8 +720,8 @@ async function loadConflicts({ silent = true } = {}) {
         const total = Number(res.summary?.total || 0);
         showToast(
           total === 0
-            ? t('全盘体检完成：未发现任何插件冲突', 'Health scan complete: 0 conflicts detected')
-            : t(`全盘体检完成：发现 ${total} 项冲突或建议`, `Health scan complete: ${total} finding(s)`),
+            ? t('冲突检查完成：未发现插件冲突', 'Conflict check complete: 0 conflicts found')
+            : t(`冲突检查完成：发现 ${total} 项警告或提示`, `Conflict check complete: ${total} item(s) found`),
           { tone: total === 0 ? 'ok' : 'warn' },
         );
       }
@@ -815,13 +863,39 @@ async function triggerRemovePluginFiles(dir) {
   try {
     const res = await apiFetch('/api/remove-files', {
       method: 'POST',
-      body: { dir },
+      body: { dir, workspaceUris: state.workspaceUris },
     });
     if (res.state) {
       state.serverState = res.state;
       syncFavoritesFromServerState();
     }
     state.removeConfirmModal = null;
+    if (res?.locked && !res?.removed) {
+      syncDetailPluginReference();
+      if (state.conflicts.loaded) {
+        void loadConflicts({ silent: true });
+      }
+      const lockMsg = t(
+        `插件 "${dir}" 的文件正被后台进程占用，无法立即删除。请关闭或重启 Antigravity 后重试。`,
+        `Files for "${dir}" are locked by a background process and could not be removed. Close or restart Antigravity and try again.`,
+      );
+      setErrorBanner({
+        title: t('插件文件移除受阻', 'Plugin Files Locked'),
+        items: [{ pluginName: dir, message: res?.error || lockMsg }],
+      });
+      showToast(lockMsg, { tone: 'err', durationMs: 7000 });
+      return;
+    }
+    if (res?.ok === false || res?.removed === false) {
+      syncDetailPluginReference();
+      const errMsg = res?.error || t('插件文件未能移除', 'Failed to remove plugin files');
+      setErrorBanner({
+        title: t('插件文件移除失败', 'Failed to Remove Plugin Files'),
+        items: [{ pluginName: dir, message: errMsg }],
+      });
+      showToast(`${t('移除失败', 'Remove failed')}: ${errMsg}`, { tone: 'err', durationMs: 7000 });
+      return;
+    }
     if (state.detailPlugin?.installStatus?.installedDir === dir) {
       if (state.detailPlugin._localOnly) {
         state.detailPlugin = null;
@@ -890,83 +964,55 @@ async function toggleFavorite(key, displayName = '') {
 }
 
 async function openSiblingSidecarPane({ dir, folder, viewPath, title, uri }) {
-  const cleanFolder = folder || '';
-  const normPath = viewPath ? (viewPath.startsWith('/') ? viewPath : `/${viewPath}`) : '/';
-  const paneUri = uri || `sidecar://${dir}/${cleanFolder}/${normPath.replace(/^\/+/, '')}`;
-  const safeTitle = title || dir;
+  const parsed = parseSidecarPaneTarget(dir, {
+    sidecarFolder: folder,
+    viewPath,
+    title,
+    uri,
+  });
+  const cleanDir = parsed?.dir || String(dir || '').trim();
+  const cleanFolder = parsed?.folder || String(folder || 'pane').trim() || 'pane';
+  const normPath = parsed?.viewPath || normalizeSidecarViewPath(viewPath);
+  const paneUri = parsed?.uri || buildSidecarPaneUri(cleanDir, cleanFolder, normPath);
+  const safeTitle = parsed?.title || title || cleanDir;
   const togglePayload = {
     tabType: 'sidecarView',
     uri: paneUri,
   };
 
-  let bridgeDelivered = false;
   const inHostIframe = Boolean(window.parent && window.parent !== window);
-  try {
-    if (typeof window.sidecar?.ui?.toggleAuxPane === 'function') {
-      const result = await window.sidecar.ui.toggleAuxPane(togglePayload);
-      if (
-        result === true ||
-        result?.ok === true ||
-        result?.posted === true ||
-        (result === undefined && inHostIframe)
-      ) {
-        bridgeDelivered = true;
-      }
-    }
-  } catch {
-    /* continue to backend /api/open-pane */
-  }
-
-  let serverOpened = false;
-  if (!bridgeDelivered) {
+  if (inHostIframe) {
     try {
-      const res = await apiFetch('/api/open-pane', {
-        method: 'POST',
-        body: {
-          dir,
-          sidecarFolder: cleanFolder,
-          viewPath: normPath,
-          title: safeTitle,
-          uri: paneUri,
-        },
-      });
-      if (res?.opened === true) {
-        serverOpened = true;
-      } else if (res?.preloadPayload && typeof window.sidecar?.ui?.toggleAuxPane === 'function') {
-        try {
-          const retryRes = await window.sidecar.ui.toggleAuxPane(res.preloadPayload);
-          if (
-            retryRes === true ||
-            retryRes?.ok === true ||
-            retryRes?.posted === true ||
-            (retryRes === undefined && inHostIframe)
-          ) {
-            bridgeDelivered = true;
-          }
-        } catch {
-          /* ignore */
-        }
+      if (typeof window.sidecar?.ui?.toggleAuxPane === 'function') {
+        await window.sidecar.ui.toggleAuxPane(togglePayload);
+      } else {
+        window.parent.postMessage({ type: 'toggle-aux-pane', payload: togglePayload }, '*');
       }
     } catch {
-      /* graceful 1-line guidance fallback */
+      try {
+        window.parent.postMessage({ type: 'toggle-aux-pane', payload: togglePayload }, '*');
+      } catch {
+        /* ignore */
+      }
     }
-  }
-
-  if (bridgeDelivered || serverOpened) {
-    showToast(t(`已打开「${safeTitle}」侧边栏`, `Opened "${safeTitle}" Sidebar`), {
-      tone: 'ok',
-      durationMs: 2500,
-    });
     return;
   }
 
-  showToast(
-    t(
-      `请在右上角「+ → Plugins → ${safeTitle}」中打开侧边栏`,
-      `Open "${safeTitle}" via "+ → Plugins → ${safeTitle}" in the top-right`,
-    ),
-    { tone: 'info', durationMs: 4500 },
-  );
+  // Standalone external browser mode only: ask backend loopback CDP helper to wake host Sidebar.
+  try {
+    await apiFetch('/api/open-pane', {
+      method: 'POST',
+      body: {
+        dir: cleanDir,
+        sidecarFolder: cleanFolder,
+        viewPath: normPath,
+        title: safeTitle,
+        uri: paneUri,
+      },
+    });
+  } catch {
+    /* ignore when external CDP hub is unavailable */
+  }
 }
 
 async function checkUpdates(force = false, { silent = true } = {}) {
@@ -1335,6 +1381,433 @@ async function triggerSelfUpdate({ confirmEscalation = false } = {}) {
   }
 }
 
+function extractGithubPrefillUrl(rawText) {
+  const s = String(rawText || '').trim();
+  if (!s) return '';
+  if (/^https?:\/\/(?:www\.|codeload\.)?github\.com\/[^\s]+/i.test(s)) {
+    return s;
+  }
+  if (/^(?:www\.)?github\.com\/[^\s]+/i.test(s)) {
+    return `https://${s}`;
+  }
+  return '';
+}
+
+function formatBytesCompact(bytes) {
+  const n = Number(bytes || 0);
+  if (!Number.isFinite(n) || n <= 0) return '';
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+function normalizeInspectEscalation(esc) {
+  if (!esc || typeof esc !== 'object') {
+    return { hasEscalation: false, addedBadges: [], addedDomains: [], addedHooks: [] };
+  }
+  const addedBadges = Array.isArray(esc.addedBadges) ? esc.addedBadges : [];
+  const addedDomains = Array.isArray(esc.addedDomains)
+    ? esc.addedDomains
+    : Array.isArray(esc.addedRemoteDomains)
+      ? esc.addedRemoteDomains
+      : [];
+  const addedHooks = Array.isArray(esc.addedHooks)
+    ? esc.addedHooks
+    : Array.isArray(esc.addedHookEvents)
+      ? esc.addedHookEvents
+      : [];
+  const hasEscalation = Boolean(
+    esc.hasEscalation ??
+      esc.escalated ??
+      (addedBadges.length > 0 || addedDomains.length > 0 || addedHooks.length > 0),
+  );
+  return { hasEscalation, addedBadges, addedDomains, addedHooks };
+}
+
+function formatInspectWarningItem(item) {
+  if (!item) return '';
+  if (typeof item === 'string') return item.trim();
+  const isEn = getLocale() === 'en';
+  const msg = isEn
+    ? item.messageEn || item.summaryEn || item.titleEn || item.message || item.messageZh || item.summaryZh || item.titleZh
+    : item.messageZh || item.summaryZh || item.titleZh || item.message || item.messageEn || item.summaryEn || item.titleEn;
+  return String(msg || item.code || '').trim();
+}
+
+function formatInspectChannelLabel(channelUsed) {
+  const ch = String(channelUsed || '').trim();
+  if (!ch) return '';
+  if (ch === 'github-mirror') return t('镜像加速', 'Mirror');
+  if (ch === 'codeload' || ch === 'github-codeload' || ch === 'codeload-head') return t('Codeload 直连', 'Codeload');
+  if (ch === 'github-release' || ch === 'release-asset') return 'GitHub Release';
+  if (ch === 'github-direct') return t('GitHub 直连', 'GitHub Direct');
+  if (ch === 'staged-inspect') return t('本地预检缓存', 'Staged Cache');
+  return ch;
+}
+
+function openGithubUrlModal(prefillUrl = '') {
+  state.githubUrlModal = {
+    phase: 'input',
+    url: String(prefillUrl || '').trim(),
+    inspectToken: '',
+    selectedPluginRoot: '.',
+    installMode: 'native',
+    confirmEscalation: false,
+    inspectResult: null,
+    subpathCandidates: null,
+    error: '',
+  };
+  state.focusGithubUrlInput = true;
+  render();
+}
+
+async function triggerGithubUrlInspect({ url = '', inspectToken = '', pluginRoot = '' } = {}) {
+  if (!state.githubUrlModal) openGithubUrlModal(url);
+  const m = state.githubUrlModal;
+  const cleanUrl = String(url || m.url || '').trim();
+  if (!cleanUrl) {
+    m.error = t('请粘贴完整的 GitHub 插件仓库或归档链接。', 'Please enter a valid GitHub repository or archive URL.');
+    m.phase = 'input';
+    render();
+    return;
+  }
+
+  const seq = ++githubInspectSeq;
+  m.url = cleanUrl;
+  m.phase = 'inspecting';
+  m.error = '';
+  if (!inspectToken) {
+    m.subpathCandidates = null;
+  }
+  render();
+
+  try {
+    const body = {
+      url: cleanUrl,
+      workspaceUris: state.workspaceUris,
+    };
+    if (inspectToken) body.inspectToken = inspectToken;
+    if (pluginRoot) body.pluginRoot = pluginRoot;
+
+    const res = await apiFetch('/api/github/inspect', {
+      method: 'POST',
+      body,
+    });
+    if (seq !== githubInspectSeq || !state.githubUrlModal) return;
+
+    const status = String(res?.status || '');
+    if (status === 'READY') {
+      const pf = res.preflight || {};
+      const defaultMode =
+        pf.defaultInstallMode && ['native', 'isolate', 'replace'].includes(pf.defaultInstallMode)
+          ? pf.defaultInstallMode
+          : pf.action === 'conflict-prompt' || pf.action === 'install-scoped' || pf.isForeignSelfCollision
+            ? 'isolate'
+            : 'native';
+      const resolvedRoot =
+        res.plugin?.pluginRoot || res.plugin?.repository?.pluginRoot || pluginRoot || '.';
+      state.githubUrlModal = {
+        ...state.githubUrlModal,
+        phase: 'preview',
+        url: cleanUrl,
+        inspectToken: res.inspectToken || inspectToken || '',
+        selectedPluginRoot: resolvedRoot,
+        installMode: defaultMode,
+        confirmEscalation: false,
+        inspectResult: res,
+        error: '',
+      };
+      return;
+    }
+
+    if (status === 'SUBPATH_SELECTION_REQUIRED') {
+      const candidates = Array.isArray(res.candidates) ? res.candidates : [];
+      state.githubUrlModal = {
+        ...state.githubUrlModal,
+        phase: 'subpaths',
+        url: cleanUrl,
+        inspectToken: res.inspectToken || inspectToken || '',
+        selectedPluginRoot: '.',
+        inspectResult: res,
+        subpathCandidates: candidates,
+        error: '',
+      };
+      return;
+    }
+
+    if (
+      status === 'NOT_A_PLUGIN_REPO' ||
+      status === 'SECURITY_BLOCKED' ||
+      status === 'UNSAFE_ARCHIVE'
+    ) {
+      state.githubUrlModal = {
+        ...state.githubUrlModal,
+        phase: 'unsupported',
+        url: cleanUrl,
+        inspectToken: '',
+        inspectResult: res,
+        error: '',
+      };
+      return;
+    }
+
+    const errMsg =
+      (getLocale() === 'en' ? res?.reasonEn || res?.error || res?.reasonZh : res?.reasonZh || res?.error || res?.reasonEn) ||
+      t('无法解析该 GitHub 链接，请检查链接格式与网络连通性。', 'Unable to inspect this GitHub URL. Check the link format and network access.');
+    state.githubUrlModal = {
+      ...state.githubUrlModal,
+      phase: 'input',
+      error: errMsg,
+    };
+  } catch (err) {
+    if (seq !== githubInspectSeq || !state.githubUrlModal) return;
+    state.githubUrlModal = {
+      ...state.githubUrlModal,
+      phase: 'input',
+      error: err?.message || String(err),
+    };
+  } finally {
+    if (seq === githubInspectSeq) render();
+  }
+}
+
+async function triggerGithubUrlInstall() {
+  const m = state.githubUrlModal;
+  if (!m || m.phase !== 'preview') return;
+
+  const pluginInfo = m.inspectResult?.plugin || {};
+  const pf = m.inspectResult?.preflight || {};
+  const esc = normalizeInspectEscalation(m.inspectResult?.escalation);
+  const pluginLabel = pluginInfo.displayName || pluginInfo.canonicalName || pluginInfo.id || 'Plugin';
+  const isUpdate = pf.action === 'update';
+
+  if (esc.hasEscalation && !m.confirmEscalation) {
+    m.error = t(
+      '此次更新包含新增能力声明，请先勾选下方确认框后再继续。',
+      'Please check the confirmation box for added capabilities before continuing.',
+    );
+    render();
+    return;
+  }
+
+  m.phase = 'installing';
+  m.error = '';
+  state.errorBanner = null;
+  render();
+
+  try {
+    const res = await apiFetch('/api/github/install', {
+      method: 'POST',
+      body: {
+        inspectToken: m.inspectToken || '',
+        url: m.url,
+        pluginRoot: m.selectedPluginRoot || pluginInfo.pluginRoot || '.',
+        installMode: m.installMode || 'native',
+        confirmEscalation: Boolean(m.confirmEscalation),
+        workspaceUris: state.workspaceUris,
+      },
+    });
+
+    if (res.state) {
+      state.serverState = res.state;
+      syncFavoritesFromServerState();
+      syncDetailPluginReference();
+    }
+
+    if (res.status === 'CONFLICT_CHOICE_REQUIRED') {
+      const nextPf = {
+        ...(m.inspectResult?.preflight || {}),
+        action: 'conflict-prompt',
+        conflictItem: res.conflict || m.inspectResult?.preflight?.conflictItem || null,
+        canReplace:
+          Array.isArray(res.choices) &&
+          res.choices.includes('replace') &&
+          res.conflict?.dir !== 'agy-market',
+      };
+      if (m.inspectResult) {
+        m.inspectResult = { ...m.inspectResult, preflight: nextPf };
+      }
+      m.installMode = 'isolate';
+      m.phase = 'preview';
+      m.error = t(
+        '检测到本地同名插件冲突，请选择隔离安装或覆盖替换后再确认。',
+        'Local plugin name collision detected. Choose isolated install or replace and confirm again.',
+      );
+      return;
+    }
+
+    if (res.status === 'CAPABILITY_ESCALATION_CONFIRM_REQUIRED') {
+      if (m.inspectResult) {
+        m.inspectResult = { ...m.inspectResult, escalation: res.escalation || m.inspectResult.escalation };
+      }
+      m.confirmEscalation = false;
+      m.phase = 'preview';
+      m.error = t(
+        '检测到新增能力权限，请勾选确认框后再继续安装。',
+        'New capabilities detected. Confirm via the checkbox to proceed.',
+      );
+      return;
+    }
+
+    if (res.ok || res.status === 'INSTALLED') {
+      state.githubUrlModal = null;
+      state.errorBanner = null;
+      const installedDir = res.installedDir || pluginInfo.canonicalName || '';
+      const installedVer = res.version || pluginInfo.version || '';
+      const act = res.activation || resolveActivationInfo(pluginInfo);
+      const restartInfo = maybeTriggerRestartBanner({
+        pluginName: pluginInfo.displayName || installedDir || pluginLabel,
+        restartRequired: Boolean(res.restartRequired),
+        reloadRequired: Boolean(res.reloadRequired),
+        retiredBinaries: res.retiredBinaries || [],
+        activation: act,
+      });
+
+      showToast(
+        `${t(isUpdate ? '更新已完成' : '安装已完成', isUpdate ? 'Updated' : 'Installed')}: ${installedDir}${installedVer ? ` v${installedVer}` : ''}`,
+        {
+          subtext: restartInfo?.reason || '',
+          tone: 'ok',
+          durationMs: restartInfo ? 6500 : 4500,
+        },
+      );
+      state.activeTab = 'installed';
+      state.installedSearch = '';
+      state.installedFilter = 'all';
+      void checkUpdates(false, { silent: true });
+      if (state.conflicts.loaded) void loadConflicts({ silent: true });
+      return;
+    }
+
+    const errMsg = res.error || res.status || t('通过 GitHub 链接安装失败', 'Install from GitHub URL failed');
+    setErrorBanner({
+      title: t('GitHub 链接安装失败', 'GitHub URL Install Failed'),
+      items: [{ pluginName: pluginLabel, message: errMsg }],
+    });
+    showToast(`${t('安装失败', 'Install failed')} (${pluginLabel}): ${errMsg}`, {
+      tone: 'danger',
+      durationMs: 8000,
+    });
+    if (state.githubUrlModal) {
+      state.githubUrlModal.phase = 'preview';
+      state.githubUrlModal.error = errMsg;
+    }
+  } catch (err) {
+    const errMsg = err?.message || String(err);
+    setErrorBanner({
+      title: t('GitHub 链接安装失败', 'GitHub URL Install Failed'),
+      items: [{ pluginName: pluginLabel, message: errMsg }],
+    });
+    showToast(`${t('安装失败', 'Install failed')} (${pluginLabel}): ${errMsg}`, {
+      tone: 'danger',
+      durationMs: 8000,
+    });
+    if (state.githubUrlModal) {
+      state.githubUrlModal.phase = 'preview';
+      state.githubUrlModal.error = errMsg;
+    }
+  } finally {
+    render();
+  }
+}
+
+async function triggerUpdateLocalGithub({ id = '', dir = '', displayName = '', confirmEscalation = false } = {}) {
+  const cleanDir = String(dir || '').trim();
+  const targetId = String(id || cleanDir).trim();
+  if (!targetId && !cleanDir) return;
+  const label = String(displayName || cleanDir || targetId).trim();
+
+  state.busyId = targetId || cleanDir;
+  state.errorBanner = null;
+  render();
+  try {
+    const res = await apiFetch('/api/update', {
+      method: 'POST',
+      body: {
+        id: targetId,
+        dir: cleanDir,
+        confirmEscalation: Boolean(confirmEscalation),
+        workspaceUris: state.workspaceUris,
+      },
+    });
+
+    if (res.state) {
+      state.serverState = res.state;
+      syncFavoritesFromServerState();
+      syncDetailPluginReference();
+    }
+
+    if (res.status === 'CAPABILITY_ESCALATION_CONFIRM_REQUIRED') {
+      const normEsc = normalizeInspectEscalation(res.escalation);
+      state.escalationModal = {
+        mode: 'local-github',
+        items: [
+          {
+            id: targetId,
+            dir: cleanDir,
+            displayName: label,
+            installedVersion: res.installedVersion || '?',
+            targetVersion: res.targetVersion || '?',
+            escalation: {
+              addedBadges: normEsc.addedBadges,
+              addedRemoteDomains: normEsc.addedDomains,
+              addedHookEvents: normEsc.addedHooks,
+            },
+          },
+        ],
+      };
+      return;
+    }
+
+    if (res.ok) {
+      state.escalationModal = null;
+      state.errorBanner = null;
+      const restartInfo = maybeTriggerRestartBanner({
+        pluginName: label,
+        restartRequired: Boolean(res.restartRequired),
+        reloadRequired: Boolean(res.reloadRequired),
+        retiredBinaries: res.retiredBinaries || [],
+        activation: res.activation || null,
+      });
+      showToast(
+        `${t('更新已完成', 'Updated')}: ${res.installedDir || cleanDir}${res.version ? ` v${res.version}` : ''}`,
+        {
+          subtext: restartInfo?.reason || '',
+          tone: 'ok',
+          durationMs: restartInfo ? 6500 : 4500,
+        },
+      );
+      void checkUpdates(false, { silent: true });
+      if (state.conflicts.loaded) void loadConflicts({ silent: true });
+    } else {
+      const errMsg = res.error || res.status || t('插件更新未能完成', 'Plugin update did not complete');
+      setErrorBanner({
+        title: t('插件更新失败', 'Plugin Update Failed'),
+        items: [{ pluginName: label, message: errMsg }],
+        retryAction: { type: 'update-local-github', id: targetId, dir: cleanDir, displayName: label },
+      });
+      showToast(`${t('更新失败', 'Update failed')} (${label}): ${errMsg}`, {
+        tone: 'danger',
+        durationMs: 8000,
+      });
+    }
+  } catch (err) {
+    const errMsg = err?.message || String(err);
+    setErrorBanner({
+      title: t('插件更新失败', 'Plugin Update Failed'),
+      items: [{ pluginName: label, message: errMsg }],
+      retryAction: { type: 'update-local-github', id: targetId, dir: cleanDir, displayName: label },
+    });
+    showToast(`${t('更新失败', 'Update failed')} (${label}): ${errMsg}`, {
+      tone: 'danger',
+      durationMs: 8000,
+    });
+  } finally {
+    state.busyId = '';
+    render();
+  }
+}
+
 function startReconnectPolling(targetVersion = '') {
   if (reconnectTimer) clearTimeout(reconnectTimer);
   const previousVersion = state.serverState?.plugin?.version || '';
@@ -1589,7 +2062,7 @@ async function copyText(text, key, toastMsg = '') {
 }
 
 // ==========================================================================
-// Rendering Helpers (Aurora Prism Optical Glass Components)
+// Rendering Helpers (UI Components)
 // ==========================================================================
 
 function renderBadgesHtml(capabilities = {}, { maxCount = 0 } = {}) {
@@ -1663,27 +2136,48 @@ function renderCardTitleHtml(title, repoUrl) {
   return `<span class="card-title-text" title="${escapeHtml(safeTitle)}">${escapeHtml(safeTitle)}</span>`;
 }
 
+function normalizeSidecarViewPath(rawPath) {
+  const s = String(rawPath || '').trim();
+  if (!s || s === '/') return '/';
+  if (s.startsWith('?') || s.startsWith('#')) return `/${s}`;
+  return `/${s.replace(/^\/+/, '')}`;
+}
+
+function buildSidecarPaneUri(dir, folder, viewPath) {
+  const cleanDir = String(dir || '').trim();
+  const cleanFolder = String(folder || 'pane').trim() || 'pane';
+  const normPath = normalizeSidecarViewPath(viewPath);
+  const relPath = normPath.replace(/^\/+/, '');
+  return `sidecar://${cleanDir}/${cleanFolder}/${relPath}`;
+}
+
 function parseSidecarPaneTarget(dir, sidecarPane) {
   if (!sidecarPane) return null;
-  let folder = sidecarPane.sidecarFolder || '';
-  let viewPath = sidecarPane.path || '/';
-  if (sidecarPane.uri && /^sidecar:\/\/([^/]+)\/([^/]+)(\/.*)?$/i.test(sidecarPane.uri)) {
-    const m = /^sidecar:\/\/([^/]+)\/([^/]+)(\/.*)?$/i.exec(sidecarPane.uri);
+  let targetDir = String(dir || '').trim();
+  let folder = String(sidecarPane.sidecarFolder || '').trim();
+  let viewPath = sidecarPane.viewPath || sidecarPane.path || '/';
+  const rawUri = String(sidecarPane.uri || '').trim();
+  const m = /^sidecar:\/\/([^/?#]+)\/([^/?#]+)((?:[/?#].*)?)$/i.exec(rawUri);
+  if (m) {
+    if (!targetDir && m[1]) targetDir = m[1];
     if (!folder && m[2]) folder = m[2];
     if (m[3]) viewPath = m[3];
   }
+  if (!targetDir) return null;
+  const finalFolder = folder || 'pane';
+  const normPath = normalizeSidecarViewPath(viewPath);
   return {
-    dir,
-    folder: folder || 'pane',
-    viewPath: viewPath || '/',
-    title: sidecarPane.title || dir,
-    uri: sidecarPane.uri || `sidecar://${dir}/${folder || 'pane'}/${String(viewPath || '').replace(/^\/+/, '')}`,
+    dir: targetDir,
+    folder: finalFolder,
+    viewPath: normPath,
+    title: sidecarPane.title || targetDir,
+    uri: buildSidecarPaneUri(targetDir, finalFolder, normPath),
   };
 }
 
 function renderOpenPaneButtonHtml({ dir, sidecarPane, enabled, btnClass = 'dock-btn is-pane', label = '' }) {
   // Never render redundant Pane button on AGY Market itself or on disabled plugins; NEVER emit raw sidecar:// <a href>!
-  if (!dir || dir === 'agy-market' || !enabled || !sidecarPane?.uri) return '';
+  if (!dir || dir === 'agy-market' || !enabled || (!sidecarPane?.uri && !sidecarPane?.sidecarFolder)) return '';
   const target = parseSidecarPaneTarget(dir, sidecarPane);
   if (!target) return '';
   return `<button type="button" class="${btnClass}" data-action="open-pane" data-dir="${escapeHtml(target.dir)}" data-folder="${escapeHtml(target.folder)}" data-path="${escapeHtml(target.viewPath)}" data-title="${escapeHtml(target.title)}" data-uri="${escapeHtml(target.uri)}" data-stop-card="1" title="${escapeHtml(t(`打开「${target.title}」Sidebar 侧边栏`, `Open "${target.title}" Sidebar`))}">${icon('panel', 12)} <span>${escapeHtml(label || t('面板', 'Pane'))}</span></button>`;
@@ -1757,10 +2251,7 @@ function getFilteredPlugins() {
       if (!cats.includes(state.category)) return false;
     }
     if (!q) return true;
-    const desc =
-      typeof p.description === 'object'
-        ? `${p.description.zh || ''} ${p.description.en || ''}`
-        : String(p.description || '');
+    const desc = `${resolveCatalogDescription(p, 'zh')} ${resolveCatalogDescription(p, 'en')}`;
     const hay = `${p.displayName || ''} ${p.canonicalName || ''} ${p.scopedName || ''} ${p.id || ''} ${desc} ${(p.taxonomy?.tags || []).join(' ')} ${(p.capabilities?.badges || []).join(' ')}`.toLowerCase();
     return hay.includes(q);
   });
@@ -1818,7 +2309,7 @@ function renderSkeletonGrid(count = 4) {
 }
 
 // ==========================================================================
-// Prominent Error Alert Banner, Smart Restart Banner & Aurora Spotlight Hero
+// Prominent Error Alert Banner, Smart Restart Banner & Overview Hero Strip
 // ==========================================================================
 
 function renderErrorAlertBanner() {
@@ -1901,11 +2392,10 @@ function renderAuroraHeroStrip() {
   const activeCount = installed.filter((x) => x.enabled).length;
   const updatesCount = getEffectiveUpdateItems().length;
   const summary = getConflictsSummary();
-  const score = computeHealthScore(summary);
   const conflictTone = summary.critical > 0 ? 'tone-danger' : summary.total > 0 ? 'tone-warn' : 'tone-emerald';
   const conflictVal =
     summary.total === 0
-      ? t(`${score}% 健康`, `${score}% Healthy`)
+      ? t('无冲突', '0 conflicts')
       : t(`${summary.total} 项冲突`, `${summary.total} Issue${summary.total > 1 ? 's' : ''}`);
 
   if (state.heroCollapsed) {
@@ -1914,13 +2404,13 @@ function renderAuroraHeroStrip() {
         <div class="aurora-hero-inner">
           <div class="aurora-hero-compact-row">
             <div class="aurora-compact-pills">
-              <span class="aurora-kicker">${icon('sparkle', 11)} ${escapeHtml(t('极光棱镜', 'Aurora Prism'))}</span>
+              <span class="aurora-kicker">${icon('sparkle', 11)} ${escapeHtml(t('概览', 'Overview'))}</span>
               <button type="button" class="compact-stat-chip" data-action="tab" data-tab="discover">${escapeHtml(t(`收录 ${catalogCount}`, `${catalogCount} Catalog`))}</button>
               <button type="button" class="compact-stat-chip" data-action="tab" data-tab="installed">${escapeHtml(t(`运行 ${activeCount}/${installed.length}`, `${activeCount}/${installed.length} Active`))}</button>
               ${updatesCount > 0 ? `<button type="button" class="compact-stat-chip" data-action="tab" data-tab="installed" style="color:var(--m-sky);border-color:var(--m-sky-border)">${escapeHtml(t(`可更新 ${updatesCount}`, `${updatesCount} Updates`))}</button>` : ''}
               <button type="button" class="compact-stat-chip" data-action="tab" data-tab="conflicts" style="color:${summary.critical > 0 ? 'var(--m-danger)' : summary.total > 0 ? 'var(--m-warn)' : 'var(--m-ok)'}">${escapeHtml(conflictVal)}</button>
             </div>
-            <button type="button" class="hero-collapse-btn" data-action="toggle-hero" title="${escapeHtml(t('展开概览展台', 'Expand spotlight strip'))}">
+            <button type="button" class="hero-collapse-btn" data-action="toggle-hero" title="${escapeHtml(t('展开概览栏', 'Expand overview'))}">
               ${icon('chevronDown', 12)} <span>${escapeHtml(t('展开', 'Expand'))}</span>
             </button>
           </div>
@@ -1934,11 +2424,10 @@ function renderAuroraHeroStrip() {
       <div class="aurora-hero-inner">
         <div class="aurora-hero-top">
           <div class="aurora-hero-brand">
-            <span class="aurora-kicker">${icon('sparkle', 11)} ${escapeHtml(t('AURORA PRISM · 反重力精选插件工坊', 'AURORA PRISM · ANTIGRAVITY PLUGIN STUDIO'))}</span>
-            <h1 class="aurora-hero-title">${escapeHtml(t('探索、启停与守护你的 Antigravity 插件生态', 'Discover, toggle, and safeguard your Antigravity plugins'))}</h1>
-            <p class="aurora-hero-sub">${escapeHtml(t('SHA-256 防篡改校验 · 停放仓无损滑块启停 · 5 层静态冲突健康雷达', 'SHA-256 verified mirrors · Vault-parking live toggles · 5-layer conflict health radar'))}</p>
+            <span class="aurora-kicker">${icon('sparkle', 11)} ${escapeHtml(t('AGY MARKET · 社区插件目录', 'AGY MARKET · COMMUNITY PLUGINS'))}</span>
+            <h1 class="aurora-hero-title">${escapeHtml(t('浏览、安装与管理 Antigravity 插件', 'Browse, install, and manage Antigravity plugins'))}</h1>
           </div>
-          <button type="button" class="hero-collapse-btn" data-action="toggle-hero" title="${escapeHtml(t('收起概览展台', 'Collapse spotlight strip'))}">
+          <button type="button" class="hero-collapse-btn" data-action="toggle-hero" title="${escapeHtml(t('收起概览栏', 'Collapse overview'))}">
             ${icon('chevronUp', 12)} <span>${escapeHtml(t('收起', 'Compact'))}</span>
           </button>
         </div>
@@ -1970,7 +2459,7 @@ function renderAuroraHeroStrip() {
 
           <button type="button" class="hero-stat-pill ${conflictTone}" data-action="tab" data-tab="conflicts">
             <div class="hero-stat-meta">
-              <span class="hero-stat-label">${escapeHtml(t('冲突健康度', 'Conflict Health'))}</span>
+              <span class="hero-stat-label">${escapeHtml(t('本地冲突', 'Conflicts'))}</span>
               <span class="hero-stat-val">${escapeHtml(conflictVal)}</span>
             </div>
             <span class="hero-stat-ico">${icon(summary.total === 0 ? 'shieldCheck' : 'shieldAlert', 15)}</span>
@@ -2103,6 +2592,8 @@ function renderFavoritesShelf() {
             const sidecarPane = loc?.sidecarPane || p?.installStatus?.sidecarPane || null;
             const upd = (p && updById.get(p.id)) || (dir ? updByDir.get(dir) : null);
             const hasUpdate = Boolean((upd && upd.installable !== false) || (!upd && p?.installStatus?.hasUpdate));
+            const isGithubUrlLocal = Boolean(!p && loc && loc.receipt?.track === 'github-url');
+            const canGithubUpdate = Boolean(isGithubUrlLocal && upd && upd.installable !== false);
             const accent = resolveCardAccent(loc || p, p);
             const iconUrl = p?.media?.iconUrl || '';
             const monogram = String(displayName).trim().charAt(0).toUpperCase() || 'P';
@@ -2118,6 +2609,9 @@ function renderFavoritesShelf() {
               });
             } else if (hasUpdate && p) {
               quickActionHtml = `<button type="button" class="btn btn-update-outline btn-sm" data-action="install" data-id="${escapeHtml(p.id)}" data-stop-card="1">${icon('update', 11)} ${escapeHtml(t('更新', 'Update'))}</button>`;
+            } else if (canGithubUpdate) {
+              const targetId = upd?.id || loc.receipt?.id || loc.dir;
+              quickActionHtml = `<button type="button" class="btn btn-update-outline btn-sm" data-action="update-local-github" data-id="${escapeHtml(targetId)}" data-dir="${escapeHtml(loc.dir)}" data-name="${escapeHtml(displayName)}" data-stop-card="1">${icon('update', 11)} ${escapeHtml(t('更新', 'Update'))}</button>`;
             } else if (!loc && p) {
               quickActionHtml = `<button type="button" class="btn btn-primary btn-sm" data-action="install" data-id="${escapeHtml(p.id)}" data-stop-card="1">${icon('download', 11)} ${escapeHtml(t('安装', 'Install'))}</button>`;
             }
@@ -2125,6 +2619,11 @@ function renderFavoritesShelf() {
             const detailAttrs = isCat
               ? `data-action="detail" data-id="${escapeHtml(p.id)}"`
               : `data-action="detail-local" data-dir="${escapeHtml(loc.dir)}"`;
+
+            const updateShortLabel =
+              upd?.updateKind === 'commit' && upd?.latestCommitSha
+                ? `↑ ${upd.latestCommitSha}`
+                : `↑ v${upd?.latestVersion || p?.version || ''}`;
 
             return `
               <div class="fav-shelf-item" style="--card-accent:${accent.a1};--card-accent-2:${accent.a2}" ${detailAttrs}>
@@ -2142,7 +2641,7 @@ function renderFavoritesShelf() {
                     <span class="fav-shelf-name" title="${escapeHtml(displayName)}">${escapeHtml(displayName)}</span>
                     <span class="fav-shelf-meta">
                       <span>v${escapeHtml(version)}</span>
-                      ${hasUpdate ? `<span style="color:var(--m-sky);font-weight:700">↑ v${escapeHtml(upd?.latestVersion || p?.version || '')}</span>` : loc ? `<span style="color:${isEnabled ? 'var(--m-ok)' : 'var(--m-muted)'}">${escapeHtml(isEnabled ? t('已启用', 'Active') : t('已停用', 'Parked'))}</span>` : ''}
+                      ${hasUpdate ? `<span style="color:var(--m-sky);font-weight:700">${escapeHtml(updateShortLabel)}</span>` : loc ? `<span style="color:${isEnabled ? 'var(--m-ok)' : 'var(--m-muted)'}">${escapeHtml(isEnabled ? t('已启用', 'Active') : t('已停用', 'Parked'))}</span>` : ''}
                     </span>
                   </div>
                 </div>
@@ -2165,10 +2664,7 @@ function renderFavoritesShelf() {
 
 function renderPluginCard(p, updateById, installedByDir) {
   const loc = getLocale();
-  const desc =
-    typeof p.description === 'object'
-      ? p.description[loc] || p.description.zh || p.description.en || ''
-      : String(p.description || '');
+  const desc = resolveCatalogDescription(p, loc);
   const st = p.installStatus || {};
   const localItem = st.installedDir ? installedByDir.get(st.installedDir) || null : null;
   const upd = updateById.get(p.id) || null;
@@ -2400,20 +2896,41 @@ function renderDiscoverView() {
           ? renderSkeletonGrid(4)
           : plugins.length
             ? `<div class="cards-grid">${plugins.map((p) => renderPluginCard(p, updById, installedByDir)).join('')}</div>`
-            : `<div class="empty-state">
-                <div class="empty-icon">${icon('search', 20)}</div>
-                <div class="empty-title">${escapeHtml(t('当前筛选条件下暂无插件', 'No matching plugins found'))}</div>
-                <div class="empty-sub">${escapeHtml(
-                  state.search || state.category !== 'all'
-                    ? t('尝试更换搜索关键词或重置分类筛选。', 'Try another search query or reset your category filter.')
-                    : t('可在「源与设置」配置自定义目录源，或点击右上角「+ 申请收录插件」提交社区插件。', 'Configure a custom feed in Sources or click "+ Submit Plugin" in the top bar.'),
-                )}</div>
-                ${
-                  state.search || state.category !== 'all'
-                    ? `<button type="button" class="btn btn-sm" data-action="reset-filters">${escapeHtml(t('重置筛选条件', 'Reset Filters'))}</button>`
-                    : ''
-                }
-              </div>`
+            : (() => {
+                const prefillUrl = extractGithubPrefillUrl(state.search);
+                const prefillAttr = prefillUrl ? ` data-prefill-url="${escapeHtml(prefillUrl)}"` : '';
+                const hasActiveFilter = Boolean(state.search || state.category !== 'all');
+                return `<div class="empty-state">
+                  <div class="empty-icon">${icon('search', 20)}</div>
+                  <div class="empty-title">${escapeHtml(t('当前筛选条件下暂无插件', 'No matching plugins found'))}</div>
+                  <div class="empty-sub">${escapeHtml(
+                    hasActiveFilter
+                      ? t(
+                          '尝试更换搜索关键词、重置分类筛选，或直接粘贴 GitHub 仓库链接添加未收录插件。',
+                          'Try another query, reset filters, or add an unlisted plugin directly via its GitHub URL.',
+                        )
+                      : t(
+                          '可在「源与设置」配置自定义目录源，或点击右上角「链接添加」直接通过 GitHub 链接安装插件。',
+                          'Configure a custom feed in Sources, or click "Add URL" in the top bar to install via GitHub URL.',
+                        ),
+                  )}</div>
+                  <div class="empty-actions">
+                    ${
+                      hasActiveFilter
+                        ? `<button type="button" class="btn btn-sm" data-action="reset-filters">${escapeHtml(t('重置筛选条件', 'Reset Filters'))}</button>`
+                        : ''
+                    }
+                    <button type="button" class="btn btn-primary btn-sm" data-action="open-github-url-modal"${prefillAttr}>
+                      ${icon('link', 12)}
+                      <span>${escapeHtml(
+                        prefillUrl
+                          ? t('解析并添加此 GitHub 链接', 'Add This GitHub URL')
+                          : t('通过 GitHub 链接添加', 'Add via GitHub URL'),
+                      )}</span>
+                    </button>
+                  </div>
+                </div>`;
+              })()
       }
     </div>
   `;
@@ -2435,10 +2952,7 @@ function renderFavoritesView() {
     if (!q) return true;
     if (entry.kind === 'catalog') {
       const p = entry.plugin;
-      const desc =
-        typeof p.description === 'object'
-          ? `${p.description.zh || ''} ${p.description.en || ''}`
-          : String(p.description || '');
+      const desc = `${resolveCatalogDescription(p, 'zh')} ${resolveCatalogDescription(p, 'en')}`;
       const hay = `${p.displayName || ''} ${p.canonicalName || ''} ${p.scopedName || ''} ${p.id || ''} ${desc} ${(p.taxonomy?.tags || []).join(' ')} ${(p.capabilities?.badges || []).join(' ')}`.toLowerCase();
       return hay.includes(q);
     }
@@ -2553,7 +3067,7 @@ function renderBatchResultsPanel() {
               ? renderOpenPaneButtonHtml({
                   dir,
                   sidecarPane: r.sidecarPane,
-                  enabled: true,
+                  enabled: !r.parkedByMarket,
                   btnClass: 'dock-btn is-pane',
                   label: t('打开面板', 'Open'),
                 })
@@ -2582,20 +3096,28 @@ function renderBatchResultsPanel() {
 function renderInstalledCard(loc, updById, updByDir, catById, catByDir) {
   const upd = updByDir.get(loc.dir) || (loc.receipt?.id ? updById.get(loc.receipt.id) : null);
   const catEntry = (upd && catById.get(upd.id)) || (loc.receipt?.id && catById.get(loc.receipt.id)) || catByDir.get(loc.dir) || null;
-  const canCatalogUpdate = Boolean(upd && upd.installable !== false && catEntry);
+  const isGithubUrlTrack = loc.receipt?.track === 'github-url';
+  const isGithubUrlUpdate = Boolean(
+    upd && upd.installable !== false && !catEntry && (upd.updateChannel === 'github-url' || isGithubUrlTrack),
+  );
+  const canInstallUpdate = Boolean(upd && upd.installable !== false && (catEntry || isGithubUrlUpdate));
   const isUpstreamOnly = Boolean(upd && upd.installable === false);
+  const busyKey = catEntry?.id || upd?.id || loc.receipt?.id || loc.dir;
   const isBusy = Boolean(
-    catEntry && (state.busyId === catEntry.id || (state.batchUpdating && state.batchTargetIds.includes(catEntry.id))),
+    state.busyId === busyKey ||
+      state.busyId === loc.dir ||
+      (state.batchUpdating && (state.batchTargetIds.includes(busyKey) || state.batchTargetIds.includes(loc.dir))),
   );
   const isSelf = loc.dir === 'agy-market';
-  const repoUrl = catEntry?.repository?.url || loc.repositoryUrl || '';
+  const repoUrl = catEntry?.repository?.url || loc.repositoryUrl || loc.receipt?.repositoryUrl || '';
   const discussUrl = deriveDiscussionsUrl(repoUrl);
-  const badgesObj = catEntry?.capabilities || loc.receipt?.grantedCapabilities || { badges: [] };
+  const badgesObj = catEntry?.capabilities || loc.capabilities || loc.receipt?.grantedCapabilities || { badges: [] };
   const accent = resolveCardAccent(loc, catEntry);
   const localizedDesc = resolveInstalledDescription(loc, catEntry);
   const isParked = !loc.enabled;
   const displayName = loc.displayName || catEntry?.displayName || loc.dir;
   const favKey = getLocalFavoriteKey(loc, catEntry);
+  const isCommitUpdate = Boolean(upd && upd.updateKind === 'commit' && upd.latestCommitSha);
 
   const canToggle =
     loc.canToggle !== undefined
@@ -2608,8 +3130,14 @@ function renderInstalledCard(loc, updById, updByDir, catById, catByDir) {
   let actionHtml = '';
   if (isBusy) {
     actionHtml = `<button type="button" class="btn btn-primary btn-sm" disabled>${icon('refresh', 12, 'spin')} ${escapeHtml(t('更新中…', 'Updating…'))}</button>`;
-  } else if (canCatalogUpdate) {
+  } else if (canInstallUpdate && catEntry) {
     actionHtml = `<button type="button" class="btn btn-update-outline btn-sm" data-action="install" data-id="${escapeHtml(catEntry.id)}">${icon('update', 12)} ${escapeHtml(t(`更新 v${upd.latestVersion}`, `Update v${upd.latestVersion}`))}</button>`;
+  } else if (canInstallUpdate && isGithubUrlUpdate) {
+    const updTargetId = upd?.id || loc.receipt?.id || loc.dir;
+    const updLabel = isCommitUpdate
+      ? t(`更新 ${upd.latestCommitSha}`, `Update ${upd.latestCommitSha}`)
+      : t(`更新 v${upd.latestVersion}`, `Update v${upd.latestVersion}`);
+    actionHtml = `<button type="button" class="btn btn-update-outline btn-sm" data-action="update-local-github" data-id="${escapeHtml(updTargetId)}" data-dir="${escapeHtml(loc.dir)}" data-name="${escapeHtml(displayName)}" data-stop-card="1">${icon('update', 12)} ${escapeHtml(updLabel)}</button>`;
   } else if (isUpstreamOnly && upd.releaseUrl) {
     actionHtml = `<a class="btn btn-upstream btn-sm" href="${escapeHtml(upd.releaseUrl)}" target="_blank" rel="noopener noreferrer" data-stop-card="1" title="${escapeHtml(t('上游 GitHub 有新版，等待目录同步', 'Available upstream, awaiting catalog sync'))}">${escapeHtml(t(`上游 v${upd.latestVersion}`, `Upstream v${upd.latestVersion}`))} ${icon('arrowUpRight', 12)}</a>`;
   } else {
@@ -2622,19 +3150,21 @@ function renderInstalledCard(loc, updById, updByDir, catById, catByDir) {
     enabled: loc.enabled,
   });
 
+  const versionBadgeHtml = upd
+    ? isCommitUpdate
+      ? `<span class="version-delta ${isUpstreamOnly ? 'is-upstream' : ''}">v${escapeHtml(loc.version)} (${escapeHtml(upd.installedCommitSha || String(loc.receipt?.commitSha || '').slice(0, 7) || 'HEAD')} → ${escapeHtml(upd.latestCommitSha)})</span>`
+      : `<span class="version-delta ${isUpstreamOnly ? 'is-upstream' : ''}">v${escapeHtml(loc.version)} → v${escapeHtml(upd.latestVersion)}</span>`
+    : `<span class="version-tag">v${escapeHtml(loc.version)}</span>`;
+
   return `
-    <article class="plugin-card ${canCatalogUpdate ? 'has-update' : ''} ${isParked ? 'is-parked' : ''}" style="--card-accent:${accent.a1};--card-accent-2:${accent.a2}">
+    <article class="plugin-card ${canInstallUpdate ? 'has-update' : ''} ${isParked ? 'is-parked' : ''}" style="--card-accent:${accent.a1};--card-accent-2:${accent.a2}">
       <div class="card-head" data-action="detail-local" data-dir="${escapeHtml(loc.dir)}">
         ${renderLogoHtml(catEntry?.media?.iconUrl, displayName, { isSelf })}
         <div class="card-title-wrap">
           <div class="card-title-row">
             ${renderCardTitleHtml(displayName, repoUrl)}
             <div class="card-title-right">
-              ${
-                upd
-                  ? `<span class="version-delta ${isUpstreamOnly ? 'is-upstream' : ''}">v${escapeHtml(loc.version)} → v${escapeHtml(upd.latestVersion)}</span>`
-                  : `<span class="version-tag">v${escapeHtml(loc.version)}</span>`
-              }
+              ${versionBadgeHtml}
               ${renderFavoriteButtonHtml({ key: favKey, displayName })}
             </div>
           </div>
@@ -2648,6 +3178,7 @@ function renderInstalledCard(loc, updById, updByDir, catById, catByDir) {
                   ? `<span class="state-pill is-parked-tag">${escapeHtml(t('停放仓待机', 'Parked'))}</span>`
                   : `<span class="state-pill ${loc.enabled ? 'is-enabled' : 'is-disabled'}">${escapeHtml(loc.enabled ? t('已启用', 'Enabled') : t('已停用', 'Disabled'))}</span>`
             }
+            ${isGithubUrlTrack ? `<span class="track-tag is-github-url" title="${escapeHtml(t('通过 GitHub 链接安装', 'Installed via GitHub URL'))}">GitHub URL</span>` : ''}
             ${upd?.changelog ? `<span class="meta-sep">·</span><button type="button" class="notes-link" data-action="detail-local" data-dir="${escapeHtml(loc.dir)}" data-detail-tab="changelog">${escapeHtml(t('更新内容 ›', 'Notes ›'))}</button>` : `<span class="meta-sep">·</span><span>${escapeHtml(loc.scope || 'global')}</span>`}
           </div>
         </div>
@@ -2723,8 +3254,9 @@ function renderInstalledView() {
     if (!q) return true;
     const localizedDesc = resolveInstalledDescription(loc, catEntry);
     const catDescObj = catEntry && typeof catEntry.description === 'object' ? catEntry.description : null;
-    const badges = (catEntry?.capabilities?.badges || loc.receipt?.grantedCapabilities?.badges || []).join(' ');
-    const hay = `${loc.displayName || ''} ${catEntry?.displayName || ''} ${loc.name || ''} ${loc.dir || ''} ${localizedDesc} ${loc.description || ''} ${catDescObj?.zh || ''} ${catDescObj?.en || ''} ${loc.scope || ''} ${badges}`.toLowerCase();
+    const badges = (catEntry?.capabilities?.badges || loc.capabilities?.badges || loc.receipt?.grantedCapabilities?.badges || []).join(' ');
+    const trackHint = loc.receipt?.track === 'github-url' ? 'github url' : loc.receipt?.track || '';
+    const hay = `${loc.displayName || ''} ${catEntry?.displayName || ''} ${loc.name || ''} ${loc.dir || ''} ${localizedDesc} ${loc.description || ''} ${catDescObj?.zh || ''} ${catDescObj?.en || ''} ${loc.scope || ''} ${trackHint} ${loc.receipt?.pluginRoot || ''} ${badges}`.toLowerCase();
     return hay.includes(q);
   });
 
@@ -2852,7 +3384,7 @@ function renderInstalledView() {
 }
 
 // ==========================================================================
-// 4th Top Tab: Conflict Radar & Health Diagnostics (`冲突与诊断`)
+// 4th Top Tab: Conflicts & Diagnostics (`冲突与诊断`)
 // ==========================================================================
 
 function renderConflictCard(item) {
@@ -2861,16 +3393,17 @@ function renderConflictCard(item) {
   const layerMeta = CONFLICT_LAYER_META[item.type] || { zh: item.type || '冲突检测', en: item.type || 'Conflict' };
   const sevLabel =
     sev === 'critical'
-      ? t('严重阻塞', 'Critical')
+      ? t('严重', 'Critical')
       : sev === 'warning'
-        ? t('覆盖警告', 'Warning')
-        : t('叠加提示', 'Notice');
+        ? t('警告', 'Warning')
+        : t('提示', 'Notice');
 
   const title = (loc === 'en' ? item.titleEn : item.titleZh) || item.titleZh || item.titleEn || layerMeta[loc];
   const summary = (loc === 'en' ? item.summaryEn : item.summaryZh) || item.summaryZh || item.summaryEn || '';
   const detail = (loc === 'en' ? item.detailEn : item.detailZh) || '';
 
   const shadowed = Array.isArray(item.shadowed) ? item.shadowed : [];
+  const affectedPlugins = Array.isArray(item.affectedPlugins) ? item.affectedPlugins : [];
   const extraPaths = Array.isArray(item.paths) ? item.paths : [];
   const fix = item.fixAction || null;
   const fixKey = fix ? `${fix.type}:${fix.targetDir}` : '';
@@ -2917,12 +3450,12 @@ function renderConflictCard(item) {
       ${detail ? `<p class="conflict-card-desc muted" style="font-size:11.4px">${escapeHtml(detail)}</p>` : ''}
 
       ${
-        item.winner || shadowed.length > 0 || extraPaths.length > 0
+        item.winner || shadowed.length > 0 || affectedPlugins.length > 0 || extraPaths.length > 0
           ? `<div class="conflict-compare">
               ${
                 item.winner
                   ? `<div class="conflict-path-box is-winner">
-                      <span class="conflict-box-label">${icon('checkCircle', 12)} ${escapeHtml(t('生效胜出方 (Winner)', 'Active Winner'))}</span>
+                      <span class="conflict-box-label">${icon('checkCircle', 12)} ${escapeHtml(t('优先加载', 'Active'))}</span>
                       <div class="conflict-path-line">
                         <strong>${escapeHtml(item.winner.dir || item.winner.name || '')}</strong>
                         ${item.winner.scope ? `<span class="scope-chip">${escapeHtml(item.winner.scope)}</span>` : ''}
@@ -2934,7 +3467,7 @@ function renderConflictCard(item) {
               ${
                 shadowed.length > 0
                   ? `<div class="conflict-path-box ${sev === 'critical' ? 'is-shadowed' : 'is-warn-box'}">
-                      <span class="conflict-box-label">${icon('alertCircle', 12)} ${escapeHtml(t('被吞没 / 受影响插件 (Shadowed)', 'Shadowed / Affected'))}</span>
+                      <span class="conflict-box-label">${icon('alertCircle', 12)} ${escapeHtml(t('被忽略或受影响', 'Ignored / Affected'))}</span>
                       ${shadowed
                         .map(
                           (s) => `
@@ -2950,7 +3483,25 @@ function renderConflictCard(item) {
                   : ''
               }
               ${
-                extraPaths.length > 0 && !item.winner && shadowed.length === 0
+                affectedPlugins.length > 0
+                  ? `<div class="conflict-path-box conflict-affected-box ${sev === 'critical' ? 'is-shadowed' : sev === 'warning' ? 'is-warn-box' : 'is-info-box'}">
+                      <span class="conflict-box-label">${icon('layers', 12)} ${escapeHtml(t('涉及插件', 'Affected Plugins'))}</span>
+                      ${affectedPlugins
+                        .map(
+                          (ap) => `
+                          <div class="conflict-path-line">
+                            <strong>${escapeHtml(ap.dir || ap.name || '')}</strong>
+                            ${ap.scope ? `<span class="scope-chip">${escapeHtml(ap.scope)}</span>` : ''}
+                            ${ap.path ? `<span class="muted">${escapeHtml(ap.path)}</span>` : ''}
+                          </div>
+                        `,
+                        )
+                        .join('')}
+                    </div>`
+                  : ''
+              }
+              ${
+                extraPaths.length > 0 && !item.winner && shadowed.length === 0 && affectedPlugins.length === 0
                   ? `<div class="conflict-path-box ${sev === 'critical' ? 'is-shadowed' : 'is-warn-box'}">
                       <span class="conflict-box-label">${icon('folder', 12)} ${escapeHtml(t('涉及路径', 'Affected Paths'))}</span>
                       ${extraPaths.map((p) => `<div class="conflict-path-line">${escapeHtml(p)}</div>`).join('')}
@@ -2968,108 +3519,36 @@ function renderConflictsView() {
   const report = state.conflicts.data;
   const items = Array.isArray(report?.items) ? report.items : [];
   const summary = getConflictsSummary();
-  const score = computeHealthScore(summary);
-  const circumference = 2 * Math.PI * 30;
-  const dashOffset = circumference * (1 - score / 100);
-  const ringStroke =
-    summary.critical > 0 ? 'var(--m-danger)' : summary.total > 0 ? 'var(--m-warn)' : 'var(--m-ok)';
   const heroToneCls = summary.critical > 0 ? 'has-critical' : summary.total > 0 ? 'has-warnings' : '';
   const checkedText = report?.checkedAt
     ? t(`上次扫描：${formatRelativeTime(report.checkedAt)}`, `Scanned ${formatRelativeTime(report.checkedAt)}`)
-    : t('实时静态只读诊断', 'Read-only static audit');
-
-  // Compute per-layer counts across all 5 audit layers
-  const layerBuckets = [
-    { key: 'duplicate-plugin-name', types: ['duplicate-plugin-name'] },
-    { key: 'windows-symlink-ignored', types: ['windows-symlink-ignored'] },
-    { key: 'mcp-collision', types: ['mcp-collision'] },
-    { key: 'skill-shadowing', types: ['skill-shadowing', 'agent-shadowing'] },
-    { key: 'host-enhancement-overlap', types: ['host-enhancement-overlap'] },
-  ];
-
-  const auditMatrixHtml = `
-    <section class="radar-checks-section">
-      <div class="radar-section-title">${icon('radar', 13)} ${escapeHtml(t('5 层静态健康体检矩阵', '5-Layer Static Health Audit Matrix'))}</div>
-      <div class="radar-checks-grid">
-        ${layerBuckets
-          .map((bucket) => {
-            const matched = items.filter((it) => bucket.types.includes(it.type));
-            const hasCrit = matched.some((it) => it.severity === 'critical');
-            const meta = CONFLICT_LAYER_META[bucket.key];
-            const tileTitle =
-              bucket.key === 'skill-shadowing'
-                ? t('Skill & Subagent 覆盖', 'Skill & Agent Shadowing')
-                : getLocale() === 'en'
-                  ? meta.en
-                  : meta.zh;
-            const tileSub = getLocale() === 'en' ? meta.descEn : meta.descZh;
-            const statusCls = matched.length === 0 ? 'is-pass' : hasCrit ? 'is-hit-critical' : 'is-hit-warn';
-            const statusLabel =
-              matched.length === 0
-                ? t('✓ 通过', '✓ Pass')
-                : t(`${matched.length} 项`, `${matched.length} hit`);
-            return `
-              <div class="radar-check-tile ${statusCls}">
-                <div class="radar-check-info">
-                  <span class="radar-check-name">${escapeHtml(tileTitle)}</span>
-                  <span class="radar-check-sub">${escapeHtml(tileSub)}</span>
-                </div>
-                <span class="radar-check-status ${statusCls}">${escapeHtml(statusLabel)}</span>
-              </div>
-            `;
-          })
-          .join('')}
-      </div>
-    </section>
-  `;
+    : t('尚未扫描', 'Not scanned yet');
 
   return `
     <div class="main-scroll">
       <section class="conflict-hero ${heroToneCls}">
-        <div class="conflict-hero-left">
-          <div class="health-ring-wrap" aria-label="${escapeHtml(t(`插件生态健康评分 ${score} 分`, `Health score ${score}`))}">
-            <svg class="health-ring-svg" viewBox="0 0 74 74">
-              <circle class="health-ring-bg" cx="37" cy="37" r="30"></circle>
-              <circle
-                class="health-ring-fg"
-                cx="37"
-                cy="37"
-                r="30"
-                stroke="${ringStroke}"
-                stroke-dasharray="${circumference.toFixed(1)}"
-                stroke-dashoffset="${dashOffset.toFixed(1)}"
-              ></circle>
-            </svg>
-            <div class="health-ring-score">
-              <span class="health-ring-num" style="color:${ringStroke}">${score}</span>
-              <span class="health-ring-lbl">${escapeHtml(t('健康分', 'SCORE'))}</span>
-            </div>
-          </div>
-
-          <div class="conflict-hero-copy">
-            <h2 class="conflict-hero-title">
-              ${
-                summary.total === 0
-                  ? `${icon('shieldCheck', 16)} ${escapeHtml(t('插件生态健康 · 零冲突运行中', 'Ecosystem Healthy · Zero Conflicts'))}`
-                  : summary.critical > 0
-                    ? `${icon('shieldAlert', 16)} ${escapeHtml(t(`检测到 ${summary.critical} 项严重冲突，可能导致插件被宿主静默丢弃`, `${summary.critical} critical conflict(s) may silently drop plugins`))}`
-                    : `${icon('alertCircle', 16)} ${escapeHtml(t(`检测到 ${summary.total} 项覆盖警告或优化建议`, `${summary.total} warning(s) or optimization notices detected`))}`
-              }
-            </h2>
-            <p class="conflict-hero-sub">${escapeHtml(t('纯只读扫描 global / workspace / builtin 插件、NTFS 联接目录、MCP 命名空间与宿主增强层，绝不改写 config.json。', 'Read-only scan across global/workspace/builtin plugins, Windows symlinks, MCP keys, and host enhancements.'))}</p>
-            <div class="conflict-kpi-row">
-              <span class="conflict-kpi-pill ${summary.critical > 0 ? 'is-critical' : ''}">${escapeHtml(t(`严重阻塞 ${summary.critical}`, `Critical ${summary.critical}`))}</span>
-              <span class="conflict-kpi-pill ${summary.warning > 0 ? 'is-warning' : ''}">${escapeHtml(t(`覆盖警告 ${summary.warning}`, `Warnings ${summary.warning}`))}</span>
-              <span class="conflict-kpi-pill ${summary.info > 0 ? 'is-info' : ''}">${escapeHtml(t(`叠加提示 ${summary.info}`, `Info ${summary.info}`))}</span>
-              <span class="conflict-kpi-pill is-ok">${escapeHtml(t(`健康插件 ${summary.healthyCount}`, `Healthy ${summary.healthyCount}`))}</span>
-            </div>
+        <div class="conflict-hero-copy">
+          <h2 class="conflict-hero-title">
+            ${
+              summary.total === 0
+                ? `${icon('shieldCheck', 16)} ${escapeHtml(t('未检测到插件冲突', 'No plugin conflicts detected'))}`
+                : summary.critical > 0
+                  ? `${icon('shieldAlert', 16)} ${escapeHtml(t(`发现 ${summary.critical} 项严重冲突，可能影响插件或 MCP 加载`, `${summary.critical} critical conflict(s) may affect plugin or MCP loading`))}`
+                  : `${icon('alertCircle', 16)} ${escapeHtml(t(`发现 ${summary.total} 项警告或提示`, `${summary.total} warning(s) or notice(s) found`))}`
+            }
+          </h2>
+          <div class="conflict-kpi-row">
+            <span class="conflict-kpi-pill ${summary.critical > 0 ? 'is-critical' : ''}">${escapeHtml(t(`严重 ${summary.critical}`, `Critical ${summary.critical}`))}</span>
+            <span class="conflict-kpi-pill ${summary.warning > 0 ? 'is-warning' : ''}">${escapeHtml(t(`警告 ${summary.warning}`, `Warnings ${summary.warning}`))}</span>
+            <span class="conflict-kpi-pill ${summary.info > 0 ? 'is-info' : ''}">${escapeHtml(t(`提示 ${summary.info}`, `Info ${summary.info}`))}</span>
+            <span class="conflict-kpi-pill is-ok">${escapeHtml(t(`正常 ${summary.healthyCount}`, `OK ${summary.healthyCount}`))}</span>
           </div>
         </div>
 
         <div class="conflict-hero-actions">
           <button type="button" class="btn btn-primary btn-sm" data-action="refresh-conflicts" ${state.conflicts.loading ? 'disabled' : ''}>
             ${icon('refresh', 12, state.conflicts.loading ? 'spin' : '')}
-            <span>${escapeHtml(state.conflicts.loading ? t('扫描中…', 'Scanning…') : t('重新全盘扫描', 'Rescan All'))}</span>
+            <span>${escapeHtml(state.conflicts.loading ? t('扫描中…', 'Scanning…') : t('重新扫描', 'Rescan'))}</span>
           </button>
           <span class="muted" style="font-size:11px">${escapeHtml(checkedText)}</span>
         </div>
@@ -3084,12 +3563,11 @@ function renderConflictsView() {
                 <button type="button" class="btn btn-sm" data-action="refresh-conflicts">${escapeHtml(t('重试', 'Retry'))}</button>
               </div>`
             : items.length > 0
-              ? `${auditMatrixHtml}<div class="conflict-list" style="margin-top:14px">${items.map((it) => renderConflictCard(it)).join('')}</div>`
-              : `${auditMatrixHtml}
-                 <div class="empty-state" style="margin-top:14px;border-color:var(--m-ok-border)">
+              ? `<div class="conflict-list">${items.map((it) => renderConflictCard(it)).join('')}</div>`
+              : `<div class="empty-state" style="border-color:var(--m-ok-border)">
                    <div class="empty-icon" style="background:var(--m-ok-soft);border-color:var(--m-ok-border);color:var(--m-ok)">${icon('shieldCheck', 22)}</div>
-                   <div class="empty-title">${escapeHtml(t('所有 5 层插件冲突检查均已通过', 'All 5 plugin conflict audit layers passed'))}</div>
-                   <div class="empty-sub">${escapeHtml(t('当前本机不存在同名插件静默吞没、Windows 符号链接跳过、MCP 服务重名或技能覆盖冲突。', 'No duplicate plugin names, skipped Windows symlinks, MCP collisions, or skill shadowing found.'))}</div>
+                   <div class="empty-title">${escapeHtml(t('未检测到插件冲突', 'No plugin conflicts detected'))}</div>
+                   <div class="empty-sub">${escapeHtml(t('当前未发现同名插件、符号链接、MCP 服务名或技能重名冲突。', 'No duplicate plugin names, symlinks, MCP collisions, or duplicate skills found.'))}</div>
                  </div>`
       }
     </div>
@@ -3111,7 +3589,7 @@ function renderSourcesView() {
       <form id="sources-form" class="settings-panel">
         <div class="field-card">
           <div class="field-head">
-            <div class="field-label">${icon('globe', 14)} ${escapeHtml(t('目录通道与实时遥测', 'Active Catalog Telemetry'))}</div>
+            <div class="field-label">${icon('globe', 14)} ${escapeHtml(t('目录源与同步状态', 'Catalog Source & Sync Status'))}</div>
             <button type="button" class="btn btn-sm" data-action="refresh" ${state.loading ? 'disabled' : ''}>
               ${icon('refresh', 12, state.loading ? 'spin' : '')}
               ${escapeHtml(t('立即同步', 'Sync Now'))}
@@ -3128,7 +3606,7 @@ function renderSourcesView() {
             </div>
             <div class="telemetry-cell">
               <span class="telemetry-k">${escapeHtml(t('客户端版本', 'Client Version'))}</span>
-              <span class="telemetry-v">v${escapeHtml(state.serverState?.plugin?.version || '1.3.0')}</span>
+              <span class="telemetry-v">v${escapeHtml(state.serverState?.plugin?.version || PLUGIN_VERSION)}</span>
             </div>
             <div class="telemetry-cell">
               <span class="telemetry-k">${escapeHtml(t('更新检查', 'Update Check'))}</span>
@@ -3163,7 +3641,7 @@ function renderSourcesView() {
 
         <div class="field-card">
           <label class="field-label" for="net-mode-select">${icon('layers', 14)} ${escapeHtml(t('目录镜像与国内网络模式', 'Catalog Mirror & Network Mode'))}</label>
-          <p class="field-hint">${escapeHtml(t('自动模式下优先通过 ETag 304 请求 GitHub Pages，超时 (>3.5s) 自动无缝切换至 npmmirror / 腾讯云 @agy-market/catalog 纯 JSON 镜像包。', 'Auto mode queries GitHub Pages with ETag 304 and falls back to @agy-market/catalog on npmmirror / Tencent mirror on timeout.'))}</p>
+          <p class="field-hint">${escapeHtml(t('自动模式下优先通过 ETag 304 请求 GitHub Pages，超时 (>3.5s) 自动回退至 npmmirror / 腾讯云 @agy-market/catalog 纯 JSON 镜像包。', 'Auto mode queries GitHub Pages with ETag 304 and falls back to @agy-market/catalog on npmmirror / Tencent mirror on timeout.'))}</p>
           <select id="net-mode-select" class="select-input">
             <option value="auto" ${prefs.networkMode === 'auto' ? 'selected' : ''}>${escapeHtml(t('自动切换 (GitHub Pages -> 国内镜像兜底)', 'Auto (GitHub Pages -> China Mirror Fallback)'))}</option>
             <option value="china-mirror" ${prefs.networkMode === 'china-mirror' ? 'selected' : ''}>${escapeHtml(t('国内镜像优先 (npmmirror / 腾讯云)', 'China Mirror Priority (npmmirror / Tencent)'))}</option>
@@ -3172,8 +3650,8 @@ function renderSourcesView() {
         </div>
 
         <div class="field-card">
-          <label class="field-label" for="mirror-prefix-input">${icon('shield', 14)} ${escapeHtml(t('GitHub Release 下载加速前缀 (SHA-256 强校验)', 'GitHub Release Download Mirror Prefix (SHA-256 Verified)'))}</label>
-          <p class="field-hint">${escapeHtml(t('可选。填写下载代理前缀后，所有 .tar.gz 解压前仍会强制比对目录 SHA-256 摘要，杜绝任何中间人篡改。', 'Optional download proxy prefix. Every archive is still verified against catalog SHA-256 before extraction.'))}</p>
+          <label class="field-label" for="mirror-prefix-input">${icon('shield', 14)} ${escapeHtml(t('GitHub Release 下载加速前缀 (SHA-256 校验)', 'GitHub Release Download Mirror Prefix (SHA-256 Verified)'))}</label>
+          <p class="field-hint">${escapeHtml(t('可选。填写下载代理前缀后，所有 .tar.gz 解压前仍会校验目录中的 SHA-256 摘要。', 'Optional download proxy prefix. Every archive is still verified against catalog SHA-256 before extraction.'))}</p>
           <input id="mirror-prefix-input" class="text-input" type="text" placeholder="https://mirror.example.com/" value="${escapeHtml(prefs.githubReleaseMirrorPrefix || '')}" />
         </div>
 
@@ -3325,12 +3803,23 @@ function renderDetailDrawer() {
   const upd = updById.get(p.id) || (st.installedDir ? updByDir.get(st.installedDir) : null);
   const hasCatalogUpdate = Boolean((upd && upd.installable !== false) || (!upd && st.installed && st.hasUpdate));
   const hasUpstreamOnly = Boolean(upd && upd.installable === false);
-  const isBusy = state.busyId === p.id;
-  const repoUrl = p.repository?.url || localItem?.repositoryUrl || '';
+  const installedDir = st.installedDir || localItem?.dir || '';
+  const isGithubUrlLocal = Boolean(
+    p._localOnly && (localItem?.receipt?.track === 'github-url' || p._track === 'github-url'),
+  );
+  const githubTargetId = upd?.id || localItem?.receipt?.id || p.id || installedDir;
+  const canGithubUpdate = Boolean(isGithubUrlLocal && upd && upd.installable !== false);
+  const isCommitUpdate = Boolean(upd && upd.updateKind === 'commit' && upd.latestCommitSha);
+  const isBusy = Boolean(
+    state.busyId === p.id ||
+      (installedDir && state.busyId === installedDir) ||
+      (githubTargetId && state.busyId === githubTargetId),
+  );
+  const repoUrl = p.repository?.url || localItem?.repositoryUrl || localItem?.receipt?.repositoryUrl || '';
+  const pluginRoot = p.repository?.pluginRoot || localItem?.receipt?.pluginRoot || '.';
   const discussUrl = deriveDiscussionsUrl(repoUrl);
   const loc = getLocale();
   const accent = resolveCardAccent(p);
-  const installedDir = st.installedDir || localItem?.dir || '';
   const isSelf = installedDir === 'agy-market' || p.canonicalName === 'agy-market' || p.id === 'azwosile__agy-market';
   const isEnabled = st.installed ? Boolean(localItem ? localItem.enabled : st.enabled) : false;
   const localScope = localItem?.scope || st.scope || 'global';
@@ -3339,10 +3828,19 @@ function renderDetailDrawer() {
   const favKey = p._localOnly ? getLocalFavoriteKey(localItem || { dir: installedDir, receipt: { id: p.id } }, null) : String(p.id || '');
 
   let primaryBtn = '';
-  if (p._localOnly) {
-    primaryBtn = '';
-  } else if (isBusy) {
+  if (isBusy) {
     primaryBtn = `<button type="button" class="btn btn-primary btn-sm" disabled>${icon('refresh', 12, 'spin')} ${escapeHtml(t('处理中…', 'Working…'))}</button>`;
+  } else if (isGithubUrlLocal) {
+    if (canGithubUpdate) {
+      const ghUpdLabel = isCommitUpdate
+        ? t(`更新至 ${upd.latestCommitSha}`, `Update to ${upd.latestCommitSha}`)
+        : t(`更新至 v${upd.latestVersion}`, `Update to v${upd.latestVersion}`);
+      primaryBtn = `<button type="button" class="btn btn-update btn-sm" data-action="update-local-github" data-id="${escapeHtml(githubTargetId)}" data-dir="${escapeHtml(installedDir)}" data-name="${escapeHtml(displayName)}">${icon('update', 12)} ${escapeHtml(ghUpdLabel)}</button>`;
+    } else {
+      primaryBtn = `<button type="button" class="btn btn-sm" data-action="update-local-github" data-id="${escapeHtml(githubTargetId)}" data-dir="${escapeHtml(installedDir)}" data-name="${escapeHtml(displayName)}">${icon('refresh', 12)} ${escapeHtml(t('从 GitHub 重新同步', 'Re-sync from GitHub'))}</button>`;
+    }
+  } else if (p._localOnly) {
+    primaryBtn = '';
   } else if (hasCatalogUpdate) {
     primaryBtn = `<button type="button" class="btn btn-update btn-sm" data-action="install" data-id="${escapeHtml(p.id)}">${icon('update', 12)} ${escapeHtml(t(`更新至 v${upd?.latestVersion || p.version}`, `Update to v${upd?.latestVersion || p.version}`))}</button>`;
   } else if (hasUpstreamOnly && upd.releaseUrl) {
@@ -3417,9 +3915,15 @@ function renderDetailDrawer() {
             : ''
         }
         ${
+          pluginRoot && pluginRoot !== '.'
+            ? `<span class="muted">${escapeHtml(t('子目录', 'Subpath'))}</span>
+               <span class="mono">${escapeHtml(pluginRoot)}</span>`
+            : ''
+        }
+        ${
           p.gitTag || p.commitSha
             ? `<span class="muted">Tag / Commit</span>
-               <span class="mono">${escapeHtml(p.gitTag || 'n/a')}${p.commitSha ? ` · ${escapeHtml(String(p.commitSha).slice(0, 12))}` : ''}</span>`
+               <span class="mono">${escapeHtml(p.gitTag || (p.commitSha ? 'commit' : 'n/a'))}${p.commitSha ? ` · ${escapeHtml(String(p.commitSha).slice(0, 12))}` : ''}</span>`
             : ''
         }
         ${
@@ -3436,18 +3940,25 @@ function renderDetailDrawer() {
       </div>
     `;
   } else if (state.detailTab === 'changelog') {
+    const changelogTitle = upd
+      ? isCommitUpdate
+        ? `v${upd.installedVersion || st.installedVersion || p.version} (${upd.installedCommitSha || String(p.commitSha || '').slice(0, 7) || 'HEAD'} → ${upd.latestCommitSha})`
+        : `v${upd.installedVersion || st.installedVersion || p.version} → v${upd.latestVersion}`
+      : '';
     bodyHtml = upd
       ? `
         <div class="changelog-banner ${hasUpstreamOnly ? 'is-upstream' : ''}">
           <div style="display:flex;flex-direction:column;gap:3px">
-            <div style="font-weight:700;font-size:12.5px">v${escapeHtml(upd.installedVersion || st.installedVersion || p.version)} → v${escapeHtml(upd.latestVersion)}</div>
+            <div style="font-weight:700;font-size:12.5px">${escapeHtml(changelogTitle)}</div>
             <div class="muted" style="font-size:11.2px">${escapeHtml(
               hasUpstreamOnly
                 ? t('来源：GitHub 上游发布（等待目录同步与 SHA-256 锁定）', 'Source: GitHub upstream (awaiting catalog SHA-256 sync)')
-                : t('来源：权威目录（已通过 SHA-256 完整性校验）', 'Source: Verified Catalog (SHA-256 attested)'),
+                : upd.updateChannel === 'github-url' || isGithubUrlLocal
+                  ? t('来源：GitHub 仓库直连更新（本地 SHA-256 校验）', 'Source: GitHub repository direct update (local SHA-256 verified)')
+                  : t('来源：已验证目录（SHA-256 已校验）', 'Source: Verified Catalog (SHA-256 verified)'),
             )}</div>
           </div>
-          ${upd.releaseUrl ? `<a class="btn btn-sm" href="${escapeHtml(upd.releaseUrl)}" target="_blank" rel="noopener noreferrer">Release ${icon('external', 11)}</a>` : ''}
+          ${upd.releaseUrl ? `<a class="btn btn-sm" href="${escapeHtml(upd.releaseUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(isCommitUpdate ? t('查看对比', 'Compare') : 'Release')} ${icon('external', 11)}</a>` : ''}
         </div>
         <div class="md-body">
           ${renderSafeMarkdown(upd.changelog, t('上游未附带详细的更新日志说明。', 'No release notes were provided for this version.'))}
@@ -3479,7 +3990,7 @@ function renderDetailDrawer() {
                   `;
                 })
                 .join('')
-            : `<p class="muted">${escapeHtml(t('暂无静态能力画像数据。', 'No static capability metadata available.'))}</p>`
+            : `<p class="muted">${escapeHtml(t('暂无静态能力声明数据。', 'No static capability metadata available.'))}</p>`
         }
       </div>
       <div class="meta-kv">
@@ -3511,9 +4022,12 @@ function renderDetailDrawer() {
                 <span class="mono">${escapeHtml(p.forceScopedInstall ? p.scopedName : p.canonicalName)}</span>
                 ${
                   upd
-                    ? `<span class="version-delta ${hasUpstreamOnly ? 'is-upstream' : ''}">v${escapeHtml(upd.installedVersion || st.installedVersion || p.version)} → v${escapeHtml(upd.latestVersion)}</span>`
+                    ? isCommitUpdate
+                      ? `<span class="version-delta ${hasUpstreamOnly ? 'is-upstream' : ''}">v${escapeHtml(upd.installedVersion || st.installedVersion || p.version)} (${escapeHtml(upd.installedCommitSha || String(p.commitSha || '').slice(0, 7) || 'HEAD')} → ${escapeHtml(upd.latestCommitSha)})</span>`
+                      : `<span class="version-delta ${hasUpstreamOnly ? 'is-upstream' : ''}">v${escapeHtml(upd.installedVersion || st.installedVersion || p.version)} → v${escapeHtml(upd.latestVersion)}</span>`
                     : `<span class="version-tag">v${escapeHtml(p.version)}</span>`
                 }
+                ${isGithubUrlLocal ? `<span class="track-tag is-github-url">GitHub URL</span>` : ''}
                 ${Number(p.repository?.stars || 0) > 0 ? `<span class="meta-star">${icon('star', 11)} ${Number(p.repository.stars)}</span>` : ''}
               </div>
             </div>
@@ -3566,6 +4080,511 @@ function renderDetailDrawer() {
 // ==========================================================================
 // Modals & Reconnect Overlay
 // ==========================================================================
+
+function renderGithubUrlModal() {
+  const m = state.githubUrlModal;
+  if (!m) return '';
+  const isBusyPhase = m.phase === 'inspecting' || m.phase === 'installing';
+  const loc = getLocale();
+
+  let bodyHtml = '';
+  let footerHtml = '';
+
+  if (m.phase === 'input') {
+    bodyHtml = `
+      <p class="muted" style="margin:0;line-height:1.55">${escapeHtml(
+        t(
+          '粘贴公开 GitHub 插件仓库、子目录或归档链接，系统将先下载并计算 SHA-256、执行本地静态预检，确认后再安装。',
+          'Paste a public GitHub repository, subpath, or tarball URL. AGY Market will download the archive, verify SHA-256, and run local static checks before installing.',
+        ),
+      )}</p>
+      <div class="gh-url-input-row">
+        <input
+          id="github-url-input"
+          class="text-input gh-url-input"
+          type="text"
+          inputmode="url"
+          autocomplete="off"
+          spellcheck="false"
+          placeholder="https://github.com/owner/repo"
+          value="${escapeHtml(m.url || '')}"
+        />
+      </div>
+      ${
+        m.error
+          ? `<div class="gh-inline-error" role="alert">${icon('alertTriangle', 14)}<span>${escapeHtml(m.error)}</span></div>`
+          : ''
+      }
+      <div class="gh-url-formats">
+        <div class="gh-url-formats-title">${escapeHtml(t('支持的链接格式', 'Supported URL formats'))}</div>
+        <div class="gh-url-format-row">
+          <span>${escapeHtml(t('仓库主页', 'Repository'))}:</span>
+          <code>https://github.com/&lt;owner&gt;/&lt;repo&gt;</code>
+        </div>
+        <div class="gh-url-format-row">
+          <span>${escapeHtml(t('分支或 Monorepo 子目录', 'Branch / Monorepo Subpath'))}:</span>
+          <code>.../tree/&lt;branch&gt;/&lt;subpath&gt;</code>
+        </div>
+        <div class="gh-url-format-row">
+          <span>${escapeHtml(t('指定 Release 标签', 'Release Tag'))}:</span>
+          <code>.../releases/tag/&lt;tag&gt;</code>
+        </div>
+        <div class="gh-url-format-row">
+          <span>${escapeHtml(t('归档直链', 'Tarball URL'))}:</span>
+          <code>.../releases/download/&lt;tag&gt;/&lt;file&gt;.tar.gz</code>
+        </div>
+      </div>
+    `;
+    footerHtml = `
+      <button type="button" class="btn btn-sm" data-action="close-modal">${escapeHtml(t('取消', 'Cancel'))}</button>
+      <button type="button" id="gh-inspect-submit-btn" class="btn btn-primary btn-sm" data-action="inspect-github-url" ${!String(m.url || '').trim() ? 'disabled' : ''}>
+        ${icon('search', 12)}
+        <span>${escapeHtml(t('解析预检', 'Inspect'))}</span>
+      </button>
+    `;
+  } else if (m.phase === 'inspecting') {
+    bodyHtml = `
+      <div class="gh-progress-box">
+        <div class="reconnect-orb">${icon('refresh', 20, 'spin')}</div>
+        <div class="gh-progress-title">${escapeHtml(t('正在获取归档并执行本地静态检查…', 'Fetching archive and running local static checks…'))}</div>
+        <div class="gh-progress-url" title="${escapeHtml(m.url || '')}">${escapeHtml(m.url || '')}</div>
+        <div class="progress-track"><div class="progress-fill"></div></div>
+        <div class="muted" style="font-size:11.4px;line-height:1.5">${escapeHtml(
+          t(
+            '正在下载压缩包、计算 SHA-256 摘要并扫描 plugin.json 与能力声明，请稍候。',
+            'Downloading tarball, computing SHA-256 digest, and inspecting plugin.json & capabilities…',
+          ),
+        )}</div>
+      </div>
+    `;
+    footerHtml = `
+      <span class="muted" style="font-size:11.2px;margin-right:auto">${escapeHtml(t('预检完成后将展示详情供确认', 'Preview will appear once inspection finishes'))}</span>
+    `;
+  } else if (m.phase === 'subpaths') {
+    const res = m.inspectResult || {};
+    const candidates = Array.isArray(m.subpathCandidates)
+      ? m.subpathCandidates
+      : Array.isArray(res.candidates)
+        ? res.candidates
+        : [];
+    const repoUrl = res.repoUrl || (isSafeHttpUrl(m.url) ? m.url : '');
+    const subpathIntro =
+      (loc === 'en' ? res.reasonEn || res.reasonZh : res.reasonZh || res.reasonEn) ||
+      t(
+        `该仓库包含 ${candidates.length} 个插件子目录，请选择需要预检和安装的插件：`,
+        `Found ${candidates.length} plugin subpaths in this repository. Select one to inspect and install:`,
+      );
+    bodyHtml = `
+      <p class="muted" style="margin:0;line-height:1.5">${escapeHtml(subpathIntro)}</p>
+      ${
+        isSafeHttpUrl(repoUrl)
+          ? `<div style="font-size:11.4px"><a class="md-link" href="${escapeHtml(repoUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(repoUrl)} ${icon('external', 11)}</a></div>`
+          : ''
+      }
+      <div class="gh-subpath-list">
+        ${candidates
+          .map((cand) => {
+            const cName = cand.displayName || cand.name || cand.pluginRoot;
+            const cDesc =
+              typeof cand.description === 'object'
+                ? cand.description[loc] || cand.description.zh || cand.description.en || ''
+                : String(cand.description || '');
+            return `
+              <button type="button" class="gh-subpath-item" data-action="select-github-subpath" data-plugin-root="${escapeHtml(cand.pluginRoot || '.')}">
+                <div class="gh-subpath-copy">
+                  <div class="gh-subpath-head">
+                    <span class="gh-subpath-name">${escapeHtml(cName)}</span>
+                    ${cand.version ? `<span class="version-tag">v${escapeHtml(cand.version)}</span>` : ''}
+                    <span class="gh-subpath-path">${icon('folder', 11)} ${escapeHtml(cand.pluginRoot || '.')}</span>
+                  </div>
+                  ${cDesc ? `<div class="gh-subpath-desc">${escapeHtml(cDesc)}</div>` : ''}
+                </div>
+                <span class="muted">${icon('chevronRight', 14)}</span>
+              </button>
+            `;
+          })
+          .join('')}
+      </div>
+    `;
+    footerHtml = `
+      <button type="button" class="btn btn-sm" data-action="reset-github-url-modal">${escapeHtml(t('返回修改链接', 'Edit URL'))}</button>
+      <button type="button" class="btn btn-sm" data-action="close-modal">${escapeHtml(t('取消', 'Cancel'))}</button>
+    `;
+  } else if (m.phase === 'preview' || m.phase === 'installing') {
+    const isInstalling = m.phase === 'installing';
+    const res = m.inspectResult || {};
+    const plugin = res.plugin || {};
+    const pf = res.preflight || {};
+    const esc = normalizeInspectEscalation(res.escalation);
+    const catalogMatch = res.catalogMatch || null;
+    const allWarnings = [
+      ...(Array.isArray(res.warnings) ? res.warnings : []),
+      ...(Array.isArray(res.componentWarnings) ? res.componentWarnings : []),
+    ]
+      .map(formatInspectWarningItem)
+      .filter(Boolean);
+
+    const displayName = plugin.displayName || plugin.canonicalName || plugin.id || 'Plugin';
+    const canonicalName = plugin.canonicalName || plugin.id || '';
+    const scopedName = plugin.scopedName || canonicalName;
+    const version = plugin.version || '0.0.0';
+    const pluginRoot = plugin.pluginRoot || plugin.repository?.pluginRoot || m.selectedPluginRoot || '.';
+    const sha256 = plugin.sha256 || plugin.distribution?.sha256 || '';
+    const commitSha = plugin.commitSha || '';
+    const gitTag = plugin.gitTag || '';
+    const sizeLabel = formatBytesCompact(plugin.sizeBytes);
+    const channelLabel = formatInspectChannelLabel(plugin.channelUsed);
+    const repoUrl = plugin.repoUrl || plugin.repository?.url || res.repoUrl || '';
+    const descText =
+      typeof plugin.description === 'object'
+        ? plugin.description[loc] || plugin.description.zh || plugin.description.en || ''
+        : String(plugin.description || '');
+    const capabilities = plugin.capabilities || { badges: [] };
+    const rulesTokens = Number(capabilities.rulesEstimatedTokens || 0);
+
+    const isUpdate = pf.action === 'update';
+    const conflictItem = pf.conflictItem || pf.conflict || null;
+    const hasConflict = pf.action === 'conflict-prompt' || Boolean(conflictItem);
+    const isForcedScoped = (pf.action === 'install-scoped' || Boolean(pf.isForeignSelfCollision)) && !hasConflict;
+    const canReplace = Boolean(
+      pf.canReplace ??
+        (Array.isArray(pf.choices) && pf.choices.includes('replace') && conflictItem?.dir !== 'agy-market'),
+    );
+
+    const tagCommitLabel =
+      gitTag && commitSha
+        ? `${gitTag} · ${String(commitSha).slice(0, 12)}`
+        : gitTag
+          ? gitTag
+          : commitSha
+            ? `commit · ${String(commitSha).slice(0, 12)}`
+            : '';
+
+    let modeSectionHtml = '';
+    if (isUpdate) {
+      const targetDir = pf.targetDir || pf.existingInstall?.dir || canonicalName;
+      const isParked = Boolean(pf.existingInstall?.parkedByMarket || pf.existingInstall?.currentlyParked);
+      modeSectionHtml = `
+        <div class="gh-notice-box is-info">
+          <div class="gh-notice-head">${icon('refresh', 13)} <span>${escapeHtml(t('同源插件原地更新', 'Same-Source Update'))}</span></div>
+          <div>${escapeHtml(
+            t(
+              `本地目录 "${targetDir}" 已安装同源插件${pf.existingInstall?.version ? ` (v${pf.existingInstall.version})` : ''}，确认后将更新至 v${version}${isParked ? '（更新后仍保持停放禁用状态）' : ''}。`,
+              `Existing install found in "${targetDir}"${pf.existingInstall?.version ? ` (v${pf.existingInstall.version})` : ''}. Will update in place to v${version}${isParked ? ' (remains parked/disabled)' : ''}.`,
+            ),
+          )}</div>
+        </div>
+      `;
+    } else if (hasConflict) {
+      const conflictDir = conflictItem?.dir || canonicalName;
+      const conflictScope = conflictItem?.scope || 'global';
+      modeSectionHtml = `
+        <div class="gh-notice-box is-warn">
+          <div class="gh-notice-head">${icon('alertCircle', 13)} <span>${escapeHtml(t('检测到本地同名插件冲突', 'Local Plugin Name Collision'))}</span></div>
+          <div>${escapeHtml(
+            t(
+              `本机已存在同名插件 "${conflictDir}" (${conflictScope})，默认推荐使用隔离命名共存安装。`,
+              `A local plugin "${conflictDir}" (${conflictScope}) already uses this name. Scoped isolation is selected by default.`,
+            ),
+          )}</div>
+        </div>
+        <div class="gh-mode-section">
+          <div class="gh-mode-label">${escapeHtml(t('安装方式', 'Install Mode'))}</div>
+          <div class="gh-mode-list">
+            <button type="button" class="gh-mode-option ${m.installMode === 'isolate' ? 'is-selected' : ''}" data-action="select-github-install-mode" data-mode="isolate" ${isInstalling ? 'disabled' : ''}>
+              <span class="gh-mode-radio" aria-hidden="true"></span>
+              <span class="gh-mode-copy">
+                <span class="gh-mode-title">
+                  <span>${escapeHtml(t('隔离安装（推荐）', 'Isolated Install (Recommended)'))}</span>
+                  <span class="version-tag">${escapeHtml(scopedName)}</span>
+                </span>
+                <span class="gh-mode-sub">${escapeHtml(t('写入独立目录并重命名清单标识，与现有本地插件安全共存。', 'Installs into a scoped directory so it coexists with the existing local plugin.'))}</span>
+              </span>
+            </button>
+            ${
+              canReplace
+                ? `<button type="button" class="gh-mode-option ${m.installMode === 'replace' ? 'is-selected' : ''}" data-action="select-github-install-mode" data-mode="replace" ${isInstalling ? 'disabled' : ''}>
+                    <span class="gh-mode-radio" aria-hidden="true"></span>
+                    <span class="gh-mode-copy">
+                      <span class="gh-mode-title">
+                        <span>${escapeHtml(t('覆盖替换本地同名插件', 'Replace Existing Local Plugin'))}</span>
+                        <span class="version-tag">${escapeHtml(conflictDir)}</span>
+                      </span>
+                      <span class="gh-mode-sub">${escapeHtml(t('用此仓库内容替换现有全局目录中的插件文件。', 'Replaces the files inside the existing global plugin directory.'))}</span>
+                    </span>
+                  </button>`
+                : ''
+            }
+          </div>
+        </div>
+      `;
+    } else if (isForcedScoped) {
+      modeSectionHtml = `
+        <div class="gh-mode-section">
+          <div class="gh-mode-label">${escapeHtml(t('安装方式', 'Install Mode'))}</div>
+          <div class="gh-mode-list">
+            <button type="button" class="gh-mode-option is-selected" data-action="select-github-install-mode" data-mode="isolate" ${isInstalling ? 'disabled' : ''}>
+              <span class="gh-mode-radio" aria-hidden="true"></span>
+              <span class="gh-mode-copy">
+                <span class="gh-mode-title">
+                  <span>${escapeHtml(t('隔离安装', 'Isolated Install'))}</span>
+                  <span class="version-tag">${escapeHtml(scopedName)}</span>
+                </span>
+                <span class="gh-mode-sub">${escapeHtml(t('该插件将采用命名空间隔离目录安装，避免与内置或核心插件冲突。', 'Installs into a scoped directory to avoid naming collisions.'))}</span>
+              </span>
+            </button>
+          </div>
+        </div>
+      `;
+    } else {
+      modeSectionHtml = `
+        <div class="gh-mode-section">
+          <div class="gh-mode-label">${escapeHtml(t('安装方式', 'Install Mode'))}</div>
+          <div class="gh-mode-list">
+            <button type="button" class="gh-mode-option ${m.installMode === 'native' ? 'is-selected' : ''}" data-action="select-github-install-mode" data-mode="native" ${isInstalling ? 'disabled' : ''}>
+              <span class="gh-mode-radio" aria-hidden="true"></span>
+              <span class="gh-mode-copy">
+                <span class="gh-mode-title">
+                  <span>${escapeHtml(t('原生安装', 'Native Install'))}</span>
+                  <span class="version-tag">${escapeHtml(canonicalName)}</span>
+                </span>
+                <span class="gh-mode-sub">${escapeHtml(t('未检测到本地同名冲突，按插件原生名称安装。', 'No local collision found. Installs under the plugin canonical name.'))}</span>
+              </span>
+            </button>
+            <button type="button" class="gh-mode-option ${m.installMode === 'isolate' ? 'is-selected' : ''}" data-action="select-github-install-mode" data-mode="isolate" ${isInstalling ? 'disabled' : ''}>
+              <span class="gh-mode-radio" aria-hidden="true"></span>
+              <span class="gh-mode-copy">
+                <span class="gh-mode-title">
+                  <span>${escapeHtml(t('隔离安装', 'Isolated Install'))}</span>
+                  <span class="version-tag">${escapeHtml(scopedName)}</span>
+                </span>
+                <span class="gh-mode-sub">${escapeHtml(t('使用 <owner>--<slug> 命名空间目录安装，便于与其他源区分。', 'Installs into an <owner>--<slug> scoped directory.'))}</span>
+              </span>
+            </button>
+          </div>
+        </div>
+      `;
+    }
+
+    const escalationHtml = esc.hasEscalation
+      ? `
+        <div class="escalation-item">
+          <div class="escalation-item-head">
+            <span style="display:inline-flex;align-items:center;gap:6px;color:var(--m-warn)">${icon('shieldAlert', 14)} ${escapeHtml(t('本次更新包含新增能力声明', 'Update Adds New Capabilities'))}</span>
+          </div>
+          ${esc.addedBadges.length ? `<div class="badge-row">${renderBadgesHtml({ badges: esc.addedBadges })}</div>` : ''}
+          ${
+            esc.addedDomains.length
+              ? `<div class="muted" style="font-size:11.2px">${escapeHtml(t('新增远程 MCP 域名', 'New Remote MCP Domains'))}: <span class="mono">${escapeHtml(esc.addedDomains.join(', '))}</span></div>`
+              : ''
+          }
+          ${
+            esc.addedHooks.length
+              ? `<div class="muted" style="font-size:11.2px">${escapeHtml(t('新增生命周期钩子', 'New Lifecycle Hooks'))}: <span class="mono">${escapeHtml(esc.addedHooks.join(', '))}</span></div>`
+              : ''
+          }
+          <label class="gh-escalate-check">
+            <input id="gh-confirm-escalation" type="checkbox" ${m.confirmEscalation ? 'checked' : ''} ${isInstalling ? 'disabled' : ''} />
+            <span>${escapeHtml(t('我已了解上述新增能力并确认继续更新', 'I have reviewed the added capabilities and confirm the update'))}</span>
+          </label>
+        </div>
+      `
+      : '';
+
+    bodyHtml = `
+      <div class="gh-preview-card">
+        <div class="gh-preview-head">
+          <div class="gh-preview-title-row">
+            <span class="gh-preview-name">${escapeHtml(displayName)}</span>
+            <span class="version-tag">v${escapeHtml(version)}</span>
+          </div>
+          <div class="gh-meta-pills">
+            ${
+              pluginRoot && pluginRoot !== '.'
+                ? `<span class="gh-meta-pill">${icon('folder', 11)} ${escapeHtml(
+                    plugin.autoDetectedSubpath
+                      ? t(`已自动定位子目录: ${pluginRoot}`, `Auto-detected subpath: ${pluginRoot}`)
+                      : t(`子目录: ${pluginRoot}`, `Subpath: ${pluginRoot}`),
+                  )}</span>`
+                : ''
+            }
+            ${channelLabel ? `<span class="gh-meta-pill is-subtle">${escapeHtml(channelLabel)}</span>` : ''}
+            ${plugin.rateLimitedFallback ? `<span class="gh-meta-pill is-subtle">${escapeHtml(t('免 API 限流直拉', 'Zero-API Fallback'))}</span>` : ''}
+            ${sizeLabel ? `<span class="gh-meta-pill is-subtle">${escapeHtml(sizeLabel)}</span>` : ''}
+          </div>
+        </div>
+
+        ${descText ? `<p class="gh-preview-desc">${escapeHtml(descText)}</p>` : ''}
+
+        ${capabilities.badges?.length ? `<div class="badge-row">${renderBadgesHtml(capabilities)}</div>` : ''}
+
+        <div class="gh-meta-grid">
+          <span class="muted">ID / Slug</span>
+          <span class="mono" style="word-break:break-all">${escapeHtml(plugin.id || canonicalName)}${canonicalName && canonicalName !== plugin.id ? ` (${escapeHtml(canonicalName)})` : ''}</span>
+          ${
+            tagCommitLabel
+              ? `<span class="muted">Ref / Commit</span>
+                 <span class="mono">${escapeHtml(tagCommitLabel)}</span>`
+              : ''
+          }
+          ${
+            sha256
+              ? `<span class="muted">SHA-256</span>
+                 <span class="gh-meta-val">
+                   <span class="mono" title="${escapeHtml(sha256)}">${escapeHtml(String(sha256).slice(0, 16))}…</span>
+                   <button type="button" class="icon-btn btn-sm" data-action="copy-text" data-copy-key="gh-sha" data-copy-val="${escapeHtml(sha256)}" title="${escapeHtml(t('复制完整 SHA-256', 'Copy full SHA-256'))}">
+                     ${icon(state.copiedKey === 'gh-sha' ? 'check' : 'copy', 11)}
+                   </button>
+                 </span>`
+              : ''
+          }
+          ${
+            rulesTokens > 0
+              ? `<span class="muted">${escapeHtml(t('常驻规则', 'Rules'))}</span>
+                 <span class="mono">~${rulesTokens} tokens</span>`
+              : ''
+          }
+          ${
+            isSafeHttpUrl(repoUrl)
+              ? `<span class="muted">GitHub</span>
+                 <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><a class="md-link" href="${escapeHtml(repoUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(repoUrl)}</a></span>`
+              : ''
+          }
+        </div>
+      </div>
+
+      ${
+        catalogMatch
+          ? `<div class="gh-notice-box is-info">
+              <div class="gh-notice-head">${icon('info', 13)} <span>${escapeHtml(t('该插件已收录于市场目录', 'Listed in Market Catalog'))}</span></div>
+              <div>${escapeHtml(
+                t(
+                  `目录中已存在 ${catalogMatch.id || displayName}${catalogMatch.version ? ` (v${catalogMatch.version})` : ''}，你可以继续通过当前链接安装，或在探索页使用目录版本。`,
+                  `Found ${catalogMatch.id || displayName}${catalogMatch.version ? ` (v${catalogMatch.version})` : ''} in the catalog. You can still continue installing from this URL or install from Discover.`,
+                ),
+              )}</div>
+            </div>`
+          : ''
+      }
+
+      ${
+        allWarnings.length > 0
+          ? `<div class="gh-notice-box is-warn">
+              <div class="gh-notice-head">${icon('alertCircle', 13)} <span>${escapeHtml(t('静态预检提示', 'Preflight Notes'))}</span></div>
+              <ul class="gh-notice-list">
+                ${allWarnings.map((w) => `<li>${escapeHtml(w)}</li>`).join('')}
+              </ul>
+            </div>`
+          : ''
+      }
+
+      ${modeSectionHtml}
+      ${escalationHtml}
+
+      ${
+        m.error
+          ? `<div class="gh-inline-error" role="alert">${icon('alertTriangle', 14)}<span>${escapeHtml(m.error)}</span></div>`
+          : ''
+      }
+
+      ${isInstalling ? `<div class="progress-track"><div class="progress-fill"></div></div>` : ''}
+    `;
+
+    const hasSubpathList = Array.isArray(m.subpathCandidates) && m.subpathCandidates.length > 1;
+    const submitDisabled = isInstalling || (esc.hasEscalation && !m.confirmEscalation);
+    footerHtml = `
+      ${
+        hasSubpathList
+          ? `<button type="button" class="btn btn-sm" data-action="back-github-subpaths" ${isInstalling ? 'disabled' : ''}>${icon('folder', 12)} ${escapeHtml(t('切换子目录', 'Subpaths'))}</button>`
+          : ''
+      }
+      <button type="button" class="btn btn-sm" data-action="reset-github-url-modal" ${isInstalling ? 'disabled' : ''}>${escapeHtml(t('返回修改链接', 'Edit URL'))}</button>
+      <button type="button" class="btn btn-primary btn-sm" data-action="install-github-url" ${submitDisabled ? 'disabled' : ''}>
+        ${icon(isInstalling ? 'refresh' : isUpdate ? 'update' : 'download', 12, isInstalling ? 'spin' : '')}
+        <span>${escapeHtml(
+          isInstalling
+            ? t(isUpdate ? '更新中…' : '安装中…', isUpdate ? 'Updating…' : 'Installing…')
+            : isUpdate
+              ? t('确认更新', 'Confirm Update')
+              : t('确认安装', 'Confirm Install'),
+        )}</span>
+      </button>
+    `;
+  } else if (m.phase === 'unsupported') {
+    const res = m.inspectResult || {};
+    const isSecurity = res.status === 'SECURITY_BLOCKED' || res.status === 'UNSAFE_ARCHIVE';
+    const reason =
+      (loc === 'en' ? res.reasonEn || res.reasonZh : res.reasonZh || res.reasonEn) ||
+      res.error ||
+      t(
+        '该仓库未包含有效的 Antigravity plugin.json 清单或未通过本地安全检查，无法直接安装。',
+        'This repository does not contain a valid Antigravity plugin.json or failed local safety checks.',
+      );
+    const rawHints = loc === 'en' ? res.hintsEn ?? res.hintsZh : res.hintsZh ?? res.hintsEn;
+    const hints = Array.isArray(rawHints) ? rawHints.filter(Boolean) : rawHints ? [String(rawHints)] : [];
+    const fileOverview = Array.isArray(res.fileOverview) ? res.fileOverview.filter(Boolean) : [];
+    const repoUrl = res.repoUrl || (isSafeHttpUrl(m.url) ? m.url : '');
+
+    bodyHtml = `
+      <div class="gh-unsupported-box ${isSecurity ? 'is-security' : ''}">
+        <div class="gh-unsupported-head">
+          ${icon(isSecurity ? 'shieldAlert' : 'alertTriangle', 15)}
+          <span>${escapeHtml(
+            isSecurity
+              ? t('本地安全检查未通过，已拦截安装', 'Blocked by Local Safety Check')
+              : t('暂不支持作为原生插件直接安装', 'Cannot Install as Native Plugin'),
+          )}</span>
+          ${res.reasonCode ? `<span class="gh-reason-code">${escapeHtml(res.reasonCode)}</span>` : ''}
+        </div>
+        <p class="gh-unsupported-reason">${escapeHtml(reason)}</p>
+        ${
+          hints.length > 0
+            ? `<ul class="gh-hints-list">${hints.map((h) => `<li>${escapeHtml(h)}</li>`).join('')}</ul>`
+            : ''
+        }
+        ${
+          fileOverview.length > 0
+            ? `<div class="gh-file-chips-wrap">
+                <div class="gh-file-chips-label">${escapeHtml(t('仓库顶层文件概览', 'Repository File Overview'))}</div>
+                <div class="gh-file-chips">
+                  ${fileOverview.map((f) => `<span class="gh-file-chip">${escapeHtml(f)}</span>`).join('')}
+                </div>
+              </div>`
+            : ''
+        }
+      </div>
+    `;
+    footerHtml = `
+      ${
+        isSafeHttpUrl(repoUrl)
+          ? `<a class="btn btn-sm" href="${escapeHtml(repoUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(t('在 GitHub 查看仓库', 'View on GitHub'))} ${icon('arrowUpRight', 12)}</a>`
+          : ''
+      }
+      <button type="button" class="btn btn-primary btn-sm" data-action="reset-github-url-modal">${escapeHtml(t('换一个链接', 'Try Another URL'))}</button>
+      <button type="button" class="btn btn-sm" data-action="close-modal">${escapeHtml(t('关闭', 'Close'))}</button>
+    `;
+  }
+
+  return `
+    <div class="modal-backdrop" ${isBusyPhase ? '' : 'data-action="close-modal"'}>
+      <div class="modal-box gh-url-modal" role="dialog" aria-modal="true" aria-label="${escapeHtml(t('通过 GitHub 链接添加插件', 'Add Plugin via GitHub URL'))}" onclick="event.stopPropagation()">
+        <div class="modal-header">
+          <div class="modal-title-wrap">
+            ${icon('link', 15)}
+            <span>${escapeHtml(t('通过 GitHub 链接添加插件', 'Add Plugin via GitHub URL'))}</span>
+          </div>
+          <button type="button" class="icon-btn is-square" data-action="close-modal" ${isBusyPhase ? 'disabled' : ''} title="${escapeHtml(t('关闭 (Esc)', 'Close (Esc)'))}">${icon('close', 14)}</button>
+        </div>
+        <div class="modal-body">
+          ${bodyHtml}
+        </div>
+        <div class="modal-footer">
+          ${footerHtml}
+        </div>
+      </div>
+    </div>
+  `;
+}
 
 function renderModals() {
   let html = '';
@@ -3638,6 +4657,10 @@ function renderModals() {
     `;
   }
 
+  if (state.githubUrlModal) {
+    html += renderGithubUrlModal();
+  }
+
   if (state.conflictModal) {
     const cm = state.conflictModal;
     html += `
@@ -3651,7 +4674,7 @@ function renderModals() {
             <button type="button" class="icon-btn is-square" data-action="close-modal">${icon('close', 14)}</button>
           </div>
           <div class="modal-body">
-            <p style="margin:0">${escapeHtml(t(`本地已存在来自其他来源的插件 "${cm.conflict.dir}" (${cm.conflict.scope})。Antigravity 对同名插件会静默丢弃后者，请选择安装方式：`, `A local plugin "${cm.conflict.dir}" (${cm.conflict.scope}) already claims this identifier. Choose how to proceed:`))}</p>
+            <p style="margin:0">${escapeHtml(t(`本地已存在来自其他来源的插件 "${cm.conflict.dir}" (${cm.conflict.scope})。Antigravity 对同名插件会忽略后者，请选择安装方式：`, `A local plugin "${cm.conflict.dir}" (${cm.conflict.scope}) already claims this identifier. Choose how to proceed:`))}</p>
           </div>
           <div class="modal-footer">
             <button type="button" class="btn btn-sm" data-action="close-modal">${escapeHtml(t('取消', 'Cancel'))}</button>
@@ -3776,7 +4799,7 @@ function render() {
   const conflictSummary = getConflictsSummary();
   const curLocale = getLocale();
   const channelLabel = state.serverState?.catalog?.channelUsed || '';
-  const clientVer = state.serverState?.plugin?.version || '1.3.0';
+  const clientVer = state.serverState?.plugin?.version || PLUGIN_VERSION;
   const showSelfOffer = isSelfBannerVisible();
   const hasDismissedSelfUpdate = Boolean(state.updates.selfUpdate && !showSelfOffer);
   const showInstalledDot = updatesCount > 0 || showSelfOffer;
@@ -3784,7 +4807,7 @@ function render() {
   const conflictBadgeHtml =
     conflictSummary.total > 0
       ? `<span class="nav-conflict-badge ${conflictSummary.critical > 0 ? 'is-critical' : 'is-warn'}" title="${escapeHtml(t(`发现 ${conflictSummary.total} 项冲突或建议`, `${conflictSummary.total} conflict(s) detected`))}">${conflictSummary.total}</span>`
-      : `<span class="nav-conflict-badge is-healthy" title="${escapeHtml(t('冲突检查健康', '0 conflicts · Healthy'))}">✓</span>`;
+      : `<span class="nav-conflict-badge is-healthy" title="${escapeHtml(t('无冲突', '0 conflicts'))}">✓</span>`;
 
   let viewHtml = '';
   if (state.activeTab === 'discover') viewHtml = renderDiscoverView();
@@ -3794,14 +4817,14 @@ function render() {
   else viewHtml = renderSourcesView();
 
   const toastTone = state.toast?.tone || 'info';
-  const toastIco =
-    toastTone === 'danger' || toastTone === 'error'
-      ? icon('alertTriangle', 14, 'toast-lead-ico')
-      : toastTone === 'ok'
-        ? icon('checkCircle', 14, 'toast-lead-ico')
-        : toastTone === 'warn'
-          ? icon('alertCircle', 14, 'toast-lead-ico')
-          : icon('info', 14, 'toast-lead-ico');
+  const isToastErr = toastTone === 'danger' || toastTone === 'error' || toastTone === 'err';
+  const toastIco = isToastErr
+    ? icon('alertTriangle', 14, 'toast-lead-ico')
+    : toastTone === 'ok'
+      ? icon('checkCircle', 14, 'toast-lead-ico')
+      : toastTone === 'warn'
+        ? icon('alertCircle', 14, 'toast-lead-ico')
+        : icon('info', 14, 'toast-lead-ico');
 
   root.innerHTML = `
     <div class="market-shell" data-stuck="${state.scrolledStuck ? 'true' : 'false'}">
@@ -3810,7 +4833,7 @@ function render() {
           <div class="brand-mark">${BRAND_LOGO_SVG}</div>
           <div class="brand-copy">
             <span class="brand-title">AGY Market</span>
-            <span class="brand-meta-pill" title="${escapeHtml(channelLabel ? `${t('目录通道', 'Channel')}: ${channelLabel}` : t('极光棱镜 · Sidebar 侧边栏', 'Aurora Prism · Sidebar Panel'))}">
+            <span class="brand-meta-pill" title="${escapeHtml(channelLabel ? `${t('目录通道', 'Channel')}: ${channelLabel}` : t('Sidebar 侧边栏', 'Sidebar Panel'))}">
               <span class="status-dot ${state.updates.rateLimited ? 'is-warn' : state.updates.loading ? 'is-pulse' : ''}"></span>
               <span>v${escapeHtml(clientVer)}</span>
             </span>
@@ -3847,6 +4870,15 @@ function render() {
         </nav>
 
         <div class="header-actions">
+          <button
+            type="button"
+            class="add-url-btn"
+            data-action="open-github-url-modal"
+            title="${escapeHtml(t('粘贴任意 GitHub 插件仓库链接进行预检与安装', 'Inspect and install a plugin from any GitHub URL'))}"
+          >
+            ${icon('link', 12)}
+            <span>${escapeHtml(t('链接添加', 'Add URL'))}</span>
+          </button>
           <a
             class="submit-plugin-btn"
             href="${escapeHtml(SUBMIT_PLUGIN_GUIDE_URL)}"
@@ -3863,7 +4895,7 @@ function render() {
               : ''
           }
           <button type="button" class="icon-btn" data-action="toggle-locale" title="${escapeHtml(t('切换界面语言与中文文档', 'Switch Language'))}">${curLocale === 'en' ? '中' : 'EN'}</button>
-          <button type="button" class="icon-btn is-square" data-action="refresh" ${state.loading || state.updates.loading ? 'disabled' : ''} title="${escapeHtml(t('刷新目录、更新与冲突体检', 'Refresh catalog, updates & conflicts'))}">
+          <button type="button" class="icon-btn is-square" data-action="refresh" ${state.loading || state.updates.loading ? 'disabled' : ''} title="${escapeHtml(t('刷新目录、更新与冲突检查', 'Refresh catalog, updates & conflicts'))}">
             ${icon('refresh', 13, state.loading || state.updates.loading ? 'spin' : '')}
           </button>
         </div>
@@ -3879,7 +4911,7 @@ function render() {
 
       ${
         state.toast
-          ? `<div class="toast-bar tone-${escapeHtml(toastTone)}" role="${toastTone === 'danger' || toastTone === 'error' ? 'alert' : 'status'}">
+          ? `<div class="toast-bar tone-${escapeHtml(toastTone)}" role="${isToastErr ? 'alert' : 'status'}">
               <div class="toast-copy">
                 <span class="toast-lead-row">${toastIco}<span>${escapeHtml(state.toast.message)}</span></span>
                 ${state.toast.subtext ? `<span class="toast-sub">${escapeHtml(state.toast.subtext)}</span>` : ''}
@@ -3914,7 +4946,20 @@ function render() {
   const drawerScrollEl = root.querySelector('#market-drawer-body');
   if (drawerScrollEl && prevDrawerScroll > 0) drawerScrollEl.scrollTop = prevDrawerScroll;
 
-  if (state.focusTokenField) {
+  if (state.focusGithubUrlInput) {
+    state.focusGithubUrlInput = false;
+    const urlEl = document.getElementById('github-url-input');
+    if (urlEl) {
+      urlEl.focus();
+      if (urlEl.value && typeof urlEl.select === 'function') {
+        try {
+          urlEl.select();
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+  } else if (state.focusTokenField) {
     state.focusTokenField = false;
     const tokEl = document.getElementById('github-token-input');
     if (tokEl) tokEl.focus();
@@ -3967,6 +5012,45 @@ function bindDomEvents(root) {
   if (searchEl) {
     searchEl.addEventListener('input', (e) => {
       state.search = e.target.value;
+      render();
+    });
+  }
+
+  const ghUrlEl = root.querySelector('#github-url-input');
+  if (ghUrlEl) {
+    ghUrlEl.addEventListener('input', (e) => {
+      if (!state.githubUrlModal) return;
+      const val = e.target.value;
+      const hadError = Boolean(state.githubUrlModal.error);
+      state.githubUrlModal.url = val;
+      if (hadError) {
+        state.githubUrlModal.error = '';
+        render();
+        return;
+      }
+      const submitBtn = root.querySelector('#gh-inspect-submit-btn');
+      if (submitBtn) {
+        submitBtn.disabled = !String(val || '').trim();
+      }
+    });
+    ghUrlEl.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        if (state.githubUrlModal?.phase === 'input') {
+          void triggerGithubUrlInspect({ url: e.target.value });
+        }
+      }
+    });
+  }
+
+  const ghEscCheckEl = root.querySelector('#gh-confirm-escalation');
+  if (ghEscCheckEl) {
+    ghEscCheckEl.addEventListener('change', (e) => {
+      if (!state.githubUrlModal) return;
+      state.githubUrlModal.confirmEscalation = Boolean(e.target.checked);
+      if (state.githubUrlModal.confirmEscalation) {
+        state.githubUrlModal.error = '';
+      }
       render();
     });
   }
@@ -4119,14 +5203,15 @@ function bindDomEvents(root) {
         e.stopPropagation();
         const uri = el.getAttribute('data-uri') || '';
         const label = el.getAttribute('data-label') || uri;
-        const m = /^sidecar:\/\/([^/]+)\/([^/]+)(\/.*)?$/i.exec(uri);
+        const m = /^sidecar:\/\/([^/?#]+)\/([^/?#]+)((?:[/?#].*)?)$/i.exec(uri);
         if (m) {
+          const normPath = normalizeSidecarViewPath(m[3] || '/');
           void openSiblingSidecarPane({
             dir: m[1],
             folder: m[2],
-            viewPath: m[3] || '/',
+            viewPath: normPath,
             title: label,
-            uri,
+            uri: buildSidecarPaneUri(m[1], m[2], normPath),
           });
         }
       } else if (action === 'prompt-remove-files') {
@@ -4153,6 +5238,13 @@ function bindDomEvents(root) {
         render();
         if (retry?.type === 'install' && retry.plugin) {
           void triggerInstall(retry.plugin, retry.opts || {});
+        } else if (retry?.type === 'update-local-github') {
+          void triggerUpdateLocalGithub({
+            id: retry.id || '',
+            dir: retry.dir || '',
+            displayName: retry.displayName || '',
+            confirmEscalation: false,
+          });
         } else if (retry?.type === 'update-all') {
           void triggerUpdateAll(retry.ids || null, { confirmEscalation: false });
         } else if (retry?.type === 'self-update') {
@@ -4170,12 +5262,75 @@ function bindDomEvents(root) {
           state.escalationModal = null;
         } else if (state.conflictModal) {
           state.conflictModal = null;
+        } else if (state.githubUrlModal) {
+          if (state.githubUrlModal.phase === 'inspecting' || state.githubUrlModal.phase === 'installing') {
+            return;
+          }
+          state.githubUrlModal = null;
         } else if (state.selfChangelogModal) {
           state.selfChangelogModal = false;
         } else {
           state.detailPlugin = null;
         }
         render();
+      } else if (action === 'open-github-url-modal') {
+        e.stopPropagation();
+        const prefill = el.getAttribute('data-prefill-url') || '';
+        openGithubUrlModal(prefill);
+      } else if (action === 'inspect-github-url') {
+        if (state.githubUrlModal) {
+          const inputVal = root.querySelector('#github-url-input')?.value ?? state.githubUrlModal.url;
+          void triggerGithubUrlInspect({ url: inputVal });
+        }
+      } else if (action === 'select-github-subpath') {
+        if (state.githubUrlModal) {
+          const pluginRoot = el.getAttribute('data-plugin-root') || '.';
+          void triggerGithubUrlInspect({
+            url: state.githubUrlModal.url,
+            inspectToken: state.githubUrlModal.inspectToken,
+            pluginRoot,
+          });
+        }
+      } else if (action === 'back-github-subpaths') {
+        if (state.githubUrlModal && Array.isArray(state.githubUrlModal.subpathCandidates)) {
+          state.githubUrlModal.phase = 'subpaths';
+          state.githubUrlModal.error = '';
+          render();
+        }
+      } else if (action === 'select-github-install-mode') {
+        if (state.githubUrlModal && state.githubUrlModal.phase === 'preview') {
+          const mode = el.getAttribute('data-mode') || 'native';
+          state.githubUrlModal.installMode = mode;
+          state.githubUrlModal.error = '';
+          render();
+        }
+      } else if (action === 'install-github-url') {
+        void triggerGithubUrlInstall();
+      } else if (action === 'reset-github-url-modal') {
+        if (state.githubUrlModal) {
+          githubInspectSeq += 1;
+          state.githubUrlModal = {
+            phase: 'input',
+            url: state.githubUrlModal.url || '',
+            inspectToken: '',
+            selectedPluginRoot: '.',
+            installMode: 'native',
+            confirmEscalation: false,
+            inspectResult: null,
+            subpathCandidates: null,
+            error: '',
+          };
+          state.focusGithubUrlInput = true;
+          render();
+        }
+      } else if (action === 'update-local-github') {
+        e.stopPropagation();
+        const id = el.getAttribute('data-id') || '';
+        const dir = el.getAttribute('data-dir') || '';
+        const displayName = el.getAttribute('data-name') || dir || id;
+        if (id || dir) {
+          void triggerUpdateLocalGithub({ id, dir, displayName, confirmEscalation: false });
+        }
       } else if (action === 'detail') {
         e.stopPropagation();
         const id = el.getAttribute('data-id');
@@ -4238,6 +5393,13 @@ function bindDomEvents(root) {
         state.escalationModal = null;
         if (em.mode === 'single' && em.items[0]?.plugin) {
           void triggerInstall(em.items[0].plugin, { confirmEscalation: true });
+        } else if (em.mode === 'local-github' && em.items[0]) {
+          void triggerUpdateLocalGithub({
+            id: em.items[0].id || '',
+            dir: em.items[0].dir || '',
+            displayName: em.items[0].displayName || '',
+            confirmEscalation: true,
+          });
         } else if (em.mode === 'self') {
           void triggerSelfUpdate({ confirmEscalation: true });
         } else {
@@ -4281,6 +5443,12 @@ window.addEventListener('keydown', (e) => {
     } else if (state.conflictModal) {
       state.conflictModal = null;
       render();
+    } else if (state.githubUrlModal) {
+      if (state.githubUrlModal.phase === 'inspecting' || state.githubUrlModal.phase === 'installing') {
+        return;
+      }
+      state.githubUrlModal = null;
+      render();
     } else if (state.selfChangelogModal) {
       state.selfChangelogModal = false;
       render();
@@ -4289,6 +5457,7 @@ window.addEventListener('keydown', (e) => {
       render();
     }
   } else if (e.key === '/' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    if (state.githubUrlModal || state.conflictModal || state.escalationModal || state.removeConfirmModal) return;
     const tag = (document.activeElement?.tagName || '').toLowerCase();
     if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
     const searchEl =

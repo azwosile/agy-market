@@ -1,10 +1,11 @@
 #!/usr/bin/env node
-// One-Line Bootstrap CLI (`npx agy-market`) & Local Diagnostics (`bin/agy-market.mjs`).
+// One-Line Bootstrap CLI (`npx agy-market`), GitHub URL Installer (`add`) & Local Diagnostics (`bin/agy-market.mjs`).
 
 import { existsSync, lstatSync, readFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { installLocalAgyMarket } from '../scripts/install-local.mjs';
+import { inspectGithubPluginUrl, installGithubPlugin } from '../src/installer/github-url.mjs';
 import { sweepRetiredBinaries } from '../src/installer/sync-dir.mjs';
 import { scanLocalPluginInventory } from '../src/preflight/index.mjs';
 import {
@@ -16,28 +17,57 @@ import {
   SIDECAR_URI,
 } from '../src/shared/constants.mjs';
 import { resolveAntigravityConfigDir, resolveMarketDataDir, resolvePluginsDir } from '../src/shared/paths.mjs';
-import { parseJsonc } from '../src/shared/schemas.mjs';
+import { loadPrefsFromDisk, parseJsonc } from '../src/shared/schemas.mjs';
+import { redactSecret } from '../src/updates/index.mjs';
 
 function printHelp() {
   console.log(`${PLUGIN_DISPLAY_NAME} v${PLUGIN_VERSION}
 
 Usage:
   npx agy-market [install] [--dest <plugins-dir>]   Install or update AGY Market into Antigravity
+  npx agy-market add <github-url> [--subpath <dir>] [--isolate|--replace] [--yes] [--dest <plugins-dir>] [--mirror <prefix>] [--token <pat>] [--json]
+                                                    Inspect and install a plugin directly from a GitHub URL
   npx agy-market status [--json]                    List installed plugins & AGY Market status
   npx agy-market doctor                             Verify installation health & sweep retired binaries
   npx agy-market --help                             Show this help message
 `);
 }
 
-export async function runCli(argv = process.argv.slice(2)) {
+function getFlagValue(args, names) {
+  for (const flag of names) {
+    const idx = args.indexOf(flag);
+    if (idx !== -1 && args[idx + 1] && !args[idx + 1].startsWith('--')) {
+      return args[idx + 1];
+    }
+    const eqPrefix = `${flag}=`;
+    const eqArg = args.find((a) => a.startsWith(eqPrefix));
+    if (eqArg) return eqArg.slice(eqPrefix.length);
+  }
+  return '';
+}
+
+function findFirstPositionalAfterSubcommand(args) {
+  const valueFlags = new Set(['--dest', '--subpath', '--root', '--mirror', '--token']);
+  for (let i = 1; i < args.length; i += 1) {
+    const cur = args[i];
+    if (valueFlags.has(cur)) {
+      i += 1;
+      continue;
+    }
+    if (cur.startsWith('-')) continue;
+    return cur.trim();
+  }
+  return '';
+}
+
+export async function runCli(argv = process.argv.slice(2), runtimeOpts = {}) {
   const args = [...argv];
   if (args.includes('-h') || args.includes('--help') || args[0] === 'help') {
     printHelp();
     return { code: 0 };
   }
 
-  const destIdx = args.indexOf('--dest');
-  const destPluginsDir = destIdx !== -1 && args[destIdx + 1] ? args[destIdx + 1] : '';
+  const destPluginsDir = getFlagValue(args, ['--dest']);
   const asJson = args.includes('--json');
   const sub = args[0] && !args[0].startsWith('--') ? args[0] : 'install';
 
@@ -54,10 +84,194 @@ export async function runCli(argv = process.argv.slice(2)) {
     return { code: 0 };
   }
 
+  if (sub === 'add') {
+    const rawUrl = findFirstPositionalAfterSubcommand(args);
+    if (!rawUrl) {
+      const msg = 'Usage: npx agy-market add <github-url> [--subpath <dir>] [--isolate|--replace] [--yes] [--dest <plugins-dir>] [--mirror <prefix>] [--token <pat>] [--json]';
+      if (asJson) {
+        console.log(JSON.stringify({ ok: false, status: 'INVALID_USAGE', error: msg }, null, 2));
+      } else {
+        console.error(`✗ ${msg}`);
+      }
+      return { code: 1 };
+    }
+
+    const subpath = getFlagValue(args, ['--subpath', '--root']);
+    const useIsolate = args.includes('--isolate');
+    const useReplace = args.includes('--replace');
+    if (useIsolate && useReplace) {
+      const msg = 'ERR_CONFLICTING_FLAGS: Cannot pass both --isolate and --replace together';
+      if (asJson) {
+        console.log(JSON.stringify({ ok: false, status: 'INVALID_USAGE', error: msg }, null, 2));
+      } else {
+        console.error(`✗ ${msg}`);
+      }
+      return { code: 1 };
+    }
+    const confirmEscalation = args.includes('--yes') || args.includes('-y');
+    const mirrorOverride = getFlagValue(args, ['--mirror']);
+    const tokenOverride = getFlagValue(args, ['--token']);
+
+    const resolvedDest = destPluginsDir ? resolve(destPluginsDir) : '';
+    const configDir =
+      runtimeOpts.configDir ||
+      (resolvedDest && basename(resolvedDest).toLowerCase() === 'plugins'
+        ? dirname(resolvedDest)
+        : resolveAntigravityConfigDir());
+    const pluginsDir = runtimeOpts.pluginsDir || resolvedDest || '';
+    const dataDir = runtimeOpts.dataDir || resolveMarketDataDir();
+    const fetchImpl = runtimeOpts.fetchImpl || fetch;
+    const githubApiBaseUrl = runtimeOpts.githubApiBaseUrl || undefined;
+    const nowMs = runtimeOpts.nowMs ?? Date.now();
+
+    const diskPrefs = loadPrefsFromDisk(dataDir);
+    const effectiveToken = tokenOverride || diskPrefs.githubToken || process.env.GITHUB_TOKEN || '';
+    const prefs = {
+      ...diskPrefs,
+      ...(mirrorOverride ? { githubReleaseMirrorPrefix: mirrorOverride } : {}),
+      githubToken: effectiveToken,
+    };
+    const installMode = useIsolate ? 'isolate' : useReplace ? 'replace' : 'native';
+
+    try {
+      const rawInspect = await inspectGithubPluginUrl({
+        url: rawUrl,
+        pluginRoot: subpath,
+        prefs,
+        configDir,
+        pluginsDir,
+        dataDir,
+        fetchImpl,
+        ...(githubApiBaseUrl ? { githubApiBaseUrl } : {}),
+        nowMs,
+      });
+      const { _internal: _ignoreInspect, ...inspectRes } = rawInspect;
+
+      if (inspectRes.status === 'SUBPATH_SELECTION_REQUIRED') {
+        if (asJson) {
+          console.log(JSON.stringify(inspectRes, null, 2));
+        } else {
+          console.log(`! Multiple plugins found in ${inspectRes.repoUrl}. Specify --subpath:`);
+          for (const c of inspectRes.candidates || []) {
+            console.log(`  - ${c.pluginRoot}  (${c.displayName} v${c.version})`);
+            console.log(`      npx agy-market add ${rawUrl} --subpath ${c.pluginRoot}`);
+          }
+        }
+        return { code: 2, result: inspectRes };
+      }
+
+      if (inspectRes.status === 'NOT_A_PLUGIN_REPO' || inspectRes.status === 'SECURITY_BLOCKED' || inspectRes.status === 'UNSAFE_ARCHIVE') {
+        if (asJson) {
+          console.log(JSON.stringify(inspectRes, null, 2));
+        } else {
+          console.error(`✗ [${inspectRes.status}] ${inspectRes.reasonZh || inspectRes.reasonEn}`);
+          if (inspectRes.reasonEn && inspectRes.reasonEn !== inspectRes.reasonZh) {
+            console.error(`  ${inspectRes.reasonEn}`);
+          }
+          if (Array.isArray(inspectRes.fileOverview) && inspectRes.fileOverview.length > 0) {
+            console.error(`  Top-level files: ${inspectRes.fileOverview.join(', ')}`);
+          }
+        }
+        return { code: 1, result: inspectRes };
+      }
+
+      const rawInstall = await installGithubPlugin({
+        inspectToken: inspectRes.inspectToken,
+        url: rawUrl,
+        pluginRoot: inspectRes.plugin.pluginRoot,
+        installMode,
+        confirmEscalation,
+        prefs,
+        configDir,
+        pluginsDir,
+        dataDir,
+        fetchImpl,
+        ...(githubApiBaseUrl ? { githubApiBaseUrl } : {}),
+        nowMs,
+      });
+      const { _internal: _ignoreInstall, ...installRes } = rawInstall;
+
+      if (installRes.status === 'CONFLICT_CHOICE_REQUIRED') {
+        if (asJson) {
+          console.log(JSON.stringify(installRes, null, 2));
+        } else {
+          console.log(
+            `! Local plugin conflict with "${installRes.conflict?.dir}" (${installRes.conflict?.scope}).`,
+          );
+          console.log(`  Run with --isolate to install as "${installRes.scopedFallbackName}"`);
+          if (Array.isArray(installRes.choices) && installRes.choices.includes('replace')) {
+            console.log('  Or run with --replace to overwrite the existing global plugin');
+          }
+        }
+        return { code: 2, result: installRes };
+      }
+
+      if (installRes.status === 'CAPABILITY_ESCALATION_CONFIRM_REQUIRED') {
+        if (asJson) {
+          console.log(JSON.stringify(installRes, null, 2));
+        } else {
+          const esc = installRes.escalation || {};
+          console.log(
+            `! Update ${installRes.installedVersion} -> ${installRes.targetVersion} requests new capabilities:`,
+          );
+          if (esc.addedBadges?.length) console.log(`  Added badges: ${esc.addedBadges.join(', ')}`);
+          if (esc.addedRemoteDomains?.length) console.log(`  Added remote domains: ${esc.addedRemoteDomains.join(', ')}`);
+          if (esc.addedHookEvents?.length) console.log(`  Added hook events: ${esc.addedHookEvents.join(', ')}`);
+          console.log('  Re-run with --yes to confirm and apply update.');
+        }
+        return { code: 2, result: installRes };
+      }
+
+      if (installRes.ok && installRes.status === 'INSTALLED') {
+        const finalPluginsDir = pluginsDir || resolvePluginsDir(configDir);
+        const installedPath = join(finalPluginsDir, installRes.installedDir);
+        const outputPayload = {
+          ...installRes,
+          installedPath,
+          capabilities: inspectRes.plugin.capabilities,
+        };
+        if (asJson) {
+          console.log(JSON.stringify(outputPayload, null, 2));
+        } else {
+          console.log(`✓ Installed ${inspectRes.plugin.displayName} (v${installRes.version})`);
+          console.log(`  Location:     ${installedPath}`);
+          if (inspectRes.plugin.pluginRoot && inspectRes.plugin.pluginRoot !== '.') {
+            console.log(`  Subpath:      ${inspectRes.plugin.pluginRoot}`);
+          }
+          console.log(`  SHA-256:      ${installRes.sha256}`);
+          if (installRes.commitSha) console.log(`  Commit:       ${installRes.commitSha.slice(0, 12)}`);
+          const badges = inspectRes.plugin.capabilities?.badges || [];
+          if (badges.length > 0) console.log(`  Capabilities: ${badges.join(', ')}`);
+          if (installRes.sidecarPane?.uri) {
+            console.log(`  Open Panel:   [Open](${installRes.sidecarPane.uri})`);
+          }
+          console.log(`  Manage:       [Manage](${installRes.customizationUri})`);
+        }
+        return { code: 0, result: outputPayload };
+      }
+
+      const failMsg = redactSecret(installRes.error || `Install did not complete (${installRes.status})`, effectiveToken);
+      if (asJson) {
+        console.log(JSON.stringify({ ok: false, ...installRes, error: failMsg }, null, 2));
+      } else {
+        console.error(`✗ ${failMsg}`);
+      }
+      return { code: 1, result: installRes };
+    } catch (err) {
+      const safeErr = redactSecret(err?.message || String(err), effectiveToken);
+      if (asJson) {
+        console.log(JSON.stringify({ ok: false, status: 'ERROR', error: safeErr }, null, 2));
+      } else {
+        console.error(`✗ ${safeErr}`);
+      }
+      return { code: 1, error: safeErr };
+    }
+  }
+
   if (sub === 'status') {
     const configDir = resolveAntigravityConfigDir();
     const dataDir = resolveMarketDataDir();
-    const inv = scanLocalPluginInventory({ configDir });
+    const inv = scanLocalPluginInventory({ configDir, dataDir });
     const summary = {
       ok: true,
       version: PLUGIN_VERSION,

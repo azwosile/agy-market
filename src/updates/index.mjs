@@ -19,7 +19,7 @@ import {
   SELF_REPO_URL,
   UPDATE_CHECK_CACHE_TTL_MS,
 } from '../shared/constants.mjs';
-import { computeCapabilityEscalation, sanitizePrefs } from '../shared/schemas.mjs';
+import { computeCapabilityEscalation, parseJsonc, sanitizePrefs } from '../shared/schemas.mjs';
 import { compareSemver, isNewerVersion, parseSemver } from '../shared/semver.mjs';
 
 const MAX_CHANGELOG_CHARS = 8000;
@@ -250,6 +250,410 @@ export async function probeGithubLatestReleaseRedirect({
   }
 }
 
+function encodePathSegments(rawPath) {
+  return String(rawPath || '')
+    .split('/')
+    .filter(Boolean)
+    .map((seg) => encodeURIComponent(seg))
+    .join('/');
+}
+
+function normalizePluginRootForUpdate(rawRoot = '.') {
+  const s = String(rawRoot || '.')
+    .trim()
+    .replace(/\\/g, '/')
+    .replace(/^\.\/+/, '')
+    .replace(/\/+$/, '');
+  return s || '.';
+}
+
+function decodeXmlEntities(raw) {
+  return String(raw || '')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, '&')
+    .trim();
+}
+
+/**
+ * Parses Git Smart HTTP `info/refs?service=git-upload-pack` output (both pkt-line wire format and
+ * plain line format) to extract `HEAD`, `defaultBranch`, branch SHAs, and highest non-prerelease SemVer tag.
+ */
+export function parseGitUploadPackRefs(rawText) {
+  const text = String(rawText || '');
+  const heads = new Map();
+  const tags = new Map();
+  let headSha = '';
+  let defaultBranch = '';
+
+  let pos = 0;
+  while (pos + 4 <= text.length) {
+    const lenHex = text.slice(pos, pos + 4);
+    if (!/^[0-9a-f]{4}$/i.test(lenHex)) break;
+    const pktLen = parseInt(lenHex, 16);
+    if (pktLen === 0) {
+      pos += 4;
+      continue;
+    }
+    if (pktLen < 4 || pos + pktLen > text.length) break;
+    const payload = text.slice(pos + 4, pos + pktLen).replace(/\r?\n$/, '');
+    pos += pktLen;
+    if (!payload || payload.startsWith('#')) continue;
+
+    const nulIdx = payload.indexOf('\0');
+    const refPart = nulIdx === -1 ? payload : payload.slice(0, nulIdx);
+    const capsPart = nulIdx === -1 ? '' : payload.slice(nulIdx + 1);
+
+    if (capsPart) {
+      const sym = /\bsymref=HEAD:refs\/heads\/([^\s]+)/.exec(capsPart);
+      if (sym && sym[1]) defaultBranch = sym[1];
+    }
+
+    const sp = refPart.indexOf(' ');
+    if (sp === -1) continue;
+    const sha = refPart.slice(0, sp).trim();
+    const refName = refPart.slice(sp + 1).trim();
+    if (!/^[0-9a-f]{40}$/i.test(sha)) continue;
+
+    if (refName === 'HEAD') {
+      headSha = sha.toLowerCase();
+    } else if (refName.startsWith('refs/heads/')) {
+      heads.set(refName.slice('refs/heads/'.length), sha.toLowerCase());
+    } else if (refName.startsWith('refs/tags/')) {
+      const rawTag = refName.slice('refs/tags/'.length);
+      if (rawTag.endsWith('^{}')) {
+        tags.set(rawTag.slice(0, -3), sha.toLowerCase());
+      } else if (!tags.has(rawTag)) {
+        tags.set(rawTag, sha.toLowerCase());
+      }
+    }
+  }
+
+  // Fallback for plain line-based output (e.g., simplified test fixtures)
+  if (!headSha && heads.size === 0 && tags.size === 0) {
+    for (const rawLine of text.split(/\r?\n/)) {
+      const m = /([0-9a-f]{40})\s+(HEAD|refs\/(?:heads|tags)\/[^\s\0]+)/i.exec(rawLine);
+      if (!m) continue;
+      const sha = m[1].toLowerCase();
+      const refName = m[2];
+      const sym = /\bsymref=HEAD:refs\/heads\/([^\s]+)/.exec(rawLine);
+      if (sym && sym[1] && !defaultBranch) defaultBranch = sym[1];
+      if (refName === 'HEAD') headSha = sha;
+      else if (refName.startsWith('refs/heads/')) heads.set(refName.slice('refs/heads/'.length), sha);
+      else if (refName.startsWith('refs/tags/')) {
+        const rawTag = refName.slice('refs/tags/'.length);
+        if (rawTag.endsWith('^{}')) tags.set(rawTag.slice(0, -3), sha);
+        else if (!tags.has(rawTag)) tags.set(rawTag, sha);
+      }
+    }
+  }
+
+  let highestSemverTag = null;
+  for (const [tagName, sha] of tags.entries()) {
+    const sem = parseSemver(tagName);
+    if (!sem || sem.prerelease.length > 0) continue;
+    if (!highestSemverTag || compareSemver(sem.version, highestSemverTag.version) > 0) {
+      highestSemverTag = { version: sem.version, tagName, commitSha: sha };
+    }
+  }
+
+  return { headSha, defaultBranch, heads, tags, highestSemverTag };
+}
+
+/**
+ * Zero-API-quota Git Smart HTTP `info/refs?service=git-upload-pack` probe.
+ * Discovers `defaultBranch`, branch tip commit SHAs, and SemVer tags without touching `api.github.com`.
+ */
+export async function probeGithubGitRefs({
+  owner,
+  repo,
+  fetchImpl = fetch,
+  timeoutMs = DEFAULT_GITHUB_TIMEOUT_MS,
+}) {
+  const url = `https://github.com/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}.git/info/refs?service=git-upload-pack`;
+  try {
+    const res = await fetchImpl(url, {
+      headers: { 'User-Agent': 'git/2.45.0 agy-market-updater/1.0' },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!res.ok) return null;
+    const text = await res.text();
+    const parsed = parseGitUploadPackRefs(text);
+    if (!parsed.headSha && parsed.heads.size === 0 && parsed.tags.size === 0) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Zero-API-quota GitHub Atom commit feed probe (`/commits/<branch>[/<subpath>].atom`).
+ */
+export async function probeGithubBranchAtom({
+  owner,
+  repo,
+  branch = 'HEAD',
+  pluginRoot = '.',
+  etag = '',
+  fetchImpl = fetch,
+  timeoutMs = DEFAULT_GITHUB_TIMEOUT_MS,
+}) {
+  const normRoot = normalizePluginRootForUpdate(pluginRoot);
+  const subPart = normRoot !== '.' ? `/${encodePathSegments(normRoot)}` : '';
+  const refSeg = encodePathSegments(branch || 'HEAD');
+  const url = `https://github.com/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/commits/${refSeg}${subPart}.atom`;
+  const headers = {
+    Accept: 'application/atom+xml, application/xml, text/xml',
+    'User-Agent': 'agy-market-updater/1.0',
+  };
+  if (etag) headers['If-None-Match'] = etag;
+  try {
+    const res = await fetchImpl(url, {
+      headers,
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (res.status === 304) {
+      return { notModified: true, etag: res.headers?.get?.('etag') || etag };
+    }
+    if (!res.ok) return null;
+    const xml = await res.text();
+    const entryMatch = /<entry\b[\s\S]*?<\/entry>/i.exec(xml);
+    const scope = entryMatch ? entryMatch[0] : xml;
+    const shaMatch =
+      /Grit::Commit\/([0-9a-f]{40})/i.exec(scope) || /\/commit\/([0-9a-f]{40})/i.exec(scope);
+    if (!shaMatch) return null;
+    const titleMatch = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(scope);
+    const updatedMatch = /<updated[^>]*>([\s\S]*?)<\/updated>/i.exec(scope);
+    return {
+      notModified: false,
+      commitSha: shaMatch[1].toLowerCase(),
+      message: titleMatch ? truncateChangelog(decodeXmlEntities(titleMatch[1]), 400) : '',
+      committedAt: updatedMatch ? updatedMatch[1].trim() : null,
+      etag: res.headers?.get?.('etag') || '',
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function probeRawManifestVersion({
+  owner,
+  repo,
+  commitSha,
+  pluginRoot = '.',
+  fetchImpl = fetch,
+  timeoutMs = 4000,
+}) {
+  const normRoot = normalizePluginRootForUpdate(pluginRoot);
+  const candidates =
+    normRoot !== '.'
+      ? [`${normRoot}/plugin.json`, `${normRoot}/.antigravity-plugin/plugin.json`]
+      : ['plugin.json', '.antigravity-plugin/plugin.json'];
+
+  for (const relPath of candidates) {
+    const url = `https://raw.githubusercontent.com/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${encodeURIComponent(commitSha)}/${encodePathSegments(relPath)}`;
+    try {
+      const res = await fetchImpl(url, {
+        headers: { 'User-Agent': 'agy-market-updater/1.0' },
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (!res.ok) continue;
+      const manifest = parseJsonc(await res.text());
+      const sem = parseSemver(manifest?.version);
+      if (sem) return sem.version;
+    } catch {
+      /* non-fatal */
+    }
+  }
+  return '';
+}
+
+/**
+ * Probes the latest commit SHA (and optional `plugin.json.version`) on a tracked branch for
+ * tagless `track === 'github-url'` plugins. Uses REST API with ETag + 30-min TTL when available,
+ * and seamlessly falls back to zero-quota Atom feed + `git-upload-pack` `info/refs` when rate-limited.
+ */
+export async function probeGithubBranchHead({
+  owner,
+  repo,
+  branch = 'HEAD',
+  pluginRoot = '.',
+  installedCommitSha = '',
+  dataDir,
+  prefs = {},
+  force = false,
+  fetchImpl = fetch,
+  nowMs = Date.now(),
+  ttlMs = UPDATE_CHECK_CACHE_TTL_MS,
+  githubApiBaseUrl = GITHUB_API_BASE_URL,
+  timeoutMs = DEFAULT_GITHUB_TIMEOUT_MS,
+  skipNetworkBecauseRateLimited = false,
+  shouldPersistCache = () => true,
+}) {
+  const cleanPrefs = sanitizePrefs(prefs);
+  const token = cleanPrefs.githubToken;
+  const authenticated = Boolean(token);
+  const normRoot = normalizePluginRootForUpdate(pluginRoot);
+  const requestedBranch = String(branch || '').trim() || 'HEAD';
+  const cacheDir = getGithubCacheDir(dataDir);
+  const branchSlug = `${requestedBranch}__${normRoot}`.toLowerCase().replace(/[^a-z0-9_.-]/gi, '_');
+  const cachePath = join(cacheDir, `branch-${safeGithubCacheKey(owner, repo)}-${branchSlug}.json`);
+  const cached = readJsonSafe(cachePath);
+  const apiBase = String(githubApiBaseUrl || GITHUB_API_BASE_URL).replace(/\/+$/, '');
+  const fullName = `${owner}/${repo}`;
+
+  if (!force && cached && Number.isFinite(cached.checkedAtMs) && nowMs - cached.checkedAtMs < ttlMs) {
+    return {
+      head: cached.head || null,
+      fromCache: true,
+      rateLimited: false,
+      warning: null,
+    };
+  }
+
+  const rlState = readRateLimitState(cacheDir);
+  let rateLimited =
+    skipNetworkBecauseRateLimited || (!force && isRateLimitBackoffActive(rlState, { nowMs, authenticated }));
+
+  let head = cached?.head || null;
+  let apiEtag = cached?.apiEtag || '';
+  let atomEtag = cached?.atomEtag || '';
+  let resolvedBranch = cached?.resolvedBranch || (requestedBranch !== 'HEAD' ? requestedBranch : '');
+  let anySuccess = false;
+  const warnings = [];
+
+  // Layer 1: GitHub REST API commit check (with ETag 304)
+  if (!rateLimited) {
+    const apiUrl =
+      normRoot !== '.'
+        ? `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/commits?sha=${encodeURIComponent(requestedBranch)}&path=${encodeURIComponent(normRoot)}&per_page=1`
+        : `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/commits/${encodeURIComponent(requestedBranch)}`;
+    try {
+      const res = await fetchImpl(apiUrl, {
+        headers: buildGithubHeaders(token, apiEtag),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (res.status === 304) {
+        anySuccess = true;
+      } else if (res.status === 200) {
+        const raw = await res.json();
+        const entry = Array.isArray(raw) ? raw[0] : raw;
+        const sha = String(entry?.sha || '').trim().toLowerCase();
+        if (/^[0-9a-f]{40}$/.test(sha)) {
+          const msg = String(entry?.commit?.message || '').split(/\r?\n/)[0] || '';
+          head = {
+            commitSha: sha,
+            message: truncateChangelog(msg, 400),
+            committedAt: entry?.commit?.committer?.date || entry?.commit?.author?.date || null,
+            branch: resolvedBranch || requestedBranch,
+            remoteVersion: head?.commitSha === sha ? head.remoteVersion || '' : '',
+          };
+          apiEtag = res.headers?.get?.('etag') || '';
+          anySuccess = true;
+        }
+      } else if (res.status === 403 || res.status === 429) {
+        const bodyText = await res.text().catch(() => '');
+        if (isRateLimitResponse(res, bodyText)) {
+          rateLimited = true;
+          const resetAtMs = computeRateLimitResetMs(res, nowMs);
+          writeRateLimitState(cacheDir, { resetAtMs, authenticated, nowMs });
+          warnings.push(`GitHub API rate limit reached (HTTP ${res.status}) while checking branch for ${fullName}; using zero-quota fallback.`);
+        }
+      }
+    } catch (err) {
+      warnings.push(redactSecret(`GitHub branch probe error for ${fullName}: ${err?.message || String(err)}`, token));
+    }
+  }
+
+  // Layer 2: Zero-API-quota fallback (Atom feed -> git-upload-pack info/refs)
+  if (!anySuccess) {
+    const atomRes = await probeGithubBranchAtom({
+      owner,
+      repo,
+      branch: resolvedBranch || requestedBranch,
+      pluginRoot: normRoot,
+      etag: atomEtag,
+      fetchImpl,
+      timeoutMs,
+    });
+    if (atomRes?.notModified) {
+      anySuccess = true;
+    } else if (atomRes?.commitSha) {
+      head = {
+        commitSha: atomRes.commitSha,
+        message: atomRes.message || '',
+        committedAt: atomRes.committedAt || null,
+        branch: resolvedBranch || requestedBranch,
+        remoteVersion: head?.commitSha === atomRes.commitSha ? head.remoteVersion || '' : '',
+      };
+      atomEtag = atomRes.etag || '';
+      anySuccess = true;
+    } else {
+      const gitRefs = await probeGithubGitRefs({ owner, repo, fetchImpl, timeoutMs });
+      if (gitRefs) {
+        const targetBranch =
+          requestedBranch !== 'HEAD' ? requestedBranch : gitRefs.defaultBranch || 'main';
+        const sha = gitRefs.heads.get(targetBranch) || gitRefs.headSha || '';
+        if (/^[0-9a-f]{40}$/.test(sha)) {
+          resolvedBranch = targetBranch;
+          head = {
+            commitSha: sha,
+            message: head?.commitSha === sha ? head.message || '' : '',
+            committedAt: head?.commitSha === sha ? head.committedAt || null : null,
+            branch: targetBranch,
+            remoteVersion: head?.commitSha === sha ? head.remoteVersion || '' : '',
+          };
+          anySuccess = true;
+        }
+      }
+    }
+  }
+
+  // Optional raw `plugin.json` version lookup when commit SHA changed
+  if (
+    head?.commitSha &&
+    installedCommitSha &&
+    head.commitSha.toLowerCase() !== String(installedCommitSha).trim().toLowerCase() &&
+    !head.remoteVersion
+  ) {
+    const remoteVer = await probeRawManifestVersion({
+      owner,
+      repo,
+      commitSha: head.commitSha,
+      pluginRoot: normRoot,
+      fetchImpl,
+      timeoutMs: Math.min(4000, timeoutMs),
+    });
+    if (remoteVer) {
+      head = { ...head, remoteVersion: remoteVer };
+    }
+  }
+
+  if (anySuccess && shouldPersistCache()) {
+    writeJsonSafe(cachePath, {
+      schemaVersion: 1,
+      repo: fullName,
+      branch: resolvedBranch || requestedBranch,
+      pluginRoot: normRoot,
+      checkedAt: new Date(nowMs).toISOString(),
+      checkedAtMs: nowMs,
+      resolvedBranch,
+      apiEtag,
+      atomEtag,
+      head,
+    });
+  }
+
+  return {
+    head,
+    fromCache: false,
+    rateLimited,
+    warning: warnings.length > 0 ? warnings.join(' ') : null,
+  };
+}
+
 /**
  * Probes GitHub Releases (`/releases/latest`) and SemVer Tags (`/tags?per_page=30`) for `owner/repo`
  * with ETag (`If-None-Match`) + 30-minute TTL disk caching in `${dataDir}/cache/github/`.
@@ -467,9 +871,13 @@ function findMatchingCatalogPlugin(loc, catalogPlugins) {
   }
 
   if (loc.repositoryUrl) {
+    const locRoot = normalizePluginRootForUpdate(loc.receipt?.pluginRoot || '.');
     const byRepo = list.find((p) => {
       const pRepo = normalizeRepoUrl(p?.repository?.url);
-      return pRepo && pRepo === loc.repositoryUrl && (p.canonicalName === loc.name || p.canonicalName === loc.dir);
+      if (!pRepo || pRepo !== loc.repositoryUrl) return false;
+      const pRoot = normalizePluginRootForUpdate(p?.repository?.pluginRoot || '.');
+      if (loc.receipt?.pluginRoot && pRoot !== locRoot) return false;
+      return p.canonicalName === loc.name || p.canonicalName === loc.dir;
     });
     if (byRepo) return byRepo;
   }
@@ -490,18 +898,30 @@ function buildUpdateItem({
   receipt,
   ghSlug,
   ghLatest,
+  branchHead = null,
   isSelf,
 }) {
+  const isGithubUrlTrack = Boolean(receipt?.track === 'github-url' && !isSelf);
   const catalogInstallable = isCatalogPluginInstallable(catPlugin);
   const catalogHasUpdate = Boolean(catPlugin && catalogInstallable && isNewerVersion(catPlugin.version, installedVersion));
   const githubHasUpdate = Boolean(ghLatest && isNewerVersion(ghLatest.version, installedVersion));
 
   if (catalogHasUpdate) {
     const matchingGh = ghLatest && compareSemver(ghLatest.version, catPlugin.version) === 0 ? ghLatest : null;
-    const tagPart = catPlugin.gitTag || `v${catPlugin.version}`;
-    const fallbackUrl = ghSlug
-      ? `https://github.com/${ghSlug.fullName}/releases/tag/${encodeURIComponent(tagPart)}`
-      : catPlugin.repository?.url || '';
+    const explicitTag = typeof catPlugin.gitTag === 'string' ? catPlugin.gitTag.trim() : '';
+    const catCommitSha = typeof catPlugin.commitSha === 'string' ? catPlugin.commitSha.trim() : '';
+    let fallbackUrl = catPlugin.repository?.url || '';
+    if (ghSlug) {
+      if (explicitTag) {
+        fallbackUrl = `https://github.com/${ghSlug.fullName}/releases/tag/${encodeURIComponent(explicitTag)}`;
+      } else if (catCommitSha) {
+        fallbackUrl = `https://github.com/${ghSlug.fullName}/commit/${encodeURIComponent(catCommitSha)}`;
+      } else if (catPlugin.gitTag === undefined && catPlugin.version) {
+        fallbackUrl = `https://github.com/${ghSlug.fullName}/releases/tag/${encodeURIComponent(`v${catPlugin.version}`)}`;
+      } else {
+        fallbackUrl = `https://github.com/${ghSlug.fullName}`;
+      }
+    }
     const escalation = computeCapabilityEscalation(receipt, catPlugin);
     const item = {
       id: catPlugin.id,
@@ -525,6 +945,26 @@ function buildUpdateItem({
   }
 
   if (githubHasUpdate) {
+    if (isGithubUrlTrack) {
+      return {
+        id: receipt?.id || catPlugin?.id || id,
+        dir,
+        displayName: catPlugin?.displayName || displayName,
+        installedVersion,
+        latestVersion: ghLatest.version,
+        source: ghLatest.source,
+        updateChannel: 'github-url',
+        updateKind: 'semver',
+        targetRef: ghLatest.tagName,
+        pluginRoot: normalizePluginRootForUpdate(receipt?.pluginRoot || '.'),
+        releaseUrl: ghLatest.releaseUrl,
+        changelog: ghLatest.changelog || '',
+        escalation: null,
+        installable: true,
+        isSelf: false,
+      };
+    }
+
     return {
       id: catPlugin?.id || id,
       dir,
@@ -539,6 +979,43 @@ function buildUpdateItem({
       note: 'available upstream, awaiting catalog sync',
       isSelf: Boolean(isSelf),
     };
+  }
+
+  // Mode B: Default-branch / branch-tracked tagless `github-url` plugins (Commit SHA / version diff)
+  if (isGithubUrlTrack && branchHead?.commitSha) {
+    const installedSha = String(receipt?.commitSha || '').trim().toLowerCase();
+    const remoteSha = String(branchHead.commitSha || '').trim().toLowerCase();
+    const remoteVersion = String(branchHead.remoteVersion || '').trim();
+    const versionBumped = Boolean(remoteVersion && isNewerVersion(remoteVersion, installedVersion));
+    const commitChanged = Boolean(installedSha && remoteSha && remoteSha !== installedSha);
+
+    if (commitChanged || versionBumped) {
+      const releaseUrl = ghSlug
+        ? installedSha
+          ? `https://github.com/${ghSlug.fullName}/compare/${installedSha.slice(0, 12)}...${remoteSha.slice(0, 12)}`
+          : `https://github.com/${ghSlug.fullName}/commit/${remoteSha}`
+        : '';
+      return {
+        id: receipt?.id || id,
+        dir,
+        displayName,
+        installedVersion,
+        latestVersion: versionBumped ? remoteVersion : installedVersion,
+        installedCommitSha: installedSha.slice(0, 7),
+        latestCommitSha: remoteSha.slice(0, 7),
+        source: 'github-branch',
+        updateChannel: 'github-url',
+        updateKind: versionBumped ? 'semver' : 'commit',
+        targetRef: remoteSha,
+        trackBranch: branchHead.branch || receipt?.githubSource?.trackBranch || '',
+        pluginRoot: normalizePluginRootForUpdate(receipt?.pluginRoot || '.'),
+        releaseUrl,
+        changelog: branchHead.message || '',
+        escalation: null,
+        installable: true,
+        isSelf: false,
+      };
+    }
   }
 
   return null;
@@ -567,6 +1044,7 @@ export async function checkPluginUpdates({
   const globalInstalled = (inventory?.installed || []).filter((loc) => loc.scope === 'global');
 
   const probeMemo = new Map();
+  const branchProbeMemo = new Map();
   const warnings = [];
   let rateLimited = false;
 
@@ -593,6 +1071,41 @@ export async function checkPluginUpdates({
     return res.latest;
   }
 
+  async function probeBranchOnce(ghSlug, loc) {
+    if (!ghSlug || !loc?.receipt) return null;
+    const branch =
+      loc.receipt?.githubSource?.trackBranch ||
+      (loc.receipt?.githubSource?.refType === 'branch' && loc.receipt?.githubSource?.ref
+        ? loc.receipt.githubSource.ref
+        : '') ||
+      'HEAD';
+    const pluginRoot = normalizePluginRootForUpdate(loc.receipt?.pluginRoot || '.');
+    const memoKey = `${ghSlug.fullName}|${branch}|${pluginRoot}`;
+    if (branchProbeMemo.has(memoKey)) return branchProbeMemo.get(memoKey);
+
+    const res = await probeGithubBranchHead({
+      owner: ghSlug.owner,
+      repo: ghSlug.repo,
+      branch,
+      pluginRoot,
+      installedCommitSha: loc.receipt?.commitSha || '',
+      dataDir,
+      prefs,
+      force,
+      fetchImpl,
+      nowMs,
+      ttlMs,
+      githubApiBaseUrl,
+      timeoutMs,
+      skipNetworkBecauseRateLimited: rateLimited,
+      shouldPersistCache,
+    });
+    if (res.rateLimited) rateLimited = true;
+    if (res.warning) warnings.push(res.warning);
+    branchProbeMemo.set(memoKey, res.head);
+    return res.head;
+  }
+
   const items = [];
   let sawInstalledSelf = false;
   let selfUpdate = null;
@@ -609,6 +1122,13 @@ export async function checkPluginUpdates({
       (isSelf ? parseGithubRepoSlug(SELF_REPO_URL) : null);
 
     const ghLatest = await probeOnce(ghSlug);
+    const shouldProbeBranch = Boolean(
+      loc.receipt?.track === 'github-url' &&
+        !isSelf &&
+        ghSlug &&
+        (loc.receipt?.githubSource?.refType === 'branch' || (!ghLatest && Boolean(loc.receipt?.commitSha))),
+    );
+    const branchHead = shouldProbeBranch ? await probeBranchOnce(ghSlug, loc) : null;
     const fallbackId = catPlugin?.id || loc.receipt?.id || (ghSlug ? `${ghSlug.owner}__${ghSlug.repo}` : loc.dir);
 
     const item = buildUpdateItem({
@@ -620,6 +1140,7 @@ export async function checkPluginUpdates({
       receipt: loc.receipt || null,
       ghSlug,
       ghLatest,
+      branchHead,
       isSelf,
     });
 

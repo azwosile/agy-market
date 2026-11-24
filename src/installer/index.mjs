@@ -634,17 +634,19 @@ export async function installOrUpdateCatalogPlugin({
   conflictStrategy = 'prompt', // 'prompt' | 'isolate' | 'replace'
   confirmEscalation = false,
   configDir = resolveAntigravityConfigDir(),
+  pluginsDir: explicitPluginsDir = '',
   dataDir = resolveMarketDataDir(),
   workspaceUris = [],
   builtinPluginsDir = '',
   fetchImpl = fetch,
+  preverifiedArchivePath = '',
   writeOverride = null,
 }) {
   if (!plugin || typeof plugin !== 'object' || !plugin.id) {
     throw new Error('ERR_INVALID_PLUGIN_ENTRY: Missing valid catalog plugin object');
   }
 
-  const pluginsDir = resolvePluginsDir(configDir);
+  const pluginsDir = explicitPluginsDir ? resolve(explicitPluginsDir) : resolvePluginsDir(configDir);
   const disabledDir = resolveDisabledPluginsDir(dataDir);
   mkdirSync(pluginsDir, { recursive: true });
   mkdirSync(dataDir, { recursive: true });
@@ -652,7 +654,13 @@ export async function installOrUpdateCatalogPlugin({
   // Sweep any previously retired `*.old.<ts>` binaries whose handles have closed
   sweepRetiredBinaries(dataDir);
 
-  const inventory = scanLocalPluginInventory({ configDir, dataDir, workspaceUris, builtinPluginsDir });
+  const inventory = scanLocalPluginInventory({
+    configDir,
+    pluginsDir,
+    dataDir,
+    workspaceUris,
+    builtinPluginsDir,
+  });
   const preflight = resolveInstallPreflight(plugin, inventory, { conflictStrategy });
 
   // Pause & ask user if Track-1 collides with a foreign local plugin
@@ -708,6 +716,7 @@ export async function installOrUpdateCatalogPlugin({
       stagingArchivePath,
       prefs,
       fetchImpl,
+      preverifiedArchivePath,
     });
 
     // Safe stream extraction (rejects `..` and symlinks/hardlinks)
@@ -716,8 +725,17 @@ export async function installOrUpdateCatalogPlugin({
     });
 
     const manifestPath = join(stagingBundleDir, 'plugin.json');
+    const dotManifestPath = join(stagingBundleDir, '.antigravity-plugin', 'plugin.json');
     if (!existsSync(manifestPath)) {
-      throw new Error('ERR_STAGING_MISSING_MANIFEST: Extracted archive does not contain plugin.json');
+      if (existsSync(dotManifestPath)) {
+        // Support `.antigravity-plugin/plugin.json` layout while preserving root mcp_config.json / assets / skills
+        const rawDotManifest = parseJsonc(readFileSync(dotManifestPath, 'utf8'));
+        const cleanDotManifest = sanitizeNativePluginManifest(rawDotManifest);
+        delete cleanDotManifest.disabled;
+        writeFileSync(manifestPath, `${JSON.stringify(cleanDotManifest, null, 2)}\n`, 'utf8');
+      } else {
+        throw new Error('ERR_STAGING_MISSING_MANIFEST: Extracted archive does not contain plugin.json');
+      }
     }
 
     let compatibilityNotes = [];
@@ -757,6 +775,7 @@ export async function installOrUpdateCatalogPlugin({
       effectivePluginName: preflight.effectivePluginName,
       scopedRewriteApplied: preflight.applyScopedRewrite,
       previousInstalledAt: existingReceipt?.installedAt || null,
+      actualSha256: dlInfo.sha256,
     });
 
     // Write crash-recovery journal BEFORE touching target plugin directory
@@ -803,7 +822,7 @@ export async function installOrUpdateCatalogPlugin({
     }
 
     // Re-scan single installed plugin for accurate Sidecar pill URI & local capabilities
-    const postInventory = scanLocalPluginInventory({ configDir, dataDir });
+    const postInventory = scanLocalPluginInventory({ configDir, pluginsDir, dataDir });
     const installedRecord = postInventory.installed.find((x) => x.dir === targetDir) || null;
     const mergedCaps = mergeCapabilityProfiles(installedRecord?.capabilities || {}, plugin.capabilities || {});
     const activation = classifyActivationRequirement(mergedCaps, {

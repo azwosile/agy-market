@@ -4,9 +4,9 @@
 
 # AGY Market (`agy-market`)
 
-**Aurora Prism Visual Community Plugin Marketplace for Google Antigravity**
+**Community Plugin Marketplace for Google Antigravity**
 
-Aurora Prism Liquid-Glass UI · ⭐ Pinned Favorites Shelf & Tab · Live Installed Search & Filters · One-Click Sidebar Launcher · Native Vault-Parking Toggle Sliders · 5-Layer Conflict Radar · Dual-Mirror China Acceleration · SHA-256 Tamper-Proof Installs
+Sidebar Panel UI · GitHub URL Preflight Installer · ⭐ Pinned Favorites Shelf & Tab · Live Installed Search & Filters · One-Click Sidebar Launcher · Native Vault-Parking Toggle Sliders · Local Conflict Checks · Dual-Mirror China Acceleration · SHA-256 Verified Installs
 
 [简体中文](./README.md) · **English** · **[📖 Submit a Plugin Guide](https://github.com/azwosile/agy-market-catalog/blob/main/docs/SUBMISSION_GUIDE.md)** · [Plugin Catalog](https://github.com/azwosile/agy-market-catalog) · [Architecture Spec](./AGENTS.md)
 
@@ -20,14 +20,14 @@ Aurora Prism Liquid-Glass UI · ⭐ Pinned Favorites Shelf & Tab · Live Install
 
 ---
 
-## ✨ Highlights (v1.3.0 Aurora Prism Polish)
+## ✨ Highlights (v1.4.0)
 
-### 1. Aurora Prism Sidebar Experience
+### 1. Sidebar Panel UI & Navigation
 - **Native Right Sidebar Panel**: Runs inside Antigravity's native `AUX_PANE` extension view (`sidecars/market_pane/sidecar.json`) with no bundled MCP servers, keeping the panel lightweight and responsive.
-- **Prismatic Bento Cards & Nebula Header**: Live top Spotlight Hero Strip displays catalog stats (*Indexed / Active / Updates / Conflict Health*) alongside a quick **`+ Submit Plugin`** button linking straight to `docs/SUBMISSION_GUIDE.md`. Each card adapts its radial hue aura (`--card-accent`), `1px` specular top rim, and pointer-tracking spotlight (`--mx, --my`), staying crisp across Dark, Light, and translucent wallpaper skins (such as Wallpaper Prism).
-- **2-Line Graceful Titles + Clickable GitHub Links**: Clicking any **plugin title** in cards or the Detail Drawer opens its GitHub repository directly in a new window, while clicking the card body opens the Detail Drawer.
+- **Overview Strip & Plugin Cards**: Collapsible top overview strip displays catalog stats (*Indexed / Active / Updates / Local Conflicts*) alongside quick **`Add URL`** (`链接添加`) and **`+ Submit Plugin`** actions. Card styles adapt across Dark, Light, and translucent wallpaper skins (such as Wallpaper Prism).
+- **2-Line Titles + Clickable GitHub Links**: Clicking any **plugin title** in cards or the Detail Drawer opens its GitHub repository directly in a new window, while clicking the card body opens the Detail Drawer.
 - **Multilingual README Drawer**: Queries `/api/readme?id=...&locale=zh|en`, preferring localized `entriesZh` / `entriesEn` from the catalog (or local `README.zh-CN.md` / `README.zh.md` for installed plugins) and rendering localized descriptions on installed cards.
-- **Direct One-Click Sidebar Launcher**: Replaces raw `<a href="sidecar://...">` links blocked inside isolated iframes. Clicking a sibling plugin's **Panel** button invokes both host `window.sidecar.ui.toggleAuxPane` and backend `POST /api/open-pane` to open or focus its Sidebar panel directly—no manual copy prompts.
+- **Direct One-Click Sidebar Launcher**: Replaces raw `<a href="sidecar://...">` links blocked inside isolated iframes. Inside the host panel, clicking a sibling plugin's **Panel** button invokes host `window.sidecar.ui.toggleAuxPane` (`tabType: "sidecarView"`) directly to open or focus its Sidebar panel—no manual copy prompts.
 
 ### 2. ⭐ Favorites Shelf & Tab, Installed Search/Filters & Update Error Alerts
 - **⭐ Pinned Favorites Shelf & Dedicated Favorites Tab**:
@@ -36,7 +36,7 @@ Aurora Prism Liquid-Glass UI · ⭐ Pinned Favorites Shelf & Tab · Live Install
 - **Live Search & Status Filters in `Installed` View**:
   - The **Installed** view includes a live search bar (matching display name, directory name, or description) and quick status filter pills (**All / Enabled / Disabled / Updatable**) for fast management at scale.
 - **High-Visibility Update Error Alert Banner (Zero Silent Failures)**:
-  - Whenever an install/update, batch **Update All**, or self-update fails due to network errors, SHA-256 mismatch, or permissions, a dismissible red glass error banner and danger toast surface the affected plugin, exact failure reason, and a one-click **Retry** button.
+  - Whenever an install/update, batch **Update All**, or self-update fails due to network errors, SHA-256 mismatch, or permissions, a dismissible red error banner and error toast surface the affected plugin, exact failure reason, and a one-click **Retry** button.
 
 ### 3. Native Card-Footer Enable / Disable Slider (Vault Parking)
 - **Zero Writes to `config.json`**: Antigravity's Language Server write-protects `~/.gemini/config/config.json`. AGY Market reads `config.json` strictly read-only and powers live toggling via **Vault Parking** (`POST /api/toggle-plugin`):
@@ -45,16 +45,16 @@ Aurora Prism Liquid-Glass UI · ⭐ Pinned Favorites Shelf & Tab · Live Install
   - **Update While Parked**: Disabled plugins remain visible in *Installed* and *Discover* tabs and update in-place inside `disabled-plugins/<dir>` without accidentally reactivating them.
   - **Safe Locking**: `agy-market` itself stays locked ON to prevent disconnecting its own panel; `workspace`, `builtin`, and host-disabled plugins show clear read-only lock states.
 
-### 4. 5-Layer Plugin Conflict & Health Radar
-Dedicated **Conflicts & Diagnostics** tab (`GET /api/conflicts`) with zero-side-effect scanning and one-click fixes (`POST /api/fix-conflict`):
+### 4. Local Plugin Conflict Checks & Fixes
+Dedicated **Conflicts & Diagnostics** tab (`GET /api/conflicts`) with read-only static conflict checks and one-click fixes (`POST /api/fix-conflict`):
 
-| Layer | Severity | What It Detects | Quick Action |
+| Check | Severity | What It Detects | Quick Action |
 | :--- | :---: | :--- | :--- |
 | `duplicate-plugin-name` | Critical | Duplicate `plugin.json.name` across `workspace > global > builtin` precedence, pinpointing the winner and silently dropped victim directories | 1-click `<owner>--<slug>` scoped isolation rename |
 | `windows-symlink-ignored` | Critical | Symlinks or NTFS junctions inside `~/.gemini/config/plugins/` that Windows `GetAllPlugins` silently skips | 1-click materialize to real directory |
 | `mcp-collision` | Critical / Warning | Duplicate `<plugin>_<server>` keys, collisions with global `mcp_config.json`, or bare generic server names (`search`, `db`, `fetch`, etc.) | Pinpoints colliding keys & sources |
 | `skill-shadowing` / `agent-shadowing` | Warning | Overlapping `skills/*/SKILL.md` or `agents/*.md` across active plugins, `~/.gemini/config/skills/*`, and built-in reserved names | Shows full override chain |
-| `host-enhancement-overlap` | Info | Two or more active plugins simultaneously using `app-asar` or `cdp` host enhancements | Advisory to disable legacy duplicate |
+| `host-enhancement-overlap` | Warning / Info | Two or more active plugins modifying `app.asar` (**Warning**, patch overlap risk) or using `cdp` UI enhancements (**Info**, generally compatible) | Advisory to review or disable duplicate |
 
 ### 5. Action-Triggered Restart & Reload Prompts
 Cards and the Detail Drawer stay clutter-free without static restart chips. Activation prompts appear **only after an install, update, batch update succeeds** (or when a Windows disable retires a locked binary):
@@ -66,12 +66,12 @@ Cards and the Detail Drawer stay clutter-free without static restart chips. Acti
 - Every plugin Detail Drawer includes a **Discussions** tab (`GET /api/discussions`) that detects whether Discussions are enabled on the repository without needing a token and provides direct links to browse or start a thread.
 - Optionally configuring a personal GitHub Token in Settings (stored locally in `prefs.json` with `0600` permissions; never logged or persisted in caches) loads the latest 10 repository discussions directly inside the Sidebar panel.
 
-### 7. Dual-Mirror China Acceleration & SHA-256 Tamper-Proof Installs
+### 7. Dual-Mirror China Acceleration & SHA-256 Verified Installs
 - **Three-Tier Live Catalog Resolution (No Stale Bundled Snapshot)**:
   1. **Custom Feeds**: User/team static `index.json` URLs configured in `prefs.json` take highest priority.
   2. **Primary Channel (GitHub Pages + `gh-pages` Raw Fallback)**: Conditional `ETag` (`If-None-Match`) / `If-Modified-Since` requests achieve `<50ms` `304 Not Modified` cache hits.
   3. **Automatic Mainland China Mirror Fallback**: If GitHub Pages times out (`> 3.5s`) or fails, streams the pure-JSON `@agy-market/catalog` transport package from `registry.npmmirror.com` or `mirrors.cloud.tencent.com/npm` in memory; falls back to disk cache when offline.
-- **Language-Agnostic & Tamper-Proof**: npm is used **strictly** as a JSON mirror CDN for catalog metadata—listed plugins do **not** need to be npm or JavaScript projects. Optional GitHub Release mirror prefixes are supported safely because every tarball is streamed and verified against the authoritative catalog `sha256` before extraction (`INTEGRITY_SHA256_MISMATCH` aborts immediately on any altered byte).
+- **Language-Agnostic & SHA-256 Verified**: npm is used **strictly** as a JSON mirror CDN for catalog metadata—listed plugins do **not** need to be npm or JavaScript projects. Optional GitHub Release mirror prefixes are supported safely because every tarball is streamed and verified against the catalog `sha256` digest before extraction (`INTEGRITY_SHA256_MISMATCH` aborts immediately on any mismatch).
 
 ---
 
@@ -98,7 +98,37 @@ Once installed in Antigravity:
 
 ---
 
-## 🏷️ Transparent Capability Badges & Update Guard
+## 🔗 Adding Plugins from Any GitHub URL
+
+Starting with v1.4.0, you can preflight and install any community plugin directly from a full GitHub URL without waiting for catalog indexing — including single-subdirectory layouts, Monorepos, and repositories without Release tags.
+
+### Option 1: Sidebar Top Bar `Add URL` (`链接添加`) Button (Two-Step Preflight)
+1. Open the AGY Market Sidebar panel and click **`Add URL`** (`链接添加`) in the top bar (or click **Add via GitHub URL** when a Discover search returns no matches).
+2. Paste any full GitHub URL and click **Inspect**:
+   - Repository homepage: `https://github.com/<owner>/<repo>` (resolves latest Release → Git Tag → default branch commit automatically)
+   - Branch or subdirectory: `https://github.com/<owner>/<repo>/tree/<branch>/<subpath>`
+   - Manifest blob URL: `https://github.com/<owner>/<repo>/blob/<ref>/[<subpath>/]plugin.json`
+   - Release / tag / archive URLs: `/releases/tag/<tag>`, `/releases/latest`, `/releases/download/<tag>/<asset>.tar.gz`, `/archive/...tar.gz`
+3. AGY Market downloads the archive into an external staging directory and runs local static checks before installing:
+   - **Multi-layout detection**: Supports root `plugin.json`, `.antigravity-plugin/plugin.json`, automatic unique-subdirectory detection (e.g. `agy-capsule/plugin.json`), and interactive subpath selection for Monorepo repositories (`plugins/*`, `.agents/plugins/*`, etc.).
+   - **Preflight & safety checks**: Displays version or short `commitSha`, SHA-256 digest, capability badges, and install mode (native directory vs. `<owner>--<slug>` scoped isolation). Repositories missing a valid `plugin.json` or failing traversal/symlink/rule-smuggling checks are rejected with clear diagnostics and zero leftover files.
+   - **Installed tracking & updates**: Installed items display a `GitHub URL` source badge in *Installed*, work with the Vault-Parking toggle slider, and check for updates via Release Tag or branch commit SHA.
+
+### Option 2: CLI `npx agy-market add <github-url>`
+```bash
+# Inspect and interactively install any GitHub plugin repository (supports subpaths & branch commits)
+npx agy-market add https://github.com/<owner>/<repo>
+
+# Target a specific Monorepo subdirectory with <owner>--<slug> scoped isolation and non-interactive confirmation
+npx agy-market add https://github.com/<owner>/<repo> --subpath plugins/<name> --isolate --yes
+
+# Optional flags: --replace, --dest <plugins-dir>, --mirror <prefix>, --token <pat>, --json
+npx agy-market add https://github.com/<owner>/<repo>/tree/main/<subpath> --yes --json
+```
+
+---
+
+## 🏷️ Capability Badges & Update Escalation Confirmation
 
 Every plugin surfaces static capability badges beside the Install button before installation:
 
@@ -125,11 +155,14 @@ Every plugin surfaces static capability badges beside the Install button before 
 # Install or update AGY Market (optional --dest <plugins-dir>)
 npx agy-market install
 
+# Preflight and install a plugin from any GitHub URL (--subpath, --isolate, --replace, --yes, --dest, --mirror, --token, --json)
+npx agy-market add <github-url>
+
 # List local installed plugins, config/data paths & market receipts (--json supported)
 npx agy-market status
 npx agy-market status --json
 
-# Run health diagnostics (Node >= 22, real directory check, 10-field manifest purity, built UI) & sweep retired Windows binaries
+# Run local installation checks (Node >= 22, real directory check, 10-field manifest purity, built UI) & sweep retired Windows binaries
 npx agy-market doctor
 ```
 
@@ -142,7 +175,7 @@ npm run build
 # Copy real plugin bundle into ~/.gemini/config/plugins/agy-market (never symlinks/junctions)
 npm run install:local
 
-# Verify local installation health
+# Verify local installation
 node ./bin/agy-market.mjs doctor
 
 # Pack deterministic release tarball (dist/agy-market.tar.gz + .sha256)

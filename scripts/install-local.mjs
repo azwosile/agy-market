@@ -3,7 +3,7 @@
 // Copies real files & directories into `~/.gemini/config/plugins/agy-market` (NEVER symlinks or NTFS junctions).
 
 import { createHash } from 'node:crypto';
-import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { CUSTOMIZATION_URI, PLUGIN_ID, PLUGIN_VERSION, SIDECAR_URI } from '../src/shared/constants.mjs';
@@ -29,7 +29,6 @@ export async function installLocalAgyMarket({ destPluginsDir = '' } = {}) {
   mkdirSync(dstDir, { recursive: true });
 
   const itemsToCopy = [
-    'plugin.json',
     'agy-market.json',
     'package.json',
     'README.md',
@@ -41,6 +40,7 @@ export async function installLocalAgyMarket({ destPluginsDir = '' } = {}) {
     'sidecars',
     'skills',
     'src',
+    'plugin.json',
   ];
 
   for (const rel of itemsToCopy) {
@@ -75,6 +75,12 @@ export async function installLocalAgyMarket({ destPluginsDir = '' } = {}) {
   if (lstatSync(dstDir).isSymbolicLink()) {
     throw new Error('ERR_SYMLINK_DETECTED: Destination directory must be a real directory, never a symlink/junction');
   }
+
+  // Refresh server.mjs mtime without altering bytes so main.mjs 2.5s hot-reload poll
+  // reliably detects updates even when only transitive modules (e.g. github-url.mjs) changed.
+  const serverMjsDst = join(dstDir, 'src', 'sidecar', 'server.mjs');
+  const touchNow = new Date();
+  utimesSync(serverMjsDst, touchNow, touchNow);
 
   const manifestRaw = readFileSync(join(dstDir, 'plugin.json'));
   const digest = createHash('sha256').update(manifestRaw).digest('hex');

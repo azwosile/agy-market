@@ -6,7 +6,7 @@ export const SELF_REPO_URL = 'https://github.com/azwosile/agy-market';
 export const SUBMIT_PLUGIN_GUIDE_URL =
   'https://github.com/azwosile/agy-market-catalog/blob/main/docs/SUBMISSION_GUIDE.md';
 export const PLUGIN_DISPLAY_NAME = 'AGY Market · 反重力插件市场';
-export const PLUGIN_VERSION = '1.3.0';
+export const PLUGIN_VERSION = '1.4.0';
 export const SIDECAR_ID = 'market_pane';
 export const SIDECAR_URI = 'sidecar://agy-market/market_pane/';
 export const CUSTOMIZATION_URI = 'customization://agy-market';

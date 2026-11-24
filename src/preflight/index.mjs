@@ -6,9 +6,9 @@
 //   - Rewrites `customization://` and `sidecar://` links in `.md` files and reports bare-name JS/hook compatibility notes.
 
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
-import { join, posix, resolve } from 'node:path';
+import { basename, dirname, join, posix, resolve } from 'node:path';
 import { classifyActivationRequirement } from '../shared/activation.mjs';
-import { PLUGIN_ID, toScopedPluginName } from '../shared/constants.mjs';
+import { PLUGIN_ID, SELF_CATALOG_ID, toScopedPluginName } from '../shared/constants.mjs';
 import {
   fileUriToLocalPath,
   resolveAntigravityConfigDir,
@@ -110,8 +110,13 @@ export function normalizeRepoUrl(rawRepo) {
 const IGNORED_README_GH_OWNERS = new Set(['features', 'topics', 'settings', 'orgs', 'sponsors', 'marketplace']);
 
 function resolveLocalPluginRepoUrl(fullDir, manifest, receipt) {
+  const fromReceipt = normalizeRepoUrl(receipt?.repositoryUrl);
+  if (receipt?.track === 'github-url' && fromReceipt) return fromReceipt;
+
   const fromRepo = normalizeRepoUrl(manifest?.repository);
   if (fromRepo) return fromRepo;
+
+  if (fromReceipt) return fromReceipt;
 
   const fromHomepage = normalizeRepoUrl(manifest?.homepage);
   if (/^https:\/\/github\.com\/[^/]+\/[^/]+$/.test(fromHomepage)) {
@@ -181,6 +186,99 @@ export function readHostEnabledMapReadOnly(configDir) {
   return enabledByDir;
 }
 
+export function stripSourceComments(source, filePath = '') {
+  const src = String(source || '');
+  const relPath = String(filePath || '');
+  if (/\.ps1$/i.test(relPath)) {
+    return src.replace(/<#[\s\S]*?#>/g, '').replace(/^\s*#.*$/gm, '');
+  }
+  if (/\.(?:py|sh)$/i.test(relPath)) {
+    return src.replace(/^\s*#.*$/gm, '');
+  }
+  if (/\.(?:cmd|bat)$/i.test(relPath)) {
+    return src.replace(/^\s*(?:rem\b|::).*$/gim, '');
+  }
+  let out = '';
+  let inSingle = false;
+  let inDouble = false;
+  let inTemplate = false;
+  let inLineComment = false;
+  let inBlockComment = false;
+  let escaped = false;
+
+  for (let i = 0; i < src.length; i += 1) {
+    const ch = src[i];
+    const next = src[i + 1];
+
+    if (inLineComment) {
+      if (ch === '\n') {
+        inLineComment = false;
+        out += ch;
+      }
+      continue;
+    }
+    if (inBlockComment) {
+      if (ch === '*' && next === '/') {
+        inBlockComment = false;
+        out += ' ';
+        i += 1;
+      } else if (ch === '\n') {
+        out += '\n';
+      }
+      continue;
+    }
+    if (inSingle) {
+      out += ch;
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === "'" || ch === '\n') inSingle = false;
+      continue;
+    }
+    if (inDouble) {
+      out += ch;
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"' || ch === '\n') inDouble = false;
+      continue;
+    }
+    if (inTemplate) {
+      out += ch;
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '`') inTemplate = false;
+      continue;
+    }
+
+    if (ch === '/' && next === '/') {
+      inLineComment = true;
+      i += 1;
+      continue;
+    }
+    if (ch === '/' && next === '*') {
+      inBlockComment = true;
+      i += 1;
+      continue;
+    }
+    if (ch === "'") {
+      inSingle = true;
+      out += ch;
+      continue;
+    }
+    if (ch === '"') {
+      inDouble = true;
+      out += ch;
+      continue;
+    }
+    if (ch === '`') {
+      inTemplate = true;
+      out += ch;
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
 function detectLocalHostEnhancementKinds(fullDir, dirName, manifestName, receipt) {
   const kinds = new Set();
 
@@ -218,7 +316,7 @@ function detectLocalHostEnhancementKinds(fullDir, dirName, manifestName, receipt
       } else if (st.isFile() && SCRIPT_EXT_RE.test(entry) && !NON_RUNTIME_TEST_FILE_RE.test(entry)) {
         if (st.size > MAX_SCRIPT_SCAN_BYTES) continue;
         try {
-          const code = readFileSync(full, 'utf8');
+          const code = stripSourceComments(readFileSync(full, 'utf8'), entry);
           if (!kinds.has('cdp') && LOCAL_CDP_RE.test(code)) kinds.add('cdp');
           if (!kinds.has('app-asar') && LOCAL_ASAR_RE.test(code)) kinds.add('app-asar');
         } catch {
@@ -232,7 +330,7 @@ function detectLocalHostEnhancementKinds(fullDir, dirName, manifestName, receipt
   return [...kinds].sort();
 }
 
-function scanLocalPluginComponents(fullDir, dirName, manifestName, receipt) {
+export function scanLocalPluginComponents(fullDir, dirName, manifestName, receipt) {
   // 1. Skills (`skills/*/SKILL.md`)
   const skills = [];
   const skillsDir = join(fullDir, 'skills');
@@ -314,9 +412,29 @@ function scanLocalPluginComponents(fullDir, dirName, manifestName, receipt) {
     }
   }
 
-  // 4. Sidecars (`sidecars/*/sidecar.json`)
+  // 4. Sidecars (`sidecars/*/sidecar.json` or optional root `sidecars.json`)
   let hasSidecarUi = false;
   let hasSidecarPane = null;
+
+  const inspectSidecarManifest = (sc, scFolder) => {
+    if (!sc || typeof sc !== 'object') return;
+    hasSidecarUi = true;
+    const auxView = (sc?.ui_config?.views || []).find(
+      (v) => v && v.entrypoint === 'SIDECAR_UI_ENTRYPOINT_AUX_PANE',
+    );
+    if (sc?.has_web_ui && auxView && !hasSidecarPane && scFolder) {
+      const rawViewPath = String(auxView.path || '/');
+      const viewPathClean = rawViewPath.replace(/^\/+/, '');
+      hasSidecarPane = {
+        sidecarFolder: scFolder,
+        sidecarId: `${dirName}/${scFolder}`,
+        viewPath: rawViewPath,
+        title: auxView.title || sc.display_name || manifestName || dirName,
+        uri: `sidecar://${dirName}/${scFolder}/${viewPathClean}`,
+      };
+    }
+  };
+
   const sidecarsDir = join(fullDir, 'sidecars');
   if (existsSync(sidecarsDir)) {
     try {
@@ -324,22 +442,67 @@ function scanLocalPluginComponents(fullDir, dirName, manifestName, receipt) {
         const scJsonPath = join(sidecarsDir, scFolder, 'sidecar.json');
         if (!existsSync(scJsonPath)) continue;
         const sc = parseJsonc(readFileSync(scJsonPath, 'utf8'));
-        if (sc && typeof sc === 'object') {
-          hasSidecarUi = true;
-        }
-        const auxView = (sc?.ui_config?.views || []).find(
-          (v) => v.entrypoint === 'SIDECAR_UI_ENTRYPOINT_AUX_PANE',
-        );
-        if (sc?.has_web_ui && auxView && !hasSidecarPane) {
-          const rawViewPath = String(auxView.path || '/');
-          const viewPathClean = rawViewPath.replace(/^\/+/, '');
-          hasSidecarPane = {
-            sidecarFolder: scFolder,
-            sidecarId: `${dirName}/${scFolder}`,
-            viewPath: rawViewPath,
-            title: auxView.title || sc.display_name || manifestName || dirName,
-            uri: `sidecar://${dirName}/${scFolder}/${viewPathClean}`,
-          };
+        inspectSidecarManifest(sc, scFolder);
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  // Fallback: optional root `sidecars.json` (array or `{ sidecars: [...] }` referencing relative subdirs/sidecar.json)
+  const rootSidecarsJsonPath = join(fullDir, 'sidecars.json');
+  if (!hasSidecarPane && existsSync(rootSidecarsJsonPath)) {
+    try {
+      const parsed = parseJsonc(readFileSync(rootSidecarsJsonPath, 'utf8'));
+      const entries = Array.isArray(parsed)
+        ? parsed
+        : Array.isArray(parsed?.sidecars)
+          ? parsed.sidecars
+          : [];
+      const absPluginRoot = resolve(fullDir);
+      const isWithinPluginRoot = (target) =>
+        target === absPluginRoot ||
+        target.startsWith(`${absPluginRoot}\\`) ||
+        target.startsWith(`${absPluginRoot}/`);
+
+      for (const item of entries) {
+        if (hasSidecarPane) break;
+        if (typeof item === 'string') {
+          const rel = item.trim();
+          if (!rel) continue;
+          const resolved = resolve(absPluginRoot, rel);
+          if (!isWithinPluginRoot(resolved)) continue;
+          const scJsonPath = resolved.toLowerCase().endsWith('.json') ? resolved : join(resolved, 'sidecar.json');
+          if (!existsSync(scJsonPath)) continue;
+          const sc = parseJsonc(readFileSync(scJsonPath, 'utf8'));
+          const parentFolder = basename(dirname(scJsonPath));
+          const folderName =
+            parentFolder && resolve(dirname(scJsonPath)) !== absPluginRoot
+              ? parentFolder
+              : basename(scJsonPath, '.json');
+          inspectSidecarManifest(sc, folderName);
+        } else if (item && typeof item === 'object') {
+          const relRef = String(
+            item.sidecarJson || item.manifest || item.config || item.path || item.dir || item.folder || '',
+          ).trim();
+          if (relRef && !item.ui_config) {
+            const resolved = resolve(absPluginRoot, relRef);
+            if (!isWithinPluginRoot(resolved)) continue;
+            const scJsonPath = resolved.toLowerCase().endsWith('.json') ? resolved : join(resolved, 'sidecar.json');
+            if (!existsSync(scJsonPath)) continue;
+            const sc = parseJsonc(readFileSync(scJsonPath, 'utf8'));
+            const explicitFolder = String(item.sidecarFolder || item.folder || item.id || item.name || '').trim();
+            const parentFolder = basename(dirname(scJsonPath));
+            const folderName =
+              explicitFolder ||
+              (parentFolder && resolve(dirname(scJsonPath)) !== absPluginRoot
+                ? parentFolder
+                : basename(scJsonPath, '.json'));
+            inspectSidecarManifest(sc, folderName);
+          } else {
+            const folderName = String(item.sidecarFolder || item.folder || item.id || item.name || '').trim();
+            inspectSidecarManifest(item, folderName);
+          }
         }
       }
     } catch {
@@ -563,13 +726,14 @@ function scanSinglePluginFolder(
  */
 export function scanLocalPluginInventory({
   configDir = resolveAntigravityConfigDir(),
+  pluginsDir = '',
   dataDir = '',
   workspaceUris = [],
   builtinPluginsDir = '',
   linkInfoOverride = null,
 } = {}) {
   const enabledByDir = readHostEnabledMapReadOnly(configDir);
-  const globalPluginsDir = resolvePluginsDir(configDir);
+  const globalPluginsDir = pluginsDir ? resolve(pluginsDir) : resolvePluginsDir(configDir);
   const disabledPluginsDir = dataDir ? resolveDisabledPluginsDir(dataDir) : '';
   const installed = [];
   const seenGlobalDirs = new Set();
@@ -646,6 +810,19 @@ export function resolveInstallPreflight(plugin, inventory, { conflictStrategy = 
   const repoId = Number(plugin?.repository?.repositoryId || 0);
   const repoUrlNorm = normalizeRepoUrl(plugin?.repository?.url);
   const canonicalName = String(plugin.canonicalName || '').trim();
+  if (
+    !canonicalName ||
+    canonicalName === '.' ||
+    canonicalName === '..' ||
+    canonicalName.includes('/') ||
+    canonicalName.includes('\\') ||
+    canonicalName.includes('..') ||
+    /[\x00-\x1f<>:"|?*]/.test(canonicalName)
+  ) {
+    throw new Error(
+      `ERR_INVALID_CANONICAL_NAME: Plugin "${plugin?.id || ''}" lacks a safe canonicalName ("${plugin?.canonicalName || ''}")`,
+    );
+  }
   const ownerFromId = String(plugin.id || '').includes('__') ? plugin.id.split('__')[0] : 'community';
   const scopedName = plugin.scopedName || toScopedPluginName(ownerFromId, canonicalName);
 
@@ -666,10 +843,11 @@ export function resolveInstallPreflight(plugin, inventory, { conflictStrategy = 
 
   if (sameSource) {
     const isScoped = Boolean(sameSource.receipt?.scopedRewriteApplied) || sameSource.dir === scopedName;
+    const effectiveScopedName = sameSource.receipt?.effectivePluginName || sameSource.dir || scopedName;
     return {
       action: 'update',
       targetDir: sameSource.dir,
-      effectivePluginName: isScoped ? scopedName : sameSource.name,
+      effectivePluginName: isScoped ? effectiveScopedName : sameSource.name,
       applyScopedRewrite: isScoped,
       existingInstall: {
         ...sameSource,
@@ -707,6 +885,9 @@ export function resolveInstallPreflight(plugin, inventory, { conflictStrategy = 
     };
   }
 
+  const isForeignSelfCollision =
+    (conflicting.dir === PLUGIN_ID || conflicting.name === PLUGIN_ID) && plugin.id !== SELF_CATALOG_ID;
+
   // 4. Foreign local/builtin collision detected!
   if (conflictStrategy === 'isolate') {
     return {
@@ -720,6 +901,11 @@ export function resolveInstallPreflight(plugin, inventory, { conflictStrategy = 
   }
 
   if (conflictStrategy === 'replace') {
+    if (isForeignSelfCollision) {
+      throw new Error(
+        `ERR_CANNOT_REPLACE_SELF: Foreign plugin "${plugin.id}" cannot overwrite "${PLUGIN_ID}"; choose isolated install (${scopedName}) instead`,
+      );
+    }
     if (conflicting.scope !== 'global') {
       throw new Error(
         `ERR_CANNOT_REPLACE_NON_GLOBAL: Conflicting plugin "${conflicting.dir}" has scope="${conflicting.scope}"; choose isolated install (${scopedName}) instead`,
@@ -739,7 +925,7 @@ export function resolveInstallPreflight(plugin, inventory, { conflictStrategy = 
   }
 
   const choices = ['isolate'];
-  if (conflicting.scope === 'global') choices.push('replace');
+  if (conflicting.scope === 'global' && !isForeignSelfCollision) choices.push('replace');
 
   return {
     action: 'conflict-prompt',

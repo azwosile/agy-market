@@ -1,11 +1,11 @@
-// 5-Layer Read-Only Local Plugin Conflict & Health Scanner (`src/preflight/conflicts.mjs`).
+// Read-Only Local Plugin Conflict Scanner (`src/preflight/conflicts.mjs`).
 //
-// Zero filesystem mutations — strictly read-only audit covering:
-//   1. `duplicate-plugin-name` (critical): workspace > global > builtin shadowing & silent plugin drop
-//   2. `windows-symlink-ignored` (critical): symlinks / NTFS junctions in global `plugins/` skipped by GetAllPlugins
+// Zero filesystem mutations — strictly read-only checks covering:
+//   1. `duplicate-plugin-name` (critical): workspace > global > builtin duplicate plugin.json.name precedence
+//   2. `windows-symlink-ignored` (critical): symlinks / NTFS junctions in global `plugins/` skipped on Windows
 //   3. `mcp-collision` (critical/warning): duplicate `<plugin>_<server>`, user `mcp_config.json` collision, generic bare key
 //   4. `skill-shadowing` & `agent-shadowing` (warning): overlapping skills/subagents across plugins, user globals & builtins
-//   5. `host-enhancement-overlap` (warning/info): >=2 active plugins simultaneously patching app-asar or CDP
+//   5. `host-enhancement-overlap` (warning/info): >=2 active plugins simultaneously using app-asar or CDP enhancements
 
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
@@ -193,7 +193,7 @@ function resolveEffectiveHostEnhancementKinds(plugin, catalogByDir, catalogById)
 }
 
 /**
- * Runs a 5-layer read-only conflict & health audit over the local Antigravity plugin environment.
+ * Runs a read-only conflict scan over the local Antigravity plugin environment.
  */
 export function scanLocalConflicts({
   inventory = null,
@@ -224,7 +224,7 @@ export function scanLocalConflicts({
   const catalogByDir = new Map();
   for (const cp of Array.isArray(catalogPlugins) ? catalogPlugins : []) {
     if (cp?.id) catalogById.set(cp.id, cp);
-    if (cp?.canonicalName) catalogByDir.set(cp.canonicalName, cp);
+    if (cp?.canonicalName && !cp?.forceScopedInstall) catalogByDir.set(cp.canonicalName, cp);
     if (cp?.scopedName) catalogByDir.set(cp.scopedName, cp);
   }
 
@@ -258,14 +258,14 @@ export function scanLocalConflicts({
       id: `duplicate-plugin-name:${pluginName}`,
       type: 'duplicate-plugin-name',
       severity: 'critical',
-      titleZh: `同名插件 "${pluginName}" 冲突（后发现副本被静默丢弃）`,
-      titleEn: `Duplicate plugin name "${pluginName}" (shadowed copy silently dropped)`,
-      summaryZh: `${winner.dir}（${scopeLabelZh(winner.scope)}）胜出，${shadowed.map((s) => `${s.dir}（${scopeLabelZh(s.scope)}）`).join('、')} 将被宿主静默忽略。`,
-      summaryEn: `${winner.dir} (${winner.scope}) wins; ${shadowed.map((s) => `${s.dir} (${s.scope})`).join(', ')} will be silently dropped by Antigravity.`,
+      titleZh: `同名插件 "${pluginName}" 冲突`,
+      titleEn: `Duplicate plugin name "${pluginName}"`,
+      summaryZh: `将优先加载 ${winner.dir}（${scopeLabelZh(winner.scope)}），${shadowed.map((s) => `${s.dir}（${scopeLabelZh(s.scope)}）`).join('、')} 将被忽略。`,
+      summaryEn: `${winner.dir} (${winner.scope}) takes precedence; ${shadowed.map((s) => `${s.dir} (${s.scope})`).join(', ')} will be ignored by Antigravity.`,
       detailZh:
-        'Antigravity 按 workspace > global > builtin 优先级以 plugin.json.name 全局去重，同名低优先级插件的技能、规则、MCP 与 Sidecar 均不会加载。',
+        'Antigravity 按 workspace > global > builtin 优先级以 plugin.json.name 全局去重，低优先级的同名插件组件不会被加载。',
       detailEn:
-        'Antigravity deduplicates plugins globally by plugin.json.name (workspace > global > builtin) and silently skips lower-precedence duplicates.',
+        'Antigravity deduplicates plugins globally by plugin.json.name (workspace > global > builtin) and skips lower-precedence duplicates.',
       winner: { dir: winner.dir, name: winner.name, scope: winner.scope, path: winner.path },
       shadowed: shadowed.map((s) => ({ dir: s.dir, name: s.name, scope: s.scope, path: s.path })),
       paths: [winner.path, ...shadowed.map((s) => s.path)],
@@ -293,12 +293,12 @@ export function scanLocalConflicts({
       id: `windows-symlink-ignored:${p.dir}`,
       type: 'windows-symlink-ignored',
       severity: 'critical',
-      titleZh: `符号链接 / Junction 目录 "${p.dir}" 会被宿主静默跳过`,
-      titleEn: `Symlink / NTFS junction "${p.dir}" is silently skipped by host`,
-      summaryZh: `全局插件目录 "${p.dir}" 为符号链接或 NTFS Junction，Windows 下 Antigravity GetAllPlugins 会直接忽略它。`,
-      summaryEn: `"${p.dir}" in global plugins/ is a symlink or NTFS junction; Antigravity GetAllPlugins silently ignores it on Windows.`,
-      detailZh: '点击一键修复可将链接目标解引用复制为实体目录（不会修改原始源目录），立即恢复宿主识别。',
-      detailEn: 'Materialize this link into a real directory copy (leaving the original target untouched) so Antigravity discovers it.',
+      titleZh: `符号链接 / Junction 目录 "${p.dir}" 在 Windows 下不会被加载`,
+      titleEn: `Symlink / NTFS junction "${p.dir}" is skipped on Windows`,
+      summaryZh: `全局插件目录 "${p.dir}" 为符号链接或 NTFS Junction，Windows 下 Antigravity 会忽略此类目录。`,
+      summaryEn: `"${p.dir}" in global plugins/ is a symlink or NTFS junction, which Antigravity ignores on Windows.`,
+      detailZh: '点击“转为实体目录”可将链接目标复制为实体目录（不会修改原始目录），以便 Antigravity 正常加载。',
+      detailEn: 'Click "Materialize to real directory" to copy the target into a real directory (leaving the original untouched) so Antigravity can load it.',
       winner: null,
       shadowed: [{ dir: p.dir, name: p.name, scope: p.scope, path: p.path }],
       paths: targetPaths,
@@ -341,8 +341,8 @@ export function scanLocalConflicts({
           titleEn: `MCP server "${fullName}" collides with user mcp_config.json`,
           summaryZh: `插件 "${p.dir}" 注册的 MCP 服务 "${fullName}" 与用户全局 mcp_config.json 中已有键重名。`,
           summaryEn: `Plugin "${p.dir}" exposes MCP server "${fullName}", which collides with an entry in user mcp_config.json.`,
-          detailZh: '重复的 MCP 服务名会导致工具路由异常或其中一方无法挂载，建议重命名其中一处服务键名。',
-          detailEn: 'Duplicate MCP server names cause ambiguous tool routing or dropped servers; rename one server key.',
+          detailZh: '重复的 MCP 服务名可能导致工具路由异常或其中一方无法挂载，建议重命名其中一处服务键名。',
+          detailEn: 'Duplicate MCP server names may cause ambiguous tool routing or prevent a server from mounting; rename one server key.',
           winner: { dir: 'user-mcp-config', name: fullName, scope: 'user-global', path: userMcpPath },
           shadowed: [{ dir: p.dir, name: fullName, scope: p.scope, path: pluginMcpPath }],
           paths: [userMcpPath, pluginMcpPath],
@@ -355,10 +355,10 @@ export function scanLocalConflicts({
           severity: 'warning',
           titleZh: `MCP 服务键 "${rawKey}" 与用户全局 mcp_config.json 裸名重叠`,
           titleEn: `MCP server key "${rawKey}" overlaps with user mcp_config.json`,
-          summaryZh: `插件 "${p.dir}" 的 MCP 键 "${rawKey}" 与用户全局 mcp_config.json 的同名服务键重叠，易引发工具调用歧义。`,
-          summaryEn: `Plugin "${p.dir}" uses MCP key "${rawKey}" which also exists in user mcp_config.json.`,
+          summaryZh: `插件 "${p.dir}" 的 MCP 键 "${rawKey}" 与用户全局 mcp_config.json 的同名服务键重叠，可能影响工具识别与选择。`,
+          summaryEn: `Plugin "${p.dir}" uses MCP key "${rawKey}", which also exists in user mcp_config.json.`,
           detailZh: '尽管插件服务会带前缀挂载，同名裸键仍可能让模型在相似工具名之间混淆。',
-          detailEn: 'Even with plugin prefixing, overlapping bare keys can confuse tool selection.',
+          detailEn: 'Even with plugin prefixing, overlapping bare keys may confuse tool selection.',
           winner: { dir: 'user-mcp-config', name: rawKey, scope: 'user-global', path: userMcpPath },
           shadowed: [{ dir: p.dir, name: fullName, scope: p.scope, path: pluginMcpPath }],
           paths: [userMcpPath, pluginMcpPath],
@@ -372,12 +372,12 @@ export function scanLocalConflicts({
           id: `mcp-collision:generic:${p.dir}:${rawKey}`,
           type: 'mcp-collision',
           severity: 'warning',
-          titleZh: `插件 "${p.dir}" 使用了通用裸 MCP 服务键 "${rawKey}"`,
-          titleEn: `Plugin "${p.dir}" uses generic bare MCP server key "${rawKey}"`,
-          summaryZh: `"${rawKey}" 属于高冲突风险通用键名（如 search / db / git / fs），建议改用更具体的业务服务名。`,
-          summaryEn: `"${rawKey}" is a generic MCP server key prone to tool-routing collisions; prefer a specific name.`,
-          detailZh: `当前完整挂载名为 "${fullName}"，建议插件作者将其调整为具象领域前缀。`,
-          detailEn: `Currently mounted as "${fullName}"; using a domain-specific server key prevents ambiguity.`,
+          titleZh: `插件 "${p.dir}" 使用了通用 MCP 服务键 "${rawKey}"`,
+          titleEn: `Plugin "${p.dir}" uses generic MCP server key "${rawKey}"`,
+          summaryZh: `"${rawKey}" 属于通用键名（如 search / db / git / fs），建议使用更具体的服务名以减少工具混淆。`,
+          summaryEn: `"${rawKey}" is a generic MCP server key (such as search / db / git / fs); consider a more specific name to reduce ambiguity.`,
+          detailZh: `当前完整挂载名为 "${fullName}"，改为更具体的服务键名有助于与其他插件区分。`,
+          detailEn: `Currently mounted as "${fullName}"; a more specific server key helps distinguish its tools from other plugins.`,
           winner: null,
           shadowed: [{ dir: p.dir, name: rawKey, scope: p.scope, path: pluginMcpPath }],
           paths: [pluginMcpPath],
@@ -405,8 +405,8 @@ export function scanLocalConflicts({
       titleEn: `Duplicate MCP server name "${fullName}"`,
       summaryZh: `多个已启用插件同时声明了 MCP 服务 "${fullName}"（${sorted.map((e) => e.plugin.dir).join('、')}）。`,
       summaryEn: `Multiple active plugins register identical MCP server "${fullName}" (${sorted.map((e) => e.plugin.dir).join(', ')}).`,
-      detailZh: 'Antigravity 全局按 <plugin>_<server> 路由 MCP 工具，重名会导致后加载的 MCP 服务被覆盖或启动失败。',
-      detailEn: 'Antigravity mounts plugin MCP servers globally as <plugin>_<server>; duplicates shadow or fail to mount.',
+      detailZh: 'Antigravity 全局按 <plugin>_<server> 路由 MCP 工具，重名可能导致后加载的 MCP 服务被覆盖或无法挂载。',
+      detailEn: 'Antigravity mounts plugin MCP servers globally as <plugin>_<server>; duplicates may shadow each other or fail to mount.',
       winner: { dir: winner.plugin.dir, name: fullName, scope: winner.plugin.scope, path: winner.path },
       shadowed: shadowed.map((s) => ({ dir: s.plugin.dir, name: fullName, scope: s.plugin.scope, path: s.path })),
       paths: sorted.map((e) => e.path),
@@ -566,8 +566,8 @@ export function scanLocalConflicts({
       titleEn: `Subagent "${agentName}" collides with another agent`,
       summaryZh: `${winner.dir}（${scopeLabelZh(winner.scope)}）将覆盖 ${shadowed.map((s) => `${s.dir}（${scopeLabelZh(s.scope)}）`).join('、')} 的同名 Subagent。`,
       summaryEn: `${winner.dir} (${winner.scope}) shadows ${shadowed.map((s) => `${s.dir} (${s.scope})`).join(', ')} for subagent "${agentName}".`,
-      detailZh: '同名子代理会遮蔽内置或其它插件的 Subagent 调度入口，建议停用多余插件或修改子代理名称。',
-      detailEn: 'Colliding subagent names override built-in or sibling plugin agents; disable one plugin or rename the agent.',
+      detailZh: '同名 Subagent 会覆盖低优先级来源的定义，建议停用多余插件或重命名。',
+      detailEn: 'Duplicate subagent names override lower-precedence definitions; disable one plugin or rename the agent.',
       winner,
       shadowed,
       paths: sorted.map((c) => c.path),
@@ -593,19 +593,15 @@ export function scanLocalConflicts({
       id: 'host-enhancement-overlap:app-asar',
       type: 'host-enhancement-overlap',
       severity: 'warning',
-      titleZh: `多个已启用插件同时包含 ${ASAR_LABEL} 宿主补丁`,
-      titleEn: `Multiple active plugins patch ${ASAR_LABEL}`,
+      titleZh: `多个已启用插件同时涉及 ${ASAR_LABEL} 修改`,
+      titleEn: `Multiple active plugins modify ${ASAR_LABEL}`,
       summaryZh: `检测到 ${asarPlugins.length} 个启用中的插件（${listStr}）均涉及 ${ASAR_LABEL} 修改，可能互相覆盖补丁。`,
-      summaryEn: `${asarPlugins.length} active plugins (${listStrEn}) modify ${ASAR_LABEL} and may overwrite each other's workbench patches.`,
-      detailZh: '建议在「已安装」卡片底部滑块中仅保留一个同类宿主补丁插件处于启用状态。',
-      detailEn: 'Consider keeping only one patcher enabled via the card toggle slider to prevent workbench patch conflicts.',
-      winner: {
-        dir: asarPlugins[0].dir,
-        name: asarPlugins[0].name,
-        scope: asarPlugins[0].scope,
-        path: asarPlugins[0].path,
-      },
-      shadowed: asarPlugins.slice(1).map((p) => ({
+      summaryEn: `${asarPlugins.length} active plugins (${listStrEn}) modify ${ASAR_LABEL} and may overwrite each other's patches.`,
+      detailZh: '如出现界面异常，建议在「已安装」页仅保留一个同类插件处于启用状态。',
+      detailEn: 'If UI issues occur, keep only one of these plugins enabled in the Installed tab.',
+      winner: null,
+      shadowed: [],
+      affectedPlugins: asarPlugins.map((p) => ({
         dir: p.dir,
         name: p.name,
         scope: p.scope,
@@ -623,19 +619,15 @@ export function scanLocalConflicts({
       id: 'host-enhancement-overlap:cdp',
       type: 'host-enhancement-overlap',
       severity: 'info',
-      titleZh: '多个已启用插件同时使用 CDP 全窗口注入',
-      titleEn: 'Multiple active plugins use CDP window injection',
+      titleZh: '多个已启用插件同时使用 CDP 界面增强',
+      titleEn: 'Multiple active plugins use CDP UI enhancements',
       summaryZh: `检测到 ${cdpPlugins.length} 个启用中的 CDP 界面增强插件（${listStr}），可能出现主题样式或挂件叠加。`,
-      summaryEn: `${cdpPlugins.length} active plugins (${listStrEn}) use CDP injection; visual styles or overlays may overlap.`,
-      detailZh: '若同时安装了旧版壁纸原型与新版主题插件，建议通过滑块停用旧版以获得最佳渲染效果。',
-      detailEn: 'If both a legacy prototype and a newer theme plugin are active, disable the older one using its toggle slider.',
-      winner: {
-        dir: cdpPlugins[0].dir,
-        name: cdpPlugins[0].name,
-        scope: cdpPlugins[0].scope,
-        path: cdpPlugins[0].path,
-      },
-      shadowed: cdpPlugins.slice(1).map((p) => ({
+      summaryEn: `${cdpPlugins.length} active plugins (${listStrEn}) use CDP UI enhancements; visual styles or overlays may overlap.`,
+      detailZh: '如出现样式重叠，可在「已安装」页停用其中一个插件。',
+      detailEn: 'If styles overlap, disable one of them in the Installed tab.',
+      winner: null,
+      shadowed: [],
+      affectedPlugins: cdpPlugins.map((p) => ({
         dir: p.dir,
         name: p.name,
         scope: p.scope,
@@ -663,6 +655,9 @@ export function scanLocalConflicts({
     if (item.winner?.path) affectedPluginPaths.add(item.winner.path);
     for (const s of item.shadowed || []) {
       if (s?.path) affectedPluginPaths.add(s.path);
+    }
+    for (const ap of item.affectedPlugins || []) {
+      if (ap?.path) affectedPluginPaths.add(ap.path);
     }
   }
 

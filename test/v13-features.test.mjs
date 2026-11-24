@@ -684,3 +684,179 @@ test('open-pane helpers normalize payload, filter Hub targets, and click Aux Pan
   assert.equal(realClosedRes.preloadPayload.tabType, 'sidecarView');
   assert.equal(realClosedRes.preloadPayload.uri, 'sidecar://demo/pane/');
 });
+
+test('GET /?token=host-secret-tok injects host token (never random sideToken) for /preload.js after __SIDECAR_BOOT__', async () => {
+  const ws = makeTempWorkspace('agy-preload-401-');
+  const prevUiTok = process.env.ANTIGRAVITY_SIDECAR_UI_TOKEN;
+  const prevAuthTok = process.env.ANTIGRAVITY_SIDECAR_AUTH_TOKEN;
+  const prevWebTok = process.env.ANTIGRAVITY_SIDECAR_WEB_TOKEN;
+  process.env.ANTIGRAVITY_SIDECAR_UI_TOKEN = 'host-secret-tok';
+  delete process.env.ANTIGRAVITY_SIDECAR_AUTH_TOKEN;
+  delete process.env.ANTIGRAVITY_SIDECAR_WEB_TOKEN;
+
+  try {
+    const srv = await createMarketSidecarServer({
+      listen: false,
+      configDir: ws.configDir,
+      dataDir: ws.dataDir,
+      recoveryDelayMs: -1,
+      fetchImpl: makeEmptyCatalogFetch(),
+    });
+    try {
+      const res = await srv.inject({ method: 'GET', url: '/?token=host-secret-tok' });
+      assert.equal(res.statusCode, 200);
+      const html = res.text;
+
+      const preloadMatch = html.match(/<script\b[^>]*\bsrc=["']([^"']*\/preload\.js[^"']*)["'][^>]*>/i);
+      assert.ok(preloadMatch, 'Returned HTML must contain <script src="/preload.js...">');
+      const preloadSrc = preloadMatch[1];
+      assert.equal(
+        preloadSrc.includes(srv.sideToken),
+        false,
+        '/preload.js URL must not contain random generatedSideToken (srv.sideToken)',
+      );
+      assert.ok(
+        preloadSrc === '/preload.js?token=host-secret-tok' || preloadSrc === '/preload.js',
+        `Unexpected /preload.js URL: ${preloadSrc}`,
+      );
+
+      const bootIdx = html.indexOf('window.__SIDECAR_BOOT__=');
+      const preloadIdx = html.indexOf(preloadMatch[0]);
+      assert.ok(bootIdx >= 0, 'Returned HTML must inject window.__SIDECAR_BOOT__');
+      assert.ok(
+        bootIdx < preloadIdx,
+        'window.__SIDECAR_BOOT__ must be injected before <script src="/preload.js...">',
+      );
+
+      // Untrusted query token must never be reflected or leak generatedSideToken
+      const forgedRes = await srv.inject({ method: 'GET', url: '/?token=forged-evil-tok' });
+      assert.equal(forgedRes.statusCode, 200);
+      assert.equal(forgedRes.text.includes('forged-evil-tok'), false);
+      assert.equal(forgedRes.text.includes(srv.sideToken), false);
+    } finally {
+      await srv.close();
+    }
+  } finally {
+    if (prevUiTok === undefined) delete process.env.ANTIGRAVITY_SIDECAR_UI_TOKEN;
+    else process.env.ANTIGRAVITY_SIDECAR_UI_TOKEN = prevUiTok;
+    if (prevAuthTok === undefined) delete process.env.ANTIGRAVITY_SIDECAR_AUTH_TOKEN;
+    else process.env.ANTIGRAVITY_SIDECAR_AUTH_TOKEN = prevAuthTok;
+    if (prevWebTok === undefined) delete process.env.ANTIGRAVITY_SIDECAR_WEB_TOKEN;
+    else process.env.ANTIGRAVITY_SIDECAR_WEB_TOKEN = prevWebTok;
+    ws.cleanup();
+  }
+});
+
+test('POST /api/open-pane and POST /api/favorites accept plugin:// Origin with valid X-Sidecar-Token', async () => {
+  const ws = makeTempWorkspace('agy-plugin-origin-');
+  try {
+    const srv = await createMarketSidecarServer({
+      listen: false,
+      configDir: ws.configDir,
+      dataDir: ws.dataDir,
+      recoveryDelayMs: -1,
+      fetchImpl: makeEmptyCatalogFetch(),
+      openPaneOptions: {
+        cdpPorts: [59339],
+        timeoutMs: 300,
+        httpGetJsonImpl: async () => {
+          const err = new Error('connect ECONNREFUSED 127.0.0.1:59339');
+          err.code = 'ECONNREFUSED';
+          throw err;
+        },
+      },
+    });
+    try {
+      const pluginOriginHeaders = {
+        'X-Sidecar-Token': srv.sideToken,
+        Origin: 'plugin://agy-market--market_pane-54321',
+      };
+
+      const openRes = await srv.inject({
+        method: 'POST',
+        url: '/api/open-pane',
+        headers: pluginOriginHeaders,
+        body: {
+          dir: 'agy-wallpaper-prism',
+          sidecarFolder: 'prism_studio',
+          viewPath: '/',
+          title: 'Wallpaper Prism',
+        },
+      });
+      assert.equal(openRes.statusCode, 200);
+      assert.equal(openRes.json().ok, true);
+
+      const favRes = await srv.inject({
+        method: 'POST',
+        url: '/api/favorites',
+        headers: pluginOriginHeaders,
+        body: { key: 'azwosile__agy-wallpaper-prism', favorite: true },
+      });
+      assert.equal(favRes.statusCode, 200);
+      assert.equal(favRes.json().ok, true);
+      assert.equal(favRes.json().isFavorite, true);
+
+      // Untrusted external web origin remains blocked
+      const evilRes = await srv.inject({
+        method: 'POST',
+        url: '/api/favorites',
+        headers: { 'X-Sidecar-Token': srv.sideToken, Origin: 'https://evil.example' },
+        body: { key: 'azwosile__agy-wallpaper-prism', favorite: false },
+      });
+      assert.equal(evilRes.statusCode, 403);
+      assert.match(evilRes.json().error, /ERR_CSRF_ORIGIN/);
+    } finally {
+      await srv.close();
+    }
+  } finally {
+    ws.cleanup();
+  }
+});
+
+test('v1.3.1 static anti-regression: UI/docs/manifests are de-hyped and inHostIframe openSiblingSidecarPane has zero showToast', () => {
+  const targetFiles = [
+    'sidecars/market_pane/index.html',
+    'src/ui/app.mjs',
+    'site/index.html',
+    'plugin.json',
+    'package.json',
+    'sidecars/market_pane/sidecar.json',
+    'skills/agy-market/SKILL.md',
+  ];
+
+  const bannedPatterns = [
+    /SHA-256\s*防篡改校验\s*·\s*停放仓无损滑块启停/,
+    /computeHealthScore/,
+    /health-ring-wrap/,
+    /健康分/,
+    /冲突健康度/,
+    /纯只读扫描\s*global\s*\/\s*workspace\s*\/\s*builtin/,
+    /5\s*层静态健康体检矩阵/,
+    /5-Layer Static Health Audit Matrix/i,
+    /radar-checks-section/,
+    /零\s*Token/i,
+    /0\s*Token/i,
+    /zero-token/i,
+    /Sidecar\s*面板/i,
+    /Sidecar\s*辅助面板/i,
+  ];
+
+  for (const rel of targetFiles) {
+    const content = readFileSync(join(REPO_ROOT, rel), 'utf8');
+    for (const pattern of bannedPatterns) {
+      assert.doesNotMatch(content, pattern, `Disallowed legacy wording ${pattern} found in ${rel}`);
+    }
+  }
+
+  const appSrc = readFileSync(join(REPO_ROOT, 'src', 'ui', 'app.mjs'), 'utf8').replace(/\r\n/g, '\n');
+  const fnMatch = appSrc.match(/async function openSiblingSidecarPane\s*\([\s\S]*?\n\}\n/);
+  assert.ok(fnMatch, 'openSiblingSidecarPane must exist in src/ui/app.mjs');
+  const inHostBranchMatch = fnMatch[0].match(/if\s*\(\s*inHostIframe\s*\)\s*\{[\s\S]*?return;\s*\}/);
+  assert.ok(inHostBranchMatch, 'openSiblingSidecarPane must contain an explicit inHostIframe early-return branch');
+  assert.match(inHostBranchMatch[0], /toggleAuxPane|toggle-aux-pane/);
+  assert.doesNotMatch(
+    inHostBranchMatch[0],
+    /\bshowToast\s*\(/,
+    'openSiblingSidecarPane inHostIframe branch must never call showToast',
+  );
+});

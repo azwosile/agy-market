@@ -97,8 +97,8 @@ export function classifyActivationRequirement(capabilities = {}, runtime = {}) {
     const partsZh = [];
     const partsEn = [];
     if (hasSidecar) {
-      partsZh.push('Sidecar 辅助面板');
-      partsEn.push('Sidecar auxiliary pane');
+      partsZh.push('Sidebar 侧边栏');
+      partsEn.push('Sidebar panel');
     }
     if (hasMcp) {
       partsZh.push('MCP 工具服务');
