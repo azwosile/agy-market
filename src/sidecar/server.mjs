@@ -69,6 +69,15 @@ const ZH_README_FILENAMES = [
 ];
 const EN_README_FILENAMES = ['README.en.md', 'readme.en.md', 'docs/README.en.md'];
 const DEFAULT_README_FILENAMES = ['README.md', 'readme.md'];
+const PLUGIN_MUTATION_ROUTES = new Set([
+  '/api/install',
+  '/api/update',
+  '/api/update-all',
+  '/api/self-update',
+  '/api/github/install',
+  '/api/uninstall',
+  '/api/remove-files',
+]);
 
 const PRELOAD_SHIM_JS = `(function() {
   var params = new URLSearchParams(window.location.search);
@@ -369,11 +378,12 @@ export async function createMarketSidecarServer(options = {}) {
   let prefs = loadPrefsFromDisk(dataDir);
   let lastCatalog = null;
   let updateCheckGeneration = 0;
-  let inFlightUpdates = null; // { key, generation, promise }
+  const inFlightUpdates = new Map(); // flightKey -> { key, force, generation, promise }
+  let activeMutation = null; // { route, startedAt }
 
   function invalidateUpdateCheckState() {
     updateCheckGeneration += 1;
-    inFlightUpdates = null;
+    inFlightUpdates.clear();
   }
 
   function hasLoadedReadmes(cat) {
@@ -584,6 +594,33 @@ export async function createMarketSidecarServer(options = {}) {
   }
 
   async function handleRequest(req, res) {
+    let acquiredMutationLock = false;
+    const acquireMutationLock = (route) => {
+      if (activeMutation) {
+        sendJson(res, 409, {
+          ok: false,
+          errorCode: 'ERR_MUTATION_BUSY',
+          error: 'ERR_MUTATION_BUSY: Another plugin install/update operation is currently in progress.',
+        });
+        return false;
+      }
+      activeMutation = { route, startedAt: nowFn() };
+      acquiredMutationLock = true;
+      invalidateUpdateCheckState();
+      return true;
+    };
+
+    try {
+      return await dispatchRequest(req, res, acquireMutationLock);
+    } finally {
+      if (acquiredMutationLock) {
+        activeMutation = null;
+        invalidateUpdateCheckState();
+      }
+    }
+  }
+
+  async function dispatchRequest(req, res, acquireMutationLock) {
     const urlObj = new URL(req.url || '/', 'http://127.0.0.1');
     const pathname = urlObj.pathname;
 
@@ -656,9 +693,15 @@ export async function createMarketSidecarServer(options = {}) {
       const wsParam = urlObj.searchParams.get('workspaceUris') || '';
       const workspaceUris = wsParam ? wsParam.split(',').filter(Boolean) : [];
       const flightKey = `${force ? '1' : '0'}|${workspaceUris.join(',')}`;
+      const existingFlight = inFlightUpdates.get(flightKey);
 
-      if (!force && inFlightUpdates && inFlightUpdates.key === flightKey && inFlightUpdates.generation === updateCheckGeneration) {
-        const sharedReport = await inFlightUpdates.promise;
+      if (
+        existingFlight &&
+        existingFlight.key === flightKey &&
+        existingFlight.force === force &&
+        existingFlight.generation === updateCheckGeneration
+      ) {
+        const sharedReport = await existingFlight.promise;
         sendJson(res, 200, sharedReport);
         return;
       }
@@ -683,15 +726,13 @@ export async function createMarketSidecarServer(options = {}) {
       };
 
       const promise = runCheck();
-      if (!force) {
-        inFlightUpdates = { key: flightKey, generation, promise };
-      }
+      inFlightUpdates.set(flightKey, { key: flightKey, force, generation, promise });
       try {
         const report = await promise;
         sendJson(res, 200, report);
       } finally {
-        if (inFlightUpdates?.promise === promise) {
-          inFlightUpdates = null;
+        if (inFlightUpdates.get(flightKey)?.promise === promise) {
+          inFlightUpdates.delete(flightKey);
         }
       }
       return;
@@ -1073,6 +1114,10 @@ export async function createMarketSidecarServer(options = {}) {
         return;
       }
 
+      if (PLUGIN_MUTATION_ROUTES.has(pathname) && !acquireMutationLock(pathname)) {
+        return;
+      }
+
       if (pathname === '/api/github/install') {
         const workspaceUris = parseWorkspaceUrisInput(body.workspaceUris);
         if (!lastCatalog) {
@@ -1297,6 +1342,7 @@ export async function createMarketSidecarServer(options = {}) {
         const workspaceUris = parseWorkspaceUrisInput(body.workspaceUris);
         const confirmEscalation = Boolean(body.confirmEscalation);
         const forceCheck = Boolean(body.forceCheck);
+        const generation = updateCheckGeneration;
         await ensureCatalogLoaded({ forceCatalogRefresh: forceCheck, includeReadmes: false });
         const inventory = scanLocalPluginInventory({
           configDir,
@@ -1319,6 +1365,7 @@ export async function createMarketSidecarServer(options = {}) {
           ...(updateCheckTtlMs !== undefined ? { ttlMs: updateCheckTtlMs } : {}),
           currentSelfVersion,
           githubApiBaseUrl,
+          shouldPersistCache: () => generation === updateCheckGeneration,
         });
 
         const updById = new Map();

@@ -1465,3 +1465,310 @@ test('Zero-quota HEAD /releases/latest redirect fallback on 403 rate limit and s
     ws.cleanup();
   }
 });
+
+test('Concurrent GET /api/updates?force=1 coalesces within the same generation and stays isolated from force=0', async () => {
+  const ws = makeTempWorkspace('agy-upd-force1-sf-');
+  try {
+    installFakeLocalPlugin(ws.pluginsDir, {
+      dir: 'force-plug',
+      manifest: { name: 'force-plug', displayName: 'Force Plug', version: '1.0.0', repository: 'https://github.com/alice/force-plug' },
+    });
+
+    let apiCalls = 0;
+    let releaseFirstWave;
+    let firstWaveEntered;
+    const firstWaveGate = new Promise((r) => {
+      releaseFirstWave = r;
+    });
+    const firstWaveStarted = new Promise((r) => {
+      firstWaveEntered = r;
+    });
+    let releaseIsoWave;
+    let isoForce0Entered;
+    let isoForce1Entered;
+    const isoWaveGate = new Promise((r) => {
+      releaseIsoWave = r;
+    });
+    const isoForce0Started = new Promise((r) => {
+      isoForce0Entered = r;
+    });
+    const isoForce1Started = new Promise((r) => {
+      isoForce1Entered = r;
+    });
+
+    const mockFetch = async (url) => {
+      const u = String(url);
+      if (u.endsWith('/index.json')) {
+        return new Response(JSON.stringify({ schemaVersion: 1, track: 'verified', plugins: [] }), { status: 200 });
+      }
+      if (u === 'https://api.github.com/repos/alice/force-plug/releases/latest') {
+        apiCalls += 1;
+        if (apiCalls === 1) {
+          firstWaveEntered();
+          await firstWaveGate;
+        } else if (apiCalls === 3) {
+          isoForce0Entered();
+          await isoWaveGate;
+        } else if (apiCalls === 4) {
+          isoForce1Entered();
+          await isoWaveGate;
+        } else {
+          await new Promise((r) => setTimeout(r, 20));
+        }
+        return new Response(
+          JSON.stringify({
+            tag_name: 'v1.8.0',
+            draft: false,
+            prerelease: false,
+            html_url: 'https://github.com/alice/force-plug/releases/tag/v1.8.0',
+            assets: [],
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response('{}', { status: 404 });
+    };
+
+    const srv = await createMarketSidecarServer({
+      listen: false,
+      configDir: ws.configDir,
+      dataDir: ws.dataDir,
+      recoveryDelayMs: -1,
+      fetchImpl: mockFetch,
+    });
+
+    try {
+      // 1. Two concurrent GET /api/updates?force=1 in the same generation -> MUST coalesce into 1 upstream probe
+      const p1 = srv.inject({ method: 'GET', url: '/api/updates?force=1' });
+      await firstWaveStarted;
+      const p2 = srv.inject({ method: 'GET', url: '/api/updates?force=1' });
+      releaseFirstWave();
+      const [r1, r2] = await Promise.all([p1, p2]);
+
+      assert.equal(r1.statusCode, 200);
+      assert.equal(r2.statusCode, 200);
+      assert.equal(apiCalls, 1, 'Concurrent GET /api/updates?force=1 must coalesce into a single flight');
+      assert.equal(r1.json().items.find((x) => x.dir === 'force-plug')?.latestVersion, '1.8.0');
+      assert.equal(r2.json().items.find((x) => x.dir === 'force-plug')?.latestVersion, '1.8.0');
+
+      // 2. Subsequent sequential GET /api/updates?force=1 after completion MUST trigger a fresh probe (no stale in-flight leak)
+      const r3 = await srv.inject({ method: 'GET', url: '/api/updates?force=1' });
+      assert.equal(r3.statusCode, 200);
+      assert.equal(apiCalls, 2, 'Sequential GET /api/updates?force=1 must trigger a new upstream probe after prior flight ends');
+
+      // 3. Clear disk cache and verify concurrent force=0 vs force=1 use distinct flight buckets while coalescing within each bucket
+      rmSync(join(ws.dataDir, 'cache'), { recursive: true, force: true });
+      const pf0a = srv.inject({ method: 'GET', url: '/api/updates?force=0' });
+      await isoForce0Started;
+      const pf0b = srv.inject({ method: 'GET', url: '/api/updates?force=0' });
+      const pf1a = srv.inject({ method: 'GET', url: '/api/updates?force=1' });
+      await isoForce1Started;
+      const pf1b = srv.inject({ method: 'GET', url: '/api/updates?force=1' });
+      releaseIsoWave();
+      const isoResults = await Promise.all([pf0a, pf0b, pf1a, pf1b]);
+      for (const res of isoResults) {
+        assert.equal(res.statusCode, 200);
+      }
+      assert.equal(apiCalls, 4, 'Concurrent force=0 (2x) and force=1 (2x) must coalesce into 1 flight per bucket (2 total)');
+    } finally {
+      await srv.close();
+    }
+  } finally {
+    ws.cleanup();
+  }
+});
+
+test('Concurrent plugin mutation routes return HTTP 409 ERR_MUTATION_BUSY and release lock upon completion', async () => {
+  const ws = makeTempWorkspace('agy-upd-mut-lock-');
+  try {
+    const alphaBuf = createDeterministicTarGz({
+      'plugin.json': JSON.stringify({ name: 'alpha-plug', displayName: 'Alpha Plug', version: '1.2.0', logo: 'assets/logo.svg' }),
+      'assets/logo.svg': CLEAN_SVG,
+    });
+    const alphaSha = createHash('sha256').update(alphaBuf).digest('hex');
+    const betaBuf = createDeterministicTarGz({
+      'plugin.json': JSON.stringify({ name: 'beta-plug', displayName: 'Beta Plug', version: '1.3.0', logo: 'assets/logo.svg' }),
+      'assets/logo.svg': CLEAN_SVG,
+    });
+    const betaSha = createHash('sha256').update(betaBuf).digest('hex');
+
+    const ALPHA_URL = 'https://github.com/alice/alpha-plug/releases/download/v1.2.0/alpha-plug.tar.gz';
+    const BETA_URL = 'https://github.com/bob/beta-plug/releases/download/v1.3.0/beta-plug.tar.gz';
+
+    installFakeLocalPlugin(ws.pluginsDir, {
+      dir: 'alpha-plug',
+      manifest: { name: 'alpha-plug', displayName: 'Alpha Plug', version: '1.0.0' },
+      receipt: {
+        schemaVersion: 1,
+        id: 'alice__alpha-plug',
+        repositoryId: 501,
+        installedDir: 'alpha-plug',
+        installedVersion: '1.0.0',
+        grantedCapabilities: { badges: ['declarative-only'], mcpRemoteDomains: [], hookEvents: [] },
+      },
+    });
+    installFakeLocalPlugin(ws.pluginsDir, {
+      dir: 'beta-plug',
+      manifest: { name: 'beta-plug', displayName: 'Beta Plug', version: '1.0.0' },
+      receipt: {
+        schemaVersion: 1,
+        id: 'bob__beta-plug',
+        repositoryId: 502,
+        installedDir: 'beta-plug',
+        installedVersion: '1.0.0',
+        grantedCapabilities: { badges: ['declarative-only'], mcpRemoteDomains: [], hookEvents: [] },
+      },
+    });
+
+    const catalogIndex = {
+      schemaVersion: 1,
+      track: 'verified',
+      plugins: [
+        makeCatalogPlugin({
+          id: 'alice__alpha-plug',
+          canonicalName: 'alpha-plug',
+          owner: 'alice',
+          repo: 'alpha-plug',
+          displayName: 'Alpha Plug',
+          version: '1.2.0',
+          repoId: 501,
+          tarballUrl: ALPHA_URL,
+          sha256: alphaSha,
+          sizeBytes: alphaBuf.length,
+        }),
+        makeCatalogPlugin({
+          id: 'bob__beta-plug',
+          canonicalName: 'beta-plug',
+          owner: 'bob',
+          repo: 'beta-plug',
+          displayName: 'Beta Plug',
+          version: '1.3.0',
+          repoId: 502,
+          tarballUrl: BETA_URL,
+          sha256: betaSha,
+          sizeBytes: betaBuf.length,
+        }),
+      ],
+    };
+
+    let markAlphaStarted;
+    let releaseAlphaDownload;
+    const alphaStarted = new Promise((r) => {
+      markAlphaStarted = r;
+    });
+    const alphaGate = new Promise((r) => {
+      releaseAlphaDownload = r;
+    });
+
+    const mockFetch = async (url) => {
+      const u = String(url);
+      if (u.endsWith('/index.json')) {
+        return new Response(JSON.stringify(catalogIndex), { status: 200 });
+      }
+      if (u === ALPHA_URL) {
+        markAlphaStarted();
+        await alphaGate;
+        return new Response(alphaBuf, { status: 200 });
+      }
+      if (u === BETA_URL) {
+        return new Response(betaBuf, { status: 200 });
+      }
+      return new Response('{}', { status: 404 });
+    };
+
+    const srv = await createMarketSidecarServer({
+      listen: false,
+      configDir: ws.configDir,
+      dataDir: ws.dataDir,
+      recoveryDelayMs: -1,
+      fetchImpl: mockFetch,
+    });
+
+    try {
+      const authHeaders = { 'X-Sidecar-Token': srv.sideToken, Origin: 'http://127.0.0.1:43210' };
+
+      // 1. Start first POST /api/update and pause mid-flight inside tarball download while mutation lock is held
+      const firstUpdatePromise = srv.inject({
+        method: 'POST',
+        url: '/api/update',
+        headers: authHeaders,
+        body: { id: 'alice__alpha-plug', dir: 'alpha-plug' },
+      });
+      await alphaStarted;
+
+      // 2. Concurrent POST /api/update, POST /api/update-all, and POST /api/install must ALL receive HTTP 409 ERR_MUTATION_BUSY
+      const [dupUpdate, dupBatch, dupInstall] = await Promise.all([
+        srv.inject({
+          method: 'POST',
+          url: '/api/update',
+          headers: authHeaders,
+          body: { id: 'bob__beta-plug', dir: 'beta-plug' },
+        }),
+        srv.inject({
+          method: 'POST',
+          url: '/api/update-all',
+          headers: authHeaders,
+          body: { ids: ['bob__beta-plug'] },
+        }),
+        srv.inject({
+          method: 'POST',
+          url: '/api/install',
+          headers: authHeaders,
+          body: { id: 'bob__beta-plug' },
+        }),
+      ]);
+
+      for (const [label, res] of [
+        ['POST /api/update', dupUpdate],
+        ['POST /api/update-all', dupBatch],
+        ['POST /api/install', dupInstall],
+      ]) {
+        assert.equal(res.statusCode, 409, `${label} must return HTTP 409 while another mutation holds lock`);
+        const body = res.json();
+        assert.equal(body.ok, false);
+        assert.equal(body.errorCode, 'ERR_MUTATION_BUSY');
+        assert.match(String(body.error || ''), /ERR_MUTATION_BUSY|in progress/i);
+      }
+
+      // 3. Release first mutation -> completes with HTTP 200 and releases lock in finally
+      releaseAlphaDownload();
+      const firstRes = await firstUpdatePromise;
+      assert.equal(firstRes.statusCode, 200);
+      assert.equal(firstRes.json().ok, true);
+      assert.equal(firstRes.json().version, '1.2.0');
+
+      // 4. Subsequent POST /api/update succeeds with HTTP 200 after lock release
+      const followUpRes = await srv.inject({
+        method: 'POST',
+        url: '/api/update',
+        headers: authHeaders,
+        body: { id: 'bob__beta-plug', dir: 'beta-plug' },
+      });
+      assert.equal(followUpRes.statusCode, 200);
+      assert.equal(followUpRes.json().ok, true);
+      assert.equal(followUpRes.json().version, '1.3.0');
+
+      // 5. Failed mutation (400 self-uninstall guard) also releases lock cleanly in finally
+      const badUninstall = await srv.inject({
+        method: 'POST',
+        url: '/api/uninstall',
+        headers: authHeaders,
+        body: { dir: 'agy-market' },
+      });
+      assert.equal(badUninstall.statusCode, 400);
+
+      const postErrRes = await srv.inject({
+        method: 'POST',
+        url: '/api/update',
+        headers: authHeaders,
+        body: { id: 'bob__beta-plug', dir: 'beta-plug' },
+      });
+      assert.equal(postErrRes.statusCode, 200);
+      assert.equal(postErrRes.json().ok, true);
+    } finally {
+      await srv.close();
+    }
+  } finally {
+    ws.cleanup();
+  }
+});
