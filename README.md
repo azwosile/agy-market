@@ -20,7 +20,7 @@ Sidebar 侧边栏界面 · 锁安全一键卸载 · Sidebar 上游直装与一�
 
 ---
 
-## ✨ 核心特性（v1.5.0）
+## ✨ 核心特性（v1.5.1）
 
 ### 1. Sidebar 侧边栏界面、15 大精准分类与导航体验
 - **原生右侧 Sidebar 侧边栏**：基于 Antigravity 原生 `AUX_PANE` 扩展视图（`sidecars/market_pane/sidecar.json`），不捆绑常驻 MCP 服务，打开即用、轻量流畅。
@@ -37,8 +37,8 @@ Sidebar 侧边栏界面 · 锁安全一键卸载 · Sidebar 上游直装与一�
 - **Sidebar 内全通道直装更新（告别外链手动下载）**：
   - 当检测到 GitHub 上游 Release/Tag 领先于目录版本或来源于 GitHub URL 时，`GET /api/updates` 统一标记 `installable: true`（`updateChannel: 'catalog' | 'github-upstream' | 'github-url'`），点击更新直接在 Sidebar 内完成拉取、预检与原位升级，彻底移除跳转外部浏览器的上游外链按钮。
   - 目录认证插件通过 GitHub 上游通道直装更新时，100% 保留原有 `receipt.track`（如 `'verified'`）与 `repositoryId`，并持续执行能力增量确认门禁。
-- **每张已安装卡片配单插件「更新」按钮 + 顶栏常驻「一键更新」**：
-  - 所有具备远端更新源的已安装插件卡片均提供单插件 **「更新」** 按钮（纯本地无源插件显示置灰禁用态，接口返回 `ERR_NO_UPDATE_SOURCE`）。
+- **每张已安装卡片配智能「更新 / 最新」状态切换 + 顶栏常驻「一键更新」**：
+  - 所有具备远端更新源的已安装插件卡片在发现新版本时展示直装 **「更新 vX.Y.Z」** 按钮，更新完成或检查确认为最新版后自动切换为不可点击的 **「✓ 最新」** 提示胶囊（未检查时点击「更新」先核验，若已是最新不重复下载重装）；纯本地无源插件展示不可点击的「本地 / 工作区 / 内置」状态胶囊（接口返回 `ERR_NO_UPDATE_SOURCE`）。
   - 「已安装」页签顶栏在 **「检查更新」** 旁常驻 **「一键更新」** 按钮：一键自动核检并按序批量更新 `catalog`、`github-upstream` 与 `github-url` 全部通道，并将 `agy-market` 自身更新严格排在最后触发重启。
 
 ### 3. ⭐ 插件收藏栏、已安装搜索筛选与更新失败告警

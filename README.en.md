@@ -20,7 +20,7 @@ Sidebar Panel UI · Lock-Safe One-Click Uninstall · Direct In-Sidebar Upstream 
 
 ---
 
-## ✨ Highlights (v1.5.0)
+## ✨ Highlights (v1.5.1)
 
 ### 1. Sidebar Panel UI, 15 Precision Categories & Navigation
 - **Native Right Sidebar Panel**: Runs inside Antigravity's native `AUX_PANE` extension view (`sidecars/market_pane/sidecar.json`) with no bundled MCP servers, keeping the panel lightweight and responsive.
@@ -37,8 +37,8 @@ Sidebar Panel UI · Lock-Safe One-Click Uninstall · Direct In-Sidebar Upstream 
 - **Direct In-Sidebar Updates Across All Channels (Zero External Download Redirects)**:
   - Whenever an upstream GitHub Release/Tag leads the catalog or comes from a GitHub URL install, `GET /api/updates` returns `installable: true` (`updateChannel: 'catalog' | 'github-upstream' | 'github-url'`), eliminating external browser download redirects.
   - Upgrading a verified catalog plugin directly from GitHub upstream preserves its original `receipt.track` (`'verified'`) and `repositoryId` while still enforcing capability-escalation confirmation.
-- **Per-Card `Update` Button & Permanent Top-Bar `Update All`**:
-  - Every installed plugin card with a catalog or GitHub source provides a per-plugin **Update** button (pure local plugins without a remote source render a disabled button and return `ERR_NO_UPDATE_SOURCE` on API calls).
+- **Per-Card Smart `Update` / `Latest` Status Pill & Permanent Top-Bar `Update All`**:
+  - Every installed plugin card with a catalog or GitHub source renders a clickable **Update vX.Y.Z** button when a newer version is available and automatically transitions into a non-clickable **✓ Latest** status pill once updated or confirmed up to date (before an initial check, clicking **Update** verifies first without re-downloading if already current; pure local plugins display a non-clickable `Local` / `Workspace` / `Built-in` status pill and return `ERR_NO_UPDATE_SOURCE` on API calls).
   - The **Installed** tab header permanently displays **Update All** beside **Check Updates**: clicking it checks for updates when needed and sequentially upgrades `catalog`, `github-upstream`, and `github-url` plugins (always scheduling `agy-market` self-update last to trigger clean restart).
 
 ### 3. ⭐ Favorites Shelf & Tab, Installed Search/Filters & Update Error Alerts

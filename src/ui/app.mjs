@@ -142,6 +142,7 @@ const state = {
     warnings: [],
     error: '',
   },
+  verifiedLatestDirs: new Set(),
   dismissedSelfVersion: readStorage(SELF_OFFER_DISMISSED_KEY, ''),
   selfUpdateBusy: false,
   selfChangelogModal: false,
@@ -609,6 +610,47 @@ function getInstallableUpdates() {
   return getEffectiveUpdateItems().filter((item) => item.installable !== false);
 }
 
+function isPluginConfirmedLatest(loc, upd) {
+  if (upd) return false;
+  const dir = String(loc?.dir || loc?.installedDir || '').trim();
+  if (!dir) return false;
+  const isSelf = dir === 'agy-market';
+  if (isSelf && state.updates.selfUpdate) return false;
+  if (state.verifiedLatestDirs.has(dir)) return true;
+  return Boolean(state.updates.checkedAt && !state.updates.error && !state.updates.loading);
+}
+
+function markPluginVerifiedLatest(dir, id = '') {
+  const cleanDir = String(dir || '').trim();
+  const cleanId = String(id || '').trim();
+  if (cleanDir) {
+    state.verifiedLatestDirs.add(cleanDir);
+  }
+  const isSelf = cleanDir === 'agy-market' || cleanId === 'azwosile__agy-market';
+  if (isSelf) {
+    state.verifiedLatestDirs.add('agy-market');
+    state.updates.selfUpdate = null;
+  }
+  if (Array.isArray(state.updates.items) && state.updates.items.length > 0) {
+    state.updates.items = state.updates.items.filter((item) => {
+      if (cleanDir && item.dir === cleanDir) return false;
+      if (cleanId && item.id === cleanId) return false;
+      if (isSelf && (item.isSelf || item.dir === 'agy-market' || item.id === 'azwosile__agy-market')) return false;
+      return true;
+    });
+  }
+  if (Array.isArray(state.serverState?.updatesAvailable) && state.serverState.updatesAvailable.length > 0) {
+    state.serverState.updatesAvailable = state.serverState.updatesAvailable.filter((item) => {
+      if (cleanDir && (item.installedDir === cleanDir || item.dir === cleanDir)) return false;
+      if (cleanId && item.id === cleanId) return false;
+      if (isSelf && (item.installedDir === 'agy-market' || item.dir === 'agy-market' || item.id === 'azwosile__agy-market')) {
+        return false;
+      }
+      return true;
+    });
+  }
+}
+
 function getCatalogMaps() {
   const byId = new Map();
   const byDir = new Map();
@@ -983,6 +1025,7 @@ async function triggerUninstallPlugin(dir, { removeFavorite = false, displayName
       return;
     }
 
+    state.verifiedLatestDirs.delete(cleanDir);
     if (state.detailPlugin?.installStatus?.installedDir === cleanDir) {
       if (state.detailPlugin._localOnly) {
         state.detailPlugin = null;
@@ -1136,7 +1179,10 @@ async function openSiblingSidecarPane({ dir, folder, viewPath, title, uri }) {
 
 async function checkUpdates(force = false, { silent = true } = {}) {
   const seq = ++updatesRequestSeq;
-  if (force) lastForcedUpdatesAt = Date.now();
+  if (force) {
+    lastForcedUpdatesAt = Date.now();
+    state.verifiedLatestDirs.clear();
+  }
   state.updates.loading = true;
   state.updates.error = '';
   render();
@@ -1145,11 +1191,19 @@ async function checkUpdates(force = false, { silent = true } = {}) {
     const res = await apiFetch(`/api/updates${qs}`);
     if (seq !== updatesRequestSeq) return;
     if (res && res.ok !== false) {
+      const nextItems = Array.isArray(res.items) ? res.items : [];
+      const nextSelfUpdate = res.selfUpdate || null;
+      for (const item of nextItems) {
+        if (item?.dir) state.verifiedLatestDirs.delete(item.dir);
+      }
+      if (nextSelfUpdate) {
+        state.verifiedLatestDirs.delete('agy-market');
+      }
       state.updates = {
         loading: false,
         checkedAt: res.checkedAt || new Date().toISOString(),
-        items: Array.isArray(res.items) ? res.items : [],
-        selfUpdate: res.selfUpdate || null,
+        items: nextItems,
+        selfUpdate: nextSelfUpdate,
         rateLimited: Boolean(res.rateLimited),
         warnings: Array.isArray(res.warnings) ? res.warnings : [],
         error: '',
@@ -1240,9 +1294,15 @@ async function triggerInstall(plugin, { conflictStrategy = 'prompt', confirmEsca
         return;
       }
 
+      const installedDir = String(
+        res.installedDir || plugin.installStatus?.installedDir || plugin.canonicalName || '',
+      ).trim();
+      markPluginVerifiedLatest(installedDir, plugin.id || '');
+      state.busyId = '';
+
       const act = res.activation || resolveActivationInfo(plugin);
       const restartInfo = maybeTriggerRestartBanner({
-        pluginName: plugin.displayName || res.installedDir || plugin.canonicalName,
+        pluginName: plugin.displayName || installedDir || plugin.canonicalName,
         operation: isUpdate ? 'update' : 'install',
         restartRequired: Boolean(res.restartRequired),
         reloadRequired: Boolean(res.reloadRequired),
@@ -1259,7 +1319,7 @@ async function triggerInstall(plugin, { conflictStrategy = 'prompt', confirmEsca
           durationMs: restartInfo ? 6500 : 4500,
         },
       );
-      void checkUpdates(false, { silent: true });
+      await checkUpdates(false, { silent: true });
       if (state.conflicts.loaded) void loadConflicts({ silent: true });
     } else {
       const errMsg = res.error || res.status || t('安装或更新未能完成', 'Install or update did not complete');
@@ -1360,6 +1420,7 @@ async function triggerUpdateAll(ids = null, { confirmEscalation = false } = {}) 
 
     for (const r of results) {
       if (r.ok) {
+        markPluginVerifiedLatest(r.installedDir || r.dir || '', r.id || '');
         maybeTriggerRestartBanner({
           pluginName: r.displayName || r.installedDir || r.id,
           operation: 'update',
@@ -1428,6 +1489,9 @@ async function triggerUpdateAll(ids = null, { confirmEscalation = false } = {}) 
       return;
     }
 
+    state.batchUpdating = false;
+    state.batchTargetIds = [];
+
     if (failCount > 0) {
       const firstFail = failedItems[0];
       const firstReason = firstFail.error || firstFail.status || t('更新失败', 'Update failed');
@@ -1454,7 +1518,7 @@ async function triggerUpdateAll(ids = null, { confirmEscalation = false } = {}) 
       showToast(t(`全部更新完成（共 ${okCount} 个插件）`, `Updated ${okCount} plugin(s) successfully`), { tone: 'ok' });
     }
 
-    void checkUpdates(false, { silent: true });
+    await checkUpdates(false, { silent: true });
     if (state.conflicts.loaded) void loadConflicts({ silent: true });
   } catch (err) {
     const errMsg = err?.message || String(err);
@@ -1833,6 +1897,7 @@ async function triggerGithubUrlInstall() {
       state.errorBanner = null;
       const installedDir = res.installedDir || pluginInfo.canonicalName || '';
       const installedVer = res.version || pluginInfo.version || '';
+      markPluginVerifiedLatest(installedDir, res.id || pluginInfo.id || '');
       const act = res.activation || resolveActivationInfo(pluginInfo);
       const restartInfo = maybeTriggerRestartBanner({
         pluginName: pluginInfo.displayName || installedDir || pluginLabel,
@@ -1983,6 +2048,12 @@ async function triggerDirectPluginUpdate({
         startReconnectPolling(res.version || '');
         return;
       }
+      const installedDir = String(res.installedDir || cleanDir).trim();
+      markPluginVerifiedLatest(installedDir, targetId);
+      if (cleanDir && cleanDir !== installedDir) {
+        markPluginVerifiedLatest(cleanDir, targetId);
+      }
+      state.busyId = '';
       const restartInfo = maybeTriggerRestartBanner({
         pluginName: label,
         operation: 'update',
@@ -1992,14 +2063,14 @@ async function triggerDirectPluginUpdate({
         activation: res.activation || null,
       });
       showToast(
-        `${t('更新已完成', 'Updated')}: ${res.installedDir || cleanDir}${res.version ? ` v${res.version}` : ''}`,
+        `${t('更新已完成', 'Updated')}: ${installedDir}${res.version ? ` v${res.version}` : ''}`,
         {
           subtext: restartInfo?.reason || '',
           tone: 'ok',
           durationMs: restartInfo ? 6500 : 4500,
         },
       );
-      void checkUpdates(false, { silent: true });
+      await checkUpdates(false, { silent: true });
       if (state.conflicts.loaded) void loadConflicts({ silent: true });
     } else {
       const errMsg = res.error || res.status || t('插件更新未能完成', 'Plugin update did not complete');
@@ -2066,17 +2137,33 @@ async function triggerSyncInstalledPlugin({ dir = '', id = '', displayName = '' 
 
   if (cleanDir === 'agy-market' || targetId === 'azwosile__agy-market') {
     state.busyId = cleanDir || targetId;
-    state.selfUpdateBusy = true;
     state.errorBanner = null;
     render();
     try {
       await checkUpdates(true, { silent: true });
+      if (state.updates.error) {
+        state.busyId = '';
+        showToast(`${t('检查更新失败', 'Update check failed')}: ${state.updates.error}`, {
+          tone: 'danger',
+          durationMs: 7000,
+        });
+        return;
+      }
       const su = state.updates.selfUpdate || null;
+      if (!su) {
+        markPluginVerifiedLatest('agy-market', 'azwosile__agy-market');
+        state.busyId = '';
+        showToast(t('AGY Market 当前已是最新版本', 'AGY Market is already up to date'), {
+          tone: 'ok',
+          durationMs: 3500,
+        });
+        return;
+      }
       await triggerSelfUpdate({
         confirmEscalation: false,
-        updateChannel: su?.updateChannel || '',
-        targetVersion: su?.latestVersion || '',
-        targetRef: su?.targetRef || '',
+        updateChannel: su.updateChannel || '',
+        targetVersion: su.latestVersion || '',
+        targetRef: su.targetRef || '',
       });
     } finally {
       state.busyId = '';
@@ -2088,24 +2175,45 @@ async function triggerSyncInstalledPlugin({ dir = '', id = '', displayName = '' 
   state.busyId = targetId || cleanDir;
   state.errorBanner = null;
   render();
-  await checkUpdates(true, { silent: true });
+  let delegated = false;
+  try {
+    await checkUpdates(true, { silent: true });
 
-  const { byId: updById, byDir: updByDir } = getUpdateMaps();
-  const { byId: catById, byDir: catByDir } = getCatalogMaps();
-  const loc = getInstalledByDirMap().get(cleanDir) || null;
-  const freshUpd =
-    (cleanDir && updByDir.get(cleanDir)) ||
-    (targetId && updById.get(targetId)) ||
-    (loc?.receipt?.id && updById.get(loc.receipt.id)) ||
-    null;
-  const catEntry =
-    (freshUpd?.id && catById.get(freshUpd.id)) ||
-    (targetId && catById.get(targetId)) ||
-    (loc?.receipt?.id && catById.get(loc.receipt.id)) ||
-    (cleanDir && catByDir.get(cleanDir)) ||
-    null;
+    if (state.updates.error) {
+      state.busyId = '';
+      showToast(`${t('检查更新失败', 'Update check failed')}: ${state.updates.error}`, {
+        tone: 'danger',
+        durationMs: 7000,
+      });
+      return;
+    }
 
-  if (freshUpd && isDirectGithubUpdateItem(freshUpd)) {
+    const { byId: updById, byDir: updByDir } = getUpdateMaps();
+    const { byId: catById, byDir: catByDir } = getCatalogMaps();
+    const loc = getInstalledByDirMap().get(cleanDir) || null;
+    const freshUpd =
+      (cleanDir && updByDir.get(cleanDir)) ||
+      (targetId && updById.get(targetId)) ||
+      (loc?.receipt?.id && updById.get(loc.receipt.id)) ||
+      null;
+    const catEntry =
+      (freshUpd?.id && catById.get(freshUpd.id)) ||
+      (targetId && catById.get(targetId)) ||
+      (loc?.receipt?.id && catById.get(loc.receipt.id)) ||
+      (cleanDir && catByDir.get(cleanDir)) ||
+      null;
+
+    if (!freshUpd) {
+      markPluginVerifiedLatest(cleanDir || loc?.dir || '', catEntry?.id || targetId);
+      state.busyId = '';
+      showToast(t(`「${label}」当前已是最新版本`, `"${label}" is already up to date`), {
+        tone: 'ok',
+        durationMs: 3500,
+      });
+      return;
+    }
+
+    delegated = true;
     await triggerDirectPluginUpdate({
       id: freshUpd.id || catEntry?.id || targetId,
       dir: freshUpd.dir || cleanDir,
@@ -2115,17 +2223,15 @@ async function triggerSyncInstalledPlugin({ dir = '', id = '', displayName = '' 
       targetRef: freshUpd.targetRef || '',
       updateKind: freshUpd.updateKind || '',
       trackBranch: freshUpd.trackBranch || '',
-      repositoryUrl: freshUpd.repositoryUrl || catEntry?.repository?.url || loc?.repositoryUrl || '',
+      repositoryUrl: freshUpd.repositoryUrl || catEntry?.repository?.url || loc?.repositoryUrl || loc?.receipt?.repositoryUrl || '',
+      preferUpstream: isDirectGithubUpdateItem(freshUpd),
     });
-    return;
+  } finally {
+    if (!delegated) {
+      state.busyId = '';
+      render();
+    }
   }
-
-  await triggerDirectPluginUpdate({
-    id: catEntry?.id || targetId,
-    dir: cleanDir,
-    displayName: label,
-    repositoryUrl: catEntry?.repository?.url || loc?.repositoryUrl || loc?.receipt?.repositoryUrl || '',
-  });
 }
 
 function startReconnectPolling(targetVersion = '') {
@@ -2167,6 +2273,9 @@ function startReconnectPolling(targetVersion = '') {
           render();
           await loadState(false);
           await checkUpdates(false, { silent: true });
+          if (!state.updates.selfUpdate && !state.updates.error) {
+            state.verifiedLatestDirs.add('agy-market');
+          }
           const versionBehind = Boolean(
             targetVersion && data?.version && String(data.version) !== String(targetVersion),
           );
@@ -3017,9 +3126,11 @@ function renderPluginCard(p, updateById, installedByDir) {
   const desc = resolveCatalogDescription(p, loc);
   const st = p.installStatus || {};
   const localItem = st.installedDir ? installedByDir.get(st.installedDir) || null : null;
-  const upd = updateById.get(p.id) || null;
   const isSelf = st.installedDir === 'agy-market' || p.canonicalName === 'agy-market' || p.id === 'azwosile__agy-market';
-  const hasAnyUpdate = Boolean(upd || (st.installed && st.hasUpdate));
+  const upd = updateById.get(p.id) || (isSelf ? state.updates.selfUpdate : null);
+  const hasAnyUpdate = Boolean(
+    upd || (st.installed && st.hasUpdate && !state.verifiedLatestDirs.has(st.installedDir || '')),
+  );
   const isSelfUpdate = Boolean(upd?.isSelf || isSelf);
   const isDirectGhUpdate = Boolean(upd && isDirectGithubUpdateItem(upd));
   const isCommitUpdate = Boolean(upd && upd.updateKind === 'commit' && upd.latestCommitSha);
@@ -3047,7 +3158,7 @@ function renderPluginCard(p, updateById, installedByDir) {
     versionChip = isCommitUpdate
       ? `<span class="version-delta" title="${escapeHtml(t('发现可用更新', 'Update available'))}">v${escapeHtml(upd.installedVersion || st.installedVersion || p.version)} (${escapeHtml(upd.installedCommitSha || 'HEAD')} → ${escapeHtml(upd.latestCommitSha)})</span>`
       : `<span class="version-delta" title="${escapeHtml(t('发现可用更新', 'Update available'))}">v${escapeHtml(upd.installedVersion || st.installedVersion || p.version)} → v${escapeHtml(upd.latestVersion)}</span>`;
-  } else if (st.installed && st.hasUpdate) {
+  } else if (st.installed && st.hasUpdate && !state.verifiedLatestDirs.has(st.installedDir || '')) {
     versionChip = `<span class="version-delta">v${escapeHtml(st.installedVersion || '?')} → v${escapeHtml(p.version)}</span>`;
   }
 
@@ -3464,9 +3575,12 @@ function renderBatchResultsPanel() {
 }
 
 function renderInstalledCard(loc, updById, updByDir, catById, catByDir) {
-  const upd = updByDir.get(loc.dir) || (loc.receipt?.id ? updById.get(loc.receipt.id) : null);
-  const catEntry = (upd && catById.get(upd.id)) || (loc.receipt?.id && catById.get(loc.receipt.id)) || catByDir.get(loc.dir) || null;
   const isSelf = loc.dir === 'agy-market';
+  const upd =
+    updByDir.get(loc.dir) ||
+    (loc.receipt?.id ? updById.get(loc.receipt.id) : null) ||
+    (isSelf ? state.updates.selfUpdate : null);
+  const catEntry = (upd && catById.get(upd.id)) || (loc.receipt?.id && catById.get(loc.receipt.id)) || catByDir.get(loc.dir) || null;
   const isGithubUrlTrack = loc.receipt?.track === 'github-url';
   const isSelfUpdate = Boolean(upd?.isSelf || isSelf);
   const isDirectGhUpdate = Boolean(upd && isDirectGithubUpdateItem(upd));
@@ -3498,10 +3612,12 @@ function renderInstalledCard(loc, updById, updByDir, catById, catByDir) {
   const hasRemoteSource =
     loc.scope === 'global' &&
     (loc.dir === 'agy-market' || Boolean(catEntry) || Boolean(loc.repositoryUrl || loc.receipt?.repositoryUrl));
+  const isConfirmedLatest = hasRemoteSource && isPluginConfirmedLatest(loc, upd);
 
   let actionHtml = '';
   if (isBusy) {
-    actionHtml = `<button type="button" class="btn btn-primary btn-sm" disabled>${icon('refresh', 12, 'spin')} ${escapeHtml(t('更新中…', 'Updating…'))}</button>`;
+    const busyLabel = upd || state.batchUpdating ? t('更新中…', 'Updating…') : t('检查中…', 'Checking…');
+    actionHtml = `<button type="button" class="btn btn-primary btn-sm" disabled>${icon('refresh', 12, 'spin')} ${escapeHtml(busyLabel)}</button>`;
   } else if (upd) {
     const updLabel = isCommitUpdate
       ? t(`更新 ${upd.latestCommitSha}`, `Update ${upd.latestCommitSha}`)
@@ -3517,6 +3633,8 @@ function renderInstalledCard(loc, updById, updByDir, catById, catByDir) {
       const updTargetId = upd.id || loc.receipt?.id || loc.dir;
       actionHtml = `<button type="button" class="btn btn-update-outline btn-sm" data-action="update-plugin-direct" data-id="${escapeHtml(updTargetId)}" data-dir="${escapeHtml(upd.dir || loc.dir)}" data-name="${escapeHtml(displayName)}" data-source="${escapeHtml(upd.source || '')}" data-update-channel="${escapeHtml(upd.updateChannel || '')}" data-target-ref="${escapeHtml(upd.targetRef || '')}" data-update-kind="${escapeHtml(upd.updateKind || '')}" data-track-branch="${escapeHtml(upd.trackBranch || '')}" data-repo-url="${escapeHtml(upd.repositoryUrl || repoUrl)}" data-stop-card="1">${icon('update', 12)} ${escapeHtml(updLabel)}</button>`;
     }
+  } else if (hasRemoteSource && isConfirmedLatest) {
+    actionHtml = `<span class="state-pill is-latest" title="${escapeHtml(t('已检查为最新版本', 'Up to date'))}">${icon('check', 11)} <span>${escapeHtml(t('最新', 'Latest'))}</span></span>`;
   } else if (hasRemoteSource) {
     actionHtml = `<button type="button" class="dock-btn is-update" data-action="sync-installed-plugin" data-dir="${escapeHtml(loc.dir)}" data-id="${escapeHtml(catEntry?.id || loc.receipt?.id || loc.dir)}" data-name="${escapeHtml(displayName)}" data-stop-card="1" title="${escapeHtml(t('检查并从此插件源同步最新版本', 'Check and sync latest build in Sidebar'))}">${icon('update', 12)} <span>${escapeHtml(t('更新', 'Update'))}</span></button>`;
   } else {
@@ -3526,7 +3644,7 @@ function renderInstalledCard(loc, updById, updByDir, catById, catByDir) {
         : loc.scope === 'builtin'
           ? t('内置插件由 Antigravity 宿主统一维护', 'Built-in plugin managed by Antigravity host')
           : t('纯本地插件，未关联目录或 GitHub 仓库更新源', 'Local-only plugin with no catalog or GitHub repository update source');
-    actionHtml = `<button type="button" class="dock-btn is-update is-disabled" disabled data-stop-card="1" title="${escapeHtml(noSourceTitle)}">${icon('update', 12)} <span>${escapeHtml(t('更新', 'Update'))}</span></button>`;
+    actionHtml = `<span class="state-pill is-local" title="${escapeHtml(noSourceTitle)}">${escapeHtml(loc.scope === 'workspace' ? t('工作区', 'Workspace') : loc.scope === 'builtin' ? t('内置', 'Built-in') : t('本地', 'Local'))}</span>`;
   }
 
   const uninstallBtnHtml = canUninstall
@@ -3609,9 +3727,12 @@ function renderInstalledView() {
   const activeCount = installed.filter((x) => x.enabled).length;
   const disabledCount = installed.filter((x) => !x.enabled).length;
   const updatableCount = installed.filter((loc) => {
-    const upd = updByDir.get(loc.dir) || (loc.receipt?.id ? updById.get(loc.receipt.id) : null);
+    const upd =
+      updByDir.get(loc.dir) ||
+      (loc.receipt?.id ? updById.get(loc.receipt.id) : null) ||
+      (loc.dir === 'agy-market' ? state.updates.selfUpdate : null);
     const catEntry = (upd && catById.get(upd.id)) || (loc.receipt?.id && catById.get(loc.receipt.id)) || catByDir.get(loc.dir) || null;
-    return Boolean(upd || catEntry?.installStatus?.hasUpdate);
+    return Boolean(upd || (catEntry?.installStatus?.hasUpdate && !state.verifiedLatestDirs.has(loc.dir)));
   }).length;
 
   const checkedLabel = state.updates.checkedAt
@@ -3623,8 +3744,14 @@ function renderInstalledView() {
     const aOn = a.enabled ? 1 : 0;
     const bOn = b.enabled ? 1 : 0;
     if (bOn !== aOn) return bOn - aOn;
-    const ua = updByDir.get(a.dir) || (a.receipt?.id ? updById.get(a.receipt.id) : null);
-    const ub = updByDir.get(b.dir) || (b.receipt?.id ? updById.get(b.receipt.id) : null);
+    const ua =
+      updByDir.get(a.dir) ||
+      (a.receipt?.id ? updById.get(a.receipt.id) : null) ||
+      (a.dir === 'agy-market' ? state.updates.selfUpdate : null);
+    const ub =
+      updByDir.get(b.dir) ||
+      (b.receipt?.id ? updById.get(b.receipt.id) : null) ||
+      (b.dir === 'agy-market' ? state.updates.selfUpdate : null);
     const sa = ua ? (ua.installable !== false ? 2 : 1) : 0;
     const sb = ub ? (ub.installable !== false ? 2 : 1) : 0;
     if (sb !== sa) return sb - sa;
@@ -3633,9 +3760,12 @@ function renderInstalledView() {
 
   const q = state.installedSearch.trim().toLowerCase();
   const filteredInstalled = sortedInstalled.filter((loc) => {
-    const upd = updByDir.get(loc.dir) || (loc.receipt?.id ? updById.get(loc.receipt.id) : null);
+    const upd =
+      updByDir.get(loc.dir) ||
+      (loc.receipt?.id ? updById.get(loc.receipt.id) : null) ||
+      (loc.dir === 'agy-market' ? state.updates.selfUpdate : null);
     const catEntry = (upd && catById.get(upd.id)) || (loc.receipt?.id && catById.get(loc.receipt.id)) || catByDir.get(loc.dir) || null;
-    const hasUpd = Boolean(upd || catEntry?.installStatus?.hasUpdate);
+    const hasUpd = Boolean(upd || (catEntry?.installStatus?.hasUpdate && !state.verifiedLatestDirs.has(loc.dir)));
 
     if (state.installedFilter === 'enabled' && !loc.enabled) return false;
     if (state.installedFilter === 'disabled' && loc.enabled) return false;
@@ -4193,10 +4323,15 @@ function renderDetailDrawer() {
   const installedByDir = getInstalledByDirMap();
   const st = p.installStatus || {};
   const localItem = st.installedDir ? installedByDir.get(st.installedDir) || null : null;
-  const upd = updById.get(p.id) || (st.installedDir ? updByDir.get(st.installedDir) : null);
   const installedDir = st.installedDir || localItem?.dir || '';
   const isSelf = installedDir === 'agy-market' || p.canonicalName === 'agy-market' || p.id === 'azwosile__agy-market';
-  const hasAnyUpdate = Boolean(upd || (st.installed && st.hasUpdate));
+  const upd =
+    updById.get(p.id) ||
+    (st.installedDir ? updByDir.get(st.installedDir) : null) ||
+    (isSelf ? state.updates.selfUpdate : null);
+  const hasAnyUpdate = Boolean(
+    upd || (st.installed && st.hasUpdate && !state.verifiedLatestDirs.has(installedDir)),
+  );
   const isSelfUpdate = Boolean(upd?.isSelf || isSelf);
   const isDirectGhUpdate = Boolean(upd && isDirectGithubUpdateItem(upd));
   const isGithubUrlLocal = Boolean(
@@ -4226,6 +4361,12 @@ function renderDetailDrawer() {
       st.canUninstall !== false,
   );
   const hasRemoteSource = localScope === 'global' && (isSelf || !p._localOnly || Boolean(repoUrl));
+  const isConfirmedLatest = Boolean(
+    st.installed &&
+      !hasAnyUpdate &&
+      hasRemoteSource &&
+      isPluginConfirmedLatest(localItem || { dir: installedDir || (isSelf ? 'agy-market' : '') }, upd),
+  );
   const displayName = p.displayName || p.canonicalName;
   const favKey = p._localOnly ? getLocalFavoriteKey(localItem || { dir: installedDir, receipt: { id: p.id } }, null) : String(p.id || '');
 
@@ -4245,14 +4386,25 @@ function renderDetailDrawer() {
       primaryBtn = `<button type="button" class="btn btn-update btn-sm" data-action="install" data-id="${escapeHtml(p.id)}">${icon('update', 12)} ${escapeHtml(updLabel)}</button>`;
     }
   } else if (st.installed) {
-    if (isSelf) {
-      primaryBtn = `<button type="button" class="btn btn-sm" data-action="self-update">${icon('refresh', 12)} ${escapeHtml(t('检查并同步市场', 'Sync Market'))}</button>`;
-    } else if (p._localOnly) {
-      primaryBtn = hasRemoteSource
-        ? `<button type="button" class="btn btn-sm" data-action="update-plugin-direct" data-id="${escapeHtml(directTargetId)}" data-dir="${escapeHtml(installedDir)}" data-name="${escapeHtml(displayName)}" data-repo-url="${escapeHtml(repoUrl)}">${icon('refresh', 12)} ${escapeHtml(t('从 GitHub 同步更新', 'Sync from GitHub'))}</button>`
-        : '';
+    if (isConfirmedLatest) {
+      const latestPillHtml = `<span class="state-pill is-latest" title="${escapeHtml(t('已检查为最新版本', 'Up to date'))}">${icon('check', 12)} ${escapeHtml(t('已是最新版本', 'Up to Date'))}</span>`;
+      if (isSelf) {
+        primaryBtn = latestPillHtml;
+      } else if (p._localOnly) {
+        primaryBtn = `${latestPillHtml}<button type="button" class="btn btn-sm" data-action="update-plugin-direct" data-id="${escapeHtml(directTargetId)}" data-dir="${escapeHtml(installedDir)}" data-name="${escapeHtml(displayName)}" data-repo-url="${escapeHtml(repoUrl)}" title="${escapeHtml(t('重新拉取并覆盖同步插件文件', 'Re-sync plugin files from GitHub'))}">${icon('refresh', 12)} ${escapeHtml(t('重新同步', 'Re-sync'))}</button>`;
+      } else {
+        primaryBtn = `${latestPillHtml}<button type="button" class="btn btn-sm" data-action="install" data-id="${escapeHtml(p.id)}" title="${escapeHtml(t('重新拉取并覆盖同步插件文件', 'Re-sync plugin files'))}">${icon('refresh', 12)} ${escapeHtml(t('重新同步', 'Re-sync'))}</button>`;
+      }
+    } else if (hasRemoteSource) {
+      primaryBtn = `<button type="button" class="btn btn-sm" data-action="sync-installed-plugin" data-dir="${escapeHtml(installedDir || (isSelf ? 'agy-market' : ''))}" data-id="${escapeHtml(directTargetId)}" data-name="${escapeHtml(displayName)}">${icon('update', 12)} ${escapeHtml(t('检查更新', 'Check Update'))}</button>`;
     } else {
-      primaryBtn = `<button type="button" class="btn btn-sm" data-action="install" data-id="${escapeHtml(p.id)}">${icon('refresh', 12)} ${escapeHtml(t('重新同步', 'Re-sync'))}</button>`;
+      const noSourceLabel =
+        localScope === 'workspace'
+          ? t('工作区', 'Workspace')
+          : localScope === 'builtin'
+            ? t('内置', 'Built-in')
+            : t('本地', 'Local');
+      primaryBtn = `<span class="state-pill is-local">${escapeHtml(noSourceLabel)}</span>`;
     }
   } else {
     primaryBtn = `<button type="button" class="btn btn-primary btn-sm" data-action="install" data-id="${escapeHtml(p.id)}">${icon('download', 12)} ${escapeHtml(t('立即安装并启用', 'Install Now'))}</button>`;

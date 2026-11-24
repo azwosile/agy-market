@@ -16,9 +16,12 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import vm from 'node:vm';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, '..');
+
+const { bundleZeroDepEsm } = await import(pathToFileURL(join(REPO_ROOT, 'scripts', 'build.mjs')).href);
 
 const { CATEGORY_LABELS, PLUGIN_ID, PLUGIN_JSON_ALLOWED_KEYS, PLUGIN_VERSION, scrubChildProcessEnv } = await import(
   pathToFileURL(join(REPO_ROOT, 'src', 'shared', 'constants.mjs')).href
@@ -1395,8 +1398,8 @@ test('v1.5 batch update-all: updates catalog + github-upstream + github-url toge
   }
 });
 
-test('v1.5 UI, taxonomy, version anchors & pure LF byte-purity assertions', () => {
-  // 1. Built sidecars/market_pane/index.html MUST contain ZERO \r bytes (0 CRLF, 0 bare CR) and 0 UTF-8 BOM
+test('v1.5.1 UI, taxonomy, version anchors & pure LF byte-purity assertions', () => {
+  // 1. Built sidecars/market_pane/index.html MUST contain ZERO \r bytes (0 CRLF, 0 bare CR), 0 UTF-8 BOM, and inline PLUGIN_VERSION = '1.5.1'
   const builtHtmlPath = join(REPO_ROOT, 'sidecars', 'market_pane', 'index.html');
   const htmlBuf = readFileSync(builtHtmlPath);
   let crCount = 0;
@@ -1411,8 +1414,16 @@ test('v1.5 UI, taxonomy, version anchors & pure LF byte-purity assertions', () =
   );
   const builtHtmlText = htmlBuf.toString('utf8');
   assert.doesNotMatch(builtHtmlText, /btn-upstream/, 'Built index.html must contain 0 btn-upstream external buttons');
+  assert.match(
+    builtHtmlText,
+    /const\s+PLUGIN_VERSION\s*=\s*'1\.5\.1'/,
+    'Built sidecars/market_pane/index.html must inline PLUGIN_VERSION = \'1.5.1\'',
+  );
+  assert.match(builtHtmlText, /function\s+isPluginConfirmedLatest\s*\(/, 'Built index.html must include isPluginConfirmedLatest');
+  assert.match(builtHtmlText, /state-pill is-latest/, 'Built index.html must include state-pill is-latest markup');
+  assert.match(builtHtmlText, /\.state-pill\.is-latest\b/, 'Built index.html must include .state-pill.is-latest style');
 
-  // 2. Static scan src/ui/app.mjs & src/ui/styles.css for v1.5.0 UI controls and zero btn-upstream
+  // 2. Static scan src/ui/app.mjs & src/ui/styles.css for v1.5.1 UI controls and zero btn-upstream
   const appSrc = readFileSync(join(REPO_ROOT, 'src', 'ui', 'app.mjs'), 'utf8');
   const cssSrc = readFileSync(join(REPO_ROOT, 'src', 'ui', 'styles.css'), 'utf8');
 
@@ -1420,8 +1431,11 @@ test('v1.5 UI, taxonomy, version anchors & pure LF byte-purity assertions', () =
   assert.match(
     appSrc,
     /data-action="sync-installed-plugin"/,
-    'Installed card must render per-plugin sync-installed-plugin update button',
+    'Installed card must render per-plugin sync-installed-plugin update button before check completes',
   );
+  assert.match(appSrc, /function\s+isPluginConfirmedLatest\s*\(/, 'src/ui/app.mjs must define isPluginConfirmedLatest');
+  assert.match(appSrc, /state-pill is-latest/, 'src/ui/app.mjs must render state-pill is-latest when up to date');
+  assert.match(cssSrc, /\.state-pill\.is-latest\b/, 'src/ui/styles.css must style .state-pill.is-latest');
   assert.match(appSrc, /data-action="update-all"/, 'Installed header must render permanent update-all button');
   assert.match(appSrc, /一键更新/, 'Installed header must display 一键更新 label');
   assert.doesNotMatch(appSrc, /btn-upstream/, 'src/ui/app.mjs must render 0 btn-upstream external link buttons');
@@ -1454,19 +1468,444 @@ test('v1.5 UI, taxonomy, version anchors & pure LF byte-purity assertions', () =
     assert.ok(CATEGORY_LABELS[key].zh && CATEGORY_LABELS[key].en, `Category "${key}" must define zh and en labels`);
   }
 
-  // 4. Version 1.5.0 anchors & 10-field plugin.json purity
+  // 4. Version 1.5.1 anchors, pure LF / 0 BOM bootstrap scripts, & 10-field plugin.json purity
   const pkgJson = JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf8'));
   const pluginJson = JSON.parse(readFileSync(join(REPO_ROOT, 'plugin.json'), 'utf8'));
-  assert.equal(PLUGIN_VERSION, '1.5.0');
-  assert.equal(pkgJson.version, '1.5.0');
-  assert.equal(pluginJson.version, '1.5.0');
+  assert.equal(PLUGIN_VERSION, '1.5.1');
+  assert.equal(pkgJson.version, '1.5.1');
+  assert.equal(pluginJson.version, '1.5.1');
   assert.equal(pluginJson.name, PLUGIN_ID);
   for (const key of Object.keys(pluginJson)) {
     assert.ok(PLUGIN_JSON_ALLOWED_KEYS.has(key), `Disallowed key "${key}" in plugin.json`);
   }
 
-  const ps1 = readFileSync(join(REPO_ROOT, 'scripts', 'install.ps1'), 'utf8');
-  const sh = readFileSync(join(REPO_ROOT, 'scripts', 'install.sh'), 'utf8');
-  assert.match(ps1, /else\s*\{\s*"1\.5\.0"\s*\}/);
-  assert.match(sh, /INSTALLED_VER="1\.5\.0"/);
+  const ps1Buf = readFileSync(join(REPO_ROOT, 'scripts', 'install.ps1'));
+  const shBuf = readFileSync(join(REPO_ROOT, 'scripts', 'install.sh'));
+  assert.equal(ps1Buf[0] === 0xef && ps1Buf[1] === 0xbb && ps1Buf[2] === 0xbf, false, 'install.ps1 must have 0 UTF-8 BOM');
+  assert.equal(ps1Buf.includes(0x0d), false, 'install.ps1 must be pure LF (0 CR)');
+  assert.equal(shBuf.includes(0x0d), false, 'install.sh must be pure LF (0 CR)');
+  assert.match(ps1Buf.toString('utf8'), /else\s*\{\s*"1\.5\.1"\s*\}/);
+  assert.match(shBuf.toString('utf8'), /INSTALLED_VER="1\.5\.1"/);
+
+  const siteHtml = readFileSync(join(REPO_ROOT, 'site', 'index.html'), 'utf8');
+  assert.match(siteHtml, /v1\.5\.1/);
+  const docsIndexPath = join(REPO_ROOT, 'docs', 'index.html');
+  if (existsSync(docsIndexPath)) {
+    const docsBuf = readFileSync(docsIndexPath);
+    assert.equal(docsBuf.includes(0x0d), false, 'docs/index.html must be pure LF (0 CR)');
+    assert.match(docsBuf.toString('utf8'), /v1\.5\.1/);
+  }
+});
+
+test('v1.5.1 UI state machine: isPluginConfirmedLatest & .state-pill.is-latest transitions (pre-check, up-to-date, direct update, single-sync no-reinstall, error handling, force re-check)', async () => {
+  const bundled = bundleZeroDepEsm(join(REPO_ROOT, 'src', 'ui', 'app.mjs'));
+  const bootMarker = 'void loadState(false);\nvoid checkUpdates(false, { silent: true });';
+  assert.ok(bundled.includes(bootMarker), 'Bundled app.mjs must contain auto-boot marker');
+
+  const instrumented = bundled.replace(
+    bootMarker,
+    [
+      'globalThis.__V151_UI__ = {',
+      '  state,',
+      '  isPluginConfirmedLatest,',
+      '  markPluginVerifiedLatest,',
+      '  checkUpdates,',
+      '  triggerDirectPluginUpdate,',
+      '  triggerSyncInstalledPlugin,',
+      '  triggerInstall,',
+      '  renderInstalledCard,',
+      '  renderDetailDrawer,',
+      '  getUpdateMaps,',
+      '  getCatalogMaps,',
+      '};',
+    ].join('\n'),
+  );
+
+  const fetchCalls = [];
+  let mockFetchHandler = async () => jsonResp({ ok: true });
+  const mockFetchFn = async (url, opts = {}) => {
+    fetchCalls.push({ url: String(url), method: String(opts.method || 'GET'), body: opts.body || null });
+    return mockFetchHandler(String(url), opts);
+  };
+
+  const storageMap = new Map();
+  const mockWindow = {
+    localStorage: {
+      getItem: (k) => (storageMap.has(k) ? storageMap.get(k) : null),
+      setItem: (k, v) => storageMap.set(k, String(v)),
+      removeItem: (k) => storageMap.delete(k),
+    },
+    addEventListener: () => {},
+    location: { reload: () => {}, origin: 'http://127.0.0.1:43210', search: '' },
+    matchMedia: () => ({ matches: false, addEventListener: () => {} }),
+    __SIDECAR_BOOT__: { token: 'test-token-v151' },
+    sidecar: null,
+    fetch: mockFetchFn,
+  };
+  const mockDocument = {
+    getElementById: () => null,
+    querySelector: () => null,
+    querySelectorAll: () => [],
+    activeElement: null,
+    documentElement: { setAttribute: () => {}, classList: { toggle: () => {} } },
+    body: { classList: { toggle: () => {} } },
+    addEventListener: () => {},
+  };
+
+  const sandbox = {
+    window: mockWindow,
+    document: mockDocument,
+    fetch: mockFetchFn,
+    URL,
+    URLSearchParams,
+    Headers,
+    Response,
+    console,
+    setTimeout: () => 1,
+    clearTimeout: () => {},
+    requestAnimationFrame: (cb) => {
+      cb();
+      return 1;
+    },
+  };
+  sandbox.globalThis = sandbox;
+  sandbox.self = mockWindow;
+
+  vm.runInNewContext(instrumented, sandbox, { filename: 'agy-market-v151-ui-test.js' });
+  const ui = sandbox.__V151_UI__;
+  assert.ok(ui, 'Instrumented UI test harness must expose __V151_UI__');
+
+  const alphaCat = {
+    id: 'alice__alpha-plug',
+    canonicalName: 'alpha-plug',
+    displayName: 'Alpha Plug',
+    version: '1.0.0',
+    description: { zh: 'Alpha 插件', en: 'Alpha plugin' },
+    repository: { url: 'https://github.com/alice/alpha-plug', stars: 10 },
+    capabilities: { badges: ['declarative-only'] },
+    taxonomy: { categories: ['developer-tools'], tags: [] },
+    installStatus: { installed: true, installedDir: 'alpha-plug', enabled: true, scope: 'global', canUninstall: true },
+  };
+  const alphaLoc = {
+    dir: 'alpha-plug',
+    name: 'alpha-plug',
+    displayName: 'Alpha Plug',
+    version: '1.0.0',
+    scope: 'global',
+    enabled: true,
+    canUninstall: true,
+    repositoryUrl: 'https://github.com/alice/alpha-plug',
+    receipt: { id: 'alice__alpha-plug', track: 'verified', repositoryUrl: 'https://github.com/alice/alpha-plug' },
+    capabilities: { badges: ['declarative-only'] },
+  };
+  const selfLoc = {
+    dir: 'agy-market',
+    name: 'agy-market',
+    displayName: 'AGY Market',
+    version: '1.5.1',
+    scope: 'global',
+    enabled: true,
+    canUninstall: false,
+    uninstallDisabledReason: 'self',
+    repositoryUrl: 'https://github.com/azwosile/agy-market',
+    receipt: { id: 'azwosile__agy-market', track: 'verified', repositoryUrl: 'https://github.com/azwosile/agy-market' },
+    capabilities: { badges: ['sidecar-ui'] },
+  };
+  const selfCat = {
+    id: 'azwosile__agy-market',
+    canonicalName: 'agy-market',
+    displayName: 'AGY Market',
+    version: '1.5.1',
+    description: { zh: '市场插件', en: 'Market plugin' },
+    repository: { url: 'https://github.com/azwosile/agy-market', stars: 99 },
+    capabilities: { badges: ['sidecar-ui'] },
+    taxonomy: { categories: ['productivity'], tags: [] },
+    installStatus: { installed: true, installedDir: 'agy-market', enabled: true, scope: 'global', canUninstall: false },
+  };
+  const localOnlyLoc = {
+    dir: 'pure-local',
+    name: 'pure-local',
+    displayName: 'Pure Local',
+    version: '0.1.0',
+    scope: 'global',
+    enabled: true,
+    canUninstall: true,
+    capabilities: { badges: ['declarative-only'] },
+  };
+  const wsLoc = {
+    dir: 'ws-plug',
+    name: 'ws-plug',
+    displayName: 'Workspace Plug',
+    version: '0.2.0',
+    scope: 'workspace',
+    enabled: true,
+    canUninstall: false,
+    capabilities: { badges: ['declarative-only'] },
+  };
+
+  const makeServerState = (locale = 'zh', alphaVersion = '1.0.0') => ({
+    plugin: { id: 'agy-market', version: '1.5.1' },
+    prefs: { locale, favorites: [], enableExperimentalTrack2: false },
+    catalog: { plugins: [{ ...alphaCat, version: alphaVersion }, selfCat], channelUsed: 'primary' },
+    installed: [{ ...alphaLoc, version: alphaVersion }, selfLoc, localOnlyLoc, wsLoc],
+    updatesAvailable: [],
+    conflictsSummary: { total: 0, critical: 0, warning: 0, info: 0 },
+  });
+
+  const renderCard = (loc) => {
+    const { byId: updById, byDir: updByDir } = ui.getUpdateMaps();
+    const { byId: catById, byDir: catByDir } = ui.getCatalogMaps();
+    return ui.renderInstalledCard(loc, updById, updByDir, catById, catByDir);
+  };
+
+  // Scenario 1: Before any update check completes -> remote plugins expose clickable sync-installed-plugin; local/workspace render .state-pill.is-local
+  ui.state.serverState = makeServerState('zh', '1.0.0');
+  ui.state.updates = { loading: false, checkedAt: '', items: [], selfUpdate: null, rateLimited: false, warnings: [], error: '' };
+  ui.state.verifiedLatestDirs.clear();
+
+  assert.equal(ui.isPluginConfirmedLatest(alphaLoc, null), false);
+  assert.equal(ui.isPluginConfirmedLatest(selfLoc, null), false);
+  const preAlphaHtml = renderCard(alphaLoc);
+  assert.match(preAlphaHtml, /data-action="sync-installed-plugin"/, 'Unchecked remote plugin must allow single-click update check');
+  assert.doesNotMatch(preAlphaHtml, /state-pill is-latest/, 'Unchecked plugin must not claim Latest before check');
+  const preLocalHtml = renderCard(localOnlyLoc);
+  assert.match(preLocalHtml, /<span class="state-pill is-local"[^>]*>本地<\/span>/);
+  assert.doesNotMatch(preLocalHtml, /data-action="sync-installed-plugin"/);
+  const preWsHtml = renderCard(wsLoc);
+  assert.match(preWsHtml, /<span class="state-pill is-local"[^>]*>工作区<\/span>/);
+
+  // Scenario 1b: Global check completes cleanly with NO updates (verifiedLatestDirs still empty) -> checkedAt non-empty alone transitions cards to .state-pill.is-latest
+  ui.state.updates = {
+    loading: false,
+    checkedAt: '2026-11-24T14:25:00Z',
+    items: [],
+    selfUpdate: null,
+    rateLimited: false,
+    warnings: [],
+    error: '',
+  };
+  ui.state.verifiedLatestDirs.clear();
+  assert.equal(ui.isPluginConfirmedLatest(alphaLoc, null), true);
+  assert.equal(ui.isPluginConfirmedLatest(selfLoc, null), true);
+  const globalLatestAlphaHtml = renderCard(alphaLoc);
+  assert.match(globalLatestAlphaHtml, /<span class="state-pill is-latest"[^>]*>[\s\S]*?<span>最新<\/span><\/span>/);
+  assert.doesNotMatch(globalLatestAlphaHtml, /data-action="sync-installed-plugin"/);
+  const globalLatestSelfHtml = renderCard(selfLoc);
+  assert.match(globalLatestSelfHtml, /<span class="state-pill is-latest"[^>]*>[\s\S]*?<span>最新<\/span><\/span>/);
+  assert.doesNotMatch(globalLatestSelfHtml, /data-action="self-update"/);
+
+  // Scenario 2: Single-plugin sync when already up to date -> MUST NOT re-download/re-install, transitions immediately to .state-pill.is-latest
+  ui.state.updates = { loading: false, checkedAt: '', items: [], selfUpdate: null, rateLimited: false, warnings: [], error: '' };
+  ui.state.verifiedLatestDirs.clear();
+  fetchCalls.length = 0;
+  mockFetchHandler = async (url) => {
+    if (url.startsWith('/api/updates')) {
+      return jsonResp({ ok: true, checkedAt: '2026-11-24T14:30:00Z', items: [], selfUpdate: null, rateLimited: false });
+    }
+    throw new Error(`Unexpected API call when already latest: ${url}`);
+  };
+  await ui.triggerSyncInstalledPlugin({ dir: 'alpha-plug', id: 'alice__alpha-plug', displayName: 'Alpha Plug' });
+  assert.equal(
+    fetchCalls.filter((c) => c.url.startsWith('/api/update') && !c.url.startsWith('/api/updates')).length,
+    0,
+    'Normal plugin single-sync must NOT call /api/update or /api/install when already latest',
+  );
+  assert.equal(ui.state.verifiedLatestDirs.has('alpha-plug'), true);
+  assert.match(ui.state.toast?.message || '', /当前已是最新版本/);
+  const afterSyncAlphaHtml = renderCard(alphaLoc);
+  assert.match(afterSyncAlphaHtml, /<span class="state-pill is-latest"[^>]*>[\s\S]*?<span>最新<\/span><\/span>/);
+  assert.doesNotMatch(afterSyncAlphaHtml, /data-action="sync-installed-plugin"/);
+  assert.doesNotMatch(afterSyncAlphaHtml, /data-action="update-plugin-direct"/);
+
+  // Scenario 3: Self single-sync when already up to date -> 0 calls to /api/self-update (no pointless restart), shows Latest pill
+  fetchCalls.length = 0;
+  ui.state.updates.checkedAt = '';
+  ui.state.verifiedLatestDirs.clear();
+  await ui.triggerSyncInstalledPlugin({ dir: 'agy-market', id: 'azwosile__agy-market', displayName: 'AGY Market' });
+  assert.equal(
+    fetchCalls.filter((c) => c.url.startsWith('/api/self-update')).length,
+    0,
+    'agy-market single-sync must NEVER call /api/self-update when already latest',
+  );
+  assert.equal(ui.state.verifiedLatestDirs.has('agy-market'), true);
+  assert.equal(ui.state.toast?.message, 'AGY Market 当前已是最新版本');
+  const afterSyncSelfHtml = renderCard(selfLoc);
+  assert.match(afterSyncSelfHtml, /<span class="state-pill is-latest"[^>]*>[\s\S]*?<span>最新<\/span><\/span>/);
+  assert.doesNotMatch(afterSyncSelfHtml, /data-action="self-update"/);
+
+  // Also verify English locale renders "Latest" pill and Detail Drawer renders .state-pill.is-latest (self has no Re-sync/self-update; normal has Re-sync)
+  ui.state.serverState = makeServerState('en', '1.0.0');
+  const enLatestCard = renderCard(alphaLoc);
+  assert.match(enLatestCard, /<span class="state-pill is-latest"[^>]*>[\s\S]*?<span>Latest<\/span><\/span>/);
+
+  ui.state.serverState = makeServerState('zh', '1.0.0');
+  ui.state.detailPlugin = selfCat;
+  const selfDrawerHtml = ui.renderDetailDrawer();
+  assert.match(selfDrawerHtml, /<span class="state-pill is-latest"[^>]*>[\s\S]*?已是最新版本<\/span>/);
+  assert.doesNotMatch(selfDrawerHtml, /data-action="self-update"/);
+  assert.doesNotMatch(selfDrawerHtml, /重新同步/);
+
+  ui.state.detailPlugin = alphaCat;
+  const alphaDrawerHtml = ui.renderDetailDrawer();
+  assert.match(alphaDrawerHtml, /<span class="state-pill is-latest"[^>]*>[\s\S]*?已是最新版本<\/span>/);
+  assert.match(alphaDrawerHtml, /重新同步/);
+  ui.state.detailPlugin = null;
+
+  // Scenario 4: Update check error MUST NOT mark verifiedLatestDirs; keeps clickable sync button for retry
+  ui.state.updates = { loading: false, checkedAt: '', items: [], selfUpdate: null, rateLimited: false, warnings: [], error: '' };
+  ui.state.verifiedLatestDirs.clear();
+  mockFetchHandler = async (url) => {
+    if (url.startsWith('/api/updates')) {
+      return jsonResp({ ok: false, error: 'NETWORK_OFFLINE' }, 503);
+    }
+    throw new Error(`Unexpected call during error scenario: ${url}`);
+  };
+  await ui.triggerSyncInstalledPlugin({ dir: 'alpha-plug', id: 'alice__alpha-plug', displayName: 'Alpha Plug' });
+  assert.equal(ui.state.verifiedLatestDirs.has('alpha-plug'), false);
+  assert.equal(ui.isPluginConfirmedLatest(alphaLoc, null), false);
+  assert.equal(ui.state.toast?.tone, 'danger');
+  assert.match(renderCard(alphaLoc), /data-action="sync-installed-plugin"/);
+
+  // Scenario 5: When a newer version IS available -> clickable direct update button renders; after updating to latest, transitions immediately to .state-pill.is-latest
+  const alphaV12Upd = {
+    id: 'alice__alpha-plug',
+    dir: 'alpha-plug',
+    installedVersion: '1.0.0',
+    latestVersion: '1.2.0',
+    installable: true,
+    source: 'github-release',
+    updateChannel: 'github-upstream',
+    targetRef: 'v1.2.0',
+    repositoryUrl: 'https://github.com/alice/alpha-plug',
+  };
+  ui.state.updates = {
+    loading: false,
+    checkedAt: '2026-11-24T14:35:00Z',
+    items: [alphaV12Upd],
+    selfUpdate: null,
+    rateLimited: false,
+    warnings: [],
+    error: '',
+  };
+  ui.state.verifiedLatestDirs.clear();
+  assert.equal(ui.isPluginConfirmedLatest(alphaLoc, alphaV12Upd), false);
+  const availHtml = renderCard(alphaLoc);
+  assert.match(availHtml, /data-action="update-plugin-direct"/);
+  assert.match(availHtml, /更新 v1\.2\.0/);
+  assert.doesNotMatch(availHtml, /state-pill is-latest/);
+
+  fetchCalls.length = 0;
+  mockFetchHandler = async (url) => {
+    if (url === '/api/update') {
+      return jsonResp({
+        ok: true,
+        installedDir: 'alpha-plug',
+        version: '1.2.0',
+        restartRequired: false,
+        state: makeServerState('zh', '1.2.0'),
+      });
+    }
+    if (url.startsWith('/api/updates')) {
+      return jsonResp({ ok: true, checkedAt: '2026-11-24T14:36:00Z', items: [], selfUpdate: null, rateLimited: false });
+    }
+    return jsonResp({ ok: true });
+  };
+  await ui.triggerDirectPluginUpdate({
+    id: 'alice__alpha-plug',
+    dir: 'alpha-plug',
+    displayName: 'Alpha Plug',
+    source: 'github-release',
+    updateChannel: 'github-upstream',
+    targetRef: 'v1.2.0',
+    repositoryUrl: 'https://github.com/alice/alpha-plug',
+    preferUpstream: true,
+  });
+  assert.equal(fetchCalls.filter((c) => c.url === '/api/update' && c.method === 'POST').length, 1);
+  assert.equal(ui.state.verifiedLatestDirs.has('alpha-plug'), true);
+  assert.equal(ui.state.updates.items.length, 0);
+  const postUpdHtml = renderCard({ ...alphaLoc, version: '1.2.0' });
+  assert.match(postUpdHtml, /<span class="state-pill is-latest"[^>]*>[\s\S]*?<span>最新<\/span><\/span>/);
+  assert.doesNotMatch(postUpdHtml, /data-action="update-plugin-direct"/);
+  assert.doesNotMatch(postUpdHtml, /data-action="sync-installed-plugin"/);
+
+  // Scenario 6: Manual top-bar force checkUpdates(true) clears verifiedLatestDirs and restores clickable button if a newer version v2.0.0 is published
+  mockFetchHandler = async (url) => {
+    if (url.startsWith('/api/updates?force=1')) {
+      return jsonResp({
+        ok: true,
+        checkedAt: '2026-11-24T14:40:00Z',
+        items: [
+          {
+            id: 'alice__alpha-plug',
+            dir: 'alpha-plug',
+            installedVersion: '1.2.0',
+            latestVersion: '2.0.0',
+            installable: true,
+            source: 'github-release',
+            updateChannel: 'github-upstream',
+            targetRef: 'v2.0.0',
+            repositoryUrl: 'https://github.com/alice/alpha-plug',
+          },
+        ],
+        selfUpdate: null,
+        rateLimited: false,
+      });
+    }
+    return jsonResp({ ok: true });
+  };
+  await ui.checkUpdates(true, { silent: true });
+  assert.equal(ui.state.verifiedLatestDirs.has('alpha-plug'), false);
+  const recheckHtml = renderCard({ ...alphaLoc, version: '1.2.0' });
+  assert.match(recheckHtml, /data-action="update-plugin-direct"/);
+  assert.match(recheckHtml, /更新 v2\.0\.0/);
+  assert.doesNotMatch(recheckHtml, /state-pill is-latest/);
+
+  // Scenario 7: Single-plugin sync when a newer version v2.1.0 IS found -> delegates to POST /api/update and immediately transitions to .state-pill.is-latest
+  ui.state.updates = { loading: false, checkedAt: '', items: [], selfUpdate: null, rateLimited: false, warnings: [], error: '' };
+  ui.state.verifiedLatestDirs.clear();
+  fetchCalls.length = 0;
+  let syncUpdated = false;
+  mockFetchHandler = async (url) => {
+    if (url.startsWith('/api/updates')) {
+      return jsonResp({
+        ok: true,
+        checkedAt: '2026-11-24T14:45:00Z',
+        items: syncUpdated
+          ? []
+          : [
+              {
+                id: 'alice__alpha-plug',
+                dir: 'alpha-plug',
+                installedVersion: '1.2.0',
+                latestVersion: '2.1.0',
+                installable: true,
+                source: 'github-release',
+                updateChannel: 'github-upstream',
+                targetRef: 'v2.1.0',
+                repositoryUrl: 'https://github.com/alice/alpha-plug',
+              },
+            ],
+        selfUpdate: null,
+        rateLimited: false,
+      });
+    }
+    if (url === '/api/update') {
+      syncUpdated = true;
+      return jsonResp({
+        ok: true,
+        installedDir: 'alpha-plug',
+        version: '2.1.0',
+        restartRequired: false,
+        state: makeServerState('zh', '2.1.0'),
+      });
+    }
+    return jsonResp({ ok: true });
+  };
+  await ui.triggerSyncInstalledPlugin({ dir: 'alpha-plug', id: 'alice__alpha-plug', displayName: 'Alpha Plug' });
+  assert.equal(fetchCalls.filter((c) => c.url === '/api/update' && c.method === 'POST').length, 1);
+  assert.equal(ui.state.verifiedLatestDirs.has('alpha-plug'), true);
+  const afterSyncUpdHtml = renderCard({ ...alphaLoc, version: '2.1.0' });
+  assert.match(afterSyncUpdHtml, /<span class="state-pill is-latest"[^>]*>[\s\S]*?<span>最新<\/span><\/span>/);
+  assert.doesNotMatch(afterSyncUpdHtml, /data-action="update-plugin-direct"/);
+  assert.doesNotMatch(afterSyncUpdHtml, /data-action="sync-installed-plugin"/);
 });
