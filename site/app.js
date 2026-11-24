@@ -2,13 +2,22 @@
   'use strict';
 
   const BADGE_LABELS = {
-    'declarative-only': '🟢 纯声明式 · 0进程',
+    'declarative-only': '⚡ 纯声明式 · 免重启',
     'global-rules': '🔵 常驻规则',
     'sidecar-ui': '🟣 Sidecar 面板 · 0 Token',
     'mcp-stdio': '🟠 本地 MCP 进程',
     'mcp-remote': '🌐 远程 MCP 服务',
     'lifecycle-hooks': '🔶 生命周期钩子',
-    'host-enhancement': '💡 宿主界面增强',
+    'host-enhancement': '🚀 宿主界面增强（需重启）',
+  };
+
+  const CATEGORY_ACCENTS = {
+    'ui-themes': ['#a855f7', '#ec4899'],
+    'developer-tools': ['#6366f1', '#06b6d4'],
+    productivity: ['#38bdf8', '#14b8a6'],
+    'mcp-integrations': ['#f59e0b', '#f97316'],
+    'skills-workflows': ['#10b981', '#34d399'],
+    security: ['#f43f5e', '#f59e0b'],
   };
 
   let plugins = [];
@@ -21,6 +30,10 @@
       .replace(/"/g, '&quot;');
   }
 
+  function isSafeUrl(u) {
+    return /^https?:\/\/[^\s]+$/i.test(String(u || '').trim());
+  }
+
   function renderGrid() {
     const grid = document.getElementById('site-grid');
     const q = (document.getElementById('site-search').value || '').trim().toLowerCase();
@@ -30,11 +43,14 @@
       if (cat !== 'all' && !(p.taxonomy?.categories || []).includes(cat)) return false;
       if (!q) return true;
       const desc = typeof p.description === 'object' ? `${p.description.zh || ''} ${p.description.en || ''}` : String(p.description || '');
-      return `${p.displayName || ''} ${p.canonicalName || ''} ${desc}`.toLowerCase().includes(q);
+      return `${p.displayName || ''} ${p.canonicalName || ''} ${desc} ${(p.capabilities?.badges || []).join(' ')}`.toLowerCase().includes(q);
     });
 
+    const totalEl = document.getElementById('stat-total');
+    if (totalEl) totalEl.textContent = `${plugins.length} 款`;
+
     if (!list.length) {
-      grid.innerHTML = `<div class="empty">目录就绪（当前包含 ${plugins.length} 个已收录插件）。安装 AGY Market 客户端或向 <code>agy-market-catalog</code> 提交 YAML PR 即可在此实时展示。</div>`;
+      grid.innerHTML = `<div class="empty">目录就绪（当前包含 ${plugins.length} 款已收录插件）。安装 AGY Market 客户端或向 <code>agy-market-catalog</code> 提交 YAML PR 即可在此实时展示。</div>`;
       return;
     }
 
@@ -44,14 +60,30 @@
         const badges = (p.capabilities?.badges || [])
           .map((b) => `<span class="badge">${escapeHtml(BADGE_LABELS[b] || b)}</span>`)
           .join('');
+        const primaryCat = (p.taxonomy?.categories || [])[0] || '';
+        const [a1, a2] = CATEGORY_ACCENTS[primaryCat] || ['#6366f1', '#06b6d4'];
+        const title = p.displayName || p.canonicalName || p.id;
+        const repoUrl = p.repository?.url || '';
+        const titleHtml = isSafeUrl(repoUrl)
+          ? `<a class="card-name-link" href="${escapeHtml(repoUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(title)} ↗</a>`
+          : `<span class="card-name">${escapeHtml(title)}</span>`;
+        const discussUrl = isSafeUrl(repoUrl) ? `${repoUrl.replace(/\/+$/, '')}/discussions` : '';
+
         return `
-          <article class="card">
+          <article class="card" style="--card-accent:${a1};--card-accent-2:${a2}">
             <div class="card-top">
-              <span class="card-name">${escapeHtml(p.displayName || p.canonicalName)}</span>
+              ${titleHtml}
               <span class="card-ver">v${escapeHtml(p.version)} · ★ ${Number(p.repository?.stars || 0)}</span>
             </div>
             <p class="card-desc">${escapeHtml(desc)}</p>
             <div class="badges">${badges}</div>
+            <div class="card-dock">
+              <span class="dock-slug">${escapeHtml(p.forceScopedInstall ? p.scopedName : p.canonicalName)}</span>
+              <div class="dock-links">
+                ${discussUrl ? `<a class="dock-link" href="${escapeHtml(discussUrl)}" target="_blank" rel="noopener noreferrer">讨论区</a>` : ''}
+                ${isSafeUrl(repoUrl) ? `<a class="dock-link" href="${escapeHtml(repoUrl)}" target="_blank" rel="noopener noreferrer">GitHub ↗</a>` : ''}
+              </div>
+            </div>
           </article>
         `;
       })
@@ -64,7 +96,9 @@
   async function fetchCatalog() {
     const url = document.getElementById('site-feed-url').value.trim();
     const candidates = url === DEFAULT_PAGES_FEED_URL ? [url, RAW_GH_PAGES_FEED_URL] : [url];
+    const channelEl = document.getElementById('stat-channel');
     let loaded = null;
+    let usedChannel = '离线缓存';
     for (const candidate of candidates) {
       try {
         const res = await fetch(candidate, { headers: { Accept: 'application/json' } });
@@ -72,6 +106,7 @@
         const json = await res.json();
         if (Array.isArray(json.plugins)) {
           loaded = json.plugins;
+          usedChannel = candidate.includes('raw.githubusercontent.com') ? 'GitHub Raw 镜像' : 'GitHub Pages';
           break;
         }
       } catch {
@@ -79,6 +114,7 @@
       }
     }
     plugins = loaded || [];
+    if (channelEl) channelEl.textContent = loaded ? usedChannel : '等待连接';
     renderGrid();
   }
 

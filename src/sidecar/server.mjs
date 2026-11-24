@@ -7,11 +7,18 @@ import { dirname, join, resolve } from 'node:path';
 import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { fetchPluginDiscussions } from '../discussions/index.mjs';
-import { installOrUpdateCatalogPlugin, removeMarketPluginFiles } from '../installer/index.mjs';
+import {
+  fixLocalConflict,
+  installOrUpdateCatalogPlugin,
+  removeMarketPluginFiles,
+  toggleInstalledPlugin,
+} from '../installer/index.mjs';
 import { recoverInterruptedJournal } from '../installer/journal.mjs';
 import { sweepRetiredBinaries } from '../installer/sync-dir.mjs';
+import { scanLocalConflicts } from '../preflight/conflicts.mjs';
 import { resolveInstallPreflight, scanLocalPluginInventory } from '../preflight/index.mjs';
 import { resolveMarketCatalog } from '../registry/index.mjs';
+import { classifyActivationRequirement } from '../shared/activation.mjs';
 import {
   CUSTOMIZATION_URI,
   DEFAULT_PREFS,
@@ -21,7 +28,12 @@ import {
   SELF_CATALOG_ID,
   SIDECAR_URI,
 } from '../shared/constants.mjs';
-import { resolveAntigravityConfigDir, resolveMarketDataDir, resolvePluginsDir } from '../shared/paths.mjs';
+import {
+  resolveAntigravityConfigDir,
+  resolveDisabledPluginsDir,
+  resolveMarketDataDir,
+  resolvePluginsDir,
+} from '../shared/paths.mjs';
 import { computeCapabilityEscalation, sanitizePrefs, toPublicPrefs } from '../shared/schemas.mjs';
 import { isNewerVersion } from '../shared/semver.mjs';
 import { checkPluginUpdates, isCatalogPluginInstallable } from '../updates/index.mjs';
@@ -30,6 +42,19 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, '..', '..');
 const DEFAULT_INDEX_HTML_PATH = join(REPO_ROOT, 'sidecars', 'market_pane', 'index.html');
 const MAX_JSON_BODY = 2 * 1024 * 1024;
+const MAX_LOCAL_README_CHARS = 64_000;
+const CJK_CHAR_RE = /[\u4e00-\u9fff]/;
+
+const ZH_README_FILENAMES = [
+  'README.zh-CN.md',
+  'README.zh.md',
+  'readme.zh-cn.md',
+  'readme.zh.md',
+  'docs/README.zh-CN.md',
+  'docs/README.zh.md',
+];
+const EN_README_FILENAMES = ['README.en.md', 'readme.en.md', 'docs/README.en.md'];
+const DEFAULT_README_FILENAMES = ['README.md', 'readme.md'];
 
 const PRELOAD_SHIM_JS = `(function() {
   var params = new URLSearchParams(window.location.search);
@@ -68,6 +93,19 @@ const PRELOAD_SHIM_JS = `(function() {
     return window.fetch(url, init);
   }
 
+  function createUiFallback() {
+    return {
+      toggleAuxPane: function(payload) {
+        try {
+          if (window.parent && window.parent !== window) {
+            window.parent.postMessage({ type: 'toggle-aux-pane', payload: payload || {} }, '*');
+          }
+        } catch (_) {}
+        return Promise.resolve({ ok: false, fallback: true });
+      }
+    };
+  }
+
   if (!window.sidecar) {
     window.sidecar = {
       conversationId: conversationId,
@@ -77,7 +115,8 @@ const PRELOAD_SHIM_JS = `(function() {
         if (typeof fn !== 'function') return function() {};
         wsListeners.add(fn);
         return function() { wsListeners.delete(fn); };
-      }
+      },
+      ui: createUiFallback()
     };
   } else {
     var origFetch = window.sidecar.fetch ? window.sidecar.fetch.bind(window.sidecar) : window.fetch.bind(window);
@@ -91,6 +130,11 @@ const PRELOAD_SHIM_JS = `(function() {
       init.headers = headers;
       return origFetch(url, init);
     };
+    if (!window.sidecar.ui) {
+      window.sidecar.ui = createUiFallback();
+    } else if (typeof window.sidecar.ui.toggleAuxPane !== 'function') {
+      window.sidecar.ui.toggleAuxPane = createUiFallback().toggleAuxPane;
+    }
   }
 })();`;
 
@@ -198,10 +242,51 @@ function isSelfPluginCandidate(plugin, installedDir = '') {
   );
 }
 
+function mergeCapabilitiesForActivation(localCap = {}, catalogCap = {}) {
+  const a = localCap && typeof localCap === 'object' ? localCap : {};
+  const b = catalogCap && typeof catalogCap === 'object' ? catalogCap : {};
+  const badges = [...new Set([...(a.badges || []), ...(b.badges || [])])];
+  const hostEnhancementKind = [
+    ...new Set([...(a.hostEnhancementKind || []), ...(b.hostEnhancementKind || [])]),
+  ].sort();
+  if (hostEnhancementKind.length > 0 && !badges.includes('host-enhancement')) {
+    badges.push('host-enhancement');
+  }
+  return {
+    badges,
+    rulesEstimatedTokens: Math.max(Number(a.rulesEstimatedTokens || 0), Number(b.rulesEstimatedTokens || 0)),
+    mcpServers: [...new Set([...(a.mcpServers || []), ...(b.mcpServers || [])])].sort(),
+    mcpRemoteDomains: [...new Set([...(a.mcpRemoteDomains || []), ...(b.mcpRemoteDomains || [])])].sort(),
+    hookEvents: [...new Set([...(a.hookEvents || []), ...(b.hookEvents || [])])].sort(),
+    hostEnhancementKind,
+  };
+}
+
+function readFirstExistingReadme(pluginRootDir, candidates) {
+  if (!pluginRootDir || !existsSync(pluginRootDir)) return '';
+  for (const rel of candidates) {
+    const full = join(pluginRootDir, rel);
+    if (!existsSync(full)) continue;
+    try {
+      const content = readFileSync(full, 'utf8').slice(0, MAX_LOCAL_README_CHARS);
+      if (content.trim()) return content;
+    } catch {
+      /* try next */
+    }
+  }
+  return '';
+}
+
+function isSafeDirSlug(raw) {
+  const s = String(raw || '').trim();
+  return Boolean(s && s !== '.' && s !== '..' && !s.includes('/') && !s.includes('\\') && !s.includes('..'));
+}
+
 export async function createMarketSidecarServer(options = {}) {
   const configDir = resolveAntigravityConfigDir(options.configDir || '');
   const pluginsDir = resolvePluginsDir(configDir);
   const dataDir = resolveMarketDataDir(options.dataDir || '');
+  const disabledPluginsDir = resolveDisabledPluginsDir(dataDir);
   const indexHtmlPath = options.indexHtmlPath || DEFAULT_INDEX_HTML_PATH;
   const fetchImpl = options.fetchImpl || fetch;
   const mirrors = options.mirrors || undefined;
@@ -209,6 +294,11 @@ export async function createMarketSidecarServer(options = {}) {
   const currentSelfVersion = options.currentSelfVersion || PLUGIN_VERSION;
   const githubApiBaseUrl = options.githubApiBaseUrl || undefined;
   const updateCheckTtlMs = options.updateCheckTtlMs ?? undefined;
+  const renameOverride = options.renameOverride || null;
+  const rmOverride = options.rmOverride || null;
+  const unlinkOverride = options.unlinkOverride || null;
+  const linkInfoOverride = options.linkInfoOverride || null;
+  const unlinkLinkOverride = options.unlinkLinkOverride || null;
   const onSelfRestart =
     typeof options.onSelfRestart === 'function'
       ? options.onSelfRestart
@@ -264,8 +354,17 @@ export async function createMarketSidecarServer(options = {}) {
     inFlightUpdates = null;
   }
 
+  function hasLoadedReadmes(cat) {
+    if (!cat) return false;
+    return (
+      Object.keys(cat.readmes || {}).length > 0 ||
+      Object.keys(cat.readmesZh || {}).length > 0 ||
+      Object.keys(cat.readmesEn || {}).length > 0
+    );
+  }
+
   async function ensureCatalogLoaded({ forceCatalogRefresh = false, includeReadmes = false } = {}) {
-    if (!lastCatalog || forceCatalogRefresh || (includeReadmes && !Object.keys(lastCatalog.readmes || {}).length)) {
+    if (!lastCatalog || forceCatalogRefresh || (includeReadmes && !hasLoadedReadmes(lastCatalog))) {
       lastCatalog = await resolveMarketCatalog({
         dataDir,
         prefs,
@@ -278,17 +377,61 @@ export async function createMarketSidecarServer(options = {}) {
     return lastCatalog;
   }
 
+  function findCatalogCapabilitiesForDir(dirName) {
+    const plugins = lastCatalog?.plugins || [];
+    const matched = plugins.find(
+      (p) => p.canonicalName === dirName || p.scopedName === dirName || p.id === dirName,
+    );
+    return matched?.capabilities || null;
+  }
+
   async function buildEnrichedState({ forceCatalogRefresh = false, workspaceUris = [] } = {}) {
     await ensureCatalogLoaded({ forceCatalogRefresh, includeReadmes: false });
 
-    const inventory = scanLocalPluginInventory({ configDir, workspaceUris });
+    const inventory = scanLocalPluginInventory({ configDir, dataDir, workspaceUris, linkInfoOverride });
     const updatesAvailable = [];
+    const catalogPlugins = lastCatalog.plugins || [];
 
-    const enrichedCatalogPlugins = lastCatalog.plugins.map((p) => {
-      const preflight = resolveInstallPreflight(p, inventory, { conflictStrategy: 'prompt' });
+    // Enrich installed items with merged catalog capabilities & activation classification
+    const catalogById = new Map();
+    const catalogByDir = new Map();
+    for (const cp of catalogPlugins) {
+      if (cp?.id) catalogById.set(cp.id, cp);
+      if (cp?.canonicalName) catalogByDir.set(cp.canonicalName, cp);
+      if (cp?.scopedName) catalogByDir.set(cp.scopedName, cp);
+    }
+
+    const enrichedInstalled = inventory.installed.map((loc) => {
+      const catMatch =
+        (loc.receipt?.id && catalogById.get(loc.receipt.id)) ||
+        catalogByDir.get(loc.dir) ||
+        catalogByDir.get(loc.name) ||
+        null;
+      if (!catMatch?.capabilities) return loc;
+      const mergedCaps = mergeCapabilitiesForActivation(loc.capabilities, catMatch.capabilities);
+      return {
+        ...loc,
+        capabilities: mergedCaps,
+        hostEnhancementKind: mergedCaps.hostEnhancementKind,
+        activation: classifyActivationRequirement(mergedCaps),
+      };
+    });
+
+    const enrichedInventory = { ...inventory, installed: enrichedInstalled };
+    const conflictsReport = scanLocalConflicts({
+      inventory: enrichedInventory,
+      configDir,
+      dataDir,
+      workspaceUris,
+      catalogPlugins,
+    });
+
+    const enrichedCatalogPlugins = catalogPlugins.map((p) => {
+      const preflight = resolveInstallPreflight(p, enrichedInventory, { conflictStrategy: 'prompt' });
       const localMatch = preflight.action === 'update' ? preflight.existingInstall : null;
       const hasUpdate = Boolean(localMatch && isNewerVersion(p.version, localMatch.version));
       const escalation = localMatch ? computeCapabilityEscalation(localMatch.receipt, p) : null;
+      const catalogActivation = classifyActivationRequirement(p.capabilities || {});
 
       if (hasUpdate && localMatch) {
         updatesAvailable.push({
@@ -303,16 +446,23 @@ export async function createMarketSidecarServer(options = {}) {
 
       return {
         ...p,
+        activation: catalogActivation,
         installStatus: {
           installed: Boolean(localMatch),
           installedDir: localMatch?.dir || null,
           installedVersion: localMatch?.version || null,
           enabled: localMatch ? localMatch.enabled : false,
+          parkedByMarket: localMatch ? Boolean(localMatch.parkedByMarket) : false,
+          hostDisabled: localMatch ? Boolean(localMatch.hostDisabled) : false,
+          canToggle: localMatch ? Boolean(localMatch.canToggle) : false,
+          toggleDisabledReason: localMatch ? localMatch.toggleDisabledReason || '' : '',
+          scope: localMatch?.scope || null,
           hasUpdate,
           customizationUri: localMatch?.customizationUri || null,
           sidecarPane: localMatch?.sidecarPane || null,
           conflictDetected: preflight.action === 'conflict-prompt',
           escalation,
+          activation: localMatch?.activation || catalogActivation,
         },
       };
     });
@@ -334,8 +484,9 @@ export async function createMarketSidecarServer(options = {}) {
         warnings: lastCatalog.warnings,
         plugins: enrichedCatalogPlugins,
       },
-      installed: inventory.installed,
+      installed: enrichedInstalled,
       updatesAvailable,
+      conflictsSummary: conflictsReport.summary,
       paths: {
         configDir,
         pluginsDir,
@@ -396,6 +547,24 @@ export async function createMarketSidecarServer(options = {}) {
       return;
     }
 
+    if (req.method === 'GET' && pathname === '/api/conflicts') {
+      const wsParam = urlObj.searchParams.get('workspaceUris') || '';
+      const workspaceUris = wsParam ? wsParam.split(',').filter(Boolean) : [];
+      if (!lastCatalog) {
+        await ensureCatalogLoaded({ forceCatalogRefresh: false, includeReadmes: false }).catch(() => null);
+      }
+      const inventory = scanLocalPluginInventory({ configDir, dataDir, workspaceUris, linkInfoOverride });
+      const report = scanLocalConflicts({
+        inventory,
+        configDir,
+        dataDir,
+        workspaceUris,
+        catalogPlugins: lastCatalog?.plugins || [],
+      });
+      sendJson(res, 200, report);
+      return;
+    }
+
     if (req.method === 'GET' && pathname === '/api/updates') {
       const force = urlObj.searchParams.get('force') === '1' || urlObj.searchParams.get('force') === 'true';
       const wsParam = urlObj.searchParams.get('workspaceUris') || '';
@@ -411,7 +580,7 @@ export async function createMarketSidecarServer(options = {}) {
       const generation = updateCheckGeneration;
       const runCheck = async () => {
         await ensureCatalogLoaded({ forceCatalogRefresh: force, includeReadmes: false });
-        const inventory = scanLocalPluginInventory({ configDir, workspaceUris });
+        const inventory = scanLocalPluginInventory({ configDir, dataDir, workspaceUris, linkInfoOverride });
         return checkPluginUpdates({
           catalog: lastCatalog,
           inventory,
@@ -463,7 +632,7 @@ export async function createMarketSidecarServer(options = {}) {
       if (!lastCatalog) {
         await ensureCatalogLoaded({ forceCatalogRefresh: false, includeReadmes: false }).catch(() => null);
       }
-      const inventory = scanLocalPluginInventory({ configDir, workspaceUris });
+      const inventory = scanLocalPluginInventory({ configDir, dataDir, workspaceUris, linkInfoOverride });
       const disc = await fetchPluginDiscussions({
         id: pluginId,
         catalog: lastCatalog || { plugins: [] },
@@ -495,24 +664,124 @@ export async function createMarketSidecarServer(options = {}) {
 
     if (req.method === 'GET' && pathname === '/api/readme') {
       const pluginId = String(urlObj.searchParams.get('id') || '').trim();
-      if (!pluginId) {
-        sendJson(res, 400, { ok: false, error: 'Missing query parameter: id' });
+      const requestedDir = String(urlObj.searchParams.get('dir') || '').trim();
+      const rawLocale = String(urlObj.searchParams.get('locale') || prefs.locale || 'zh')
+        .trim()
+        .toLowerCase();
+      const locale = rawLocale.startsWith('en') ? 'en' : 'zh';
+
+      if (!pluginId && !requestedDir) {
+        sendJson(res, 400, { ok: false, error: 'Missing query parameter: id or dir' });
         return;
       }
-      let markdown = lastCatalog?.readmes?.[pluginId] || '';
-      if (!markdown) {
-        const withReadmes = await resolveMarketCatalog({
-          dataDir,
-          prefs,
-          forceRefresh: false,
-          includeReadmes: true,
-          fetchImpl,
-          mirrors,
-        });
-        lastCatalog = withReadmes;
-        markdown = withReadmes.readmes?.[pluginId] || '';
+
+      if (pluginId && !hasLoadedReadmes(lastCatalog)) {
+        try {
+          lastCatalog = await resolveMarketCatalog({
+            dataDir,
+            prefs,
+            forceRefresh: false,
+            includeReadmes: true,
+            fetchImpl,
+            mirrors,
+          });
+        } catch {
+          /* continue with local fallback */
+        }
       }
-      sendJson(res, 200, { ok: true, id: pluginId, markdown });
+
+      // Resolve optional local plugin root (active or parked)
+      let localPluginPath = '';
+      let resolvedDir = '';
+      if (isSafeDirSlug(requestedDir)) {
+        const activeCand = join(pluginsDir, requestedDir);
+        const parkedCand = join(disabledPluginsDir, requestedDir);
+        if (existsSync(activeCand)) {
+          localPluginPath = activeCand;
+          resolvedDir = requestedDir;
+        } else if (existsSync(parkedCand)) {
+          localPluginPath = parkedCand;
+          resolvedDir = requestedDir;
+        }
+      }
+      if (!localPluginPath && pluginId) {
+        const inv = scanLocalPluginInventory({ configDir, dataDir });
+        const matched = inv.installed.find(
+          (x) => x.receipt?.id === pluginId || x.dir === pluginId || x.name === pluginId,
+        );
+        if (matched) {
+          localPluginPath = matched.path;
+          resolvedDir = matched.dir;
+        }
+      }
+
+      const catZh = pluginId ? String(lastCatalog?.readmesZh?.[pluginId] || '') : '';
+      const catEn = pluginId ? String(lastCatalog?.readmesEn?.[pluginId] || '') : '';
+      const catDefault = pluginId ? String(lastCatalog?.readmes?.[pluginId] || '') : '';
+
+      const localZh = localPluginPath ? readFirstExistingReadme(localPluginPath, ZH_README_FILENAMES) : '';
+      const localEn = localPluginPath ? readFirstExistingReadme(localPluginPath, EN_README_FILENAMES) : '';
+      const localDefault = localPluginPath ? readFirstExistingReadme(localPluginPath, DEFAULT_README_FILENAMES) : '';
+
+      let markdown = '';
+      let isTranslatedOrNativeZh = false;
+
+      if (locale === 'zh') {
+        if (catZh.trim()) {
+          markdown = catZh;
+          isTranslatedOrNativeZh = true;
+        } else if (localZh.trim()) {
+          markdown = localZh;
+          isTranslatedOrNativeZh = true;
+        } else if (catDefault.trim() && CJK_CHAR_RE.test(catDefault)) {
+          markdown = catDefault;
+          isTranslatedOrNativeZh = true;
+        } else if (localDefault.trim() && CJK_CHAR_RE.test(localDefault)) {
+          markdown = localDefault;
+          isTranslatedOrNativeZh = true;
+        } else if (catDefault.trim()) {
+          markdown = catDefault;
+          isTranslatedOrNativeZh = false;
+        } else if (catEn.trim()) {
+          markdown = catEn;
+          isTranslatedOrNativeZh = false;
+        } else if (localDefault.trim()) {
+          markdown = localDefault;
+          isTranslatedOrNativeZh = CJK_CHAR_RE.test(localDefault);
+        } else if (localEn.trim()) {
+          markdown = localEn;
+          isTranslatedOrNativeZh = false;
+        }
+      } else {
+        if (catEn.trim()) {
+          markdown = catEn;
+          isTranslatedOrNativeZh = CJK_CHAR_RE.test(catEn);
+        } else if (localEn.trim()) {
+          markdown = localEn;
+          isTranslatedOrNativeZh = CJK_CHAR_RE.test(localEn);
+        } else if (catDefault.trim()) {
+          markdown = catDefault;
+          isTranslatedOrNativeZh = CJK_CHAR_RE.test(catDefault);
+        } else if (localDefault.trim()) {
+          markdown = localDefault;
+          isTranslatedOrNativeZh = CJK_CHAR_RE.test(localDefault);
+        } else if (catZh.trim()) {
+          markdown = catZh;
+          isTranslatedOrNativeZh = true;
+        } else if (localZh.trim()) {
+          markdown = localZh;
+          isTranslatedOrNativeZh = true;
+        }
+      }
+
+      sendJson(res, 200, {
+        ok: true,
+        id: pluginId || resolvedDir || requestedDir,
+        dir: resolvedDir || requestedDir,
+        locale,
+        isTranslatedOrNativeZh,
+        markdown,
+      });
       return;
     }
 
@@ -564,6 +833,7 @@ export async function createMarketSidecarServer(options = {}) {
         }
         const inventory = scanLocalPluginInventory({
           configDir,
+          dataDir,
           workspaceUris: Array.isArray(body.workspaceUris) ? body.workspaceUris : [],
         });
         const preflight = resolveInstallPreflight(plugin, inventory, {
@@ -574,14 +844,71 @@ export async function createMarketSidecarServer(options = {}) {
         return;
       }
 
+      if (pathname === '/api/toggle-plugin') {
+        const workspaceUris = Array.isArray(body.workspaceUris) ? body.workspaceUris : [];
+        if (!lastCatalog) {
+          await ensureCatalogLoaded({ forceCatalogRefresh: false, includeReadmes: false }).catch(() => null);
+        }
+        const catalogCapabilities = findCatalogCapabilitiesForDir(String(body.dir || '').trim());
+        const toggleRes = toggleInstalledPlugin({
+          dir: body.dir,
+          enabled: body.enabled,
+          configDir,
+          dataDir,
+          catalogCapabilities,
+          nowMs: nowFn(),
+          renameOverride,
+          rmOverride,
+          unlinkOverride,
+        });
+        invalidateUpdateCheckState();
+        const state = await buildEnrichedState({ forceCatalogRefresh: false, workspaceUris });
+        sendJson(res, 200, {
+          ...toggleRes,
+          conflictsSummary: state.conflictsSummary,
+          state,
+        });
+        return;
+      }
+
+      if (pathname === '/api/fix-conflict') {
+        const workspaceUris = Array.isArray(body.workspaceUris) ? body.workspaceUris : [];
+        const fixRes = fixLocalConflict({
+          type: body.type,
+          targetDir: body.targetDir,
+          suggestedDir: body.suggestedDir || '',
+          configDir,
+          dataDir,
+          linkInfoOverride,
+          unlinkLinkOverride,
+        });
+        invalidateUpdateCheckState();
+        const state = await buildEnrichedState({ forceCatalogRefresh: false, workspaceUris });
+        const freshInv = scanLocalPluginInventory({ configDir, dataDir, workspaceUris, linkInfoOverride });
+        const conflicts = scanLocalConflicts({
+          inventory: { ...freshInv, installed: state.installed },
+          configDir,
+          dataDir,
+          workspaceUris,
+          catalogPlugins: lastCatalog?.plugins || [],
+        });
+        sendJson(res, 200, {
+          ...fixRes,
+          conflicts,
+          state,
+        });
+        return;
+      }
+
       if (pathname === '/api/install' || pathname === '/api/update') {
         const targetId = String(body.id || '').trim();
         if (!lastCatalog) {
           await buildEnrichedState({ forceCatalogRefresh: false });
         }
-        const plugin = body.plugin && typeof body.plugin === 'object'
-          ? body.plugin
-          : (lastCatalog?.plugins || []).find((p) => p.id === targetId);
+        const plugin =
+          body.plugin && typeof body.plugin === 'object'
+            ? body.plugin
+            : (lastCatalog?.plugins || []).find((p) => p.id === targetId);
 
         if (!plugin) {
           sendJson(res, 404, { ok: false, error: `Plugin "${targetId}" not found in active catalog` });
@@ -617,7 +944,7 @@ export async function createMarketSidecarServer(options = {}) {
         const workspaceUris = Array.isArray(body.workspaceUris) ? body.workspaceUris : [];
         const confirmEscalation = Boolean(body.confirmEscalation);
         await ensureCatalogLoaded({ forceCatalogRefresh: false, includeReadmes: false });
-        const inventory = scanLocalPluginInventory({ configDir, workspaceUris });
+        const inventory = scanLocalPluginInventory({ configDir, dataDir, workspaceUris, linkInfoOverride });
         const catalogPlugins = lastCatalog?.plugins || [];
 
         const queue = [];
@@ -734,7 +1061,10 @@ export async function createMarketSidecarServer(options = {}) {
               ...(out.escalation ? { escalation: out.escalation } : {}),
               ...(out.conflict ? { conflict: out.conflict } : {}),
               ...(out.isSelfUpdate ? { isSelfUpdate: true } : {}),
+              ...(out.parkedByMarket !== undefined ? { parkedByMarket: out.parkedByMarket } : {}),
               ...(out.reloadRequired !== undefined ? { reloadRequired: out.reloadRequired } : {}),
+              ...(out.restartRequired !== undefined ? { restartRequired: out.restartRequired } : {}),
+              ...(out.activation ? { activation: out.activation } : {}),
               ...(out.customizationUri ? { customizationUri: out.customizationUri } : {}),
               ...(out.sidecarPane !== undefined ? { sidecarPane: out.sidecarPane } : {}),
             });
@@ -753,6 +1083,7 @@ export async function createMarketSidecarServer(options = {}) {
         invalidateUpdateCheckState();
         const state = await buildEnrichedState({ forceCatalogRefresh: false, workspaceUris });
         const allOk = results.every((r) => r.ok);
+        const restartRequired = results.some((r) => Boolean(r.restartRequired));
         sendJson(
           res,
           200,
@@ -760,6 +1091,7 @@ export async function createMarketSidecarServer(options = {}) {
             ok: allOk,
             results,
             willRestart: didSelfUpdate,
+            restartRequired,
             state,
           },
           didSelfUpdate ? () => onSelfRestart() : null,

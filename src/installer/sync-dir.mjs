@@ -85,6 +85,17 @@ function writeRetiredBinariesList(dataDir, pathsList) {
 }
 
 /**
+ * Appends retired `*.old.<ts>` binary paths to `${dataDir}/retired-binaries.json` for later GC.
+ */
+export function recordRetiredBinaries(dataDir, newPaths = []) {
+  const additions = Array.isArray(newPaths) ? newPaths.filter((p) => typeof p === 'string' && p.trim()) : [];
+  if (additions.length === 0) return readRetiredBinariesList(dataDir);
+  const merged = [...new Set([...readRetiredBinariesList(dataDir), ...additions])];
+  writeRetiredBinariesList(dataDir, merged);
+  return merged;
+}
+
+/**
  * Sweeps `retired-binaries.json` and deletes any `*.old.<ts>` file whose Windows handle has closed.
  */
 export function sweepRetiredBinaries(dataDir) {

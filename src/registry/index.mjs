@@ -150,7 +150,7 @@ export async function loadCatalogFromNpmMirror(
         track: 'unverified',
         plugins: [],
       };
-      const readmesJson = pickJson('readmes.json') || { schemaVersion: 1, entries: {} };
+      const readmesJson = pickJson('readmes.json') || { schemaVersion: 1, entries: {}, entriesZh: {}, entriesEn: {} };
 
       writeCachedJson(cacheDir, 'index', indexJson, { channel: 'npm-mirror', mirrorBase, version: packument.version });
       writeCachedJson(cacheDir, 'unverified-index', unverifiedIndexJson, {
@@ -290,7 +290,12 @@ export async function resolveMarketCatalog({
       unverifiedFeed = readCachedJson(cacheDir, 'unverified-index').data || unverifiedFeed;
     }
     if (includeReadmes) {
-      readmesFeed = readCachedJson(cacheDir, 'readmes').data || { schemaVersion: 1, entries: {} };
+      readmesFeed = readCachedJson(cacheDir, 'readmes').data || {
+        schemaVersion: 1,
+        entries: {},
+        entriesZh: {},
+        entriesEn: {},
+      };
     }
   }
 
@@ -356,12 +361,18 @@ export async function resolveMarketCatalog({
     }
   }
 
+  const resolvedReadmes = readmesFeed || readCachedJson(cacheDir, 'readmes').data || {};
+
   return {
     channelUsed,
     catalogVersion: verifiedFeed?.catalogVersion || '',
     generatedAt: verifiedFeed?.generatedAt || null,
     plugins: mergedPlugins,
-    readmes: readmesFeed?.entries || readCachedJson(cacheDir, 'readmes').data?.entries || {},
+    readmes: resolvedReadmes.entries && typeof resolvedReadmes.entries === 'object' ? resolvedReadmes.entries : {},
+    readmesZh:
+      resolvedReadmes.entriesZh && typeof resolvedReadmes.entriesZh === 'object' ? resolvedReadmes.entriesZh : {},
+    readmesEn:
+      resolvedReadmes.entriesEn && typeof resolvedReadmes.entriesEn === 'object' ? resolvedReadmes.entriesEn : {},
     warnings,
   };
 }

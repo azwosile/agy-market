@@ -1,5 +1,7 @@
 // Safe zero-dependency Markdown-to-HTML renderer for plugin README & changelog previews (`src/ui/markdown.mjs`).
 // Escapes all raw HTML first so untrusted READMEs and release notes cannot inject scripts or event handlers.
+// Converts internal `sidecar://` and `customization://` URIs into copyable interactive buttons so zero raw
+// Chromium-blocked protocol `<a href>` links ever appear inside the isolated Sidecar iframe.
 
 export function escapeHtml(str) {
   return String(str ?? '')
@@ -19,13 +21,15 @@ function formatInline(escapedLine) {
     return `\u0000CODE${idx}\u0000`;
   });
 
-  // Markdown links (allow only safe http(s), sidecar://, customization:// schemes)
+  // Markdown links: http(s) open externally; internal `sidecar://` & `customization://` render as copyable pill buttons
   text = text.replace(
     /\[([^\]]+)\]\((https?:\/\/[^\s)]+|sidecar:\/\/[^\s)]+|customization:\/\/[^\s)]+)\)/g,
     (_m, label, url) => {
       const isInternal = url.startsWith('sidecar://') || url.startsWith('customization://');
-      const attrs = isInternal ? '' : ' target="_blank" rel="noopener noreferrer"';
-      return `<a href="${url}"${attrs} class="md-link">${label}</a>`;
+      if (isInternal) {
+        return `<button type="button" class="md-pill-btn" data-action="copy-uri-pill" data-uri="${url}" data-label="${label}" title="点击复制聊天药丸 / Click to copy chat pill">${label}</button>`;
+      }
+      return `<a href="${url}" target="_blank" rel="noopener noreferrer" class="md-link">${label}</a>`;
     },
   );
 

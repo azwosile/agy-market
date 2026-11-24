@@ -3,52 +3,91 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>AGY Market — Google Antigravity 社区可视化插件市场</title>
+  <title>AGY Market v1.2 — 极光棱镜 · Google Antigravity 社区可视化插件市场</title>
   <link rel="stylesheet" href="./styles.css" />
 </head>
 <body>
+  <div class="aurora-bg" aria-hidden="true"></div>
+  <div class="prism-top-line" aria-hidden="true"></div>
+
   <header class="hero">
     <div class="hero-inner">
-      <div class="hero-badge">Zero-Token Sidecar · SHA-256 Verified · Non-npm Language Agnostic</div>
+      <div class="hero-badge">
+        <span class="badge-dot" aria-hidden="true"></span>
+        <span>v1.2 Aurora Prism · 零 Token 辅助面板 · SHA-256 强校验 · 全语言生态</span>
+      </div>
       <h1>AGY Market · 反重力插件市场</h1>
       <p class="hero-lead">
-        在 Google Antigravity 右侧辅助面板内一键浏览、搜索与安装社区插件（Markdown 技能、Python/Rust/Go/Node MCP 服务与 Sidecar 面板），内置双轨自动收录与国内高速镜像兜底。
+        在 Google Antigravity 右侧辅助面板内以极光棱镜玻璃美学一键浏览、安装、停放仓即时启停社区插件（Markdown 技能、Python / Rust / Go / Node MCP 服务与 Sidecar 面板），内置 5 层冲突雷达与国内双通道镜像加速。
       </p>
+
+      <div class="feature-pills" aria-label="核心特性">
+        <span class="feat-pill">✦ 极光棱镜高定 UI</span>
+        <span class="feat-pill">⇄ 卡片底部原生启停滑块</span>
+        <span class="feat-pill">🛡 5 层插件冲突健康雷达</span>
+        <span class="feat-pill">⚡ 智能重启生效分级引擎</span>
+        <span class="feat-pill">🌏 中文 README 抽屉直览</span>
+      </div>
 
       <div class="bootstrap-box">
         <div class="boot-tabs">
-          <button class="boot-tab active" data-cmd="npx agy-market@latest">npx 一行安装</button>
-          <button class="boot-tab" data-cmd="irm https://raw.githubusercontent.com/azwosile/agy-market/main/scripts/install.ps1 | iex">Windows PowerShell (零 npm)</button>
-          <button class="boot-tab" data-cmd="curl -fsSL https://raw.githubusercontent.com/azwosile/agy-market/main/scripts/install.sh | sh">macOS / Linux Shell</button>
+          <button type="button" class="boot-tab active" data-cmd="npx agy-market@latest">npx 一行安装</button>
+          <button type="button" class="boot-tab" data-cmd="irm https://raw.githubusercontent.com/azwosile/agy-market/main/scripts/install.ps1 | iex">Windows PowerShell（零 npm）</button>
+          <button type="button" class="boot-tab" data-cmd="curl -fsSL https://raw.githubusercontent.com/azwosile/agy-market/main/scripts/install.sh | sh">macOS / Linux Shell</button>
         </div>
         <div class="boot-code-row">
           <code id="boot-cmd-text">npx agy-market@latest</code>
-          <button id="copy-boot-btn" class="copy-btn">复制命令</button>
+          <button type="button" id="copy-boot-btn" class="copy-btn">复制命令</button>
         </div>
       </div>
     </div>
   </header>
 
   <main class="container">
+    <section class="stats-strip" id="site-stats">
+      <div class="stat-pill">
+        <span class="stat-k">已收录社区插件</span>
+        <strong class="stat-v" id="stat-total">—</strong>
+      </div>
+      <div class="stat-pill">
+        <span class="stat-k">安全校验机制</span>
+        <strong class="stat-v">SHA-256 + 4 层静态扫描</strong>
+      </div>
+      <div class="stat-pill">
+        <span class="stat-k">启停控制</span>
+        <strong class="stat-v">停放仓无损滑块（免改 config.json）</strong>
+      </div>
+      <div class="stat-pill">
+        <span class="stat-k">目录通道</span>
+        <strong class="stat-v" id="stat-channel">同步中…</strong>
+      </div>
+    </section>
+
     <section class="controls-bar">
-      <input id="site-search" type="search" placeholder="搜索社区插件、分类或能力标签…" />
-      <select id="site-category">
+      <input id="site-search" type="search" placeholder="搜索社区插件名称、能力徽章、MCP 或分类标签…" />
+      <select id="site-category" aria-label="插件分类">
         <option value="all">全部分类</option>
         <option value="productivity">效率与工作流</option>
         <option value="ui-themes">界面与主题美化</option>
         <option value="developer-tools">开发者工具</option>
         <option value="mcp-integrations">MCP 服务集成</option>
         <option value="skills-workflows">技能与自动化</option>
+        <option value="security">安全与审计</option>
       </select>
-      <input id="site-feed-url" type="url" value="https://azwosile.github.io/agy-market-catalog/index.json" title="Catalog index.json URL" />
-      <button id="site-load-btn" class="load-btn">同步目录</button>
+      <input id="site-feed-url" type="url" value="https://azwosile.github.io/agy-market-catalog/index.json" title="目录 index.json 地址" />
+      <button type="button" id="site-load-btn" class="load-btn">同步目录</button>
     </section>
 
     <section id="site-grid" class="grid"></section>
   </main>
 
   <footer class="site-footer">
-    <span>AGY Market Suite · MIT License · 提交插件 PR 请前往 <a href="https://github.com/azwosile/agy-market-catalog" target="_blank" rel="noopener noreferrer" style="color:inherit"><code>azwosile/agy-market-catalog</code></a></span>
+    <span>
+      AGY Market Suite · MIT License · 客户端源码
+      <a href="https://github.com/azwosile/agy-market" target="_blank" rel="noopener noreferrer"><code>azwosile/agy-market</code></a>
+      · 提交社区插件 PR 请前往
+      <a href="https://github.com/azwosile/agy-market-catalog" target="_blank" rel="noopener noreferrer"><code>azwosile/agy-market-catalog</code></a>
+    </span>
   </footer>
 
   <script src="./app.js"></script>

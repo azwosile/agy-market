@@ -33,6 +33,7 @@ export async function installLocalAgyMarket({ destPluginsDir = '' } = {}) {
     'agy-market.json',
     'package.json',
     'README.md',
+    'README.en.md',
     'LICENSE',
     'assets',
     'bin',

@@ -23,6 +23,10 @@ export function resolveMarketDataDir(explicitDataDir = '') {
   return join(homedir(), '.gemini', 'sidecar_data', PLUGIN_ID, SIDECAR_ID, 'data');
 }
 
+export function resolveDisabledPluginsDir(explicitDataDir = '') {
+  return join(resolveMarketDataDir(explicitDataDir), 'disabled-plugins');
+}
+
 export function fileUriToLocalPath(uri) {
   if (typeof uri !== 'string' || !uri.startsWith('file://')) return null;
   try {

@@ -187,6 +187,9 @@ export function buildInstallReceipt({
       badges: Array.isArray(cap.badges) ? [...cap.badges] : [],
       mcpRemoteDomains: Array.isArray(cap.mcpRemoteDomains) ? [...cap.mcpRemoteDomains] : [],
       hookEvents: Array.isArray(cap.hookEvents) ? [...cap.hookEvents] : [],
+      ...(Array.isArray(cap.hostEnhancementKind) && cap.hostEnhancementKind.length > 0
+        ? { hostEnhancementKind: [...cap.hostEnhancementKind] }
+        : {}),
     },
     installedAt: previousInstalledAt || nowIso,
     updatedAt: nowIso,

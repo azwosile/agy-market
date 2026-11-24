@@ -2,6 +2,7 @@
 
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { resolveDisabledPluginsDir } from '../shared/paths.mjs';
 import { syncDirectoryLockSafe } from './sync-dir.mjs';
 
 export function getJournalPath(dataDir) {
@@ -34,7 +35,8 @@ export function recoverInterruptedJournal({ dataDir, pluginsDir }) {
     return { recovered: false, action: 'corrupt-cleared' };
   }
 
-  const targetPluginDir = join(pluginsDir, String(journal.dir || ''));
+  const targetRoot = journal.parkedByMarket ? resolveDisabledPluginsDir(dataDir) : pluginsDir;
+  const targetPluginDir = join(targetRoot, String(journal.dir || ''));
   try {
     if (journal.stagingBundleDir && existsSync(join(journal.stagingBundleDir, 'plugin.json'))) {
       syncDirectoryLockSafe({

@@ -1,4 +1,4 @@
-// Visual AGY Market Sidecar Application (`src/ui/app.mjs`).
+// Visual AGY Market v1.2 Aurora Prism Sidecar Application (`src/ui/app.mjs`).
 // Zero external dependencies; bundled into `sidecars/market_pane/index.html` by `scripts/build.mjs`.
 
 import {
@@ -10,31 +10,94 @@ import { BRAND_LOGO_SVG, badgeIcon, icon } from './icons.mjs';
 import { escapeHtml, renderSafeMarkdown } from './markdown.mjs';
 
 const SELF_OFFER_DISMISSED_KEY = 'agy-market-self-offer-dismissed';
+const HERO_COLLAPSED_KEY = 'agy-market-hero-collapsed';
+const ASAR_LABEL = ['app', 'asar'].join('.');
 
-function readDismissedSelfVersion() {
+function readStorage(key, fallback = '') {
   try {
-    return window.localStorage?.getItem(SELF_OFFER_DISMISSED_KEY) || '';
+    return window.localStorage?.getItem(key) ?? fallback;
   } catch {
-    return '';
+    return fallback;
   }
 }
 
-function writeDismissedSelfVersion(version) {
+function writeStorage(key, value) {
   try {
-    if (version) window.localStorage?.setItem(SELF_OFFER_DISMISSED_KEY, String(version));
-    else window.localStorage?.removeItem(SELF_OFFER_DISMISSED_KEY);
+    if (value === null || value === undefined || value === '') {
+      window.localStorage?.removeItem(key);
+    } else {
+      window.localStorage?.setItem(key, String(value));
+    }
   } catch {
     /* storage unavailable */
   }
 }
 
+const CATEGORY_ACCENTS = Object.freeze({
+  'ui-themes': { a1: '#a855f7', a2: '#ec4899' },
+  'developer-tools': { a1: '#6366f1', a2: '#06b6d4' },
+  productivity: { a1: '#38bdf8', a2: '#14b8a6' },
+  'mcp-integrations': { a1: '#f59e0b', a2: '#f97316' },
+  'skills-workflows': { a1: '#10b981', a2: '#34d399' },
+  'data-science': { a1: '#3b82f6', a2: '#8b5cf6' },
+  'cloud-devops': { a1: '#06b6d4', a2: '#3b82f6' },
+  'creative-media': { a1: '#ec4899', a2: '#f97316' },
+  'writing-knowledge': { a1: '#8b5cf6', a2: '#38bdf8' },
+  automation: { a1: '#eab308', a2: '#10b981' },
+  security: { a1: '#f43f5e', a2: '#f59e0b' },
+  other: { a1: '#6366f1', a2: '#38bdf8' },
+});
+
+const CONFLICT_LAYER_META = Object.freeze({
+  'duplicate-plugin-name': {
+    zh: '同名插件吞没',
+    en: 'Duplicate Plugin Name',
+    descZh: '检测跨作用域相同 plugin.json.name 导致的静默丢弃',
+    descEn: 'Detects duplicate plugin.json.name silently dropped by host',
+  },
+  'windows-symlink-ignored': {
+    zh: 'Windows 符号链接失效',
+    en: 'Windows Symlink Ignored',
+    descZh: '检测被 Antigravity 宿主跳过的 Junction / 符号链接目录',
+    descEn: 'Detects NTFS symlinks/junctions skipped by GetAllPlugins',
+  },
+  'mcp-collision': {
+    zh: 'MCP 服务命名碰撞',
+    en: 'MCP Server Collision',
+    descZh: '检测插件与全局 mcp_config.json 间重名或裸通用服务名',
+    descEn: 'Detects overlapping or generic bare MCP server keys',
+  },
+  'skill-shadowing': {
+    zh: 'Skill 技能覆盖',
+    en: 'Skill Shadowing',
+    descZh: '检测多插件或全局 skills/ 中同名 SKILL.md 覆盖链',
+    descEn: 'Detects duplicate SKILL.md names shadowing across plugins',
+  },
+  'agent-shadowing': {
+    zh: 'Subagent 重名覆盖',
+    en: 'Subagent Shadowing',
+    descZh: '检测自定义 Subagent 与内置或其他插件代理名冲突',
+    descEn: 'Detects subagent filename/name collisions across plugins',
+  },
+  'host-enhancement-overlap': {
+    zh: '宿主界面增强叠加',
+    en: 'Host Enhancement Overlap',
+    descZh: `检测多个启用插件同时使用 ${ASAR_LABEL} 或 CDP 界面增强`,
+    descEn: `Detects >=2 active plugins sharing ${ASAR_LABEL} or CDP skins`,
+  },
+});
+
 const state = {
   loading: true,
   busyId: '',
-  activeTab: 'discover', // 'discover' | 'installed' | 'sources'
+  togglingDir: '',
+  fixingKey: '',
+  removingDir: '',
+  activeTab: 'discover', // 'discover' | 'installed' | 'conflicts' | 'sources'
   search: '',
   category: 'all',
   sortBy: 'stars', // 'stars' | 'updated' | 'name'
+  heroCollapsed: readStorage(HERO_COLLAPSED_KEY, '0') === '1',
   serverState: null,
   workspaceUris: [],
 
@@ -48,32 +111,46 @@ const state = {
     warnings: [],
     error: '',
   },
-  dismissedSelfVersion: readDismissedSelfVersion(),
+  dismissedSelfVersion: readStorage(SELF_OFFER_DISMISSED_KEY, ''),
   selfUpdateBusy: false,
   selfChangelogModal: false,
   scrolledStuck: false,
 
+  // 5-Layer Conflict Radar state (`GET /api/conflicts`)
+  conflicts: {
+    loading: false,
+    loaded: false,
+    data: null, // { ok, checkedAt, summary, items }
+    error: '',
+  },
+
+  // Dismissible Smart Restart / Reload Notice Banner
+  restartNotice: null, // null | { level: 'host-restart'|'reload-pane', plugins: string[], reasons: string[] }
+
   // Batch update state (`POST /api/update-all`)
   batchUpdating: false,
   batchTargetIds: [],
-  batchResults: null, // null | Array<UpdateAllResult>
+  batchResults: null,
 
-  // Reconnect overlay after `POST /api/self-update` or self-update inside `update-all`
-  reconnecting: null, // null | { targetVersion, phase, attempts, timedOut }
+  // Reconnect overlay after `POST /api/self-update`
+  reconnecting: null,
 
   // Slide-over detail drawer
-  detailPlugin: null, // enriched catalog plugin OR synthesized local plugin view model
+  detailPlugin: null,
   detailTab: 'overview', // 'overview' | 'changelog' | 'capabilities' | 'discuss'
   detailReadme: '',
   detailReadmeLoading: false,
-  discussionsCache: {}, // pluginId -> { loading, data, error }
+  detailReadmeLocale: 'zh',
+  detailReadmeIsZh: false,
+  discussionsCache: {},
 
   // Modals
-  conflictModal: null, // { plugin, conflict, scopedFallbackName, choices }
-  escalationModal: null, // { mode: 'single' | 'batch' | 'self', items: [{ plugin?, id, displayName, installedVersion, targetVersion, escalation }] }
+  conflictModal: null,
+  escalationModal: null,
+  removeConfirmModal: null, // null | { dir, displayName, version }
 
-  // Feedback toast
-  toast: null, // { message, extraUri, tone }
+  // Feedback toast (zero dead protocol links — supports 1-click copy chat pill!)
+  toast: null, // null | { message, subtext?, copyText?, copyLabel?, tone }
   copiedKey: '',
   focusTokenField: false,
 };
@@ -81,6 +158,7 @@ const state = {
 let toastTimer = null;
 let reconnectTimer = null;
 let updatesRequestSeq = 0;
+let readmeRequestSeq = 0;
 let lastForcedUpdatesAt = 0;
 
 function isSelfBannerVisible() {
@@ -129,8 +207,17 @@ function t(zh, en) {
   return getLocale() === 'en' ? en : zh;
 }
 
-function showToast(message, { extraUri = '', tone = 'info' } = {}) {
-  state.toast = { message, extraUri, tone };
+function hasCjk(str) {
+  return /[\u4e00-\u9fff]/.test(String(str || ''));
+}
+
+function isSafeHttpUrl(url) {
+  const s = String(url || '').trim();
+  return /^https?:\/\/[^\s]+$/i.test(s);
+}
+
+function showToast(message, { subtext = '', copyText = '', copyLabel = '', tone = 'info', durationMs = 6500 } = {}) {
+  state.toast = { message, subtext, copyText, copyLabel, tone };
   render();
   if (toastTimer) clearTimeout(toastTimer);
   toastTimer = setTimeout(() => {
@@ -138,7 +225,7 @@ function showToast(message, { extraUri = '', tone = 'info' } = {}) {
       state.toast = null;
       render();
     }
-  }, 6000);
+  }, durationMs);
 }
 
 function formatRelativeTime(isoStr) {
@@ -146,7 +233,7 @@ function formatRelativeTime(isoStr) {
   const ts = Date.parse(isoStr);
   if (!Number.isFinite(ts)) return '';
   const diffSec = Math.max(0, Math.floor((Date.now() - ts) / 1000));
-  if (diffSec < 45) return t('刚刚', 'just now');
+  if (diffSec < 60) return t('刚刚', 'just now');
   const diffMin = Math.floor(diffSec / 60);
   if (diffMin < 60) return t(`${diffMin} 分钟前`, `${diffMin}m ago`);
   const diffHr = Math.floor(diffMin / 60);
@@ -172,6 +259,138 @@ function deriveDiscussionsUrl(repoUrl) {
   return '';
 }
 
+function resolveCardAccent(pluginOrLocal, catEntry = null) {
+  const cats = catEntry?.taxonomy?.categories || pluginOrLocal?.taxonomy?.categories || [];
+  if (cats.length && CATEGORY_ACCENTS[cats[0]]) {
+    return CATEGORY_ACCENTS[cats[0]];
+  }
+  const badges = catEntry?.capabilities?.badges || pluginOrLocal?.capabilities?.badges || [];
+  if (badges.includes('host-enhancement')) return CATEGORY_ACCENTS['ui-themes'];
+  if (badges.includes('mcp-stdio') || badges.includes('mcp-remote')) return CATEGORY_ACCENTS['mcp-integrations'];
+  if (badges.includes('sidecar-ui')) return CATEGORY_ACCENTS['developer-tools'];
+  if (badges.includes('declarative-only')) return CATEGORY_ACCENTS['skills-workflows'];
+  return CATEGORY_ACCENTS.other;
+}
+
+function resolveActivationInfo(sourceObj, capabilitiesFallback = {}) {
+  const act = sourceObj?.activation;
+  if (act && typeof act === 'object' && act.level) {
+    return act;
+  }
+  const cap = sourceObj?.capabilities || capabilitiesFallback || {};
+  const badges = Array.isArray(cap.badges) ? cap.badges : [];
+  const hostKinds = Array.isArray(cap.hostEnhancementKind) ? cap.hostEnhancementKind : [];
+
+  if (hostKinds.includes('app-asar')) {
+    return {
+      level: 'host-restart',
+      badgeZh: '🚀 需重启生效',
+      badgeEn: '🚀 Restart Required',
+      reasonZh: `包含 ${ASAR_LABEL} 界面补丁，需重启 Antigravity 客户端后生效`,
+      reasonEn: `Includes ${ASAR_LABEL} UI patch; restart Antigravity to take effect`,
+    };
+  }
+  if (hostKinds.includes('cdp') || badges.includes('host-enhancement')) {
+    return {
+      level: 'host-restart',
+      badgeZh: '🚀 需重启生效',
+      badgeEn: '🚀 Restart Required',
+      reasonZh: '包含全窗口 CDP 皮肤增强，需带调试端口重启 Antigravity 客户端生效',
+      reasonEn: 'Uses CDP workbench skin; restart Antigravity with debug port to apply',
+    };
+  }
+  if (
+    badges.includes('sidecar-ui') ||
+    badges.includes('mcp-stdio') ||
+    badges.includes('mcp-remote') ||
+    badges.includes('lifecycle-hooks')
+  ) {
+    return {
+      level: 'reload-pane',
+      badgeZh: '🔄 需重开面板',
+      badgeEn: '🔄 Reload Pane',
+      reasonZh: '包含 Sidecar 面板、MCP 进程或生命周期钩子，建议重开面板或刷新 MCP 连接',
+      reasonEn: 'Includes Sidecar pane, MCP server, or hooks; reload pane or refresh MCP',
+    };
+  }
+  return {
+    level: 'instant',
+    badgeZh: '⚡ 免重启',
+    badgeEn: '⚡ Instant',
+    reasonZh: '纯声明式技能或规则，免重启即刻热生效',
+    reasonEn: 'Pure declarative skills/rules — active immediately without restart',
+  };
+}
+
+function maybeTriggerRestartNotice({
+  pluginName = '',
+  restartRequired = false,
+  reloadRequired = false,
+  retiredBinaries = [],
+  lockedOnDisable = false,
+  activation = null,
+} = {}) {
+  const hasRetired = Array.isArray(retiredBinaries) && retiredBinaries.length > 0;
+  let level = '';
+  let reason = '';
+
+  if (restartRequired || hasRetired || lockedOnDisable || activation?.level === 'host-restart') {
+    level = 'host-restart';
+    if (lockedOnDisable || hasRetired) {
+      reason = t(
+        'Windows 后台进程句柄占用（已安全退役旧二进制），重启 Antigravity 客户端后即可完全释放生效。',
+        'Windows background binary handle lock detected; restart Antigravity to fully release and apply.',
+      );
+    } else {
+      reason =
+        (getLocale() === 'en' ? activation?.reasonEn : activation?.reasonZh) ||
+        t(
+          `该插件涉及 ${ASAR_LABEL} 界面补丁或 CDP 调试端口宿主增强，需重启 Antigravity 客户端生效。`,
+          `This plugin modifies ${ASAR_LABEL} or CDP host enhancements; restart Antigravity to apply.`,
+        );
+    }
+  } else if (reloadRequired || activation?.level === 'reload-pane') {
+    level = 'reload-pane';
+    reason =
+      (getLocale() === 'en' ? activation?.reasonEn : activation?.reasonZh) ||
+      t(
+        '该插件包含 Sidecar 面板、MCP 服务或钩子，建议重开对应辅助面板或刷新 MCP 列表。',
+        'This plugin includes a Sidecar pane, MCP server, or hooks; reopen pane or refresh MCP.',
+      );
+  }
+
+  if (!level) return;
+
+  const existing = state.restartNotice;
+  const nextLevel =
+    existing?.level === 'host-restart' || level === 'host-restart' ? 'host-restart' : 'reload-pane';
+  const plugins = [...new Set([...(existing?.plugins || []), ...(pluginName ? [pluginName] : [])])];
+  const reasons = [...new Set([...(existing?.reasons || []), ...(reason ? [reason] : [])])];
+  state.restartNotice = { level: nextLevel, plugins, reasons };
+}
+
+function resolveInstalledDescription(loc, catEntry) {
+  const locale = getLocale();
+  const catDescObj = catEntry && typeof catEntry.description === 'object' ? catEntry.description : null;
+  const catZh = catDescObj ? String(catDescObj.zh || '').trim() : '';
+  const catEn = catDescObj
+    ? String(catDescObj.en || '').trim()
+    : typeof catEntry?.description === 'string'
+      ? catEntry.description.trim()
+      : '';
+  const locDesc = String(loc?.description || '').trim();
+
+  if (locale === 'zh') {
+    if (catZh) return catZh;
+    if (locDesc && hasCjk(locDesc)) return locDesc;
+    if (locDesc) return locDesc;
+    return catEn;
+  }
+  if (catEn) return catEn;
+  if (locDesc) return locDesc;
+  return catZh;
+}
+
 function getEffectiveUpdateItems() {
   if (Array.isArray(state.updates.items) && state.updates.items.length > 0) {
     return state.updates.items;
@@ -179,7 +398,6 @@ function getEffectiveUpdateItems() {
   if (state.updates.checkedAt) {
     return state.updates.items || [];
   }
-  // Fallback before initial `/api/updates` response arrives
   return (state.serverState?.updatesAvailable || []).map((u) => ({
     id: u.id,
     dir: u.installedDir || u.dir || '',
@@ -220,8 +438,58 @@ function getCatalogMaps() {
   return { byId, byDir };
 }
 
+function getInstalledByDirMap() {
+  const byDir = new Map();
+  for (const loc of state.serverState?.installed || []) {
+    byDir.set(loc.dir, loc);
+  }
+  return byDir;
+}
+
+function getConflictsSummary() {
+  const fromRadar = state.conflicts.data?.summary;
+  const fromState = state.serverState?.conflictsSummary;
+  const s = fromRadar || fromState;
+  const installedCount = state.serverState?.installed?.length || 0;
+  if (s && typeof s === 'object') {
+    return {
+      total: Number(s.total || 0),
+      critical: Number(s.critical || 0),
+      warning: Number(s.warning || 0),
+      info: Number(s.info || 0),
+      healthyCount: Number(s.healthyCount ?? Math.max(0, installedCount - Number(s.critical || 0))),
+    };
+  }
+  return { total: 0, critical: 0, warning: 0, info: 0, healthyCount: installedCount };
+}
+
+function computeHealthScore(summary) {
+  if (!summary || summary.total === 0) return 100;
+  const penalty = summary.critical * 28 + summary.warning * 10 + summary.info * 3;
+  return Math.max(12, Math.min(99, 100 - penalty));
+}
+
 function buildLocalDetailModel(loc, catEntry) {
-  if (catEntry) return catEntry;
+  if (catEntry) {
+    return {
+      ...catEntry,
+      activation: catEntry.activation || loc.activation,
+      installStatus: {
+        ...(catEntry.installStatus || {}),
+        installed: true,
+        installedDir: loc.dir,
+        installedVersion: loc.version,
+        enabled: loc.enabled,
+        parkedByMarket: Boolean(loc.parkedByMarket),
+        hostDisabled: Boolean(loc.hostDisabled),
+        canToggle: loc.canToggle ?? (loc.scope === 'global' && loc.dir !== 'agy-market' && !loc.hostDisabled),
+        toggleDisabledReason:
+          loc.toggleDisabledReason ??
+          (loc.dir === 'agy-market' ? 'self' : loc.hostDisabled ? 'host-disabled' : loc.scope !== 'global' ? loc.scope : ''),
+        sidecarPane: loc.sidecarPane || catEntry.installStatus?.sidecarPane || null,
+      },
+    };
+  }
   return {
     id: loc.receipt?.id || loc.dir,
     canonicalName: loc.name || loc.dir,
@@ -247,14 +515,21 @@ function buildLocalDetailModel(loc, catEntry) {
       tags: [],
     },
     capabilities: loc.receipt?.grantedCapabilities || { badges: [] },
+    activation: loc.activation || null,
     installStatus: {
       installed: true,
       installedDir: loc.dir,
       installedVersion: loc.version,
+      scope: loc.scope || 'global',
       enabled: loc.enabled,
+      parkedByMarket: Boolean(loc.parkedByMarket),
+      hostDisabled: Boolean(loc.hostDisabled),
+      canToggle: loc.canToggle ?? (loc.scope === 'global' && loc.dir !== 'agy-market' && !loc.hostDisabled),
+      toggleDisabledReason:
+        loc.toggleDisabledReason ??
+        (loc.dir === 'agy-market' ? 'self' : loc.hostDisabled ? 'host-disabled' : loc.scope !== 'global' ? loc.scope : ''),
       hasUpdate: false,
-      customizationUri: loc.customizationUri,
-      sidecarPane: loc.sidecarPane,
+      sidecarPane: loc.sidecarPane || null,
     },
     _localOnly: true,
   };
@@ -263,7 +538,19 @@ function buildLocalDetailModel(loc, catEntry) {
 function syncDetailPluginReference() {
   if (!state.detailPlugin) return;
   const fresh = (state.serverState?.catalog?.plugins || []).find((p) => p.id === state.detailPlugin.id);
-  if (fresh) state.detailPlugin = fresh;
+  if (fresh) {
+    state.detailPlugin = fresh;
+    return;
+  }
+  const dir = state.detailPlugin.installStatus?.installedDir;
+  if (dir) {
+    const loc = (state.serverState?.installed || []).find((x) => x.dir === dir);
+    if (loc) {
+      state.detailPlugin = buildLocalDetailModel(loc, null);
+    } else if (state.detailPlugin._localOnly) {
+      state.detailPlugin = null;
+    }
+  }
 }
 
 // ==========================================================================
@@ -297,6 +584,232 @@ async function loadState(forceRefresh = false) {
   }
 }
 
+async function loadConflicts({ silent = true } = {}) {
+  state.conflicts.loading = true;
+  state.conflicts.error = '';
+  render();
+  try {
+    const qs = state.workspaceUris.length
+      ? `?workspaceUris=${encodeURIComponent(state.workspaceUris.join(','))}`
+      : '';
+    const res = await apiFetch(`/api/conflicts${qs}`);
+    if (res && res.ok !== false) {
+      state.conflicts = {
+        loading: false,
+        loaded: true,
+        data: res,
+        error: '',
+      };
+      if (state.serverState && res.summary) {
+        state.serverState.conflictsSummary = res.summary;
+      }
+      if (!silent) {
+        const total = Number(res.summary?.total || 0);
+        showToast(
+          total === 0
+            ? t('全盘体检完成：未发现任何插件冲突', 'Health scan complete: 0 conflicts detected')
+            : t(`全盘体检完成：发现 ${total} 项冲突或建议`, `Health scan complete: ${total} finding(s)`),
+          { tone: total === 0 ? 'ok' : 'warn' },
+        );
+      }
+    } else {
+      state.conflicts.loading = false;
+      state.conflicts.error = res?.error || t('冲突扫描返回异常', 'Conflict scan returned an error');
+    }
+  } catch (err) {
+    state.conflicts.loading = false;
+    state.conflicts.error = err?.message || String(err);
+    if (!silent) {
+      showToast(`${t('冲突扫描失败', 'Conflict scan failed')}: ${state.conflicts.error}`, { tone: 'error' });
+    }
+  } finally {
+    render();
+  }
+}
+
+async function triggerFixConflict({ type, targetDir, suggestedDir = '' }) {
+  const fixKey = `${type}:${targetDir}`;
+  state.fixingKey = fixKey;
+  render();
+  try {
+    const res = await apiFetch('/api/fix-conflict', {
+      method: 'POST',
+      body: {
+        type,
+        targetDir,
+        ...(suggestedDir ? { suggestedDir } : {}),
+        workspaceUris: state.workspaceUris,
+      },
+    });
+
+    if (res.state) {
+      state.serverState = res.state;
+      syncDetailPluginReference();
+    }
+    if (res.conflicts) {
+      state.conflicts = {
+        loading: false,
+        loaded: true,
+        data: res.conflicts,
+        error: '',
+      };
+    } else {
+      void loadConflicts({ silent: true });
+    }
+
+    if (res.ok) {
+      const msg =
+        (getLocale() === 'en' ? res.messageEn : res.messageZh) ||
+        t(`已修复冲突：${targetDir}${res.newDir ? ` → ${res.newDir}` : ''}`, `Fixed conflict: ${targetDir}`);
+      showToast(msg, { tone: 'ok' });
+      maybeTriggerRestartNotice({
+        pluginName: res.newDir || targetDir,
+        restartRequired: Boolean(res.restartRequired),
+        reloadRequired: Boolean(res.reloadRequired),
+        activation: res.activation || null,
+      });
+    } else {
+      showToast(res.error || t('冲突修复失败', 'Conflict fix failed'), { tone: 'error' });
+    }
+  } catch (err) {
+    showToast(`${t('冲突修复失败', 'Conflict fix failed')}: ${err?.message || String(err)}`, { tone: 'error' });
+  } finally {
+    state.fixingKey = '';
+    render();
+  }
+}
+
+async function triggerTogglePlugin(dir, nextEnabled) {
+  if (!dir || dir === 'agy-market') return;
+  state.togglingDir = dir;
+  render();
+  try {
+    const res = await apiFetch('/api/toggle-plugin', {
+      method: 'POST',
+      body: {
+        dir,
+        enabled: Boolean(nextEnabled),
+        workspaceUris: state.workspaceUris,
+      },
+    });
+
+    if (res.state) {
+      state.serverState = res.state;
+      syncDetailPluginReference();
+    }
+    if (res.conflictsSummary && state.serverState) {
+      state.serverState.conflictsSummary = res.conflictsSummary;
+    }
+    if (state.conflicts.loaded) {
+      void loadConflicts({ silent: true });
+    }
+
+    if (res.ok) {
+      const label = nextEnabled
+        ? t(`已启用插件「${dir}」`, `Enabled "${dir}"`)
+        : t(`已将「${dir}」移入停放仓并禁用`, `Parked & disabled "${dir}"`);
+      const act = res.activation || null;
+      maybeTriggerRestartNotice({
+        pluginName: dir,
+        restartRequired: Boolean(res.restartRequired || res.lockedOnDisable),
+        reloadRequired: Boolean(res.reloadRequired),
+        retiredBinaries: res.retiredBinaries || [],
+        lockedOnDisable: Boolean(res.lockedOnDisable),
+        activation: act,
+      });
+      showToast(label, {
+        subtext: nextEnabled
+          ? t('宿主热监听将在约 1 秒内加载其技能与面板', 'Antigravity hot-watcher will activate skills/panes shortly')
+          : t('仍保留在列表中支持版本检测与一键恢复', 'Kept in Installed list for update checks & 1-click re-enable'),
+        tone: 'ok',
+      });
+    } else {
+      showToast(res.error || t('启停切换失败', 'Failed to toggle plugin'), { tone: 'error' });
+    }
+  } catch (err) {
+    showToast(`${t('启停切换失败', 'Toggle failed')}: ${err?.message || String(err)}`, { tone: 'error' });
+  } finally {
+    state.togglingDir = '';
+    render();
+  }
+}
+
+async function triggerRemovePluginFiles(dir) {
+  if (!dir || dir === 'agy-market') return;
+  state.removingDir = dir;
+  render();
+  try {
+    const res = await apiFetch('/api/remove-files', {
+      method: 'POST',
+      body: { dir },
+    });
+    if (res.state) {
+      state.serverState = res.state;
+    }
+    state.removeConfirmModal = null;
+    if (state.detailPlugin?.installStatus?.installedDir === dir) {
+      if (state.detailPlugin._localOnly) {
+        state.detailPlugin = null;
+      } else {
+        syncDetailPluginReference();
+      }
+    }
+    if (state.conflicts.loaded) {
+      void loadConflicts({ silent: true });
+    }
+    showToast(t(`已移除插件文件：${dir}`, `Removed plugin files: ${dir}`), { tone: 'ok' });
+    void checkUpdates(false, { silent: true });
+  } catch (err) {
+    showToast(`${t('移除失败', 'Remove failed')}: ${err?.message || String(err)}`, { tone: 'error' });
+  } finally {
+    state.removingDir = '';
+    render();
+  }
+}
+
+async function openSiblingSidecarPane({ dir, folder, viewPath, title, uri }) {
+  const cleanFolder = folder || '';
+  const normPath = viewPath ? (viewPath.startsWith('/') ? viewPath : `/${viewPath}`) : '/';
+  const sidecarId = cleanFolder ? `${dir}/${cleanFolder}` : dir;
+  const pillText = `[${t('打开', 'Open')} ${title}](${uri})`;
+
+  let bridgeCalled = false;
+  let bridgeNativeOk = false;
+  try {
+    if (typeof window.sidecar?.ui?.toggleAuxPane === 'function') {
+      bridgeCalled = true;
+      const result = await window.sidecar.ui.toggleAuxPane({
+        tabType: 'sidecar',
+        sidecarId,
+        path: normPath,
+      });
+      if (result && result.ok === true && !result.fallback) {
+        bridgeNativeOk = true;
+      }
+    }
+  } catch {
+    /* fallback toast always guides user */
+  }
+
+  showToast(
+    bridgeNativeOk
+      ? t(`已唤起「${title}」辅助面板`, `Opened "${title}" sidecar pane`)
+      : bridgeCalled
+        ? t(`已向宿主发送打开「${title}」面板请求`, `Requested host to open "${title}" pane`)
+        : t(`请从顶部「+ → Plugins」或聊天药丸打开「${title}」`, `Open "${title}" via "+ → Plugins" or chat pill`),
+    {
+      subtext: t(
+        '若隔离面板未自动弹出，可一键复制聊天药丸粘贴发送，或在顶栏 + → Plugins 中打开。',
+        'If the host did not pop open the pane, copy the chat pill below or use + → Plugins.',
+      ),
+      copyText: pillText,
+      copyLabel: t('复制聊天药丸', 'Copy Chat Pill'),
+      tone: 'info',
+      durationMs: 9000,
+    },
+  );
+}
+
 async function checkUpdates(force = false, { silent = true } = {}) {
   const seq = ++updatesRequestSeq;
   if (force) lastForcedUpdatesAt = Date.now();
@@ -306,7 +819,7 @@ async function checkUpdates(force = false, { silent = true } = {}) {
   try {
     const qs = force ? '?force=1' : '?force=0';
     const res = await apiFetch(`/api/updates${qs}`);
-    if (seq !== updatesRequestSeq) return; // Ignore stale response superseded by newer check
+    if (seq !== updatesRequestSeq) return;
     if (res && res.ok !== false) {
       state.updates = {
         loading: false,
@@ -397,12 +910,29 @@ async function triggerInstall(plugin, { conflictStrategy = 'prompt', confirmEsca
         startReconnectPolling(res.version || plugin.version || '');
         return;
       }
+
+      const act = res.activation || resolveActivationInfo(plugin);
+      maybeTriggerRestartNotice({
+        pluginName: plugin.displayName || res.installedDir || plugin.canonicalName,
+        restartRequired: Boolean(res.restartRequired),
+        reloadRequired: Boolean(res.reloadRequired),
+        retiredBinaries: res.retiredBinaries || [],
+        activation: act,
+      });
+
       const noteSuffix = res.compatibilityNotes?.length ? ` (${res.compatibilityNotes[0]})` : '';
+      const paneUri = res.sidecarPane?.uri || '';
+      const paneTitle = res.sidecarPane?.title || plugin.displayName || res.installedDir;
       showToast(
-        `${t('已就绪并立即启用', 'Installed & active')}: ${res.installedDir} v${res.version}${noteSuffix}`,
-        { extraUri: res.sidecarPane?.uri || res.customizationUri || '', tone: 'ok' },
+        `${t('安装 / 更新已完成', 'Installed & synced')}: ${res.installedDir} v${res.version}${noteSuffix}`,
+        {
+          copyText: paneUri && res.installedDir !== 'agy-market' ? `[${t('打开', 'Open')} ${paneTitle}](${paneUri})` : '',
+          copyLabel: paneUri && res.installedDir !== 'agy-market' ? t('复制面板药丸', 'Copy Pane Pill') : '',
+          tone: 'ok',
+        },
       );
       void checkUpdates(false, { silent: true });
+      if (state.conflicts.loaded) void loadConflicts({ silent: true });
     } else {
       showToast(res.error || t('安装未完成', 'Install did not complete'), { tone: 'error' });
     }
@@ -448,6 +978,18 @@ async function triggerUpdateAll(ids = null, { confirmEscalation = false } = {}) 
       state.batchResults = [...merged.values()];
     } else {
       state.batchResults = results;
+    }
+
+    for (const r of results) {
+      if (r.ok) {
+        maybeTriggerRestartNotice({
+          pluginName: r.displayName || r.installedDir || r.id,
+          restartRequired: Boolean(r.restartRequired),
+          reloadRequired: Boolean(r.reloadRequired),
+          retiredBinaries: r.retiredBinaries || [],
+          activation: r.activation || null,
+        });
+      }
     }
 
     const { byId: updById } = getUpdateMaps();
@@ -502,6 +1044,7 @@ async function triggerUpdateAll(ids = null, { confirmEscalation = false } = {}) 
     }
 
     void checkUpdates(false, { silent: true });
+    if (state.conflicts.loaded) void loadConflicts({ silent: true });
   } catch (err) {
     showToast(`${t('批量更新失败', 'Batch update error')}: ${err?.message || String(err)}`, { tone: 'error' });
   } finally {
@@ -592,7 +1135,7 @@ function startReconnectPolling(targetVersion = '') {
         if (recovered) {
           state.reconnecting = null;
           state.dismissedSelfVersion = '';
-          writeDismissedSelfVersion('');
+          writeStorage(SELF_OFFER_DISMISSED_KEY, '');
           render();
           await loadState(false);
           await checkUpdates(false, { silent: true });
@@ -632,34 +1175,51 @@ function startReconnectPolling(targetVersion = '') {
   reconnectTimer = setTimeout(poll, 700);
 }
 
+async function fetchDetailReadme(plugin) {
+  if (!plugin) return;
+  const seq = ++readmeRequestSeq;
+  const locale = getLocale();
+  const dir = plugin.installStatus?.installedDir || plugin.canonicalName || '';
+  state.detailReadmeLoading = true;
+  state.detailReadmeLocale = locale;
+  render();
+  try {
+    const qs = new URLSearchParams();
+    if (plugin.id) qs.set('id', plugin.id);
+    if (dir) qs.set('dir', dir);
+    qs.set('locale', locale);
+    const res = await apiFetch(`/api/readme?${qs.toString()}`);
+    if (seq !== readmeRequestSeq) return;
+    if (state.detailPlugin?.id === plugin.id) {
+      state.detailReadme = res.markdown || '';
+      state.detailReadmeLocale = res.locale || locale;
+      state.detailReadmeIsZh = Boolean(res.isTranslatedOrNativeZh || hasCjk(res.markdown || ''));
+    }
+  } catch {
+    if (seq === readmeRequestSeq && state.detailPlugin?.id === plugin.id) {
+      state.detailReadme = '';
+      state.detailReadmeIsZh = false;
+    }
+  } finally {
+    if (seq === readmeRequestSeq && state.detailPlugin?.id === plugin.id) {
+      state.detailReadmeLoading = false;
+      render();
+    }
+  }
+}
+
 async function openPluginDetail(plugin, initialTab = 'overview') {
   state.detailPlugin = plugin;
   state.detailTab = initialTab;
   state.detailReadme = '';
-  state.detailReadmeLoading = !plugin._localOnly;
+  state.detailReadmeIsZh = false;
+  state.detailReadmeLoading = true;
   render();
 
   if (initialTab === 'discuss') {
     void loadPluginDiscussions(plugin.id, false);
   }
-
-  if (!plugin._localOnly) {
-    try {
-      const res = await apiFetch(`/api/readme?id=${encodeURIComponent(plugin.id)}`);
-      if (state.detailPlugin?.id === plugin.id) {
-        state.detailReadme = res.markdown || '';
-      }
-    } catch {
-      if (state.detailPlugin?.id === plugin.id) {
-        state.detailReadme = '';
-      }
-    } finally {
-      if (state.detailPlugin?.id === plugin.id) {
-        state.detailReadmeLoading = false;
-        render();
-      }
-    }
-  }
+  void fetchDetailReadme(plugin);
 }
 
 async function loadPluginDiscussions(pluginId, force = false) {
@@ -704,11 +1264,13 @@ async function updatePrefs(patch, successMsg = '') {
       body: { ...patch, workspaceUris: state.workspaceUris },
     });
     syncDetailPluginReference();
-    // Clear discussions cache if token changed so user sees newly unlocked threads immediately
     if ('githubToken' in patch || 'clearGithubToken' in patch) {
       state.discussionsCache = {};
     }
     showToast(successMsg || t('已保存源与网络加速设置', 'Saved catalog & mirror preferences'), { tone: 'ok' });
+    if ('locale' in patch && state.detailPlugin) {
+      void fetchDetailReadme(state.detailPlugin);
+    }
     if ('githubToken' in patch || 'clearGithubToken' in patch || 'primaryCatalogUrl' in patch || 'networkMode' in patch) {
       void checkUpdates(true, { silent: true });
     }
@@ -720,7 +1282,7 @@ async function updatePrefs(patch, successMsg = '') {
   }
 }
 
-async function copyText(text, key) {
+async function copyText(text, key, toastMsg = '') {
   try {
     if (navigator.clipboard?.writeText) {
       await navigator.clipboard.writeText(text);
@@ -735,20 +1297,24 @@ async function copyText(text, key) {
       ta.remove();
     }
     state.copiedKey = key;
-    render();
+    if (toastMsg) {
+      showToast(toastMsg, { tone: 'ok', durationMs: 3200 });
+    } else {
+      render();
+    }
     setTimeout(() => {
       if (state.copiedKey === key) {
         state.copiedKey = '';
         render();
       }
-    }, 1600);
+    }, 1800);
   } catch {
     showToast(t('复制失败，请手动选中复制', 'Copy failed'), { tone: 'error' });
   }
 }
 
 // ==========================================================================
-// Rendering Helpers
+// Rendering Helpers (Aurora Prism Optical Glass Components)
 // ==========================================================================
 
 function renderBadgesHtml(capabilities = {}, { maxCount = 0 } = {}) {
@@ -775,14 +1341,124 @@ function renderBadgesHtml(capabilities = {}, { maxCount = 0 } = {}) {
   return html;
 }
 
-function renderLogoHtml(iconUrl, name, sizeClass = '') {
+function renderActivationBadgeHtml(activation) {
+  if (!activation || !activation.level) return '';
+  const loc = getLocale();
+  const tip = (loc === 'en' ? activation.reasonEn : activation.reasonZh) || '';
+  if (activation.level === 'host-restart') {
+    return `<span class="act-badge is-host-restart" title="${escapeHtml(tip)}">${icon('rocket', 10)} <span>${escapeHtml(t('需重启生效', 'Restart App'))}</span></span>`;
+  }
+  if (activation.level === 'reload-pane') {
+    return `<span class="act-badge is-reload-pane" title="${escapeHtml(tip)}">${icon('refresh', 10)} <span>${escapeHtml(t('需重开面板', 'Reload Pane'))}</span></span>`;
+  }
+  return `<span class="act-badge is-instant" title="${escapeHtml(tip)}">${icon('zap', 10)} <span>${escapeHtml(t('免重启', 'Instant'))}</span></span>`;
+}
+
+function renderLogoHtml(iconUrl, name, { sizeClass = '', isSelf = false } = {}) {
   const monogram = String(name || 'P').trim().charAt(0).toUpperCase() || 'P';
   const cls = sizeClass ? `plugin-logo ${sizeClass}` : 'plugin-logo';
+  const inner = iconUrl
+    ? `<span aria-hidden="true">${escapeHtml(monogram)}</span><img src="${escapeHtml(iconUrl)}" alt="" loading="lazy" onerror="this.style.display='none'" />`
+    : isSelf
+      ? BRAND_LOGO_SVG
+      : `<span aria-hidden="true">${escapeHtml(monogram)}</span>`;
   return `
-    <div class="${cls}">
-      <span aria-hidden="true">${escapeHtml(monogram)}</span>
-      ${iconUrl ? `<img src="${escapeHtml(iconUrl)}" alt="" loading="lazy" onerror="this.style.display='none'" />` : ''}
+    <div class="plugin-logo-wrap">
+      <div class="${cls}">
+        ${inner}
+      </div>
     </div>
+  `;
+}
+
+function renderCardTitleHtml(title, repoUrl) {
+  const safeTitle = String(title || '').trim() || 'Plugin';
+  if (isSafeHttpUrl(repoUrl)) {
+    return `<a class="card-title-link" href="${escapeHtml(repoUrl)}" target="_blank" rel="noopener noreferrer" data-stop-card="1" title="${escapeHtml(t(`打开 GitHub 仓库：${safeTitle}`, `Open GitHub repository: ${safeTitle}`))}">${escapeHtml(safeTitle)}<span class="title-ext-ico" aria-hidden="true">${icon('arrowUpRight', 12)}</span></a>`;
+  }
+  return `<span class="card-title-text" title="${escapeHtml(safeTitle)}">${escapeHtml(safeTitle)}</span>`;
+}
+
+function parseSidecarPaneTarget(dir, sidecarPane) {
+  if (!sidecarPane) return null;
+  let folder = sidecarPane.sidecarFolder || '';
+  let viewPath = sidecarPane.path || '/';
+  if (sidecarPane.uri && /^sidecar:\/\/([^/]+)\/([^/]+)(\/.*)?$/i.test(sidecarPane.uri)) {
+    const m = /^sidecar:\/\/([^/]+)\/([^/]+)(\/.*)?$/i.exec(sidecarPane.uri);
+    if (!folder && m[2]) folder = m[2];
+    if (m[3]) viewPath = m[3];
+  }
+  return {
+    dir,
+    folder: folder || 'pane',
+    viewPath: viewPath || '/',
+    title: sidecarPane.title || dir,
+    uri: sidecarPane.uri || `sidecar://${dir}/${folder || 'pane'}/${String(viewPath || '').replace(/^\/+/, '')}`,
+  };
+}
+
+function renderOpenPaneButtonHtml({ dir, sidecarPane, enabled, btnClass = 'dock-btn is-pane', label = '' }) {
+  // Never render redundant Pane button on AGY Market itself or on disabled plugins; NEVER emit raw sidecar:// <a href>!
+  if (!dir || dir === 'agy-market' || !enabled || !sidecarPane?.uri) return '';
+  const target = parseSidecarPaneTarget(dir, sidecarPane);
+  if (!target) return '';
+  return `<button type="button" class="${btnClass}" data-action="open-pane" data-dir="${escapeHtml(target.dir)}" data-folder="${escapeHtml(target.folder)}" data-path="${escapeHtml(target.viewPath)}" data-title="${escapeHtml(target.title)}" data-uri="${escapeHtml(target.uri)}" title="${escapeHtml(t(`打开「${target.title}」辅助面板`, `Open "${target.title}" Sidecar pane`))}">${icon('panel', 12)} <span>${escapeHtml(label || t('面板', 'Pane'))}</span></button>`;
+}
+
+function renderToggleSliderHtml({ dir, enabled, canToggle, toggleDisabledReason }) {
+  if (!dir) return '';
+  const reason = String(toggleDisabledReason || '');
+  const isSelf = dir === 'agy-market' || reason === 'self';
+  const isLocked = isSelf || canToggle === false;
+  const isBusy = state.togglingDir === dir;
+  const isOn = isSelf ? true : Boolean(enabled);
+
+  let tooltip = isOn
+    ? t('点击移入停放仓并禁用（免改 config.json）', 'Click to park & disable plugin (no config.json edits)')
+    : t('点击从停放仓恢复并立即启用', 'Click to restore & enable plugin');
+  let labelText = isBusy
+    ? t('切换中…', 'Switching…')
+    : isOn
+      ? t('启用', 'Enabled')
+      : t('已禁用', 'Disabled');
+
+  if (isSelf) {
+    tooltip = t('当前面板运行中 · 不可在市场面板内停用自身', 'Active panel running — cannot disable self inside pane');
+    labelText = t('当前面板运行中', 'Active Panel');
+  } else if (reason === 'host-disabled') {
+    tooltip = t('已在 Antigravity 宿主设置中禁用，请通过宿主插件管理启用', 'Disabled by Antigravity host settings');
+    labelText = t('宿主已禁用', 'Host Disabled');
+  } else if (reason === 'workspace') {
+    tooltip = t('工作区级插件（.agents/plugins）由当前仓库管理', 'Workspace plugin managed by current repository');
+    labelText = t('工作区', 'Workspace');
+  } else if (reason === 'builtin') {
+    tooltip = t('Antigravity 内置插件不可停用', 'Built-in Antigravity plugin');
+    labelText = t('内置', 'Built-in');
+  }
+
+  return `
+    <button
+      type="button"
+      role="switch"
+      aria-checked="${isOn ? 'true' : 'false'}"
+      class="prism-toggle ${isOn ? 'is-on' : 'is-off'} ${isLocked ? 'is-locked' : ''} ${isBusy ? 'is-busy' : ''}"
+      data-action="toggle-plugin"
+      data-dir="${escapeHtml(dir)}"
+      data-next-enabled="${isOn ? '0' : '1'}"
+      data-stop-card="1"
+      ${isLocked || isBusy ? 'disabled aria-disabled="true"' : ''}
+      title="${escapeHtml(tooltip)}"
+    >
+      <span class="prism-toggle-track" aria-hidden="true">
+        <span class="prism-toggle-thumb">
+          ${isBusy ? icon('refresh', 9, 'spin') : '<span class="prism-toggle-thumb-core"></span>'}
+        </span>
+      </span>
+      <span class="prism-toggle-label">
+        ${isLocked && !isBusy ? icon('lock', 10) : ''}
+        <span>${escapeHtml(labelText)}</span>
+      </span>
+    </button>
   `;
 }
 
@@ -839,12 +1515,12 @@ function renderSkeletonGrid(count = 4) {
             <div class="skel-row">
               <div class="skel skel-avatar"></div>
               <div style="flex:1;display:flex;flex-direction:column;gap:7px">
-                <div class="skel skel-line" style="width:62%"></div>
-                <div class="skel skel-line" style="width:38%"></div>
+                <div class="skel skel-line" style="width:68%"></div>
+                <div class="skel skel-line" style="width:42%"></div>
               </div>
             </div>
             <div class="skel skel-line" style="width:94%"></div>
-            <div class="skel skel-line" style="width:74%"></div>
+            <div class="skel skel-line" style="width:76%"></div>
             <div class="skel-row">
               <div class="skel skel-pill"></div>
               <div class="skel skel-pill" style="width:96px"></div>
@@ -857,20 +1533,150 @@ function renderSkeletonGrid(count = 4) {
   `;
 }
 
-function renderPluginCard(p, updateById) {
+// ==========================================================================
+// Aurora Spotlight Hero Strip & Smart Restart Notice Banner
+// ==========================================================================
+
+function renderRestartNoticeBanner() {
+  const rn = state.restartNotice;
+  if (!rn) return '';
+  const isHostRestart = rn.level === 'host-restart';
+  return `
+    <div class="restart-notice-banner ${isHostRestart ? 'is-host-restart' : 'is-reload-pane'}" role="status" aria-live="polite">
+      <div class="restart-notice-main">
+        <div class="restart-notice-icon">${icon(isHostRestart ? 'rocket' : 'refresh', 14)}</div>
+        <div class="restart-notice-copy">
+          <div class="restart-notice-title">
+            <span>${escapeHtml(
+              isHostRestart
+                ? t('需重启 Antigravity 客户端后生效', 'Restart Antigravity to apply changes')
+                : t('建议重开目标面板或刷新 MCP 生效', 'Reopen sidecar pane or refresh MCP'),
+            )}</span>
+            ${rn.plugins.length ? `<span class="restart-notice-tags">${rn.plugins.map((n) => `<span class="restart-plugin-chip">${escapeHtml(n)}</span>`).join('')}</span>` : ''}
+          </div>
+          <div class="restart-notice-reason">${escapeHtml(rn.reasons.join(' · '))}</div>
+        </div>
+      </div>
+      <div class="self-update-actions">
+        <button type="button" class="icon-btn is-square" data-action="dismiss-restart-notice" title="${escapeHtml(t('知道了，收起提示', 'Dismiss notice'))}">${icon('close', 13)}</button>
+      </div>
+    </div>
+  `;
+}
+
+function renderAuroraHeroStrip() {
+  const catalogCount = state.serverState?.catalog?.plugins?.length || 0;
+  const installed = state.serverState?.installed || [];
+  const activeCount = installed.filter((x) => x.enabled).length;
+  const updatesCount = getEffectiveUpdateItems().length;
+  const summary = getConflictsSummary();
+  const score = computeHealthScore(summary);
+  const conflictTone = summary.critical > 0 ? 'tone-danger' : summary.total > 0 ? 'tone-warn' : 'tone-emerald';
+  const conflictVal =
+    summary.total === 0
+      ? t(`${score}% 健康`, `${score}% Healthy`)
+      : t(`${summary.total} 项冲突`, `${summary.total} Issue${summary.total > 1 ? 's' : ''}`);
+
+  if (state.heroCollapsed) {
+    return `
+      <section class="aurora-hero is-collapsed">
+        <div class="aurora-hero-inner">
+          <div class="aurora-hero-compact-row">
+            <div class="aurora-compact-pills">
+              <span class="aurora-kicker">${icon('sparkle', 11)} ${escapeHtml(t('极光棱镜', 'Aurora Prism'))}</span>
+              <button type="button" class="compact-stat-chip" data-action="tab" data-tab="discover">${escapeHtml(t(`收录 ${catalogCount}`, `${catalogCount} Catalog`))}</button>
+              <button type="button" class="compact-stat-chip" data-action="tab" data-tab="installed">${escapeHtml(t(`运行 ${activeCount}/${installed.length}`, `${activeCount}/${installed.length} Active`))}</button>
+              ${updatesCount > 0 ? `<button type="button" class="compact-stat-chip" data-action="tab" data-tab="installed" style="color:var(--m-sky);border-color:var(--m-sky-border)">${escapeHtml(t(`可更新 ${updatesCount}`, `${updatesCount} Updates`))}</button>` : ''}
+              <button type="button" class="compact-stat-chip" data-action="tab" data-tab="conflicts" style="color:${summary.critical > 0 ? 'var(--m-danger)' : summary.total > 0 ? 'var(--m-warn)' : 'var(--m-ok)'}">${escapeHtml(conflictVal)}</button>
+            </div>
+            <button type="button" class="hero-collapse-btn" data-action="toggle-hero" title="${escapeHtml(t('展开概览展台', 'Expand spotlight strip'))}">
+              ${icon('chevronDown', 12)} <span>${escapeHtml(t('展开', 'Expand'))}</span>
+            </button>
+          </div>
+        </div>
+      </section>
+    `;
+  }
+
+  return `
+    <section class="aurora-hero">
+      <div class="aurora-hero-inner">
+        <div class="aurora-hero-top">
+          <div class="aurora-hero-brand">
+            <span class="aurora-kicker">${icon('sparkle', 11)} ${escapeHtml(t('AURORA PRISM · 零 TOKEN 插件工坊', 'AURORA PRISM · ZERO-TOKEN ECOSYSTEM'))}</span>
+            <h1 class="aurora-hero-title">${escapeHtml(t('探索、启停与守护你的 Antigravity 插件生态', 'Discover, toggle, and safeguard your Antigravity plugins'))}</h1>
+            <p class="aurora-hero-sub">${escapeHtml(t('SHA-256 防篡改校验 · 停放仓无损滑块启停 · 5 层静态冲突健康雷达', 'SHA-256 verified mirrors · Vault-parking live toggles · 5-layer conflict health radar'))}</p>
+          </div>
+          <button type="button" class="hero-collapse-btn" data-action="toggle-hero" title="${escapeHtml(t('收起概览展台', 'Collapse spotlight strip'))}">
+            ${icon('chevronUp', 12)} <span>${escapeHtml(t('收起', 'Compact'))}</span>
+          </button>
+        </div>
+
+        <div class="hero-stats-row">
+          <button type="button" class="hero-stat-pill tone-indigo" data-action="tab" data-tab="discover">
+            <div class="hero-stat-meta">
+              <span class="hero-stat-label">${escapeHtml(t('已收录插件', 'Catalog Plugins'))}</span>
+              <span class="hero-stat-val">${catalogCount}</span>
+            </div>
+            <span class="hero-stat-ico">${icon('compass', 15)}</span>
+          </button>
+
+          <button type="button" class="hero-stat-pill tone-emerald" data-action="tab" data-tab="installed">
+            <div class="hero-stat-meta">
+              <span class="hero-stat-label">${escapeHtml(t('运行中', 'Running'))}</span>
+              <span class="hero-stat-val">${activeCount} / ${installed.length}</span>
+            </div>
+            <span class="hero-stat-ico">${icon('package', 15)}</span>
+          </button>
+
+          <button type="button" class="hero-stat-pill tone-sky" data-action="tab" data-tab="installed">
+            <div class="hero-stat-meta">
+              <span class="hero-stat-label">${escapeHtml(t('可更新', 'Updates'))}</span>
+              <span class="hero-stat-val">${updatesCount}</span>
+            </div>
+            <span class="hero-stat-ico">${icon('update', 15)}</span>
+          </button>
+
+          <button type="button" class="hero-stat-pill ${conflictTone}" data-action="tab" data-tab="conflicts">
+            <div class="hero-stat-meta">
+              <span class="hero-stat-label">${escapeHtml(t('冲突健康度', 'Conflict Health'))}</span>
+              <span class="hero-stat-val">${escapeHtml(conflictVal)}</span>
+            </div>
+            <span class="hero-stat-ico">${icon(summary.total === 0 ? 'shieldCheck' : 'shieldAlert', 15)}</span>
+          </button>
+        </div>
+      </div>
+    </section>
+  `;
+}
+
+// ==========================================================================
+// Discover Card & Discover View
+// ==========================================================================
+
+function renderPluginCard(p, updateById, installedByDir) {
   const loc = getLocale();
   const desc =
     typeof p.description === 'object'
       ? p.description[loc] || p.description.zh || p.description.en || ''
       : String(p.description || '');
   const st = p.installStatus || {};
+  const localItem = st.installedDir ? installedByDir.get(st.installedDir) || null : null;
   const upd = updateById.get(p.id) || null;
   const hasCatalogUpdate = Boolean((upd && upd.installable !== false) || (!upd && st.installed && st.hasUpdate));
   const hasUpstreamOnly = Boolean(upd && upd.installable === false);
   const isBusy = state.busyId === p.id || (state.batchUpdating && state.batchTargetIds.includes(p.id));
   const effectiveSlug = p.forceScopedInstall ? p.scopedName : p.canonicalName;
-  const discussUrl = deriveDiscussionsUrl(p.repository?.url);
+  const repoUrl = p.repository?.url || '';
+  const discussUrl = deriveDiscussionsUrl(repoUrl);
   const relUpdated = formatRelativeTime(p.updatedAt);
+  const accent = resolveCardAccent(p);
+  const isSelf = st.installedDir === 'agy-market' || p.canonicalName === 'agy-market' || p.id === 'azwosile__agy-market';
+  const isEnabled = st.installed ? Boolean(localItem ? localItem.enabled : st.enabled) : false;
+  const isParked = Boolean(st.installed && !isEnabled);
+  const canToggle = localItem ? localItem.canToggle : st.canToggle;
+  const toggleDisabledReason = localItem ? localItem.toggleDisabledReason : st.toggleDisabledReason;
+  const activation = resolveActivationInfo(p);
 
   let versionChip = `<span class="version-tag">v${escapeHtml(p.version)}</span>`;
   if (upd && st.installed) {
@@ -885,27 +1691,47 @@ function renderPluginCard(p, updateById) {
 
   let actionBtn = '';
   if (isBusy) {
-    actionBtn = `<button class="btn btn-primary btn-sm" disabled>${icon('refresh', 12, 'spin')} ${escapeHtml(t('处理中…', 'Working…'))}</button>`;
+    actionBtn = `<button type="button" class="btn btn-primary btn-sm" disabled>${icon('refresh', 12, 'spin')} ${escapeHtml(t('处理中…', 'Working…'))}</button>`;
   } else if (hasCatalogUpdate) {
     const targetV = upd?.latestVersion || p.version;
-    actionBtn = `<button class="btn btn-update-outline btn-sm" data-action="install" data-id="${escapeHtml(p.id)}">${icon('update', 12)} ${escapeHtml(t(`更新 v${targetV}`, `Update v${targetV}`))}</button>`;
+    actionBtn = `<button type="button" class="btn btn-update-outline btn-sm" data-action="install" data-id="${escapeHtml(p.id)}">${icon('update', 12)} ${escapeHtml(t(`更新 v${targetV}`, `Update v${targetV}`))}</button>`;
   } else if (hasUpstreamOnly) {
     actionBtn = upd.releaseUrl
-      ? `<a class="btn btn-upstream btn-sm" href="${escapeHtml(upd.releaseUrl)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(t('上游有新版，等待目录同步', 'Available upstream, awaiting catalog sync'))}">${escapeHtml(t(`上游 v${upd.latestVersion}`, `Upstream v${upd.latestVersion}`))} ${icon('arrowUpRight', 12)}</a>`
+      ? `<a class="btn btn-upstream btn-sm" href="${escapeHtml(upd.releaseUrl)}" target="_blank" rel="noopener noreferrer" data-stop-card="1" title="${escapeHtml(t('上游有新版，等待目录同步', 'Available upstream, awaiting catalog sync'))}">${escapeHtml(t(`上游 v${upd.latestVersion}`, `Upstream v${upd.latestVersion}`))} ${icon('arrowUpRight', 12)}</a>`
       : `<span class="version-delta is-upstream">${escapeHtml(t('待目录同步', 'Awaiting Sync'))}</span>`;
   } else if (st.installed) {
-    actionBtn = `<button class="btn btn-installed btn-sm" data-action="detail" data-id="${escapeHtml(p.id)}">${icon('check', 12)} ${escapeHtml(t('已安装', 'Installed'))}</button>`;
+    actionBtn = `<button type="button" class="btn btn-installed btn-sm" data-action="detail" data-id="${escapeHtml(p.id)}">${icon('check', 12)} ${escapeHtml(t('详情', 'Details'))}</button>`;
   } else {
-    actionBtn = `<button class="btn btn-primary btn-sm" data-action="install" data-id="${escapeHtml(p.id)}">${icon('download', 12)} ${escapeHtml(t('安装', 'Install'))}</button>`;
+    actionBtn = `<button type="button" class="btn btn-primary btn-sm" data-action="install" data-id="${escapeHtml(p.id)}">${icon('download', 12)} ${escapeHtml(t('安装', 'Install'))}</button>`;
   }
 
+  const dockLeftHtml = st.installed
+    ? renderToggleSliderHtml({
+        dir: st.installedDir || p.canonicalName,
+        enabled: isEnabled,
+        canToggle,
+        toggleDisabledReason: isSelf ? 'self' : toggleDisabledReason,
+      })
+    : `
+      ${discussUrl ? `<a class="dock-btn" href="${escapeHtml(discussUrl)}" target="_blank" rel="noopener noreferrer" data-stop-card="1" title="${escapeHtml(t('打开 GitHub Discussions 社区讨论', 'Open GitHub Discussions'))}">${icon('message', 12)} <span>${escapeHtml(t('讨论', 'Discuss'))}</span></a>` : ''}
+      ${repoUrl ? `<a class="dock-btn" href="${escapeHtml(repoUrl)}" target="_blank" rel="noopener noreferrer" data-stop-card="1" title="${escapeHtml(t('查看 GitHub 源码仓库', 'View GitHub Repository'))}">${icon('external', 11)} <span>GitHub</span></a>` : ''}
+    `;
+
+  const paneBtnHtml = st.installed
+    ? renderOpenPaneButtonHtml({
+        dir: st.installedDir || p.canonicalName,
+        sidecarPane: localItem?.sidecarPane || st.sidecarPane,
+        enabled: isEnabled,
+      })
+    : '';
+
   return `
-    <article class="plugin-card ${hasCatalogUpdate ? 'has-update' : ''}">
+    <article class="plugin-card ${hasCatalogUpdate ? 'has-update' : ''} ${isParked ? 'is-parked' : ''}" style="--card-accent:${accent.a1};--card-accent-2:${accent.a2}">
       <div class="card-head" data-action="detail" data-id="${escapeHtml(p.id)}">
-        ${renderLogoHtml(p.media?.iconUrl, p.displayName || p.canonicalName)}
+        ${renderLogoHtml(p.media?.iconUrl, p.displayName || p.canonicalName, { isSelf })}
         <div class="card-title-wrap">
           <div class="card-title-row">
-            <span class="card-title" title="${escapeHtml(p.displayName || p.canonicalName)}">${escapeHtml(p.displayName || p.canonicalName)}</span>
+            ${renderCardTitleHtml(p.displayName || p.canonicalName, repoUrl)}
             ${versionChip}
           </div>
           <div class="card-meta">
@@ -922,16 +1748,19 @@ function renderPluginCard(p, updateById) {
       <p class="card-desc" data-action="detail" data-id="${escapeHtml(p.id)}">${escapeHtml(desc)}</p>
 
       <div class="badge-row" data-action="detail" data-id="${escapeHtml(p.id)}" data-detail-tab="capabilities">
-        ${renderBadgesHtml(p.capabilities, { maxCount: 3 })}
+        ${renderBadgesHtml(p.capabilities, { maxCount: 2 })}
+        ${renderActivationBadgeHtml(activation)}
       </div>
 
-      <div class="card-foot">
-        <div class="foot-links">
-          ${st.sidecarPane?.uri ? `<a class="ghost-link is-accent" href="${escapeHtml(st.sidecarPane.uri)}" title="${escapeHtml(t('打开插件 Sidecar 面板', 'Open Sidecar Pane'))}">${icon('panel', 12)} ${escapeHtml(t('面板', 'Pane'))}</a>` : ''}
-          ${st.customizationUri ? `<a class="ghost-link" href="${escapeHtml(st.customizationUri)}" title="${escapeHtml(t('在宿主中管理启用/停用/卸载', 'Manage in Host'))}">${icon('sliders', 12)} ${escapeHtml(t('管理', 'Manage'))}</a>` : ''}
-          ${discussUrl ? `<a class="ghost-link" href="${escapeHtml(discussUrl)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(t('打开 GitHub Discussions 社区讨论', 'Open GitHub Discussions'))}">${icon('message', 12)} ${escapeHtml(t('讨论', 'Discuss'))}</a>` : ''}
+      <div class="card-dock">
+        <div class="dock-left">
+          ${dockLeftHtml}
         </div>
-        ${actionBtn}
+        <div class="dock-right">
+          ${paneBtnHtml}
+          ${st.installed && discussUrl ? `<a class="dock-btn" href="${escapeHtml(discussUrl)}" target="_blank" rel="noopener noreferrer" data-stop-card="1" title="GitHub Discussions">${icon('message', 12)}</a>` : ''}
+          ${actionBtn}
+        </div>
       </div>
     </article>
   `;
@@ -955,10 +1784,10 @@ function renderSelfUpdateBanner() {
         </div>
       </div>
       <div class="self-update-actions">
-        ${su.changelog ? `<button class="btn btn-sm" data-action="open-self-changelog">${icon('history', 12)} ${escapeHtml(t('更新日志', 'Notes'))}</button>` : ''}
+        ${su.changelog ? `<button type="button" class="btn btn-sm" data-action="open-self-changelog">${icon('history', 12)} ${escapeHtml(t('更新日志', 'Notes'))}</button>` : ''}
         ${
           canInstall
-            ? `<button class="btn btn-primary btn-sm" data-action="self-update" ${state.selfUpdateBusy ? 'disabled' : ''}>
+            ? `<button type="button" class="btn btn-primary btn-sm" data-action="self-update" ${state.selfUpdateBusy ? 'disabled' : ''}>
                 ${state.selfUpdateBusy ? icon('refresh', 12, 'spin') : icon('update', 12)}
                 ${escapeHtml(state.selfUpdateBusy ? t('正在更新…', 'Updating…') : t('立即更新市场', 'Update Market'))}
               </button>`
@@ -966,7 +1795,7 @@ function renderSelfUpdateBanner() {
               ? `<a class="btn btn-upstream btn-sm" href="${escapeHtml(su.releaseUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(t('查看发布', 'Release'))} ${icon('arrowUpRight', 12)}</a>`
               : ''
         }
-        <button class="icon-btn is-square" data-action="dismiss-self-banner" title="${escapeHtml(t('暂时收起', 'Dismiss'))}">${icon('close', 13)}</button>
+        <button type="button" class="icon-btn is-square" data-action="dismiss-self-banner" title="${escapeHtml(t('暂时收起', 'Dismiss'))}">${icon('close', 13)}</button>
       </div>
     </div>
   `;
@@ -978,9 +1807,9 @@ function renderDiscoverView() {
   const plugins = getFilteredPlugins();
   const catCounts = getCategoryCounts();
   const { byId: updById } = getUpdateMaps();
+  const installedByDir = getInstalledByDirMap();
   const installableUpds = getInstallableUpdates();
 
-  // Show "all", active selected category, and categories that have >= 1 plugin (plus top 4 core categories if catalog empty)
   const coreOrder = ['all', 'productivity', 'ui-themes', 'developer-tools', 'mcp-integrations', 'skills-workflows'];
   const chipKeys = Object.keys(CATEGORY_LABELS).filter(
     (k) => k === 'all' || k === state.category || (catCounts[k] || 0) > 0 || (plugins.length === 0 && coreOrder.includes(k)),
@@ -1001,7 +1830,7 @@ function renderDiscoverView() {
           />
           ${
             state.search
-              ? `<button class="search-clear" data-action="clear-search" title="${escapeHtml(t('清空搜索', 'Clear search'))}">${icon('close', 11)}</button>`
+              ? `<button type="button" class="search-clear" data-action="clear-search" title="${escapeHtml(t('清空搜索', 'Clear search'))}">${icon('close', 11)}</button>`
               : `<span class="search-kbd" aria-hidden="true">/</span>`
           }
         </div>
@@ -1025,13 +1854,15 @@ function renderDiscoverView() {
           .map((key) => {
             const label = CATEGORY_LABELS[key]?.[loc] || CATEGORY_LABELS[key]?.zh || key;
             const n = catCounts[key] || 0;
-            return `<button class="cat-chip ${state.category === key ? 'active' : ''}" data-action="category" data-category="${escapeHtml(key)}">${escapeHtml(label)}${n > 0 ? `<span class="cat-chip-n">${n}</span>` : ''}</button>`;
+            return `<button type="button" class="cat-chip ${state.category === key ? 'active' : ''}" data-action="category" data-category="${escapeHtml(key)}">${escapeHtml(label)}${n > 0 ? `<span class="cat-chip-n">${n}</span>` : ''}</button>`;
           })
           .join('')}
       </div>
     </div>
 
     <div class="main-scroll">
+      ${renderAuroraHeroStrip()}
+
       ${
         installableUpds.length > 0
           ? `<div class="quick-update-strip">
@@ -1040,8 +1871,8 @@ function renderDiscoverView() {
                 <span>${escapeHtml(t(`有 ${installableUpds.length} 个已安装插件可立即更新`, `${installableUpds.length} installed plugin update(s) ready`))}</span>
               </div>
               <div class="quick-update-actions">
-                <button class="btn btn-sm" data-action="tab" data-tab="installed">${escapeHtml(t('查看详情', 'Review'))}</button>
-                <button class="btn btn-update btn-sm" data-action="update-all" ${state.batchUpdating ? 'disabled' : ''}>
+                <button type="button" class="btn btn-sm" data-action="tab" data-tab="installed">${escapeHtml(t('查看详情', 'Review'))}</button>
+                <button type="button" class="btn btn-update btn-sm" data-action="update-all" ${state.batchUpdating ? 'disabled' : ''}>
                   ${state.batchUpdating ? icon('refresh', 12, 'spin') : icon('update', 12)}
                   ${escapeHtml(state.batchUpdating ? t('更新中…', 'Updating…') : t('全部更新', 'Update All'))}
                 </button>
@@ -1054,7 +1885,7 @@ function renderDiscoverView() {
         state.loading && !plugins.length
           ? renderSkeletonGrid(4)
           : plugins.length
-            ? `<div class="cards-grid">${plugins.map((p) => renderPluginCard(p, updById)).join('')}</div>`
+            ? `<div class="cards-grid">${plugins.map((p) => renderPluginCard(p, updById, installedByDir)).join('')}</div>`
             : `<div class="empty-state">
                 <div class="empty-icon">${icon('search', 20)}</div>
                 <div class="empty-title">${escapeHtml(t('当前筛选条件下暂无插件', 'No matching plugins found'))}</div>
@@ -1065,7 +1896,7 @@ function renderDiscoverView() {
                 )}</div>
                 ${
                   state.search || state.category !== 'all'
-                    ? `<button class="btn btn-sm" data-action="reset-filters">${escapeHtml(t('重置筛选条件', 'Reset Filters'))}</button>`
+                    ? `<button type="button" class="btn btn-sm" data-action="reset-filters">${escapeHtml(t('重置筛选条件', 'Reset Filters'))}</button>`
                     : ''
                 }
               </div>`
@@ -1074,13 +1905,17 @@ function renderDiscoverView() {
   `;
 }
 
+// ==========================================================================
+// Installed View (Localized Descriptions + Tactile Toggle Sliders + Zero Dead Links)
+// ==========================================================================
+
 function renderBatchResultsPanel() {
   if (!Array.isArray(state.batchResults) || state.batchResults.length === 0) return '';
   return `
     <div class="batch-results">
       <div class="batch-results-head">
         <span>${escapeHtml(t('本次批量更新结果', 'Batch Update Results'))}</span>
-        <button class="ghost-link" data-action="clear-batch-results">${escapeHtml(t('收起', 'Dismiss'))}</button>
+        <button type="button" class="ghost-link" data-action="clear-batch-results">${escapeHtml(t('收起', 'Dismiss'))}</button>
       </div>
       ${state.batchResults
         .map((r) => {
@@ -1097,17 +1932,29 @@ function renderBatchResultsPanel() {
               ? t('新增能力权限，等待确认', 'Capability escalation requires confirmation')
               : r.error || r.status || t('更新失败', 'Update failed');
 
+          const dir = r.installedDir || r.dir || '';
+          const openPaneBtn =
+            r.ok && r.sidecarPane?.uri && dir !== 'agy-market'
+              ? renderOpenPaneButtonHtml({
+                  dir,
+                  sidecarPane: r.sidecarPane,
+                  enabled: true,
+                  btnClass: 'dock-btn is-pane',
+                  label: t('打开面板', 'Open'),
+                })
+              : '';
+
           return `
             <div class="batch-row ${toneCls}">
               <div class="batch-row-left">
                 ${ico}
-                <span class="batch-row-name">${escapeHtml(r.displayName || r.installedDir || r.id)}</span>
+                <span class="batch-row-name">${escapeHtml(r.displayName || dir || r.id)}</span>
                 <span class="batch-row-msg" title="${escapeHtml(statusMsg)}">${escapeHtml(statusMsg)}</span>
               </div>
               <div class="batch-row-right">
-                ${r.reloadRequired && r.customizationUri ? `<a class="pill-link" href="${escapeHtml(r.customizationUri)}">${escapeHtml(t('需重载', 'Reload'))}</a>` : ''}
-                ${r.ok && r.sidecarPane?.uri ? `<a class="ghost-link is-accent" href="${escapeHtml(r.sidecarPane.uri)}">${escapeHtml(t('打开面板', 'Open'))}</a>` : ''}
-                ${!r.ok && !isEscalated ? `<button class="btn btn-sm" data-action="retry-batch-one" data-id="${escapeHtml(r.id)}">${escapeHtml(t('重试', 'Retry'))}</button>` : ''}
+                ${r.restartRequired ? `<span class="act-badge is-host-restart">${icon('rocket', 10)} ${escapeHtml(t('需重启', 'Restart'))}</span>` : r.reloadRequired ? `<span class="act-badge is-reload-pane">${icon('refresh', 10)} ${escapeHtml(t('需重开面板', 'Reload'))}</span>` : ''}
+                ${openPaneBtn}
+                ${!r.ok && !isEscalated ? `<button type="button" class="btn btn-sm" data-action="retry-batch-one" data-id="${escapeHtml(r.id)}">${escapeHtml(t('重试', 'Retry'))}</button>` : ''}
               </div>
             </div>
           `;
@@ -1124,11 +1971,13 @@ function renderInstalledView() {
   const allUpdates = getEffectiveUpdateItems();
   const installableUpds = getInstallableUpdates();
   const upstreamOnlyCount = allUpdates.length - installableUpds.length;
+  const activeCount = installed.filter((x) => x.enabled).length;
+  const parkedCount = installed.filter((x) => x.parkedByMarket || !x.enabled).length;
   const checkedLabel = state.updates.checkedAt
     ? t(`上次检查：${formatRelativeTime(state.updates.checkedAt)}`, `Last checked ${formatRelativeTime(state.updates.checkedAt)}`)
     : t('正在自动检查远程更新…', 'Checking remote updates…');
 
-  // 3-tier automatic ordering (DSH-market pattern): enabled -> updatable -> alphabetical
+  // 3-tier automatic ordering: enabled -> updatable -> alphabetical
   const sortedInstalled = [...installed].sort((a, b) => {
     const aOn = a.enabled ? 1 : 0;
     const bOn = b.enabled ? 1 : 0;
@@ -1153,7 +2002,7 @@ function renderInstalledView() {
                   ? t('正在检测插件更新…', 'Checking for plugin updates…')
                   : allUpdates.length > 0
                     ? t(`发现 ${allUpdates.length} 个插件更新`, `${allUpdates.length} plugin update(s) available`)
-                    : t(`已安装 ${installed.length} 个插件，全部为最新`, `${installed.length} installed — all up to date`),
+                    : t(`已安装 ${installed.length} 个插件（${activeCount} 运行中${parkedCount > 0 ? ` · ${parkedCount} 已停放` : ''}）`, `${installed.length} installed (${activeCount} active${parkedCount > 0 ? ` · ${parkedCount} parked` : ''})`),
               )}</span>
             </div>
             <div class="updates-summary-sub">
@@ -1163,13 +2012,13 @@ function renderInstalledView() {
           </div>
 
           <div class="updates-command-actions">
-            <button class="btn btn-sm" data-action="check-updates" ${state.updates.loading ? 'disabled' : ''}>
+            <button type="button" class="btn btn-sm" data-action="check-updates" ${state.updates.loading ? 'disabled' : ''}>
               ${icon('refresh', 12, state.updates.loading ? 'spin' : '')}
               ${escapeHtml(t('检查更新', 'Check Now'))}
             </button>
             ${
               installableUpds.length > 0
-                ? `<button class="btn btn-update btn-sm" data-action="update-all" ${state.batchUpdating ? 'disabled' : ''}>
+                ? `<button type="button" class="btn btn-update btn-sm" data-action="update-all" ${state.batchUpdating ? 'disabled' : ''}>
                     ${state.batchUpdating ? icon('refresh', 12, 'spin') : icon('update', 12)}
                     ${escapeHtml(
                       state.batchUpdating
@@ -1188,7 +2037,7 @@ function renderInstalledView() {
           state.updates.rateLimited
             ? `<div class="notice-strip">
                 <span>${icon('alertCircle', 13)} ${escapeHtml(t('GitHub API 匿名请求已限流，可在「源与设置」配置 GitHub Token 解除限额。', 'GitHub API rate limit reached. Add an optional GitHub Token in Sources & Settings.'))}</span>
-                <button class="btn btn-sm" data-action="goto-token">${escapeHtml(t('去配置', 'Configure'))}</button>
+                <button type="button" class="btn btn-sm" data-action="goto-token">${escapeHtml(t('去配置', 'Configure'))}</button>
               </div>`
             : ''
         }
@@ -1204,7 +2053,7 @@ function renderInstalledView() {
                 <div class="empty-icon">${icon('package', 20)}</div>
                 <div class="empty-title">${escapeHtml(t('尚未检测到已安装的插件', 'No local plugins detected yet'))}</div>
                 <div class="empty-sub">${escapeHtml(t('前往「探索」标签浏览并一键安装社区插件。', 'Browse the Discover tab to install community plugins with one click.'))}</div>
-                <button class="btn btn-primary btn-sm" data-action="tab" data-tab="discover">${escapeHtml(t('探索插件市场', 'Explore Market'))}</button>
+                <button type="button" class="btn btn-primary btn-sm" data-action="tab" data-tab="discover">${escapeHtml(t('探索插件市场', 'Explore Market'))}</button>
               </div>`
             : `<div class="cards-grid">
                 ${sortedInstalled
@@ -1216,27 +2065,47 @@ function renderInstalledView() {
                     const isBusy = Boolean(
                       catEntry && (state.busyId === catEntry.id || (state.batchUpdating && state.batchTargetIds.includes(catEntry.id))),
                     );
-                    const discussUrl = deriveDiscussionsUrl(catEntry?.repository?.url || loc.repositoryUrl);
+                    const isSelf = loc.dir === 'agy-market';
+                    const repoUrl = catEntry?.repository?.url || loc.repositoryUrl || '';
+                    const discussUrl = deriveDiscussionsUrl(repoUrl);
                     const badgesObj = catEntry?.capabilities || loc.receipt?.grantedCapabilities || { badges: [] };
+                    const activation = resolveActivationInfo(loc.activation ? loc : catEntry || loc, badgesObj);
+                    const accent = resolveCardAccent(loc, catEntry);
+                    const localizedDesc = resolveInstalledDescription(loc, catEntry);
+                    const isParked = !loc.enabled;
+
+                    const canToggle =
+                      loc.canToggle !== undefined
+                        ? loc.canToggle
+                        : loc.scope === 'global' && !isSelf && !loc.hostDisabled;
+                    const toggleDisabledReason =
+                      loc.toggleDisabledReason ||
+                      (isSelf ? 'self' : loc.hostDisabled ? 'host-disabled' : loc.scope !== 'global' ? loc.scope : '');
 
                     let actionHtml = '';
                     if (isBusy) {
-                      actionHtml = `<button class="btn btn-primary btn-sm" disabled>${icon('refresh', 12, 'spin')} ${escapeHtml(t('更新中…', 'Updating…'))}</button>`;
+                      actionHtml = `<button type="button" class="btn btn-primary btn-sm" disabled>${icon('refresh', 12, 'spin')} ${escapeHtml(t('更新中…', 'Updating…'))}</button>`;
                     } else if (canCatalogUpdate) {
-                      actionHtml = `<button class="btn btn-update-outline btn-sm" data-action="install" data-id="${escapeHtml(catEntry.id)}">${icon('update', 12)} ${escapeHtml(t(`更新 v${upd.latestVersion}`, `Update v${upd.latestVersion}`))}</button>`;
+                      actionHtml = `<button type="button" class="btn btn-update-outline btn-sm" data-action="install" data-id="${escapeHtml(catEntry.id)}">${icon('update', 12)} ${escapeHtml(t(`更新 v${upd.latestVersion}`, `Update v${upd.latestVersion}`))}</button>`;
                     } else if (isUpstreamOnly && upd.releaseUrl) {
-                      actionHtml = `<a class="btn btn-upstream btn-sm" href="${escapeHtml(upd.releaseUrl)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(t('上游 GitHub 有新版，等待目录同步', 'Available upstream, awaiting catalog sync'))}">${escapeHtml(t(`上游 v${upd.latestVersion}`, `Upstream v${upd.latestVersion}`))} ${icon('arrowUpRight', 12)}</a>`;
+                      actionHtml = `<a class="btn btn-upstream btn-sm" href="${escapeHtml(upd.releaseUrl)}" target="_blank" rel="noopener noreferrer" data-stop-card="1" title="${escapeHtml(t('上游 GitHub 有新版，等待目录同步', 'Available upstream, awaiting catalog sync'))}">${escapeHtml(t(`上游 v${upd.latestVersion}`, `Upstream v${upd.latestVersion}`))} ${icon('arrowUpRight', 12)}</a>`;
                     } else {
                       actionHtml = `<span class="state-pill is-enabled">${icon('check', 11)} ${escapeHtml(t('最新', 'Latest'))}</span>`;
                     }
 
+                    const paneBtnHtml = renderOpenPaneButtonHtml({
+                      dir: loc.dir,
+                      sidecarPane: loc.sidecarPane,
+                      enabled: loc.enabled,
+                    });
+
                     return `
-                      <article class="plugin-card ${canCatalogUpdate ? 'has-update' : ''}">
+                      <article class="plugin-card ${canCatalogUpdate ? 'has-update' : ''} ${isParked ? 'is-parked' : ''}" style="--card-accent:${accent.a1};--card-accent-2:${accent.a2}">
                         <div class="card-head" data-action="detail-local" data-dir="${escapeHtml(loc.dir)}">
-                          ${renderLogoHtml(catEntry?.media?.iconUrl, loc.displayName)}
+                          ${renderLogoHtml(catEntry?.media?.iconUrl, loc.displayName, { isSelf })}
                           <div class="card-title-wrap">
                             <div class="card-title-row">
-                              <span class="card-title" title="${escapeHtml(loc.displayName)}">${escapeHtml(loc.displayName)}</span>
+                              ${renderCardTitleHtml(loc.displayName || catEntry?.displayName || loc.dir, repoUrl)}
                               ${
                                 upd
                                   ? `<span class="version-delta ${isUpstreamOnly ? 'is-upstream' : ''}">v${escapeHtml(loc.version)} → v${escapeHtml(upd.latestVersion)}</span>`
@@ -1244,30 +2113,41 @@ function renderInstalledView() {
                               }
                             </div>
                             <div class="card-meta">
-                              <span class="card-slug">${escapeHtml(loc.dir)}</span>
+                              <span class="card-slug" title="${escapeHtml(loc.dir)}">${escapeHtml(loc.dir)}</span>
                               <span class="meta-sep">·</span>
-                              <span class="state-pill ${loc.enabled ? 'is-enabled' : 'is-disabled'}">${escapeHtml(loc.enabled ? t('已启用', 'Enabled') : t('已停用', 'Disabled'))}</span>
-                              ${upd?.changelog ? `<span class="meta-sep">·</span><button type="button" class="notes-link" data-action="detail-local" data-dir="${escapeHtml(loc.dir)}" data-detail-tab="changelog">${escapeHtml(t('更新内容 ›', 'Notes ›'))}</button>` : `<span class="meta-sep">·</span><span>${escapeHtml(loc.scope)}</span>`}
+                              ${
+                                isSelf
+                                  ? `<span class="self-running-pill">${icon('sparkle', 10)} ${escapeHtml(t('当前面板', 'Active Pane'))}</span>`
+                                  : loc.parkedByMarket
+                                    ? `<span class="state-pill is-parked-tag">${escapeHtml(t('停放仓待机', 'Parked'))}</span>`
+                                    : `<span class="state-pill ${loc.enabled ? 'is-enabled' : 'is-disabled'}">${escapeHtml(loc.enabled ? t('已启用', 'Enabled') : t('已停用', 'Disabled'))}</span>`
+                              }
+                              ${upd?.changelog ? `<span class="meta-sep">·</span><button type="button" class="notes-link" data-action="detail-local" data-dir="${escapeHtml(loc.dir)}" data-detail-tab="changelog">${escapeHtml(t('更新内容 ›', 'Notes ›'))}</button>` : `<span class="meta-sep">·</span><span>${escapeHtml(loc.scope || 'global')}</span>`}
                             </div>
                           </div>
                         </div>
 
-                        <p class="card-desc" data-action="detail-local" data-dir="${escapeHtml(loc.dir)}">${escapeHtml(
-                          loc.description ||
-                            (typeof catEntry?.description === 'object'
-                              ? catEntry.description[getLocale()] || catEntry.description.zh || ''
-                              : catEntry?.description || ''),
-                        )}</p>
+                        <p class="card-desc" data-action="detail-local" data-dir="${escapeHtml(loc.dir)}">${escapeHtml(localizedDesc)}</p>
 
-                        ${badgesObj?.badges?.length ? `<div class="badge-row">${renderBadgesHtml(badgesObj, { maxCount: 3 })}</div>` : ''}
+                        <div class="badge-row" data-action="detail-local" data-dir="${escapeHtml(loc.dir)}" data-detail-tab="capabilities">
+                          ${badgesObj?.badges?.length ? renderBadgesHtml(badgesObj, { maxCount: 2 }) : ''}
+                          ${renderActivationBadgeHtml(activation)}
+                        </div>
 
-                        <div class="card-foot">
-                          <div class="foot-links">
-                            ${loc.sidecarPane?.uri ? `<a class="ghost-link is-accent" href="${escapeHtml(loc.sidecarPane.uri)}">${icon('panel', 12)} ${escapeHtml(t('面板', 'Pane'))}</a>` : ''}
-                            <a class="ghost-link" href="${escapeHtml(loc.customizationUri)}">${icon('sliders', 12)} ${escapeHtml(t('管理', 'Manage'))}</a>
-                            ${discussUrl ? `<a class="ghost-link" href="${escapeHtml(discussUrl)}" target="_blank" rel="noopener noreferrer" title="GitHub Discussions">${icon('message', 12)} ${escapeHtml(t('讨论', 'Discuss'))}</a>` : ''}
+                        <div class="card-dock">
+                          <div class="dock-left">
+                            ${renderToggleSliderHtml({
+                              dir: loc.dir,
+                              enabled: loc.enabled,
+                              canToggle,
+                              toggleDisabledReason,
+                            })}
                           </div>
-                          ${actionHtml}
+                          <div class="dock-right">
+                            ${paneBtnHtml}
+                            ${discussUrl ? `<a class="dock-btn" href="${escapeHtml(discussUrl)}" target="_blank" rel="noopener noreferrer" data-stop-card="1" title="GitHub Discussions">${icon('message', 12)} <span>${escapeHtml(t('讨论', 'Discuss'))}</span></a>` : ''}
+                            ${actionHtml}
+                          </div>
                         </div>
                       </article>
                     `;
@@ -1278,6 +2158,255 @@ function renderInstalledView() {
     </div>
   `;
 }
+
+// ==========================================================================
+// 4th Top Tab: Conflict Radar & Health Diagnostics (`冲突与诊断`)
+// ==========================================================================
+
+function renderConflictCard(item) {
+  const loc = getLocale();
+  const sev = item.severity === 'critical' ? 'critical' : item.severity === 'info' ? 'info' : 'warning';
+  const layerMeta = CONFLICT_LAYER_META[item.type] || { zh: item.type || '冲突检测', en: item.type || 'Conflict' };
+  const sevLabel =
+    sev === 'critical'
+      ? t('严重阻塞', 'Critical')
+      : sev === 'warning'
+        ? t('覆盖警告', 'Warning')
+        : t('叠加提示', 'Notice');
+
+  const title = (loc === 'en' ? item.titleEn : item.titleZh) || item.titleZh || item.titleEn || layerMeta[loc];
+  const summary = (loc === 'en' ? item.summaryEn : item.summaryZh) || item.summaryZh || item.summaryEn || '';
+  const detail = (loc === 'en' ? item.detailEn : item.detailZh) || '';
+
+  const shadowed = Array.isArray(item.shadowed) ? item.shadowed : [];
+  const extraPaths = Array.isArray(item.paths) ? item.paths : [];
+  const fix = item.fixAction || null;
+  const fixKey = fix ? `${fix.type}:${fix.targetDir}` : '';
+  const isFixing = fixKey && state.fixingKey === fixKey;
+
+  const defaultFixLabel =
+    fix?.type === 'materialize-symlink'
+      ? t('转为实体目录', 'Materialize Directory')
+      : t('隔离重命名修复', 'Isolate & Rename');
+  const fixLabel = (loc === 'en' ? fix?.labelEn : fix?.labelZh) || defaultFixLabel;
+
+  return `
+    <article class="conflict-card sev-${sev}">
+      <div class="conflict-card-head">
+        <div class="conflict-card-title-group">
+          <div class="conflict-card-badges">
+            <span class="sev-pill sev-${sev}">
+              ${icon(sev === 'critical' ? 'shieldAlert' : sev === 'warning' ? 'alertCircle' : 'info', 11)}
+              <span>${escapeHtml(sevLabel)}</span>
+            </span>
+            <span class="layer-tag">${escapeHtml(loc === 'en' ? layerMeta.en : layerMeta.zh)}</span>
+          </div>
+          <h3 class="conflict-card-title">${escapeHtml(title)}</h3>
+        </div>
+        ${
+          fix
+            ? `<button
+                type="button"
+                class="btn btn-fix btn-sm"
+                data-action="fix-conflict"
+                data-fix-type="${escapeHtml(fix.type)}"
+                data-target-dir="${escapeHtml(fix.targetDir || '')}"
+                data-suggested-dir="${escapeHtml(fix.suggestedDir || '')}"
+                ${isFixing ? 'disabled' : ''}
+              >
+                ${icon(isFixing ? 'refresh' : 'wrench', 12, isFixing ? 'spin' : '')}
+                <span>${escapeHtml(isFixing ? t('修复中…', 'Fixing…') : fixLabel)}</span>
+              </button>`
+            : ''
+        }
+      </div>
+
+      ${summary ? `<p class="conflict-card-desc">${escapeHtml(summary)}</p>` : ''}
+      ${detail ? `<p class="conflict-card-desc muted" style="font-size:11.4px">${escapeHtml(detail)}</p>` : ''}
+
+      ${
+        item.winner || shadowed.length > 0 || extraPaths.length > 0
+          ? `<div class="conflict-compare">
+              ${
+                item.winner
+                  ? `<div class="conflict-path-box is-winner">
+                      <span class="conflict-box-label">${icon('checkCircle', 12)} ${escapeHtml(t('生效胜出方 (Winner)', 'Active Winner'))}</span>
+                      <div class="conflict-path-line">
+                        <strong>${escapeHtml(item.winner.dir || item.winner.name || '')}</strong>
+                        ${item.winner.scope ? `<span class="scope-chip">${escapeHtml(item.winner.scope)}</span>` : ''}
+                      </div>
+                      ${item.winner.path ? `<div class="conflict-path-line muted">${escapeHtml(item.winner.path)}</div>` : ''}
+                    </div>`
+                  : ''
+              }
+              ${
+                shadowed.length > 0
+                  ? `<div class="conflict-path-box ${sev === 'critical' ? 'is-shadowed' : 'is-warn-box'}">
+                      <span class="conflict-box-label">${icon('alertCircle', 12)} ${escapeHtml(t('被吞没 / 受影响插件 (Shadowed)', 'Shadowed / Affected'))}</span>
+                      ${shadowed
+                        .map(
+                          (s) => `
+                          <div class="conflict-path-line">
+                            <strong>${escapeHtml(s.dir || s.name || '')}</strong>
+                            ${s.scope ? `<span class="scope-chip">${escapeHtml(s.scope)}</span>` : ''}
+                            ${s.path ? `<span class="muted">${escapeHtml(s.path)}</span>` : ''}
+                          </div>
+                        `,
+                        )
+                        .join('')}
+                    </div>`
+                  : ''
+              }
+              ${
+                extraPaths.length > 0 && !item.winner && shadowed.length === 0
+                  ? `<div class="conflict-path-box ${sev === 'critical' ? 'is-shadowed' : 'is-warn-box'}">
+                      <span class="conflict-box-label">${icon('folder', 12)} ${escapeHtml(t('涉及路径', 'Affected Paths'))}</span>
+                      ${extraPaths.map((p) => `<div class="conflict-path-line">${escapeHtml(p)}</div>`).join('')}
+                    </div>`
+                  : ''
+              }
+            </div>`
+          : ''
+      }
+    </article>
+  `;
+}
+
+function renderConflictsView() {
+  const report = state.conflicts.data;
+  const items = Array.isArray(report?.items) ? report.items : [];
+  const summary = getConflictsSummary();
+  const score = computeHealthScore(summary);
+  const circumference = 2 * Math.PI * 30;
+  const dashOffset = circumference * (1 - score / 100);
+  const ringStroke =
+    summary.critical > 0 ? 'var(--m-danger)' : summary.total > 0 ? 'var(--m-warn)' : 'var(--m-ok)';
+  const heroToneCls = summary.critical > 0 ? 'has-critical' : summary.total > 0 ? 'has-warnings' : '';
+  const checkedText = report?.checkedAt
+    ? t(`上次扫描：${formatRelativeTime(report.checkedAt)}`, `Scanned ${formatRelativeTime(report.checkedAt)}`)
+    : t('实时静态只读诊断', 'Read-only static audit');
+
+  // Compute per-layer counts across all 5 audit layers
+  const layerBuckets = [
+    { key: 'duplicate-plugin-name', types: ['duplicate-plugin-name'] },
+    { key: 'windows-symlink-ignored', types: ['windows-symlink-ignored'] },
+    { key: 'mcp-collision', types: ['mcp-collision'] },
+    { key: 'skill-shadowing', types: ['skill-shadowing', 'agent-shadowing'] },
+    { key: 'host-enhancement-overlap', types: ['host-enhancement-overlap'] },
+  ];
+
+  const auditMatrixHtml = `
+    <section class="radar-checks-section">
+      <div class="radar-section-title">${icon('radar', 13)} ${escapeHtml(t('5 层静态健康体检矩阵', '5-Layer Static Health Audit Matrix'))}</div>
+      <div class="radar-checks-grid">
+        ${layerBuckets
+          .map((bucket) => {
+            const matched = items.filter((it) => bucket.types.includes(it.type));
+            const hasCrit = matched.some((it) => it.severity === 'critical');
+            const meta = CONFLICT_LAYER_META[bucket.key];
+            const tileTitle =
+              bucket.key === 'skill-shadowing'
+                ? t('Skill & Subagent 覆盖', 'Skill & Agent Shadowing')
+                : getLocale() === 'en'
+                  ? meta.en
+                  : meta.zh;
+            const tileSub = getLocale() === 'en' ? meta.descEn : meta.descZh;
+            const statusCls = matched.length === 0 ? 'is-pass' : hasCrit ? 'is-hit-critical' : 'is-hit-warn';
+            const statusLabel =
+              matched.length === 0
+                ? t('✓ 通过', '✓ Pass')
+                : t(`${matched.length} 项`, `${matched.length} hit`);
+            return `
+              <div class="radar-check-tile ${statusCls}">
+                <div class="radar-check-info">
+                  <span class="radar-check-name">${escapeHtml(tileTitle)}</span>
+                  <span class="radar-check-sub">${escapeHtml(tileSub)}</span>
+                </div>
+                <span class="radar-check-status ${statusCls}">${escapeHtml(statusLabel)}</span>
+              </div>
+            `;
+          })
+          .join('')}
+      </div>
+    </section>
+  `;
+
+  return `
+    <div class="main-scroll">
+      <section class="conflict-hero ${heroToneCls}">
+        <div class="conflict-hero-left">
+          <div class="health-ring-wrap" aria-label="${escapeHtml(t(`插件生态健康评分 ${score} 分`, `Health score ${score}`))}">
+            <svg class="health-ring-svg" viewBox="0 0 74 74">
+              <circle class="health-ring-bg" cx="37" cy="37" r="30"></circle>
+              <circle
+                class="health-ring-fg"
+                cx="37"
+                cy="37"
+                r="30"
+                stroke="${ringStroke}"
+                stroke-dasharray="${circumference.toFixed(1)}"
+                stroke-dashoffset="${dashOffset.toFixed(1)}"
+              ></circle>
+            </svg>
+            <div class="health-ring-score">
+              <span class="health-ring-num" style="color:${ringStroke}">${score}</span>
+              <span class="health-ring-lbl">${escapeHtml(t('健康分', 'SCORE'))}</span>
+            </div>
+          </div>
+
+          <div class="conflict-hero-copy">
+            <h2 class="conflict-hero-title">
+              ${
+                summary.total === 0
+                  ? `${icon('shieldCheck', 16)} ${escapeHtml(t('插件生态健康 · 零冲突运行中', 'Ecosystem Healthy · Zero Conflicts'))}`
+                  : summary.critical > 0
+                    ? `${icon('shieldAlert', 16)} ${escapeHtml(t(`检测到 ${summary.critical} 项严重冲突，可能导致插件被宿主静默丢弃`, `${summary.critical} critical conflict(s) may silently drop plugins`))}`
+                    : `${icon('alertCircle', 16)} ${escapeHtml(t(`检测到 ${summary.total} 项覆盖警告或优化建议`, `${summary.total} warning(s) or optimization notices detected`))}`
+              }
+            </h2>
+            <p class="conflict-hero-sub">${escapeHtml(t('纯只读扫描 global / workspace / builtin 插件、NTFS 联接目录、MCP 命名空间与宿主增强层，绝不改写 config.json。', 'Read-only scan across global/workspace/builtin plugins, Windows symlinks, MCP keys, and host enhancements.'))}</p>
+            <div class="conflict-kpi-row">
+              <span class="conflict-kpi-pill ${summary.critical > 0 ? 'is-critical' : ''}">${escapeHtml(t(`严重阻塞 ${summary.critical}`, `Critical ${summary.critical}`))}</span>
+              <span class="conflict-kpi-pill ${summary.warning > 0 ? 'is-warning' : ''}">${escapeHtml(t(`覆盖警告 ${summary.warning}`, `Warnings ${summary.warning}`))}</span>
+              <span class="conflict-kpi-pill ${summary.info > 0 ? 'is-info' : ''}">${escapeHtml(t(`叠加提示 ${summary.info}`, `Info ${summary.info}`))}</span>
+              <span class="conflict-kpi-pill is-ok">${escapeHtml(t(`健康插件 ${summary.healthyCount}`, `Healthy ${summary.healthyCount}`))}</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="conflict-hero-actions">
+          <button type="button" class="btn btn-primary btn-sm" data-action="refresh-conflicts" ${state.conflicts.loading ? 'disabled' : ''}>
+            ${icon('refresh', 12, state.conflicts.loading ? 'spin' : '')}
+            <span>${escapeHtml(state.conflicts.loading ? t('扫描中…', 'Scanning…') : t('重新全盘扫描', 'Rescan All'))}</span>
+          </button>
+          <span class="muted" style="font-size:11px">${escapeHtml(checkedText)}</span>
+        </div>
+      </section>
+
+      ${
+        state.conflicts.loading && !state.conflicts.loaded
+          ? renderSkeletonGrid(2)
+          : state.conflicts.error
+            ? `<div class="notice-strip">
+                <span>${icon('alertCircle', 13)} ${escapeHtml(state.conflicts.error)}</span>
+                <button type="button" class="btn btn-sm" data-action="refresh-conflicts">${escapeHtml(t('重试', 'Retry'))}</button>
+              </div>`
+            : items.length > 0
+              ? `${auditMatrixHtml}<div class="conflict-list" style="margin-top:14px">${items.map((it) => renderConflictCard(it)).join('')}</div>`
+              : `${auditMatrixHtml}
+                 <div class="empty-state" style="margin-top:14px;border-color:var(--m-ok-border)">
+                   <div class="empty-icon" style="background:var(--m-ok-soft);border-color:var(--m-ok-border);color:var(--m-ok)">${icon('shieldCheck', 22)}</div>
+                   <div class="empty-title">${escapeHtml(t('所有 5 层插件冲突检查均已通过', 'All 5 plugin conflict audit layers passed'))}</div>
+                   <div class="empty-sub">${escapeHtml(t('当前本机不存在同名插件静默吞没、Windows 符号链接跳过、MCP 服务重名或技能覆盖冲突。', 'No duplicate plugin names, skipped Windows symlinks, MCP collisions, or skill shadowing found.'))}</div>
+                 </div>`
+      }
+    </div>
+  `;
+}
+
+// ==========================================================================
+// Sources & Settings View
+// ==========================================================================
 
 function renderSourcesView() {
   const prefs = state.serverState?.prefs || {};
@@ -1307,7 +2436,7 @@ function renderSourcesView() {
             </div>
             <div class="telemetry-cell">
               <span class="telemetry-k">${escapeHtml(t('客户端版本', 'Client Version'))}</span>
-              <span class="telemetry-v">v${escapeHtml(state.serverState?.plugin?.version || '1.1.0')}</span>
+              <span class="telemetry-v">v${escapeHtml(state.serverState?.plugin?.version || '1.2.0')}</span>
             </div>
             <div class="telemetry-cell">
               <span class="telemetry-k">${escapeHtml(t('更新检查', 'Update Check'))}</span>
@@ -1375,7 +2504,7 @@ function renderSourcesView() {
 }
 
 // ==========================================================================
-// Slide-Over Detail Drawer
+// Slide-Over Detail Drawer (Clickable GitHub Title + Live Toggle + Remove Files + Localized README)
 // ==========================================================================
 
 function renderDiscussTabContent(plugin) {
@@ -1392,7 +2521,7 @@ function renderDiscussTabContent(plugin) {
         <span>GitHub Discussions</span>
       </div>
       <div style="display:flex;align-items:center;gap:6px">
-        <button class="btn btn-sm" data-action="refresh-discussions" data-id="${escapeHtml(plugin.id)}" ${entry?.loading ? 'disabled' : ''}>
+        <button type="button" class="btn btn-sm" data-action="refresh-discussions" data-id="${escapeHtml(plugin.id)}" ${entry?.loading ? 'disabled' : ''}>
           ${icon('refresh', 12, entry?.loading ? 'spin' : '')}
         </button>
         ${openUrl && !data?.disabled ? `<a class="btn btn-sm" href="${escapeHtml(openUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(t('打开 GitHub', 'Open GitHub'))} ${icon('external', 11)}</a>` : ''}
@@ -1477,7 +2606,7 @@ function renderDiscussTabContent(plugin) {
         <div style="font-weight:650">${escapeHtml(t('在面板内预览讨论需要配置 GitHub Token', 'Add a GitHub Token to preview discussions inline'))}</div>
         <div class="muted" style="font-size:11.8px;line-height:1.55">${escapeHtml(t('GitHub Discussions 列表接口仅通过 GraphQL 开放且要求鉴权。你仍可直接点击上方按钮前往 GitHub 浏览与发帖，或在「源与设置」填写只读 Token 解锁内联列表。', 'GitHub Discussions queries require an authenticated GraphQL request. You can open GitHub directly above, or configure an optional read-only token in Sources & Settings.'))}</div>
         <div style="display:flex;flex-wrap:wrap;gap:7px">
-          <button class="btn btn-primary btn-sm" data-action="goto-token">${icon('key', 12)} ${escapeHtml(t('前往配置 Token', 'Configure Token'))}</button>
+          <button type="button" class="btn btn-primary btn-sm" data-action="goto-token">${icon('key', 12)} ${escapeHtml(t('前往配置 Token', 'Configure Token'))}</button>
           ${openUrl ? `<a class="btn btn-sm" href="${escapeHtml(openUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(t('在 GitHub 浏览讨论', 'Browse on GitHub'))} ${icon('external', 11)}</a>` : ''}
         </div>
       </div>
@@ -1498,33 +2627,82 @@ function renderDetailDrawer() {
   const p = state.detailPlugin;
   if (!p) return '';
   const { byId: updById, byDir: updByDir } = getUpdateMaps();
-  const upd = updById.get(p.id) || (p.installStatus?.installedDir ? updByDir.get(p.installStatus.installedDir) : null);
+  const installedByDir = getInstalledByDirMap();
   const st = p.installStatus || {};
+  const localItem = st.installedDir ? installedByDir.get(st.installedDir) || null : null;
+  const upd = updById.get(p.id) || (st.installedDir ? updByDir.get(st.installedDir) : null);
   const hasCatalogUpdate = Boolean((upd && upd.installable !== false) || (!upd && st.installed && st.hasUpdate));
   const hasUpstreamOnly = Boolean(upd && upd.installable === false);
   const isBusy = state.busyId === p.id;
-  const discussUrl = deriveDiscussionsUrl(p.repository?.url);
+  const repoUrl = p.repository?.url || localItem?.repositoryUrl || '';
+  const discussUrl = deriveDiscussionsUrl(repoUrl);
   const loc = getLocale();
+  const accent = resolveCardAccent(p);
+  const installedDir = st.installedDir || localItem?.dir || '';
+  const isSelf = installedDir === 'agy-market' || p.canonicalName === 'agy-market' || p.id === 'azwosile__agy-market';
+  const isEnabled = st.installed ? Boolean(localItem ? localItem.enabled : st.enabled) : false;
+  const localScope = localItem?.scope || st.scope || 'global';
+  const canRemoveFiles = Boolean(st.installed && installedDir && !isSelf && localScope === 'global');
+  const activation = resolveActivationInfo(p, localItem?.capabilities || p.capabilities);
 
   let primaryBtn = '';
   if (p._localOnly) {
-    primaryBtn = `<a class="btn btn-sm" href="${escapeHtml(st.customizationUri || '#')}">${icon('sliders', 12)} ${escapeHtml(t('在宿主中管理', 'Manage in Host'))}</a>`;
+    primaryBtn = '';
   } else if (isBusy) {
-    primaryBtn = `<button class="btn btn-primary btn-sm" disabled>${icon('refresh', 12, 'spin')} ${escapeHtml(t('处理中…', 'Working…'))}</button>`;
+    primaryBtn = `<button type="button" class="btn btn-primary btn-sm" disabled>${icon('refresh', 12, 'spin')} ${escapeHtml(t('处理中…', 'Working…'))}</button>`;
   } else if (hasCatalogUpdate) {
-    primaryBtn = `<button class="btn btn-update btn-sm" data-action="install" data-id="${escapeHtml(p.id)}">${icon('update', 12)} ${escapeHtml(t(`更新至 v${upd?.latestVersion || p.version}`, `Update to v${upd?.latestVersion || p.version}`))}</button>`;
+    primaryBtn = `<button type="button" class="btn btn-update btn-sm" data-action="install" data-id="${escapeHtml(p.id)}">${icon('update', 12)} ${escapeHtml(t(`更新至 v${upd?.latestVersion || p.version}`, `Update to v${upd?.latestVersion || p.version}`))}</button>`;
   } else if (hasUpstreamOnly && upd.releaseUrl) {
     primaryBtn = `<a class="btn btn-upstream btn-sm" href="${escapeHtml(upd.releaseUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(t(`查看上游 v${upd.latestVersion}`, `Upstream v${upd.latestVersion}`))} ${icon('arrowUpRight', 12)}</a>`;
   } else if (st.installed) {
-    primaryBtn = `<button class="btn btn-sm" data-action="install" data-id="${escapeHtml(p.id)}">${icon('refresh', 12)} ${escapeHtml(t('重新同步', 'Re-sync'))}</button>`;
+    primaryBtn = `<button type="button" class="btn btn-sm" data-action="install" data-id="${escapeHtml(p.id)}">${icon('refresh', 12)} ${escapeHtml(t('重新同步', 'Re-sync'))}</button>`;
   } else {
-    primaryBtn = `<button class="btn btn-primary btn-sm" data-action="install" data-id="${escapeHtml(p.id)}">${icon('download', 12)} ${escapeHtml(t('立即安装并启用', 'Install Now'))}</button>`;
+    primaryBtn = `<button type="button" class="btn btn-primary btn-sm" data-action="install" data-id="${escapeHtml(p.id)}">${icon('download', 12)} ${escapeHtml(t('立即安装并启用', 'Install Now'))}</button>`;
   }
+
+  const drawerPaneBtn = st.installed
+    ? renderOpenPaneButtonHtml({
+        dir: installedDir,
+        sidecarPane: localItem?.sidecarPane || st.sidecarPane,
+        enabled: isEnabled,
+        btnClass: 'btn btn-sm',
+        label: t('打开面板', 'Open Pane'),
+      })
+    : '';
+
+  const drawerToggleHtml = st.installed
+    ? `<div class="drawer-toggle-box">${renderToggleSliderHtml({
+        dir: installedDir,
+        enabled: isEnabled,
+        canToggle: localItem ? localItem.canToggle : st.canToggle,
+        toggleDisabledReason: isSelf ? 'self' : localItem ? localItem.toggleDisabledReason : st.toggleDisabledReason,
+      })}</div>`
+    : '';
+
+  const drawerTitleHtml = isSafeHttpUrl(repoUrl)
+    ? `<a class="drawer-title-link" href="${escapeHtml(repoUrl)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(t('在新窗口打开 GitHub 仓库', 'Open GitHub repository'))}"><span>${escapeHtml(p.displayName || p.canonicalName)}</span>${icon('arrowUpRight', 14)}</a>`
+    : escapeHtml(p.displayName || p.canonicalName);
 
   let bodyHtml = '';
   if (state.detailTab === 'overview') {
+    const langTag =
+      state.detailReadme && !state.detailReadmeLoading
+        ? `<div class="readme-lang-bar">
+            <span class="readme-lang-pill">${icon('book', 12)} ${escapeHtml(
+              state.detailReadmeIsZh
+                ? t('简体中文说明文档', 'Simplified Chinese README')
+                : t('English 原文文档', 'English README'),
+            )}</span>
+            <span>${escapeHtml(loc === 'zh' ? 'README.zh-CN.md / README.md' : 'README.en.md / README.md')}</span>
+          </div>`
+        : '';
+
     bodyHtml = `
-      <div class="badge-row">${renderBadgesHtml(p.capabilities)}</div>
+      <div class="badge-row">
+        ${renderBadgesHtml(p.capabilities)}
+        ${renderActivationBadgeHtml(activation)}
+      </div>
+      ${langTag}
       <div class="md-body">
         ${
           state.detailReadmeLoading
@@ -1541,9 +2719,9 @@ function renderDetailDrawer() {
         <span class="muted">ID / Slug</span>
         <span class="mono">${escapeHtml(p.id)} (${escapeHtml(p.forceScopedInstall ? p.scopedName : p.canonicalName)})</span>
         ${
-          p.repository?.url
+          repoUrl
             ? `<span class="muted">Repository</span>
-               <span><a class="md-link" href="${escapeHtml(p.repository.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(p.repository.url)}</a></span>`
+               <span><a class="md-link" href="${escapeHtml(repoUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(repoUrl)}</a></span>`
             : ''
         }
         ${
@@ -1557,7 +2735,7 @@ function renderDetailDrawer() {
             ? `<span class="muted">SHA-256</span>
                <span class="meta-kv-val">
                  <span class="mono" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(p.distribution.sha256)}</span>
-                 <button class="icon-btn btn-sm" data-action="copy-text" data-copy-key="sha-${escapeHtml(p.id)}" data-copy-val="${escapeHtml(p.distribution.sha256)}" title="${escapeHtml(t('复制完整 SHA-256', 'Copy SHA-256'))}">
+                 <button type="button" class="icon-btn btn-sm" data-action="copy-text" data-copy-key="sha-${escapeHtml(p.id)}" data-copy-val="${escapeHtml(p.distribution.sha256)}" title="${escapeHtml(t('复制完整 SHA-256', 'Copy SHA-256'))}">
                    ${icon(state.copiedKey === `sha-${p.id}` ? 'check' : 'copy', 11)}
                  </button>
                </span>`
@@ -1587,12 +2765,16 @@ function renderDetailDrawer() {
           <div class="empty-icon">${icon('history', 20)}</div>
           <div class="empty-title">${escapeHtml(t('当前已是最新版本', 'Currently up to date'))}</div>
           <div class="empty-sub">${escapeHtml(t(`当前版本 v${p.version}，暂无待安装的更新日志。`, `Running v${p.version} with no pending update changelog.`))}</div>
-          ${p.repository?.url ? `<a class="btn btn-sm" href="${escapeHtml(p.repository.url)}/releases" target="_blank" rel="noopener noreferrer">${escapeHtml(t('查看 GitHub Releases', 'View GitHub Releases'))} ${icon('external', 11)}</a>` : ''}
+          ${repoUrl ? `<a class="btn btn-sm" href="${escapeHtml(repoUrl)}/releases" target="_blank" rel="noopener noreferrer">${escapeHtml(t('查看 GitHub Releases', 'View GitHub Releases'))} ${icon('external', 11)}</a>` : ''}
         </div>`;
   } else if (state.detailTab === 'capabilities') {
     const cap = p.capabilities || {};
     const badges = Array.isArray(cap.badges) ? cap.badges : [];
     bodyHtml = `
+      <div class="cap-detail-card" style="border-color:${activation.level === 'host-restart' ? 'var(--m-warn-border)' : activation.level === 'reload-pane' ? 'var(--m-sky-border)' : 'var(--m-ok-border)'}">
+        <div>${renderActivationBadgeHtml(activation)}</div>
+        <p class="cap-detail-desc">${escapeHtml((loc === 'en' ? activation.reasonEn : activation.reasonZh) || '')}</p>
+      </div>
       <div class="cap-detail-list">
         ${
           badges.length
@@ -1631,12 +2813,12 @@ function renderDetailDrawer() {
 
   return `
     <div class="drawer-backdrop" data-action="close-modal">
-      <aside class="drawer-panel" role="dialog" aria-modal="true" aria-label="${escapeHtml(p.displayName || p.canonicalName)}" onclick="event.stopPropagation()">
+      <aside class="drawer-panel" style="--card-accent:${accent.a1};--card-accent-2:${accent.a2}" role="dialog" aria-modal="true" aria-label="${escapeHtml(p.displayName || p.canonicalName)}" onclick="event.stopPropagation()">
         <div class="drawer-hero">
           <div class="drawer-hero-top">
-            ${renderLogoHtml(p.media?.iconUrl, p.displayName || p.canonicalName, 'is-lg')}
+            ${renderLogoHtml(p.media?.iconUrl, p.displayName || p.canonicalName, { sizeClass: 'is-lg', isSelf })}
             <div class="drawer-hero-info">
-              <h2 class="drawer-title">${escapeHtml(p.displayName || p.canonicalName)}</h2>
+              <h2 class="drawer-title">${drawerTitleHtml}</h2>
               <div class="drawer-subtitle">
                 <span class="mono">${escapeHtml(p.forceScopedInstall ? p.scopedName : p.canonicalName)}</span>
                 ${
@@ -1647,30 +2829,37 @@ function renderDetailDrawer() {
                 ${Number(p.repository?.stars || 0) > 0 ? `<span class="meta-star">${icon('star', 11)} ${Number(p.repository.stars)}</span>` : ''}
               </div>
             </div>
-            <button class="icon-btn is-square" data-action="close-modal" title="${escapeHtml(t('关闭 (Esc)', 'Close (Esc)'))}">${icon('close', 14)}</button>
+            <button type="button" class="icon-btn is-square" data-action="close-modal" title="${escapeHtml(t('关闭 (Esc)', 'Close (Esc)'))}">${icon('close', 14)}</button>
           </div>
 
           <div class="drawer-cta-bar">
+            ${drawerToggleHtml}
             ${primaryBtn}
-            ${st.sidecarPane?.uri ? `<a class="btn btn-sm" href="${escapeHtml(st.sidecarPane.uri)}">${icon('panel', 12)} ${escapeHtml(t('打开面板', 'Open Pane'))}</a>` : ''}
-            ${st.customizationUri ? `<a class="btn btn-sm" href="${escapeHtml(st.customizationUri)}">${icon('sliders', 12)} ${escapeHtml(t('管理', 'Manage'))}</a>` : ''}
-            ${p.repository?.url ? `<a class="btn btn-sm" href="${escapeHtml(p.repository.url)}" target="_blank" rel="noopener noreferrer">GitHub ${icon('external', 11)}</a>` : ''}
+            ${drawerPaneBtn}
+            ${repoUrl ? `<a class="btn btn-sm" href="${escapeHtml(repoUrl)}" target="_blank" rel="noopener noreferrer">GitHub ${icon('external', 11)}</a>` : ''}
             ${discussUrl ? `<a class="btn btn-sm" href="${escapeHtml(discussUrl)}" target="_blank" rel="noopener noreferrer">${icon('message', 12)} ${escapeHtml(t('讨论区', 'Discussions'))}</a>` : ''}
+            ${
+              canRemoveFiles
+                ? `<button type="button" class="btn btn-danger-ghost btn-sm" data-action="prompt-remove-files" data-dir="${escapeHtml(installedDir)}" data-name="${escapeHtml(p.displayName || installedDir)}" data-version="${escapeHtml(st.installedVersion || p.version || '')}">
+                    ${icon('trash', 12)} ${escapeHtml(t('移除插件文件', 'Remove Files'))}
+                  </button>`
+                : ''
+            }
           </div>
         </div>
 
         <nav class="drawer-tabs" role="tablist">
-          <button class="drawer-tab ${state.detailTab === 'overview' ? 'active' : ''}" data-action="detail-tab" data-tab="overview">
+          <button type="button" class="drawer-tab ${state.detailTab === 'overview' ? 'active' : ''}" data-action="detail-tab" data-tab="overview">
             ${icon('book', 12)} ${escapeHtml(t('概览', 'Overview'))}
           </button>
-          <button class="drawer-tab ${state.detailTab === 'changelog' ? 'active' : ''}" data-action="detail-tab" data-tab="changelog">
+          <button type="button" class="drawer-tab ${state.detailTab === 'changelog' ? 'active' : ''}" data-action="detail-tab" data-tab="changelog">
             ${icon('history', 12)} ${escapeHtml(t('更新日志', 'Changelog'))}
             ${upd ? '<span class="status-dot is-pulse"></span>' : ''}
           </button>
-          <button class="drawer-tab ${state.detailTab === 'capabilities' ? 'active' : ''}" data-action="detail-tab" data-tab="capabilities">
-            ${icon('shield', 12)} ${escapeHtml(t('能力与安全', 'Capabilities'))}
+          <button type="button" class="drawer-tab ${state.detailTab === 'capabilities' ? 'active' : ''}" data-action="detail-tab" data-tab="capabilities">
+            ${icon('shield', 12)} ${escapeHtml(t('能力与生效', 'Capabilities'))}
           </button>
-          <button class="drawer-tab ${state.detailTab === 'discuss' ? 'active' : ''}" data-action="detail-tab" data-tab="discuss">
+          <button type="button" class="drawer-tab ${state.detailTab === 'discuss' ? 'active' : ''}" data-action="detail-tab" data-tab="discuss">
             ${icon('message', 12)} ${escapeHtml(t('讨论', 'Discuss'))}
           </button>
         </nav>
@@ -1694,6 +2883,39 @@ function renderModals() {
     html += renderDetailDrawer();
   }
 
+  if (state.removeConfirmModal) {
+    const rm = state.removeConfirmModal;
+    const isRemoving = state.removingDir === rm.dir;
+    html += `
+      <div class="modal-backdrop" data-action="close-modal">
+        <div class="modal-box" onclick="event.stopPropagation()">
+          <div class="modal-header">
+            <div class="modal-title-wrap">
+              <span style="color:var(--m-danger)">${icon('trash', 15)}</span>
+              <span>${escapeHtml(t('确认移除插件文件', 'Confirm Remove Plugin Files'))}</span>
+            </div>
+            <button type="button" class="icon-btn is-square" data-action="close-modal">${icon('close', 14)}</button>
+          </div>
+          <div class="modal-body">
+            <p style="margin:0;line-height:1.58">${escapeHtml(
+              t(
+                `即将永久删除本地插件目录 "${rm.dir}"（${rm.displayName}${rm.version ? ` v${rm.version}` : ''}）的文件。若仅需暂时关闭，建议直接使用卡片底部的「启用 / 禁用」停放仓滑块。`,
+                `This permanently deletes files for "${rm.dir}" (${rm.displayName}${rm.version ? ` v${rm.version}` : ''}). To temporarily pause a plugin without deleting it, use the Enable/Disable toggle slider instead.`,
+              ),
+            )}</p>
+          </div>
+          <div class="modal-footer">
+            <button type="button" class="btn btn-sm" data-action="close-modal" ${isRemoving ? 'disabled' : ''}>${escapeHtml(t('取消', 'Cancel'))}</button>
+            <button type="button" class="btn btn-danger-solid btn-sm" data-action="confirm-remove-files" data-dir="${escapeHtml(rm.dir)}" ${isRemoving ? 'disabled' : ''}>
+              ${icon(isRemoving ? 'refresh' : 'trash', 12, isRemoving ? 'spin' : '')}
+              ${escapeHtml(isRemoving ? t('移除中…', 'Removing…') : t('确认永久移除', 'Remove Permanently'))}
+            </button>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
   if (state.selfChangelogModal && state.updates.selfUpdate) {
     const su = state.updates.selfUpdate;
     const canInstall = su.installable !== false;
@@ -1706,17 +2928,17 @@ function renderModals() {
               <span>${escapeHtml(t('AGY Market 新版本更新日志', 'AGY Market Release Notes'))}</span>
               <span class="version-delta ${canInstall ? '' : 'is-upstream'}">v${escapeHtml(su.installedVersion || '?')} → v${escapeHtml(su.latestVersion || '?')}</span>
             </div>
-            <button class="icon-btn is-square" data-action="close-modal">${icon('close', 14)}</button>
+            <button type="button" class="icon-btn is-square" data-action="close-modal">${icon('close', 14)}</button>
           </div>
           <div class="modal-body md-body">
             ${renderSafeMarkdown(su.changelog, t('暂无更新日志详情。', 'No changelog provided.'))}
           </div>
           <div class="modal-footer">
             ${su.releaseUrl ? `<a class="btn btn-sm" href="${escapeHtml(su.releaseUrl)}" target="_blank" rel="noopener noreferrer">GitHub Release ${icon('external', 11)}</a>` : ''}
-            <button class="btn btn-sm" data-action="close-modal">${escapeHtml(t('关闭', 'Close'))}</button>
+            <button type="button" class="btn btn-sm" data-action="close-modal">${escapeHtml(t('关闭', 'Close'))}</button>
             ${
               canInstall
-                ? `<button class="btn btn-primary btn-sm" data-action="self-update" ${state.selfUpdateBusy ? 'disabled' : ''}>${icon('update', 12)} ${escapeHtml(t('立即更新市场', 'Update Market'))}</button>`
+                ? `<button type="button" class="btn btn-primary btn-sm" data-action="self-update" ${state.selfUpdateBusy ? 'disabled' : ''}>${icon('update', 12)} ${escapeHtml(t('立即更新市场', 'Update Market'))}</button>`
                 : ''
             }
           </div>
@@ -1735,19 +2957,19 @@ function renderModals() {
               <span style="color:var(--m-warn)">${icon('alertCircle', 16)}</span>
               <span>${escapeHtml(t('检测到本地同名插件冲突', 'Local Plugin Name Collision Detected'))}</span>
             </div>
-            <button class="icon-btn is-square" data-action="close-modal">${icon('close', 14)}</button>
+            <button type="button" class="icon-btn is-square" data-action="close-modal">${icon('close', 14)}</button>
           </div>
           <div class="modal-body">
             <p style="margin:0">${escapeHtml(t(`本地已存在来自其他来源的插件 "${cm.conflict.dir}" (${cm.conflict.scope})。Antigravity 对同名插件会静默丢弃后者，请选择安装方式：`, `A local plugin "${cm.conflict.dir}" (${cm.conflict.scope}) already claims this identifier. Choose how to proceed:`))}</p>
           </div>
           <div class="modal-footer">
-            <button class="btn btn-sm" data-action="close-modal">${escapeHtml(t('取消', 'Cancel'))}</button>
+            <button type="button" class="btn btn-sm" data-action="close-modal">${escapeHtml(t('取消', 'Cancel'))}</button>
             ${
               cm.choices.includes('replace')
-                ? `<button class="btn btn-sm" data-action="resolve-conflict" data-strategy="replace">${escapeHtml(t('覆盖替换本地同名插件', 'Replace Existing'))}</button>`
+                ? `<button type="button" class="btn btn-sm" data-action="resolve-conflict" data-strategy="replace">${escapeHtml(t('覆盖替换本地同名插件', 'Replace Existing'))}</button>`
                 : ''
             }
-            <button class="btn btn-primary btn-sm" data-action="resolve-conflict" data-strategy="isolate">
+            <button type="button" class="btn btn-primary btn-sm" data-action="resolve-conflict" data-strategy="isolate">
               ${escapeHtml(t(`隔离安装为 ${cm.scopedFallbackName}`, `Install Isolated as ${cm.scopedFallbackName}`))}
             </button>
           </div>
@@ -1767,7 +2989,7 @@ function renderModals() {
               <span style="color:var(--m-warn)">${icon('shieldAlert', 16)}</span>
               <span>${escapeHtml(isBatch ? t(`以下 ${em.items.length} 个插件更新包含新增能力`, `${em.items.length} Updates Add New Capabilities`) : t('版本更新包含新增能力声明', 'Update Adds New Capabilities'))}</span>
             </div>
-            <button class="icon-btn is-square" data-action="close-modal">${icon('close', 14)}</button>
+            <button type="button" class="icon-btn is-square" data-action="close-modal">${icon('close', 14)}</button>
           </div>
           <div class="modal-body">
             <p class="muted" style="margin:0">${escapeHtml(t('确认授权后将立即继续安装并更新本地能力凭证：', 'Confirm to proceed with installation and record the newly granted capabilities:'))}</p>
@@ -1796,8 +3018,8 @@ function renderModals() {
               .join('')}
           </div>
           <div class="modal-footer">
-            <button class="btn btn-sm" data-action="close-modal">${escapeHtml(t('暂不更新', 'Cancel'))}</button>
-            <button class="btn btn-primary btn-sm" data-action="confirm-escalation">
+            <button type="button" class="btn btn-sm" data-action="close-modal">${escapeHtml(t('暂不更新', 'Cancel'))}</button>
+            <button type="button" class="btn btn-primary btn-sm" data-action="confirm-escalation">
               ${icon('check', 12)} ${escapeHtml(isBatch ? t('全部确认并继续更新', 'Confirm & Update All') : t('确认并立即更新', 'Confirm & Update'))}
             </button>
           </div>
@@ -1829,8 +3051,8 @@ function renderModals() {
           ${
             rc.timedOut
               ? `<div style="display:flex;gap:8px;margin-top:4px">
-                  <button class="btn btn-primary btn-sm" data-action="retry-reconnect">${icon('refresh', 12)} ${escapeHtml(t('重试连接', 'Retry'))}</button>
-                  <button class="btn btn-sm" data-action="reload-page">${escapeHtml(t('刷新面板', 'Reload Pane'))}</button>
+                  <button type="button" class="btn btn-primary btn-sm" data-action="retry-reconnect">${icon('refresh', 12)} ${escapeHtml(t('重试连接', 'Retry'))}</button>
+                  <button type="button" class="btn btn-sm" data-action="reload-page">${escapeHtml(t('刷新面板', 'Reload Pane'))}</button>
                 </div>`
               : ''
           }
@@ -1859,12 +3081,24 @@ function render() {
   const catalogCount = state.serverState?.catalog?.plugins?.length || 0;
   const installedCount = state.serverState?.installed?.length || 0;
   const updatesCount = getEffectiveUpdateItems().length;
+  const conflictSummary = getConflictsSummary();
   const curLocale = getLocale();
   const channelLabel = state.serverState?.catalog?.channelUsed || '';
-  const clientVer = state.serverState?.plugin?.version || '1.1.0';
+  const clientVer = state.serverState?.plugin?.version || '1.2.0';
   const showSelfOffer = isSelfBannerVisible();
   const hasDismissedSelfUpdate = Boolean(state.updates.selfUpdate && !showSelfOffer);
   const showInstalledDot = updatesCount > 0 || showSelfOffer;
+
+  const conflictBadgeHtml =
+    conflictSummary.total > 0
+      ? `<span class="nav-conflict-badge ${conflictSummary.critical > 0 ? 'is-critical' : 'is-warn'}" title="${escapeHtml(t(`发现 ${conflictSummary.total} 项冲突或建议`, `${conflictSummary.total} conflict(s) detected`))}">${conflictSummary.total}</span>`
+      : `<span class="nav-conflict-badge is-healthy" title="${escapeHtml(t('冲突检查健康', '0 conflicts · Healthy'))}">✓</span>`;
+
+  let viewHtml = '';
+  if (state.activeTab === 'discover') viewHtml = renderDiscoverView();
+  else if (state.activeTab === 'installed') viewHtml = renderInstalledView();
+  else if (state.activeTab === 'conflicts') viewHtml = renderConflictsView();
+  else viewHtml = renderSourcesView();
 
   root.innerHTML = `
     <div class="market-shell" data-stuck="${state.scrolledStuck ? 'true' : 'false'}">
@@ -1872,8 +3106,8 @@ function render() {
         <div class="brand-group">
           <div class="brand-mark">${BRAND_LOGO_SVG}</div>
           <div class="brand-copy">
-            <span class="brand-title">${escapeHtml(t('AGY Market', 'AGY Market'))}</span>
-            <span class="brand-meta-pill" title="${escapeHtml(channelLabel ? `${t('目录通道', 'Channel')}: ${channelLabel}` : t('零 Token 辅助面板', 'Zero-Token Sidecar'))}">
+            <span class="brand-title">AGY Market</span>
+            <span class="brand-meta-pill" title="${escapeHtml(channelLabel ? `${t('目录通道', 'Channel')}: ${channelLabel}` : t('极光棱镜 · 零 Token 辅助面板', 'Aurora Prism · Zero-Token Sidecar'))}">
               <span class="status-dot ${state.updates.rateLimited ? 'is-warn' : state.updates.loading ? 'is-pulse' : ''}"></span>
               <span>v${escapeHtml(clientVer)}</span>
             </span>
@@ -1881,19 +3115,24 @@ function render() {
         </div>
 
         <nav class="segmented-nav" role="tablist" aria-label="${escapeHtml(t('主导航', 'Main navigation'))}">
-          <button class="nav-pill ${state.activeTab === 'discover' ? 'active' : ''}" data-action="tab" data-tab="discover" role="tab" aria-selected="${state.activeTab === 'discover'}">
+          <button type="button" class="nav-pill ${state.activeTab === 'discover' ? 'active' : ''}" data-action="tab" data-tab="discover" role="tab" aria-selected="${state.activeTab === 'discover'}">
             ${icon('compass', 13)}
             <span>${escapeHtml(t('探索', 'Discover'))}</span>
             <span class="nav-count">${catalogCount}</span>
           </button>
-          <button class="nav-pill ${state.activeTab === 'installed' ? 'active' : ''}" data-action="tab" data-tab="installed" role="tab" aria-selected="${state.activeTab === 'installed'}">
+          <button type="button" class="nav-pill ${state.activeTab === 'installed' ? 'active' : ''}" data-action="tab" data-tab="installed" role="tab" aria-selected="${state.activeTab === 'installed'}">
             ${icon('package', 13)}
             <span>${escapeHtml(t('已安装', 'Installed'))}</span>
             <span class="nav-count">${installedCount}</span>
             ${updatesCount > 0 ? `<span class="nav-update-badge" title="${escapeHtml(t(`${updatesCount} 个可用更新`, `${updatesCount} updates available`))}">↑${updatesCount}</span>` : ''}
             ${showInstalledDot ? '<span class="tab-red-dot" aria-hidden="true"></span>' : ''}
           </button>
-          <button class="nav-pill ${state.activeTab === 'sources' ? 'active' : ''}" data-action="tab" data-tab="sources" role="tab" aria-selected="${state.activeTab === 'sources'}">
+          <button type="button" class="nav-pill ${state.activeTab === 'conflicts' ? 'active' : ''}" data-action="tab" data-tab="conflicts" role="tab" aria-selected="${state.activeTab === 'conflicts'}">
+            ${icon(conflictSummary.total > 0 ? 'shieldAlert' : 'shieldCheck', 13)}
+            <span>${escapeHtml(t('冲突与诊断', 'Conflicts'))}</span>
+            ${conflictBadgeHtml}
+          </button>
+          <button type="button" class="nav-pill ${state.activeTab === 'sources' ? 'active' : ''}" data-action="tab" data-tab="sources" role="tab" aria-selected="${state.activeTab === 'sources'}">
             ${icon('sliders', 13)}
             <span>${escapeHtml(t('源与设置', 'Sources'))}</span>
           </button>
@@ -1902,35 +3141,40 @@ function render() {
         <div class="header-actions">
           ${
             hasDismissedSelfUpdate
-              ? `<button class="icon-btn has-alert" data-action="restore-self-banner" title="${escapeHtml(t('AGY Market 有新版本可用', 'AGY Market update available'))}">${icon('sparkle', 13)} <span>v${escapeHtml(state.updates.selfUpdate.latestVersion)}</span></button>`
+              ? `<button type="button" class="icon-btn has-alert" data-action="restore-self-banner" title="${escapeHtml(t('AGY Market 有新版本可用', 'AGY Market update available'))}">${icon('sparkle', 13)} <span>v${escapeHtml(state.updates.selfUpdate.latestVersion)}</span></button>`
               : ''
           }
-          <button class="icon-btn" data-action="toggle-locale" title="${escapeHtml(t('切换语言', 'Switch Language'))}">${curLocale === 'en' ? '中' : 'EN'}</button>
-          <button class="icon-btn is-square" data-action="refresh" ${state.loading || state.updates.loading ? 'disabled' : ''} title="${escapeHtml(t('刷新目录并检查更新', 'Refresh catalog & check updates'))}">
+          <button type="button" class="icon-btn" data-action="toggle-locale" title="${escapeHtml(t('切换界面语言与中文文档', 'Switch Language'))}">${curLocale === 'en' ? '中' : 'EN'}</button>
+          <button type="button" class="icon-btn is-square" data-action="refresh" ${state.loading || state.updates.loading ? 'disabled' : ''} title="${escapeHtml(t('刷新目录、更新与冲突体检', 'Refresh catalog, updates & conflicts'))}">
             ${icon('refresh', 13, state.loading || state.updates.loading ? 'spin' : '')}
           </button>
         </div>
       </header>
 
       ${renderSelfUpdateBanner()}
+      ${renderRestartNoticeBanner()}
 
-      ${
-        state.activeTab === 'discover'
-          ? renderDiscoverView()
-          : state.activeTab === 'installed'
-            ? renderInstalledView()
-            : renderSourcesView()
-      }
+      ${viewHtml}
 
       ${renderModals()}
 
       ${
         state.toast
           ? `<div class="toast-bar tone-${escapeHtml(state.toast.tone || 'info')}" role="status">
-              <span>${escapeHtml(state.toast.message)}</span>
+              <div class="toast-copy">
+                <span>${escapeHtml(state.toast.message)}</span>
+                ${state.toast.subtext ? `<span class="toast-sub">${escapeHtml(state.toast.subtext)}</span>` : ''}
+              </div>
               <div class="toast-actions">
-                ${state.toast.extraUri ? `<a class="pill-link" href="${escapeHtml(state.toast.extraUri)}">${escapeHtml(t('打开', 'Open'))}</a>` : ''}
-                <button class="icon-btn is-square" data-action="dismiss-toast" title="${escapeHtml(t('关闭', 'Dismiss'))}">${icon('close', 12)}</button>
+                ${
+                  state.toast.copyText
+                    ? `<button type="button" class="pill-link" data-action="copy-text" data-copy-key="toast-pill" data-copy-val="${escapeHtml(state.toast.copyText)}">
+                        ${icon(state.copiedKey === 'toast-pill' ? 'check' : 'copy', 11)}
+                        <span>${escapeHtml(state.copiedKey === 'toast-pill' ? t('已复制', 'Copied') : state.toast.copyLabel || t('复制药丸', 'Copy Pill'))}</span>
+                      </button>`
+                    : ''
+                }
+                <button type="button" class="icon-btn is-square" data-action="dismiss-toast" title="${escapeHtml(t('关闭', 'Dismiss'))}">${icon('close', 12)}</button>
               </div>
             </div>`
           : ''
@@ -1979,10 +3223,35 @@ function render() {
 }
 
 // ==========================================================================
-// Event Binding
+// Event Binding & Pointer-Tracking Spotlight
 // ==========================================================================
 
 function bindDomEvents(root) {
+  // Pointer-tracking optical spotlight on plugin cards (zero DOM re-renders!)
+  const reducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches;
+  if (!reducedMotion) {
+    root.querySelectorAll('.cards-grid').forEach((grid) => {
+      grid.addEventListener(
+        'pointermove',
+        (e) => {
+          const card = e.target?.closest?.('.plugin-card');
+          if (!card) return;
+          const rect = card.getBoundingClientRect();
+          card.style.setProperty('--mx', `${Math.round(e.clientX - rect.left)}px`);
+          card.style.setProperty('--my', `${Math.round(e.clientY - rect.top)}px`);
+        },
+        { passive: true },
+      );
+    });
+  }
+
+  // Stop propagation on direct external title links & dock controls inside clickable card headers
+  root.querySelectorAll('[data-stop-card]').forEach((el) => {
+    el.addEventListener('click', (e) => {
+      e.stopPropagation();
+    });
+  });
+
   const searchEl = root.querySelector('#market-search-input');
   if (searchEl) {
     searchEl.addEventListener('input', (e) => {
@@ -2039,7 +3308,13 @@ function bindDomEvents(root) {
         render();
         if (nextTab === 'installed' && Date.now() - lastForcedUpdatesAt > 10_000 && !state.updates.loading) {
           void checkUpdates(true, { silent: true });
+        } else if (nextTab === 'conflicts' && !state.conflicts.loading) {
+          void loadConflicts({ silent: true });
         }
+      } else if (action === 'toggle-hero') {
+        state.heroCollapsed = !state.heroCollapsed;
+        writeStorage(HERO_COLLAPSED_KEY, state.heroCollapsed ? '1' : '0');
+        render();
       } else if (action === 'category') {
         state.category = el.getAttribute('data-category') || 'all';
         render();
@@ -2051,14 +3326,69 @@ function bindDomEvents(root) {
         state.category = 'all';
         render();
       } else if (action === 'refresh') {
-        void Promise.all([loadState(true), checkUpdates(true, { silent: false })]);
+        void Promise.all([
+          loadState(true),
+          checkUpdates(true, { silent: false }),
+          state.activeTab === 'conflicts' || state.conflicts.loaded ? loadConflicts({ silent: true }) : Promise.resolve(),
+        ]);
+      } else if (action === 'refresh-conflicts') {
+        void loadConflicts({ silent: false });
+      } else if (action === 'fix-conflict') {
+        e.stopPropagation();
+        const type = el.getAttribute('data-fix-type') || '';
+        const targetDir = el.getAttribute('data-target-dir') || '';
+        const suggestedDir = el.getAttribute('data-suggested-dir') || '';
+        if (type && targetDir) {
+          void triggerFixConflict({ type, targetDir, suggestedDir });
+        }
+      } else if (action === 'toggle-plugin') {
+        e.stopPropagation();
+        const dir = el.getAttribute('data-dir') || '';
+        const nextEnabled = el.getAttribute('data-next-enabled') === '1';
+        if (dir && !el.disabled) {
+          void triggerTogglePlugin(dir, nextEnabled);
+        }
+      } else if (action === 'open-pane') {
+        e.stopPropagation();
+        const dir = el.getAttribute('data-dir') || '';
+        const folder = el.getAttribute('data-folder') || '';
+        const viewPath = el.getAttribute('data-path') || '/';
+        const title = el.getAttribute('data-title') || dir;
+        const uri = el.getAttribute('data-uri') || '';
+        if (dir) {
+          void openSiblingSidecarPane({ dir, folder, viewPath, title, uri });
+        }
+      } else if (action === 'copy-uri-pill') {
+        e.stopPropagation();
+        const uri = el.getAttribute('data-uri') || '';
+        const label = el.getAttribute('data-label') || uri;
+        if (uri) {
+          void copyText(`[${label}](${uri})`, `md-pill-${uri}`, t(`已复制聊天药丸 [${label}](${uri})`, `Copied chat pill [${label}](${uri})`));
+        }
+      } else if (action === 'prompt-remove-files') {
+        e.stopPropagation();
+        const dir = el.getAttribute('data-dir') || '';
+        const displayName = el.getAttribute('data-name') || dir;
+        const version = el.getAttribute('data-version') || '';
+        if (dir && dir !== 'agy-market') {
+          state.removeConfirmModal = { dir, displayName, version };
+          render();
+        }
+      } else if (action === 'confirm-remove-files') {
+        const dir = el.getAttribute('data-dir') || '';
+        if (dir) void triggerRemovePluginFiles(dir);
+      } else if (action === 'dismiss-restart-notice') {
+        state.restartNotice = null;
+        render();
       } else if (action === 'check-updates') {
         void checkUpdates(true, { silent: false });
       } else if (action === 'toggle-locale') {
         const nextLocale = getLocale() === 'en' ? 'zh' : 'en';
-        void updatePrefs({ locale: nextLocale }, nextLocale === 'en' ? 'Switched to English' : '已切换为中文');
+        void updatePrefs({ locale: nextLocale }, nextLocale === 'en' ? 'Switched to English' : '已切换为简体中文');
       } else if (action === 'close-modal') {
-        if (state.escalationModal) {
+        if (state.removeConfirmModal) {
+          state.removeConfirmModal = null;
+        } else if (state.escalationModal) {
           state.escalationModal = null;
         } else if (state.conflictModal) {
           state.conflictModal = null;
@@ -2116,11 +3446,11 @@ function bindDomEvents(root) {
       } else if (action === 'dismiss-self-banner') {
         const ver = state.updates.selfUpdate?.latestVersion || '__dismissed__';
         state.dismissedSelfVersion = ver;
-        writeDismissedSelfVersion(ver);
+        writeStorage(SELF_OFFER_DISMISSED_KEY, ver);
         render();
       } else if (action === 'restore-self-banner') {
         state.dismissedSelfVersion = '';
-        writeDismissedSelfVersion('');
+        writeStorage(SELF_OFFER_DISMISSED_KEY, '');
         render();
       } else if (action === 'resolve-conflict' && state.conflictModal) {
         const strategy = el.getAttribute('data-strategy') || 'isolate';
@@ -2144,6 +3474,7 @@ function bindDomEvents(root) {
       } else if (action === 'clear-github-token') {
         void updatePrefs({ githubToken: '', clearGithubToken: true }, t('已清除本地 GitHub Token', 'Cleared local GitHub Token'));
       } else if (action === 'copy-text') {
+        e.stopPropagation();
         const val = el.getAttribute('data-copy-val') || '';
         const key = el.getAttribute('data-copy-key') || 'copy';
         if (val) void copyText(val, key);
@@ -2159,11 +3490,14 @@ function bindDomEvents(root) {
   });
 }
 
-// Global keyboard shortcuts (Esc to close drawer/modals, `/` to focus search)
+// Global keyboard shortcuts (Esc to close modals/drawer, `/` to focus search)
 window.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
     if (state.reconnecting) return;
-    if (state.escalationModal) {
+    if (state.removeConfirmModal) {
+      state.removeConfirmModal = null;
+      render();
+    } else if (state.escalationModal) {
       state.escalationModal = null;
       render();
     } else if (state.conflictModal) {

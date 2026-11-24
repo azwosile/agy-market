@@ -31,6 +31,7 @@ export async function packReleaseBundle({ outDir = join(repoRoot, 'dist') } = {}
       'agy-market.json',
       'package.json',
       'README.md',
+      'README.en.md',
       'LICENSE',
       'assets',
       'bin',
