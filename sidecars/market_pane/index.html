@@ -5142,7 +5142,7 @@ const SELF_REPO_URL = 'https://github.com/azwosile/agy-market';
 const SUBMIT_PLUGIN_GUIDE_URL =
   'https://github.com/azwosile/agy-market-catalog/blob/main/docs/SUBMISSION_GUIDE.md';
 const PLUGIN_DISPLAY_NAME = 'AGY Market · 反重力插件市场';
-const PLUGIN_VERSION = '1.5.2';
+const PLUGIN_VERSION = '1.5.3';
 const SIDECAR_ID = 'market_pane';
 const SIDECAR_URI = 'sidecar://agy-market/market_pane/';
 const CUSTOMIZATION_URI = 'customization://agy-market';
@@ -6194,25 +6194,47 @@ function resolveInstalledDescription(loc, catEntry) {
 }
 
 function getEffectiveUpdateItems() {
+  let raw;
   if (Array.isArray(state.updates.items) && state.updates.items.length > 0) {
-    return state.updates.items;
+    raw = state.updates.items;
+  } else if (state.updates.checkedAt) {
+    raw = state.updates.items || [];
+  } else {
+    raw = (state.serverState?.updatesAvailable || []).map((u) => ({
+      id: u.id,
+      dir: u.installedDir || u.dir || '',
+      displayName: u.displayName || u.id,
+      installedVersion: u.installedVersion,
+      latestVersion: u.latestVersion,
+      source: 'catalog',
+      releaseUrl: '',
+      changelog: '',
+      escalation: u.escalation || null,
+      installable: true,
+      isSelf: u.installedDir === 'agy-market' || u.id === 'azwosile__agy-market',
+    }));
   }
-  if (state.updates.checkedAt) {
-    return state.updates.items || [];
+
+  const base = raw.filter((item) => {
+    const dir = String(item?.dir || '').trim();
+    if (dir && state.verifiedLatestDirs.has(dir)) return false;
+    if ((item?.isSelf || item?.id === 'azwosile__agy-market') && state.verifiedLatestDirs.has('agy-market')) {
+      return false;
+    }
+    return true;
+  });
+
+  const su = state.updates.selfUpdate;
+  if (
+    su &&
+    !state.verifiedLatestDirs.has('agy-market') &&
+    (state.serverState?.installed || []).some((loc) => loc.scope === 'global' && loc.dir === 'agy-market') &&
+    !base.some((item) => item?.isSelf || item?.dir === 'agy-market' || item?.id === 'azwosile__agy-market')
+  ) {
+    return [...base, { ...su, id: su.id || 'azwosile__agy-market', dir: 'agy-market', isSelf: true }];
   }
-  return (state.serverState?.updatesAvailable || []).map((u) => ({
-    id: u.id,
-    dir: u.installedDir || u.dir || '',
-    displayName: u.displayName || u.id,
-    installedVersion: u.installedVersion,
-    latestVersion: u.latestVersion,
-    source: 'catalog',
-    releaseUrl: '',
-    changelog: '',
-    escalation: u.escalation || null,
-    installable: true,
-    isSelf: u.installedDir === 'agy-market' || u.id === 'azwosile__agy-market',
-  }));
+
+  return base;
 }
 
 function getUpdateMaps() {
@@ -8994,11 +9016,15 @@ function renderDiscoverView() {
       ${renderAuroraHeroStrip()}
 
       ${
-        installableUpds.length > 0
+        state.batchUpdating || installableUpds.length > 0
           ? `<div class="quick-update-strip">
               <div class="quick-update-left">
                 ${icon('update', 14)}
-                <span>${escapeHtml(t(`有 ${installableUpds.length} 个已安装插件可立即更新`, `${installableUpds.length} installed plugin update(s) ready`))}</span>
+                <span>${escapeHtml(
+                  state.batchUpdating && installableUpds.length === 0
+                    ? t('正在批量更新已安装插件…', 'Updating installed plugins…')
+                    : t(`有 ${installableUpds.length} 个已安装插件可立即更新`, `${installableUpds.length} installed plugin update(s) ready`),
+                )}</span>
               </div>
               <div class="quick-update-actions">
                 <button type="button" class="btn btn-sm" data-action="tab" data-tab="installed">${escapeHtml(t('查看详情', 'Review'))}</button>
@@ -9369,7 +9395,6 @@ function renderInstalledCard(loc, updById, updByDir, catById, catByDir) {
 
 function renderInstalledView() {
   const installed = state.serverState?.installed || [];
-  const globalInstalled = installed.filter((x) => x.scope === 'global');
   const { byId: updById, byDir: updByDir } = getUpdateMaps();
   const { byId: catById, byDir: catByDir } = getCatalogMaps();
   const allUpdates = getEffectiveUpdateItems();
@@ -9500,7 +9525,7 @@ function renderInstalledView() {
               ${escapeHtml(t('检查更新', 'Check Now'))}
             </button>
             ${
-              globalInstalled.length > 0
+              state.batchUpdating || installableUpds.length > 0
                 ? `<button type="button" class="btn btn-update btn-sm" data-action="update-all"${updateActionLocked ? ' disabled aria-disabled="true"' : ''}>
                     ${state.batchUpdating ? icon('refresh', 12, 'spin') : icon('update', 12)}
                     ${escapeHtml(
@@ -9508,9 +9533,7 @@ function renderInstalledView() {
                         ? state.batchTargetIds.length > 0
                           ? t(`正在一键更新 (${state.batchTargetIds.length})…`, `Updating All (${state.batchTargetIds.length})…`)
                           : t('正在一键更新…', 'Updating All…')
-                        : installableUpds.length > 0
-                          ? t(`一键更新 (${installableUpds.length})`, `Update All (${installableUpds.length})`)
-                          : t('一键更新', 'Update All'),
+                        : t(`一键更新 (${installableUpds.length})`, `Update All (${installableUpds.length})`),
                     )}
                   </button>`
                 : ''

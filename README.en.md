@@ -20,7 +20,7 @@ Sidebar Panel UI · Lock-Safe One-Click Uninstall · Direct In-Sidebar Upstream 
 
 ---
 
-## ✨ Highlights (v1.5.2)
+## ✨ Highlights (v1.5.3)
 
 ### 1. Sidebar Panel UI, 15 Precision Categories & Navigation
 - **Native Right Sidebar Panel**: Runs inside Antigravity's native `AUX_PANE` extension view (`sidecars/market_pane/sidecar.json`) with no bundled MCP servers, keeping the panel lightweight and responsive.
@@ -30,16 +30,16 @@ Sidebar Panel UI · Lock-Safe One-Click Uninstall · Direct In-Sidebar Upstream 
 - **Multilingual README Drawer**: Queries `/api/readme?id=...&locale=zh|en`, preferring localized `entriesZh` / `entriesEn` from the catalog (or local `README.zh-CN.md` / `README.zh.md` for installed plugins) and rendering localized descriptions on installed cards.
 - **Direct One-Click Sidebar Launcher**: Replaces raw `<a href="sidecar://...">` links blocked inside isolated iframes. Inside the host panel, clicking a sibling plugin's **Panel** button invokes host `window.sidecar.ui.toggleAuxPane` (`tabType: "sidecarView"`) directly to open or focus its Sidebar panel—no manual copy prompts.
 
-### 2. Lock-Safe Uninstall, Direct In-Sidebar Updates & Permanent Update All
+### 2. Lock-Safe Uninstall, Direct In-Sidebar Updates & On-Demand Update All
 - **Lock-Safe Plugin Uninstall (Sidebar Card/Drawer + `npx agy-market uninstall <dir>`)**:
   - Every removable global plugin card and Detail Drawer exposes an **Uninstall** (`卸载`) button backed by `POST /api/uninstall` (with `POST /api/remove-files` compatibility) and a confirmation modal with an optional *Also remove from favorites* checkbox.
   - Handles both active (`~/.gemini/config/plugins/<dir>`) and Vault-Parked (`${PLUGIN_DATA}/disabled-plugins/<dir>`) directories; never writes `config.json` or calls restricted RPCs; unlinks symlinks/NTFS junctions without touching target source directories; retires Windows `EBUSY`-locked binaries to `.old.<ts>` while immediately deleting `plugin.json` (with `sweepRetiredBinaries` later removing empty orphan shells); strictly blocks self-deletion of `agy-market` (`ERR_CANNOT_SELF_DELETE`) as well as `workspace` and `builtin` plugins.
 - **Direct In-Sidebar Updates Across All Channels (Zero External Download Redirects)**:
   - Whenever an upstream GitHub Release/Tag leads the catalog or comes from a GitHub URL install, `GET /api/updates` returns `installable: true` (`updateChannel: 'catalog' | 'github-upstream' | 'github-url'`), eliminating external browser download redirects.
   - Upgrading a verified catalog plugin directly from GitHub upstream preserves its original `receipt.track` (`'verified'`) and `repositoryId` while still enforcing capability-escalation confirmation.
-- **Per-Card Smart `Update` / `Latest` Status Pill & Permanent Top-Bar `Update All`**:
+- **Per-Card Smart `Update` / `Latest` Status Pill & On-Demand Top-Bar `Update All`**:
   - Every installed plugin card with a catalog or GitHub source renders a clickable **Update vX.Y.Z** button when a newer version is available and automatically transitions into a non-clickable **✓ Latest** status pill once updated or confirmed up to date (before an initial check, clicking **Update** verifies first without re-downloading if already current; pure local plugins display a non-clickable `Local` / `Workspace` / `Built-in` status pill and return `ERR_NO_UPDATE_SOURCE` on API calls).
-  - The **Installed** tab header permanently displays **Update All** beside **Check Updates**: clicking it checks for updates when needed and sequentially upgrades `catalog`, `github-upstream`, and `github-url` plugins (always scheduling `agy-market` self-update last to trigger clean restart).
+  - The **Installed** tab header displays **Update All (N)** beside **Check Updates** on demand: it appears when installable updates are detected (or while a batch update is running) to sequentially upgrade `catalog`, `github-upstream`, and `github-url` plugins (always scheduling `agy-market` self-update last to trigger clean restart), and automatically hides when all plugins are up to date to keep the header uncluttered.
 
 ### 3. ⭐ Favorites Shelf & Tab, Installed Search/Filters & Update Error Alerts
 - **⭐ Pinned Favorites Shelf & Dedicated Favorites Tab**:

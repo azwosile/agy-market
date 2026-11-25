@@ -20,7 +20,7 @@ Sidebar 侧边栏界面 · 锁安全一键卸载 · Sidebar 上游直装与一�
 
 ---
 
-## ✨ 核心特性（v1.5.2）
+## ✨ 核心特性（v1.5.3）
 
 ### 1. Sidebar 侧边栏界面、15 大精准分类与导航体验
 - **原生右侧 Sidebar 侧边栏**：基于 Antigravity 原生 `AUX_PANE` 扩展视图（`sidecars/market_pane/sidecar.json`），不捆绑常驻 MCP 服务，打开即用、轻量流畅。
@@ -30,16 +30,16 @@ Sidebar 侧边栏界面 · 锁安全一键卸载 · Sidebar 上游直装与一�
 - **开箱优先呈现简体中文文档**：详情抽屉请求 `/api/readme?id=...&locale=zh`，自动优先渲染目录源 `entriesZh` 或本地 `README.zh-CN.md` / `README.zh.md`，并在已安装卡片优先显示中文化简介。
 - **点击「面板」一键直开目标 Sidebar 侧边栏**：移除会被 Chromium 拦截的裸 `<a href="sidecar://...">` 链接；在宿主侧边栏内点击其他 Sidebar 插件卡片上的「面板」按钮时，直接调用宿主 `window.sidecar.ui.toggleAuxPane`（`tabType: "sidecarView"`）拉起或聚焦对应侧边栏，无需手动复制提示。
 
-### 2. 锁安全一键卸载、Sidebar 全通道直装更新与常驻「一键更新」
+### 2. 锁安全一键卸载、Sidebar 全通道直装更新与按需「一键更新」
 - **锁安全插件卸载（Sidebar 卡片/详情抽屉 + `npx agy-market uninstall <dir>`）**：
   - 每张可卸载全局已安装插件卡片与详情抽屉均内置 **「卸载」** 按钮（`POST /api/uninstall`，同时兼容 `/api/remove-files`），确认弹窗支持可选勾选「同时从收藏夹移除」。
   - 统一覆盖活跃目录（`~/.gemini/config/plugins/<dir>`）与停放仓（`${PLUGIN_DATA}/disabled-plugins/<dir>`）；绝不写 `config.json` 或调用受限 RPC；遇到符号链接/NTFS Junction 仅删除链接本身绝不误删源目录；Windows 下遇到 `EBUSY` 文件锁自动 `.old.<ts>` 改名退避并立即摘除 `plugin.json`，下次启动由 `sweepRetiredBinaries` 自动清扫残留空壳目录；硬性拦截 `agy-market` 自删（`ERR_CANNOT_SELF_DELETE`）及 `workspace` / `builtin` 插件误删。
 - **Sidebar 内全通道直装更新（告别外链手动下载）**：
   - 当检测到 GitHub 上游 Release/Tag 领先于目录版本或来源于 GitHub URL 时，`GET /api/updates` 统一标记 `installable: true`（`updateChannel: 'catalog' | 'github-upstream' | 'github-url'`），点击更新直接在 Sidebar 内完成拉取、预检与原位升级，彻底移除跳转外部浏览器的上游外链按钮。
   - 目录认证插件通过 GitHub 上游通道直装更新时，100% 保留原有 `receipt.track`（如 `'verified'`）与 `repositoryId`，并持续执行能力增量确认门禁。
-- **每张已安装卡片配智能「更新 / 最新」状态切换 + 顶栏常驻「一键更新」**：
+- **每张已安装卡片配智能「更新 / 最新」状态切换 + 顶栏按需「一键更新」**：
   - 所有具备远端更新源的已安装插件卡片在发现新版本时展示直装 **「更新 vX.Y.Z」** 按钮，更新完成或检查确认为最新版后自动切换为不可点击的 **「✓ 最新」** 提示胶囊（未检查时点击「更新」先核验，若已是最新不重复下载重装）；纯本地无源插件展示不可点击的「本地 / 工作区 / 内置」状态胶囊（接口返回 `ERR_NO_UPDATE_SOURCE`）。
-  - 「已安装」页签顶栏在 **「检查更新」** 旁常驻 **「一键更新」** 按钮：一键自动核检并按序批量更新 `catalog`、`github-upstream` 与 `github-url` 全部通道，并将 `agy-market` 自身更新严格排在最后触发重启。
+  - 「已安装」页签顶栏在 **「检查更新」** 旁按需显示 **「一键更新 (N)」** 按钮：当检测到可安装更新（或批量更新进行中）时显示，按序批量更新 `catalog`、`github-upstream` 与 `github-url` 全部通道（并将 `agy-market` 自身更新严格排在最后触发重启）；全部插件处于最新版本时自动隐藏，保持界面清爽。
 
 ### 3. ⭐ 插件收藏栏、已安装搜索筛选与更新失败告警
 - **⭐ 插件收藏栏 & 独立「收藏」标签页**：
