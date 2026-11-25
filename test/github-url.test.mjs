@@ -1469,3 +1469,327 @@ test('Category 5: CLI `agy-market add` supports --json, --subpath, --isolate, se
     ws.cleanup();
   }
 });
+
+// ============================================================================
+// 6. v1.5.4 Regressions: RC-3 Tag/Manifest mismatch & RC-5 Branch -> Tag graduation
+// ============================================================================
+test('v1.5.4 RC-3: SemVer tag with unbumped plugin.json resolves tag version and never triggers infinite update loop', async () => {
+  const ws = makeTempWorkspace('agy-gh-rc3-');
+  try {
+    // Release tag is v1.3.0, but author forgot to bump plugin.json inside the archive (still 1.2.0)
+    const mismatchTar = buildGithubArchiveTarGz(
+      {
+        'plugin.json': JSON.stringify({
+          name: 'tag-mismatch',
+          displayName: 'Tag Mismatch Plug',
+          version: '1.2.0',
+          description: 'Tag v1.3.0 with forgotten manifest version 1.2.0',
+          logo: 'assets/logo.svg',
+        }),
+        'assets/logo.svg': CLEAN_SVG,
+        'skills/tm/SKILL.md': '---\nname: tm\ndescription: x\n---\n# TM',
+      },
+      { topDir: 'tag-mismatch-1.3.0', commitSha: SHA_2 },
+    );
+
+    const mockFetch = async (url, init = {}) => {
+      const s = String(url);
+      if (s.endsWith('/index.json') || s.endsWith('/unverified-index.json')) return jsonResponse(emptyCatalogIndex());
+      if (s.endsWith('/readmes.json')) return jsonResponse({ entries: {} });
+      if (s === 'https://api.github.com/repos/alice/tag-mismatch') {
+        return jsonResponse({ id: 7101, full_name: 'alice/tag-mismatch', default_branch: 'main' });
+      }
+      if (
+        s === 'https://api.github.com/repos/alice/tag-mismatch/releases/latest' ||
+        s === 'https://api.github.com/repos/alice/tag-mismatch/releases/tags/v1.3.0'
+      ) {
+        return jsonResponse({
+          tag_name: 'v1.3.0',
+          html_url: 'https://github.com/alice/tag-mismatch/releases/tag/v1.3.0',
+          tarball_url: 'https://github.com/alice/tag-mismatch/archive/refs/tags/v1.3.0.tar.gz',
+          assets: [],
+          body: '## v1.3.0',
+        });
+      }
+      if (s.includes('alice/tag-mismatch') && init?.method === 'HEAD') {
+        return new Response('', { status: 200 });
+      }
+      if (s.includes('alice/tag-mismatch') && (s.includes('tar.gz') || s.includes('/archive/') || s.includes('/tarball/'))) {
+        return binaryResponse(mismatchTar);
+      }
+      return new Response('Not Found', { status: 404 });
+    };
+
+    const srv = await createMarketSidecarServer({
+      listen: false,
+      recoveryDelayMs: -1,
+      configDir: ws.configDir,
+      dataDir: ws.dataDir,
+      fetchImpl: mockFetch,
+    });
+    try {
+      const headers = makeAuthHeaders(srv);
+
+      // 1. Fresh install via GitHub URL: inspect & receipt MUST resolve 1.3.0 from stable SemVer tag (not 1.2.0)
+      const ins = (
+        await srv.inject({
+          method: 'POST',
+          url: '/api/github/inspect',
+          headers,
+          body: { url: 'https://github.com/alice/tag-mismatch' },
+        })
+      ).json();
+      assert.equal(ins.status, 'READY');
+      assert.equal(ins.plugin.version, '1.3.0', 'inspectGithubPluginUrl must prefer newer stable SemVer tag over unbumped manifest.version');
+
+      const inst = (
+        await srv.inject({
+          method: 'POST',
+          url: '/api/github/install',
+          headers,
+          body: { inspectToken: ins.inspectToken, url: 'https://github.com/alice/tag-mismatch', installMode: 'native' },
+        })
+      ).json();
+      assert.equal(inst.status, 'INSTALLED');
+      assert.equal(inst.version, '1.3.0');
+
+      const installedReceipt = JSON.parse(
+        readFileSync(join(ws.pluginsDir, 'tag-mismatch', '.agy-market-receipt.json'), 'utf8'),
+      );
+      assert.equal(installedReceipt.installedVersion, '1.3.0');
+      assert.equal(installedReceipt.gitTag, 'v1.3.0');
+
+      // 2. Also plant a pre-v1.5.4 legacy install with installedVersion: '1.2.0' but gitTag: 'v1.3.0'
+      const legacyDir = join(ws.pluginsDir, 'legacy-mismatch');
+      mkdirSync(legacyDir, { recursive: true });
+      writeFileSync(
+        join(legacyDir, 'plugin.json'),
+        JSON.stringify({
+          name: 'legacy-mismatch',
+          displayName: 'Legacy Mismatch',
+          version: '1.2.0',
+          repository: 'https://github.com/alice/tag-mismatch',
+        }),
+        'utf8',
+      );
+      writeFileSync(
+        join(legacyDir, '.agy-market-receipt.json'),
+        JSON.stringify({
+          schemaVersion: 1,
+          id: 'gh-url__alice__tag-mismatch--legacy',
+          track: 'github-url',
+          repositoryId: 7101,
+          repositoryUrl: 'https://github.com/alice/tag-mismatch',
+          installedDir: 'legacy-mismatch',
+          installedVersion: '1.2.0',
+          gitTag: 'v1.3.0',
+          grantedCapabilities: { badges: ['declarative-only'], mcpRemoteDomains: [], hookEvents: [] },
+        }),
+        'utf8',
+      );
+
+      // 3. Subsequent GET /api/updates?force=1 MUST return 0 items for BOTH fresh and legacy mismatch installs
+      const updRes = await srv.inject({ method: 'GET', url: '/api/updates?force=1' });
+      assert.equal(updRes.statusCode, 200);
+      assert.deepEqual(
+        updRes.json().items,
+        [],
+        'Tag/Manifest version mismatch must produce 0 updates (zero infinite update loop)',
+      );
+    } finally {
+      await srv.close();
+    }
+  } finally {
+    ws.cleanup();
+  }
+});
+
+test('v1.5.4 RC-5: branch-tracked github-url plugin upgrading to SemVer tag transitions off branch tracking without sticky commit loop', async () => {
+  const ws = makeTempWorkspace('agy-gh-rc5-');
+  try {
+    const branchV1Tar = buildGithubArchiveTarGz(
+      {
+        'plugin.json': JSON.stringify({
+          name: 'grad-plug',
+          displayName: 'Graduating Plug',
+          version: '1.0.0',
+          description: 'Initially installed from main branch before any tags existed.',
+          logo: 'assets/logo.svg',
+        }),
+        'assets/logo.svg': CLEAN_SVG,
+        'skills/gp/SKILL.md': '---\nname: gp\ndescription: x\n---\n# GP v1.0.0',
+      },
+      { topDir: 'grad-plug-main', commitSha: SHA_1 },
+    );
+
+    const releaseV120Tar = buildGithubArchiveTarGz(
+      {
+        'plugin.json': JSON.stringify({
+          name: 'grad-plug',
+          displayName: 'Graduating Plug',
+          version: '1.2.0',
+          description: 'Graduated to formal SemVer release v1.2.0.',
+          logo: 'assets/logo.svg',
+        }),
+        'assets/logo.svg': CLEAN_SVG,
+        'skills/gp/SKILL.md': '---\nname: gp\ndescription: x\n---\n# GP v1.2.0',
+      },
+      { topDir: 'grad-plug-1.2.0', commitSha: SHA_2 },
+    );
+
+    let hasFormalRelease = false;
+    let mainBranchSha = SHA_1;
+
+    const mockFetch = async (url, init = {}) => {
+      const s = String(url);
+      if (s.endsWith('/index.json') || s.endsWith('/unverified-index.json')) return jsonResponse(emptyCatalogIndex());
+      if (s.endsWith('/readmes.json')) return jsonResponse({ entries: {} });
+      if (s === 'https://api.github.com/repos/zou/grad-plug') {
+        return jsonResponse({ id: 7202, full_name: 'zou/grad-plug', default_branch: 'main' });
+      }
+      if (s === 'https://api.github.com/repos/zou/grad-plug/releases/latest') {
+        if (!hasFormalRelease) return new Response('', { status: 404 });
+        return jsonResponse({
+          tag_name: 'v1.2.0',
+          html_url: 'https://github.com/zou/grad-plug/releases/tag/v1.2.0',
+          tarball_url: 'https://github.com/zou/grad-plug/archive/refs/tags/v1.2.0.tar.gz',
+          assets: [],
+          body: '## v1.2.0 first formal release',
+        });
+      }
+      if (s === 'https://api.github.com/repos/zou/grad-plug/releases/tags/v1.2.0') {
+        if (!hasFormalRelease) return new Response('', { status: 404 });
+        return jsonResponse({
+          tag_name: 'v1.2.0',
+          html_url: 'https://github.com/zou/grad-plug/releases/tag/v1.2.0',
+          tarball_url: 'https://github.com/zou/grad-plug/archive/refs/tags/v1.2.0.tar.gz',
+          assets: [],
+          body: '## v1.2.0 first formal release',
+        });
+      }
+      if (s.includes('zou/grad-plug/tags')) {
+        return jsonResponse(hasFormalRelease ? [{ name: 'v1.2.0', commit: { sha: SHA_2 } }] : []);
+      }
+      if (s.includes('zou/grad-plug/commits/main.atom')) {
+        return new Response(
+          `<?xml version="1.0" encoding="UTF-8"?><feed><entry><id>tag:github.com,2008:Grit::Commit/${mainBranchSha}</id><title>chore: main commit</title></entry></feed>`,
+          { status: 200, headers: { 'content-type': 'application/atom+xml' } },
+        );
+      }
+      if (s.includes('zou/grad-plug/commits/main')) {
+        return jsonResponse({ sha: mainBranchSha, commit: { message: 'chore: main commit' } });
+      }
+      if (s.startsWith('https://raw.githubusercontent.com/zou/grad-plug/main/plugin.json')) {
+        return jsonResponse({ name: 'grad-plug', version: hasFormalRelease ? '1.2.0' : '1.0.0' });
+      }
+      if (s.includes('/releases/latest') && init?.method === 'HEAD') {
+        return new Response('', { status: hasFormalRelease ? 200 : 404 });
+      }
+      if (s.includes('v1.2.0')) return binaryResponse(releaseV120Tar);
+      if (s.includes('zou/grad-plug') && (s.includes('main') || s.includes('HEAD') || s.includes(SHA_1))) {
+        return binaryResponse(branchV1Tar);
+      }
+      return new Response('Not Found', { status: 404 });
+    };
+
+    const srv = await createMarketSidecarServer({
+      listen: false,
+      recoveryDelayMs: -1,
+      configDir: ws.configDir,
+      dataDir: ws.dataDir,
+      fetchImpl: mockFetch,
+    });
+    try {
+      const headers = makeAuthHeaders(srv);
+
+      // 1. Install initially from tagless main branch -> receipt tracks branch 'main'
+      const ins = (
+        await srv.inject({
+          method: 'POST',
+          url: '/api/github/inspect',
+          headers,
+          body: { url: 'https://github.com/zou/grad-plug' },
+        })
+      ).json();
+      assert.equal(ins.status, 'READY');
+      const inst = (
+        await srv.inject({
+          method: 'POST',
+          url: '/api/github/install',
+          headers,
+          body: { inspectToken: ins.inspectToken, url: 'https://github.com/zou/grad-plug', installMode: 'native' },
+        })
+      ).json();
+      assert.equal(inst.status, 'INSTALLED');
+
+      const beforeReceipt = JSON.parse(
+        readFileSync(join(ws.pluginsDir, 'grad-plug', '.agy-market-receipt.json'), 'utf8'),
+      );
+      assert.equal(beforeReceipt.track, 'github-url');
+      assert.equal(beforeReceipt.githubSource?.refType, 'branch');
+      assert.equal(beforeReceipt.githubSource?.trackBranch, 'main');
+
+      // 2. Upstream publishes formal SemVer release v1.2.0 -> detect and upgrade
+      hasFormalRelease = true;
+      mainBranchSha = SHA_2;
+
+      const u1 = (await srv.inject({ method: 'GET', url: '/api/updates?force=1' })).json();
+      const gradUpd = u1.items.find((i) => i.dir === 'grad-plug');
+      assert.ok(gradUpd, 'SemVer release v1.2.0 must be detected for branch-installed github-url plugin');
+      assert.equal(gradUpd.updateKind, 'semver');
+      assert.equal(gradUpd.latestVersion, '1.2.0');
+      assert.equal(gradUpd.targetRef, 'v1.2.0');
+
+      const upRes = await srv.inject({
+        method: 'POST',
+        url: '/api/update',
+        headers,
+        body: {
+          id: gradUpd.id,
+          dir: 'grad-plug',
+          source: gradUpd.source,
+          updateChannel: gradUpd.updateChannel,
+          targetRef: gradUpd.targetRef,
+          updateKind: gradUpd.updateKind,
+        },
+      });
+      assert.equal(upRes.statusCode, 200);
+      assert.equal(upRes.json().ok, true);
+      assert.equal(upRes.json().status, 'INSTALLED');
+      assert.equal(upRes.json().version, '1.2.0');
+
+      const afterReceipt = JSON.parse(
+        readFileSync(join(ws.pluginsDir, 'grad-plug', '.agy-market-receipt.json'), 'utf8'),
+      );
+      assert.equal(afterReceipt.installedVersion, '1.2.0');
+      assert.equal(afterReceipt.gitTag, 'v1.2.0');
+      assert.notEqual(
+        afterReceipt.githubSource?.refType,
+        'branch',
+        'Upgrading branch plugin to SemVer tag MUST clear sticky refType="branch"',
+      );
+      assert.ok(
+        afterReceipt.githubSource?.refType === 'release' || afterReceipt.githubSource?.refType === 'tag',
+        `Expected refType to be release/tag after SemVer upgrade, got "${afterReceipt.githubSource?.refType}"`,
+      );
+      assert.equal(
+        Boolean(afterReceipt.githubSource?.trackBranch),
+        false,
+        'trackBranch MUST be cleared after upgrading to SemVer tag',
+      );
+
+      // 3. Upstream pushes another commit SHA_3 onto main branch (no new tag) -> MUST NOT trigger branch commit updates!
+      mainBranchSha = SHA_3;
+      const u2 = (await srv.inject({ method: 'GET', url: '/api/updates?force=1' })).json();
+      assert.deepEqual(
+        u2.items,
+        [],
+        'After graduating to SemVer tag v1.2.0, unrelated commits on main branch must NOT trigger commit update loop',
+      );
+    } finally {
+      await srv.close();
+    }
+  } finally {
+    ws.cleanup();
+  }
+});

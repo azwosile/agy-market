@@ -889,6 +889,40 @@ function findMatchingCatalogPlugin(loc, catalogPlugins) {
   return null;
 }
 
+const FULL_COMMIT_SHA_RE = /^[0-9a-f]{40}$/i;
+
+export function isSameInstalledRelease(receipt, { gitTag = '', commitSha = '' } = {}) {
+  if (!receipt || typeof receipt !== 'object') return false;
+  const recTag = String(receipt.gitTag || '').trim().toLowerCase();
+  const remTag = String(gitTag || '').trim().toLowerCase();
+  const recSha = String(receipt.commitSha || '').trim().toLowerCase();
+  const remSha = String(commitSha || '').trim().toLowerCase();
+
+  if (recTag && remTag) {
+    if (recTag !== remTag) return false;
+    if (recSha && remSha && recSha !== remSha) return false;
+    return true;
+  }
+
+  if (FULL_COMMIT_SHA_RE.test(recSha) && FULL_COMMIT_SHA_RE.test(remSha) && recSha === remSha) {
+    return true;
+  }
+
+  return false;
+}
+
+function enforceUpdateItemInvariant(item) {
+  if (!item || typeof item !== 'object') return null;
+  if (item.updateKind === 'commit') {
+    const curSha = String(item.installedCommitSha || '').trim().toLowerCase();
+    const nextSha = String(item.latestCommitSha || '').trim().toLowerCase();
+    return curSha && nextSha && curSha !== nextSha ? item : null;
+  }
+  const latestVer = String(item.latestVersion || '').trim();
+  const curVer = String(item.installedVersion || '').trim();
+  return latestVer && isNewerVersion(latestVer, curVer) ? item : null;
+}
+
 function buildUpdateItem({
   id,
   dir,
@@ -904,8 +938,16 @@ function buildUpdateItem({
 }) {
   const isGithubUrlTrack = Boolean(receipt?.track === 'github-url' && !isSelf);
   const catalogInstallable = isCatalogPluginInstallable(catPlugin);
-  const catalogHasUpdate = Boolean(catPlugin && catalogInstallable && isNewerVersion(catPlugin.version, installedVersion));
-  const githubHasUpdate = Boolean(ghLatest && isNewerVersion(ghLatest.version, installedVersion));
+  const sameCatalogRelease = Boolean(
+    catPlugin && isSameInstalledRelease(receipt, { gitTag: catPlugin.gitTag, commitSha: catPlugin.commitSha }),
+  );
+  const sameGithubRelease = Boolean(
+    ghLatest && isSameInstalledRelease(receipt, { gitTag: ghLatest.tagName, commitSha: ghLatest.commitSha || '' }),
+  );
+  const catalogHasUpdate = Boolean(
+    catPlugin && catalogInstallable && !sameCatalogRelease && isNewerVersion(catPlugin.version, installedVersion),
+  );
+  const githubHasUpdate = Boolean(ghLatest && !sameGithubRelease && isNewerVersion(ghLatest.version, installedVersion));
   const resolvedRepoUrl = normalizeRepoUrl(
     catPlugin?.repository?.url ||
       repositoryUrl ||
@@ -935,7 +977,7 @@ function buildUpdateItem({
       }
     }
     const escalation = computeCapabilityEscalation(receipt, catPlugin);
-    return {
+    return enforceUpdateItemInvariant({
       id: catPlugin.id,
       dir,
       displayName: catPlugin.displayName || displayName,
@@ -950,12 +992,12 @@ function buildUpdateItem({
       escalation,
       installable: true,
       isSelf: Boolean(isSelf),
-    };
+    });
   }
 
   // Scenario B: GitHub Release/SemVer Tag is newer than local (and ahead of catalog, or unlisted) -> direct-installable in Sidebar
   if (githubHasUpdate) {
-    return {
+    return enforceUpdateItemInvariant({
       id: isGithubUrlTrack ? receipt?.id || catPlugin?.id || id : catPlugin?.id || receipt?.id || id,
       dir,
       displayName: catPlugin?.displayName || displayName,
@@ -972,7 +1014,7 @@ function buildUpdateItem({
       escalation: null,
       installable: true,
       isSelf: Boolean(isSelf),
-    };
+    });
   }
 
   // Scenario C: Default-branch / branch-tracked tagless `github-url` plugins (Commit SHA / version diff)
@@ -989,7 +1031,7 @@ function buildUpdateItem({
           ? `https://github.com/${ghSlug.fullName}/compare/${installedSha.slice(0, 12)}...${remoteSha.slice(0, 12)}`
           : `https://github.com/${ghSlug.fullName}/commit/${remoteSha}`
         : '';
-      return {
+      return enforceUpdateItemInvariant({
         id: receipt?.id || id,
         dir,
         displayName,
@@ -1009,7 +1051,7 @@ function buildUpdateItem({
         escalation: null,
         installable: true,
         isSelf: false,
-      };
+      });
     }
   }
 

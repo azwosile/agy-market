@@ -1723,13 +1723,18 @@ function buildSyntheticPluginRecord({
 }) {
   const { plugin, resolution, parsed } = inspectData;
   const forceScopedInstall = Boolean(preserveForceScopedInstall) || installMode === 'isolate';
-  const trackBranch =
-    preserveTrackBranch ||
-    (resolution.refType === 'branch' && resolution.ref && resolution.ref !== 'HEAD'
+  const isReleaseOrTagResolution =
+    resolution.refType === 'release' || resolution.refType === 'tag' || resolution.refType === 'asset';
+  const keepBranchTracking = Boolean(preserveTrackBranch && !isReleaseOrTagResolution);
+  const trackBranch = keepBranchTracking
+    ? preserveTrackBranch
+    : !isReleaseOrTagResolution && resolution.refType === 'branch' && resolution.ref && resolution.ref !== 'HEAD'
       ? resolution.ref
-      : resolution.defaultBranch || '');
-  const effectiveRefType = preserveTrackBranch ? 'branch' : resolution.refType || 'branch';
-  const effectiveRef = preserveTrackBranch || resolution.ref || '';
+      : !isReleaseOrTagResolution
+        ? resolution.defaultBranch || ''
+        : '';
+  const effectiveRefType = keepBranchTracking ? 'branch' : resolution.refType || 'branch';
+  const effectiveRef = keepBranchTracking ? preserveTrackBranch : resolution.ref || '';
   const effectiveRepoId =
     Number(preserveRepositoryId) > 0 ? Number(preserveRepositoryId) : Number(resolution.repositoryId || 0);
   const mergedPreservePaths = [
@@ -2051,9 +2056,14 @@ export async function inspectGithubPluginUrl({
   const syntheticId = deriveSyntheticPluginId(ownerLower, repoLower, selectedRoot);
   const displayName = String(cleanManifest.displayName || cleanManifest.name || canonicalName);
   const description = String(cleanManifest.description || effectiveResolution.repoDescription || '');
+  const manifestSem = parseSemver(cleanManifest.version);
+  const tagSem = parseSemver(effectiveResolution.gitTag);
+  const stableTagSem = tagSem && tagSem.prerelease.length === 0 ? tagSem : null;
   const version =
-    parseSemver(cleanManifest.version)?.version ||
-    parseSemver(effectiveResolution.gitTag)?.version ||
+    (stableTagSem && (!manifestSem || compareSemver(stableTagSem.version, manifestSem.version) > 0)
+      ? stableTagSem.version
+      : manifestSem?.version) ||
+    tagSem?.version ||
     (typeof cleanManifest.version === 'string' && cleanManifest.version.trim()) ||
     '0.0.0';
   const preservePaths = extractCompanionPreservePaths(scopedFiles, allFiles);
@@ -2226,6 +2236,7 @@ export async function installGithubPlugin({
   url = '',
   pluginRoot = '',
   installMode = '', // '' | 'native' | 'isolate' | 'replace'
+  preferredDir = '',
   confirmEscalation = false,
   prefs = {},
   configDir = resolveAntigravityConfigDir(),
@@ -2321,6 +2332,7 @@ export async function installGithubPlugin({
     track: effectiveTrack,
     prefs,
     conflictStrategy,
+    preferredDir,
     confirmEscalation: Boolean(confirmEscalation),
     configDir,
     pluginsDir,
@@ -2470,6 +2482,10 @@ export async function resolveAndStageGithubUpdate({
     ]),
   ];
 
+  const isTagOrReleaseTarget = Boolean(
+    updateHint?.targetRef && updateHint.updateKind !== 'commit' && !FULL_SHA_RE.test(updateHint.targetRef),
+  );
+
   let targetUrl = repoUrl;
   if (updateHint?.targetRef) {
     if (updateHint.updateKind === 'commit' || FULL_SHA_RE.test(updateHint.targetRef)) {
@@ -2490,6 +2506,7 @@ export async function resolveAndStageGithubUpdate({
     url: targetUrl,
     pluginRoot,
     installMode,
+    preferredDir: loc?.dir || '',
     confirmEscalation: Boolean(confirmEscalation),
     prefs,
     configDir,
@@ -2511,7 +2528,7 @@ export async function resolveAndStageGithubUpdate({
       preservePaths: preservedPaths,
     },
     _preserveReceiptId: preservedId,
-    _preserveTrackBranch: preservedTrack === 'github-url' ? preserveTrackBranch : '',
+    _preserveTrackBranch: preservedTrack === 'github-url' && !isTagOrReleaseTarget ? preserveTrackBranch : '',
   });
 
   if (result.status === 'NOT_A_PLUGIN_REPO' || result.status === 'SECURITY_BLOCKED') {

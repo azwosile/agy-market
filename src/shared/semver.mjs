@@ -50,3 +50,7 @@ export function isNewerVersion(candidateVersion, installedVersion) {
   if (!installedVersion) return true;
   return compareSemver(candidateVersion, installedVersion) > 0;
 }
+
+export function stripLeadingV(raw) {
+  return String(raw ?? '').trim().replace(/^v+/i, '');
+}

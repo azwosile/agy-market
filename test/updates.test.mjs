@@ -35,6 +35,9 @@ const { createMarketSidecarServer } = await import(pathToFileURL(join(REPO_ROOT,
 const { createDeterministicTarGz } = await import(
   pathToFileURL(join(REPO_ROOT, 'src', 'installer', 'tar-extract.mjs')).href
 );
+const { resolveInstallPreflight, scanLocalPluginInventory } = await import(
+  pathToFileURL(join(REPO_ROOT, 'src', 'preflight', 'index.mjs')).href
+);
 
 const CLEAN_SVG =
   '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><rect x="16" y="16" width="96" height="96" rx="20" fill="#6366f1"/></svg>';
@@ -1765,6 +1768,733 @@ test('Concurrent plugin mutation routes return HTTP 409 ERR_MUTATION_BUSY and re
       });
       assert.equal(postErrRes.statusCode, 200);
       assert.equal(postErrRes.json().ok, true);
+    } finally {
+      await srv.close();
+    }
+  } finally {
+    ws.cleanup();
+  }
+});
+
+test('v1.5.4 server rejects stale body.plugin downgrade in POST /api/update and POST /api/install in favor of fresher lastCatalog', async () => {
+  const ws = makeTempWorkspace('agy-upd-stale-body-');
+  try {
+    const neko120Buf = createDeterministicTarGz({
+      'plugin.json': JSON.stringify({
+        name: 'gemini-neko-cockpit',
+        displayName: 'Gemini Neko Cockpit',
+        version: '1.2.0',
+        logo: 'assets/logo.svg',
+      }),
+      'assets/logo.svg': CLEAN_SVG,
+    });
+    const neko120Sha = createHash('sha256').update(neko120Buf).digest('hex');
+
+    const neko130Buf = createDeterministicTarGz({
+      'plugin.json': JSON.stringify({
+        name: 'gemini-neko-cockpit',
+        displayName: 'Gemini Neko Cockpit',
+        version: '1.3.0',
+        logo: 'assets/logo.svg',
+      }),
+      'assets/logo.svg': CLEAN_SVG,
+      'docs/guide.md': '# v1.3.0 docs\n',
+    });
+    const neko130Sha = createHash('sha256').update(neko130Buf).digest('hex');
+
+    const NEKO_120_URL = 'https://github.com/azwosile/gemini-neko-cockpit/releases/download/v1.2.0/neko-1.2.0.tar.gz';
+    const NEKO_130_URL = 'https://github.com/azwosile/gemini-neko-cockpit/releases/download/v1.3.0/neko-1.3.0.tar.gz';
+
+    const staleClientPlugin120 = {
+      ...makeCatalogPlugin({
+        id: 'azwosile__gemini-neko-cockpit',
+        canonicalName: 'gemini-neko-cockpit',
+        owner: 'azwosile',
+        repo: 'gemini-neko-cockpit',
+        displayName: 'Gemini Neko Cockpit',
+        version: '1.2.0',
+        repoId: 801,
+        tarballUrl: NEKO_120_URL,
+        sha256: neko120Sha,
+        sizeBytes: neko120Buf.length,
+      }),
+      commitSha: '1'.repeat(40),
+    };
+
+    const freshCatalogPlugin130 = {
+      ...makeCatalogPlugin({
+        id: 'azwosile__gemini-neko-cockpit',
+        canonicalName: 'gemini-neko-cockpit',
+        owner: 'azwosile',
+        repo: 'gemini-neko-cockpit',
+        displayName: 'Gemini Neko Cockpit',
+        version: '1.3.0',
+        repoId: 801,
+        tarballUrl: NEKO_130_URL,
+        sha256: neko130Sha,
+        sizeBytes: neko130Buf.length,
+      }),
+      commitSha: '2'.repeat(40),
+    };
+
+    installFakeLocalPlugin(ws.pluginsDir, {
+      dir: 'gemini-neko-cockpit',
+      manifest: {
+        name: 'gemini-neko-cockpit',
+        displayName: 'Gemini Neko Cockpit',
+        version: '1.2.0',
+        repository: 'https://github.com/azwosile/gemini-neko-cockpit',
+      },
+      receipt: {
+        schemaVersion: 1,
+        id: 'azwosile__gemini-neko-cockpit',
+        track: 'verified',
+        repositoryId: 801,
+        installedDir: 'gemini-neko-cockpit',
+        installedVersion: '1.2.0',
+        gitTag: 'v1.2.0',
+        commitSha: '1'.repeat(40),
+        sha256: neko120Sha,
+        grantedCapabilities: { badges: ['declarative-only'], mcpRemoteDomains: [], hookEvents: [] },
+      },
+    });
+
+    const catalogIndex = {
+      schemaVersion: 1,
+      track: 'verified',
+      catalogVersion: '2026.1125.1',
+      plugins: [freshCatalogPlugin130],
+    };
+
+    let downloads120 = 0;
+    let downloads130 = 0;
+    const mockFetch = async (url) => {
+      const u = String(url);
+      if (u.endsWith('/index.json')) {
+        return new Response(JSON.stringify(catalogIndex), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      if (u === NEKO_120_URL) {
+        downloads120 += 1;
+        return new Response(neko120Buf, { status: 200 });
+      }
+      if (u === NEKO_130_URL) {
+        downloads130 += 1;
+        return new Response(neko130Buf, { status: 200 });
+      }
+      if (u === 'https://api.github.com/repos/azwosile/gemini-neko-cockpit/releases/latest') {
+        return new Response(
+          JSON.stringify({
+            tag_name: 'v1.3.0',
+            html_url: 'https://github.com/azwosile/gemini-neko-cockpit/releases/tag/v1.3.0',
+            body: '## v1.3.0',
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      return new Response('{}', { status: 404 });
+    };
+
+    const srv = await createMarketSidecarServer({
+      listen: false,
+      configDir: ws.configDir,
+      dataDir: ws.dataDir,
+      recoveryDelayMs: -1,
+      fetchImpl: mockFetch,
+    });
+
+    try {
+      const authHeaders = { 'X-Sidecar-Token': srv.sideToken, Origin: 'http://127.0.0.1:43210' };
+
+      // 1. Prime server lastCatalog to 1.3.0 via GET /api/updates?force=1 (matching check-updates flow)
+      const chk = await srv.inject({ method: 'GET', url: '/api/updates?force=1' });
+      assert.equal(chk.statusCode, 200);
+      assert.equal(chk.json().items.length, 1);
+      assert.equal(chk.json().items[0].latestVersion, '1.3.0');
+
+      // 2. Client submits POST /api/update carrying stale body.plugin (1.2.0) -> server MUST install 1.3.0 from lastCatalog
+      const updRes = await srv.inject({
+        method: 'POST',
+        url: '/api/update',
+        headers: authHeaders,
+        body: {
+          id: 'azwosile__gemini-neko-cockpit',
+          dir: 'gemini-neko-cockpit',
+          plugin: staleClientPlugin120,
+        },
+      });
+      assert.equal(updRes.statusCode, 200);
+      const updBody = updRes.json();
+      assert.equal(updBody.ok, true);
+      assert.equal(updBody.status, 'INSTALLED');
+      assert.equal(updBody.version, '1.3.0');
+      assert.equal(downloads120, 0, 'Server must NEVER download stale body.plugin 1.2.0 tarball');
+      assert.equal(downloads130, 1, 'Server must download fresher 1.3.0 tarball from lastCatalog');
+      assert.equal(
+        JSON.parse(readFileSync(join(ws.pluginsDir, 'gemini-neko-cockpit', 'plugin.json'), 'utf8')).version,
+        '1.3.0',
+      );
+      assert.equal(existsSync(join(ws.pluginsDir, 'gemini-neko-cockpit', 'docs', 'guide.md')), true);
+
+      // 3. Repeat POST /api/update with stale body.plugin (1.2.0) when already on 1.3.0 -> HTTP 200 ALREADY_UP_TO_DATE, 0 downloads
+      const noopRes = await srv.inject({
+        method: 'POST',
+        url: '/api/update',
+        headers: authHeaders,
+        body: {
+          id: 'azwosile__gemini-neko-cockpit',
+          dir: 'gemini-neko-cockpit',
+          plugin: staleClientPlugin120,
+        },
+      });
+      assert.equal(noopRes.statusCode, 200);
+      assert.equal(noopRes.json().ok, true);
+      assert.equal(noopRes.json().status, 'ALREADY_UP_TO_DATE');
+      assert.equal(noopRes.json().alreadyUpToDate, true);
+      assert.equal(noopRes.json().noop, true);
+      assert.equal(downloads120, 0);
+      assert.equal(downloads130, 1);
+
+      // 4. Remove local plugin and test POST /api/install with stale body.plugin (1.2.0) -> still installs 1.3.0
+      rmSync(join(ws.pluginsDir, 'gemini-neko-cockpit'), { recursive: true, force: true });
+      const instRes = await srv.inject({
+        method: 'POST',
+        url: '/api/install',
+        headers: authHeaders,
+        body: {
+          id: 'azwosile__gemini-neko-cockpit',
+          plugin: staleClientPlugin120,
+        },
+      });
+      assert.equal(instRes.statusCode, 200);
+      assert.equal(instRes.json().ok, true);
+      assert.equal(instRes.json().version, '1.3.0');
+      assert.equal(downloads120, 0);
+      assert.equal(downloads130, 2);
+    } finally {
+      await srv.close();
+    }
+  } finally {
+    ws.cleanup();
+  }
+});
+
+test('v1.5.4 POST /api/update and /api/update-all return HTTP 200 ALREADY_UP_TO_DATE with 0 downloads, support forceResync: true, and honor preferredDir across dual global dirs', async () => {
+  const ws = makeTempWorkspace('agy-upd-noop-resync-');
+  try {
+    const neko130Buf = createDeterministicTarGz({
+      'plugin.json': JSON.stringify({
+        name: 'gemini-neko-cockpit',
+        displayName: 'Gemini Neko Cockpit',
+        version: '1.3.0',
+        logo: 'assets/logo.svg',
+      }),
+      'assets/logo.svg': CLEAN_SVG,
+      'extra.txt': 'fresh-1.3.0-payload\n',
+    });
+    const neko130Sha = createHash('sha256').update(neko130Buf).digest('hex');
+
+    const upstream130Buf = createDeterministicTarGz({
+      'gemini-neko-cockpit-1.3.0/plugin.json': JSON.stringify({
+        name: 'gemini-neko-cockpit',
+        displayName: 'Gemini Neko Cockpit',
+        version: '1.3.0',
+        logo: 'assets/logo.svg',
+      }),
+      'gemini-neko-cockpit-1.3.0/assets/logo.svg': CLEAN_SVG,
+      'gemini-neko-cockpit-1.3.0/upstream-marker.txt': 'upstream-resync\n',
+    });
+
+    const NEKO_130_URL = 'https://github.com/azwosile/gemini-neko-cockpit/releases/download/v1.3.0/neko-1.3.0.tar.gz';
+    const NEKO_UPSTREAM_ARCHIVE_URL =
+      'https://github.com/azwosile/gemini-neko-cockpit/archive/refs/tags/v1.3.0.tar.gz';
+
+    // Dual global installs sharing the same receipt.id: main dir at 1.3.0 + isolated dir at 1.2.0
+    installFakeLocalPlugin(ws.pluginsDir, {
+      dir: 'gemini-neko-cockpit',
+      manifest: {
+        name: 'gemini-neko-cockpit',
+        displayName: 'Gemini Neko Cockpit',
+        version: '1.3.0',
+        repository: 'https://github.com/azwosile/gemini-neko-cockpit',
+      },
+      receipt: {
+        schemaVersion: 1,
+        id: 'azwosile__gemini-neko-cockpit',
+        track: 'verified',
+        repositoryId: 802,
+        installedDir: 'gemini-neko-cockpit',
+        installedVersion: '1.3.0',
+        gitTag: 'v1.3.0',
+        commitSha: '2'.repeat(40),
+        sha256: neko130Sha,
+        grantedCapabilities: { badges: ['declarative-only'], mcpRemoteDomains: [], hookEvents: [] },
+      },
+    });
+    installFakeLocalPlugin(ws.pluginsDir, {
+      dir: 'azwosile--gemini-neko-cockpit',
+      manifest: {
+        name: 'azwosile--gemini-neko-cockpit',
+        displayName: 'Gemini Neko Cockpit (Isolated)',
+        version: '1.2.0',
+        repository: 'https://github.com/azwosile/gemini-neko-cockpit',
+      },
+      receipt: {
+        schemaVersion: 1,
+        id: 'azwosile__gemini-neko-cockpit',
+        track: 'verified',
+        repositoryId: 802,
+        installedDir: 'azwosile--gemini-neko-cockpit',
+        effectivePluginName: 'azwosile--gemini-neko-cockpit',
+        scopedRewriteApplied: true,
+        installedVersion: '1.2.0',
+        gitTag: 'v1.2.0',
+        commitSha: '1'.repeat(40),
+        grantedCapabilities: { badges: ['declarative-only'], mcpRemoteDomains: [], hookEvents: [] },
+      },
+    });
+
+    const catEntry = {
+      ...makeCatalogPlugin({
+        id: 'azwosile__gemini-neko-cockpit',
+        canonicalName: 'gemini-neko-cockpit',
+        owner: 'azwosile',
+        repo: 'gemini-neko-cockpit',
+        displayName: 'Gemini Neko Cockpit',
+        version: '1.3.0',
+        repoId: 802,
+        tarballUrl: NEKO_130_URL,
+        sha256: neko130Sha,
+        sizeBytes: neko130Buf.length,
+      }),
+      commitSha: '2'.repeat(40),
+    };
+
+    // Preflight preferredDir unit verification before HTTP calls
+    const inv = scanLocalPluginInventory({ configDir: ws.configDir, dataDir: ws.dataDir });
+    const preflightIsolated = resolveInstallPreflight(catEntry, inv, {
+      conflictStrategy: 'prompt',
+      preferredDir: 'azwosile--gemini-neko-cockpit',
+    });
+    assert.equal(preflightIsolated.action, 'update');
+    assert.equal(preflightIsolated.existingInstall?.dir, 'azwosile--gemini-neko-cockpit');
+    assert.equal(preflightIsolated.existingInstall?.version, '1.2.0');
+
+    let catalogDownloads = 0;
+    let upstreamDownloads = 0;
+    const mockFetch = async (url) => {
+      const u = String(url);
+      if (u.endsWith('/index.json')) {
+        return new Response(
+          JSON.stringify({ schemaVersion: 1, track: 'verified', plugins: [catEntry] }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      if (u === NEKO_130_URL) {
+        catalogDownloads += 1;
+        return new Response(neko130Buf, { status: 200 });
+      }
+      if (u === 'https://api.github.com/repos/azwosile/gemini-neko-cockpit') {
+        return new Response(
+          JSON.stringify({ id: 802, full_name: 'azwosile/gemini-neko-cockpit', default_branch: 'main' }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      if (
+        u === 'https://api.github.com/repos/azwosile/gemini-neko-cockpit/releases/tags/v1.3.0' ||
+        u === 'https://api.github.com/repos/azwosile/gemini-neko-cockpit/releases/latest'
+      ) {
+        return new Response(
+          JSON.stringify({
+            tag_name: 'v1.3.0',
+            tarball_url: NEKO_UPSTREAM_ARCHIVE_URL,
+            html_url: 'https://github.com/azwosile/gemini-neko-cockpit/releases/tag/v1.3.0',
+            assets: [],
+            body: 'v1.3.0 release',
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      if (u === NEKO_UPSTREAM_ARCHIVE_URL || u.includes('/archive/refs/tags/v1.3.0.tar.gz') || u.includes('/tarball/v1.3.0')) {
+        upstreamDownloads += 1;
+        return new Response(upstream130Buf, { status: 200 });
+      }
+      return new Response('{}', { status: 404 });
+    };
+
+    const srv = await createMarketSidecarServer({
+      listen: false,
+      configDir: ws.configDir,
+      dataDir: ws.dataDir,
+      recoveryDelayMs: -1,
+      fetchImpl: mockFetch,
+    });
+
+    try {
+      const authHeaders = { 'X-Sidecar-Token': srv.sideToken, Origin: 'http://127.0.0.1:43210' };
+
+      // 1. Catalog POST /api/update on already-latest dir (gemini-neko-cockpit 1.3.0) -> HTTP 200 ALREADY_UP_TO_DATE, 0 downloads
+      const noopCat = await srv.inject({
+        method: 'POST',
+        url: '/api/update',
+        headers: authHeaders,
+        body: { id: 'azwosile__gemini-neko-cockpit', dir: 'gemini-neko-cockpit' },
+      });
+      assert.equal(noopCat.statusCode, 200);
+      const noopCatBody = noopCat.json();
+      assert.equal(noopCatBody.ok, true);
+      assert.equal(noopCatBody.status, 'ALREADY_UP_TO_DATE');
+      assert.equal(noopCatBody.alreadyUpToDate, true);
+      assert.equal(noopCatBody.noop, true);
+      assert.equal(noopCatBody.installedDir, 'gemini-neko-cockpit');
+      assert.equal(noopCatBody.version, '1.3.0');
+      assert.equal(noopCatBody.restartRequired, false);
+      assert.equal(noopCatBody.reloadRequired, false);
+      assert.equal(catalogDownloads, 0, 'Same-version catalog POST /api/update MUST perform 0 tarball downloads');
+
+      // 2. Catalog POST /api/update targeting isolated 1.2.0 dir via preferredDir -> updates isolated dir in-place!
+      const isoUpd = await srv.inject({
+        method: 'POST',
+        url: '/api/update',
+        headers: authHeaders,
+        body: { id: 'azwosile__gemini-neko-cockpit', dir: 'azwosile--gemini-neko-cockpit' },
+      });
+      assert.equal(isoUpd.statusCode, 200);
+      assert.equal(isoUpd.json().ok, true);
+      assert.equal(isoUpd.json().status, 'INSTALLED');
+      assert.equal(isoUpd.json().installedDir, 'azwosile--gemini-neko-cockpit');
+      assert.equal(catalogDownloads, 1);
+      assert.equal(
+        JSON.parse(readFileSync(join(ws.pluginsDir, 'azwosile--gemini-neko-cockpit', 'plugin.json'), 'utf8')).version,
+        '1.3.0',
+      );
+
+      // 3. Catalog POST /api/update WITH forceResync: true -> downloads and overwrites existing 1.3.0 directory
+      assert.equal(existsSync(join(ws.pluginsDir, 'gemini-neko-cockpit', 'extra.txt')), false);
+      const resyncCat = await srv.inject({
+        method: 'POST',
+        url: '/api/update',
+        headers: authHeaders,
+        body: { id: 'azwosile__gemini-neko-cockpit', dir: 'gemini-neko-cockpit', forceResync: true },
+      });
+      assert.equal(resyncCat.statusCode, 200);
+      assert.equal(resyncCat.json().ok, true);
+      assert.equal(resyncCat.json().status, 'INSTALLED');
+      assert.equal(resyncCat.json().version, '1.3.0');
+      assert.equal(catalogDownloads, 2, 'forceResync: true MUST bypass No-Op short-circuit and download tarball');
+      assert.equal(existsSync(join(ws.pluginsDir, 'gemini-neko-cockpit', 'extra.txt')), true);
+
+      // 4. POST /api/update-all with explicit ids pointing to already-latest plugin -> ALREADY_UP_TO_DATE, 0 extra downloads
+      const batchNoop = await srv.inject({
+        method: 'POST',
+        url: '/api/update-all',
+        headers: authHeaders,
+        body: { ids: ['azwosile__gemini-neko-cockpit'] },
+      });
+      assert.equal(batchNoop.statusCode, 200);
+      const batchBody = batchNoop.json();
+      assert.equal(batchBody.ok, true);
+      assert.equal(batchBody.results.length, 1);
+      assert.equal(batchBody.results[0].status, 'ALREADY_UP_TO_DATE');
+      assert.equal(batchBody.results[0].alreadyUpToDate, true);
+      assert.equal(batchBody.results[0].noop, true);
+      assert.equal(catalogDownloads, 2, 'Explicit ids on already-latest plugin in /api/update-all must do 0 downloads');
+
+      // 5. Upstream direct channel (source: 'github-release', targetRef: 'v1.3.0'): No-Op without forceResync, installs with forceResync: true
+      const noopUp = await srv.inject({
+        method: 'POST',
+        url: '/api/update',
+        headers: authHeaders,
+        body: {
+          id: 'azwosile__gemini-neko-cockpit',
+          dir: 'gemini-neko-cockpit',
+          source: 'github-release',
+          updateChannel: 'github-upstream',
+          targetRef: 'v1.3.0',
+        },
+      });
+      assert.equal(noopUp.statusCode, 200);
+      assert.equal(noopUp.json().ok, true);
+      assert.equal(noopUp.json().status, 'ALREADY_UP_TO_DATE');
+      assert.equal(noopUp.json().alreadyUpToDate, true);
+      assert.equal(noopUp.json().noop, true);
+      assert.equal(upstreamDownloads, 0, 'Same-tag upstream POST /api/update MUST do 0 archive downloads');
+
+      const resyncUp = await srv.inject({
+        method: 'POST',
+        url: '/api/update',
+        headers: authHeaders,
+        body: {
+          id: 'azwosile__gemini-neko-cockpit',
+          dir: 'gemini-neko-cockpit',
+          source: 'github-release',
+          updateChannel: 'github-upstream',
+          targetRef: 'v1.3.0',
+          forceResync: true,
+        },
+      });
+      assert.equal(resyncUp.statusCode, 200);
+      assert.equal(resyncUp.json().ok, true);
+      assert.equal(resyncUp.json().status, 'INSTALLED');
+      assert.equal(upstreamDownloads, 1, 'forceResync: true on upstream channel MUST download and overwrite');
+      assert.equal(existsSync(join(ws.pluginsDir, 'gemini-neko-cockpit', 'upstream-marker.txt')), true);
+    } finally {
+      await srv.close();
+    }
+  } finally {
+    ws.cleanup();
+  }
+});
+
+test('v1.5.4 same version with different distribution sha256 (agy-dart & agy-market scenario) never reports false updates', async () => {
+  const ws = makeTempWorkspace('agy-upd-diff-sha-');
+  try {
+    const dartTar = buildTarArtifact(ws.artifactsDir, 'agy-dart-1.7.2.tar.gz', {
+      'plugin.json': JSON.stringify({ name: 'agy-dart', displayName: 'AGY Dart', version: '1.7.2' }),
+    });
+    const marketTar = buildTarArtifact(ws.artifactsDir, 'agy-market-1.5.4.tar.gz', {
+      'plugin.json': JSON.stringify({ name: 'agy-market', displayName: 'AGY Market', version: '1.5.4' }),
+    });
+
+    // Local receipts have legitimately different sha256 digests vs catalog archive digests (e.g. local copy / tag tarball)
+    installFakeLocalPlugin(ws.pluginsDir, {
+      dir: 'agy-dart',
+      manifest: {
+        name: 'agy-dart',
+        displayName: 'AGY Dart',
+        version: '1.7.2',
+        repository: 'https://github.com/azwosile/agy-dart',
+      },
+      receipt: {
+        schemaVersion: 1,
+        id: 'azwosile__agy-dart',
+        track: 'verified',
+        repositoryId: 901,
+        installedDir: 'agy-dart',
+        installedVersion: '1.7.2',
+        gitTag: 'v1.7.2',
+        commitSha: 'd'.repeat(40),
+        sha256: `7369087c${'0'.repeat(56)}`,
+        grantedCapabilities: { badges: ['declarative-only'], mcpRemoteDomains: [], hookEvents: [] },
+      },
+    });
+    installFakeLocalPlugin(ws.pluginsDir, {
+      dir: 'agy-market',
+      manifest: {
+        name: 'agy-market',
+        displayName: 'AGY Market',
+        version: '1.5.4',
+        repository: 'https://github.com/azwosile/agy-market',
+      },
+      receipt: {
+        schemaVersion: 1,
+        id: 'azwosile__agy-market',
+        track: 'verified',
+        repositoryId: 1468650761,
+        installedDir: 'agy-market',
+        installedVersion: '1.5.4',
+        gitTag: 'v1.5.4',
+        sha256: `78f68582${'0'.repeat(56)}`,
+        grantedCapabilities: { badges: ['sidecar-ui'], mcpRemoteDomains: [], hookEvents: [] },
+      },
+    });
+
+    const catalogIndex = {
+      schemaVersion: 1,
+      track: 'verified',
+      plugins: [
+        {
+          ...makeCatalogPlugin({
+            id: 'azwosile__agy-dart',
+            canonicalName: 'agy-dart',
+            owner: 'azwosile',
+            repo: 'agy-dart',
+            displayName: 'AGY Dart',
+            version: '1.7.2',
+            repoId: 901,
+            tarballUrl: dartTar.url,
+            sha256: `e9f1435b${'f'.repeat(56)}`,
+            sizeBytes: dartTar.sizeBytes,
+          }),
+          commitSha: 'd'.repeat(40),
+        },
+        {
+          ...makeCatalogPlugin({
+            id: 'azwosile__agy-market',
+            canonicalName: 'agy-market',
+            owner: 'azwosile',
+            repo: 'agy-market',
+            displayName: 'AGY Market',
+            version: '1.5.4',
+            repoId: 1468650761,
+            tarballUrl: marketTar.url,
+            sha256: `0691e6e1${'e'.repeat(56)}`,
+            sizeBytes: marketTar.sizeBytes,
+            badges: ['sidecar-ui'],
+          }),
+          commitSha: 'c'.repeat(40),
+        },
+      ],
+    };
+
+    const mockFetch = async (url) => {
+      const u = String(url);
+      if (u.endsWith('/index.json')) {
+        return new Response(JSON.stringify(catalogIndex), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      if (u === 'https://api.github.com/repos/azwosile/agy-dart/releases/latest') {
+        return new Response(JSON.stringify({ tag_name: 'v1.7.2', body: '1.7.2' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (u === 'https://api.github.com/repos/azwosile/agy-market/releases/latest') {
+        return new Response(JSON.stringify({ tag_name: 'v1.5.4', body: '1.5.4' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return new Response('{}', { status: 404 });
+    };
+
+    const srv = await createMarketSidecarServer({
+      listen: false,
+      configDir: ws.configDir,
+      dataDir: ws.dataDir,
+      recoveryDelayMs: -1,
+      fetchImpl: mockFetch,
+    });
+
+    try {
+      const updRes = await srv.inject({ method: 'GET', url: '/api/updates?force=1' });
+      assert.equal(updRes.statusCode, 200);
+      const updBody = updRes.json();
+      assert.deepEqual(updBody.items, [], 'Different sha256 on same SemVer must NEVER trigger updates');
+      assert.equal(updBody.selfUpdate, null, 'Different sha256 on same agy-market SemVer must NEVER trigger selfUpdate');
+
+      const stRes = await srv.inject({ method: 'GET', url: '/api/state' });
+      assert.equal(stRes.statusCode, 200);
+      const stBody = stRes.json();
+      assert.deepEqual(stBody.updatesAvailable, []);
+      for (const p of stBody.catalog.plugins) {
+        assert.equal(p.installStatus.hasUpdate, false, `${p.id} must have hasUpdate === false`);
+      }
+    } finally {
+      await srv.close();
+    }
+  } finally {
+    ws.cleanup();
+  }
+});
+
+test('v1.5.4 scanner version priority (RC-4): externally upgraded manifest.version beats stale receipt, while older manifest does not downgrade newer receipt', async () => {
+  const ws = makeTempWorkspace('agy-upd-rc4-scanner-');
+  try {
+    // 1. Externally upgraded plugin: manifest.version (1.4.0) > stale receipt.installedVersion (1.2.0)
+    installFakeLocalPlugin(ws.pluginsDir, {
+      dir: 'ext-upgraded',
+      manifest: {
+        name: 'ext-upgraded',
+        displayName: 'Externally Upgraded',
+        version: '1.4.0',
+        repository: 'https://github.com/alice/ext-upgraded',
+      },
+      receipt: {
+        schemaVersion: 1,
+        id: 'alice__ext-upgraded',
+        track: 'verified',
+        repositoryId: 911,
+        installedDir: 'ext-upgraded',
+        installedVersion: '1.2.0',
+        gitTag: 'v1.2.0',
+        grantedCapabilities: { badges: ['declarative-only'], mcpRemoteDomains: [], hookEvents: [] },
+      },
+    });
+
+    // 2. Unbumped manifest inside newer tag release: manifest.version (1.2.0) < receipt.installedVersion (1.3.0)
+    installFakeLocalPlugin(ws.pluginsDir, {
+      dir: 'tag-newer',
+      manifest: {
+        name: 'tag-newer',
+        displayName: 'Tag Newer',
+        version: '1.2.0',
+        repository: 'https://github.com/bob/tag-newer',
+      },
+      receipt: {
+        schemaVersion: 1,
+        id: 'bob__tag-newer',
+        track: 'verified',
+        repositoryId: 912,
+        installedDir: 'tag-newer',
+        installedVersion: '1.3.0',
+        gitTag: 'v1.3.0',
+        grantedCapabilities: { badges: ['declarative-only'], mcpRemoteDomains: [], hookEvents: [] },
+      },
+    });
+
+    const inv = scanLocalPluginInventory({ configDir: ws.configDir, dataDir: ws.dataDir });
+    const extLoc = inv.installed.find((x) => x.dir === 'ext-upgraded');
+    const tagLoc = inv.installed.find((x) => x.dir === 'tag-newer');
+    assert.equal(extLoc?.version, '1.4.0', 'Externally upgraded manifest.version > receipt must win');
+    assert.equal(tagLoc?.version, '1.3.0', 'Older manifest.version < receipt must NOT downgrade receipt version');
+
+    const dummyTar = buildTarArtifact(ws.artifactsDir, 'dummy-1.3.0.tar.gz', {
+      'plugin.json': JSON.stringify({ name: 'dummy', version: '1.3.0' }),
+    });
+    const catalogIndex = {
+      schemaVersion: 1,
+      track: 'verified',
+      plugins: [
+        makeCatalogPlugin({
+          id: 'alice__ext-upgraded',
+          canonicalName: 'ext-upgraded',
+          owner: 'alice',
+          repo: 'ext-upgraded',
+          displayName: 'Externally Upgraded',
+          version: '1.3.0',
+          repoId: 911,
+          tarballUrl: dummyTar.url,
+          sha256: dummyTar.sha256,
+          sizeBytes: dummyTar.sizeBytes,
+        }),
+        makeCatalogPlugin({
+          id: 'bob__tag-newer',
+          canonicalName: 'tag-newer',
+          owner: 'bob',
+          repo: 'tag-newer',
+          displayName: 'Tag Newer',
+          version: '1.3.0',
+          repoId: 912,
+          tarballUrl: dummyTar.url,
+          sha256: dummyTar.sha256,
+          sizeBytes: dummyTar.sizeBytes,
+        }),
+      ],
+    };
+
+    const mockFetch = async (url) => {
+      const u = String(url);
+      if (u.endsWith('/index.json')) {
+        return new Response(JSON.stringify(catalogIndex), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      return new Response('{}', { status: 404 });
+    };
+
+    const srv = await createMarketSidecarServer({
+      listen: false,
+      configDir: ws.configDir,
+      dataDir: ws.dataDir,
+      recoveryDelayMs: -1,
+      fetchImpl: mockFetch,
+    });
+
+    try {
+      const updRes = await srv.inject({ method: 'GET', url: '/api/updates?force=1' });
+      assert.equal(updRes.statusCode, 200);
+      assert.deepEqual(
+        updRes.json().items,
+        [],
+        'Neither externally upgraded (1.4.0 vs 1.3.0) nor tag-newer (1.3.0 vs 1.3.0) may produce a spurious update',
+      );
     } finally {
       await srv.close();
     }

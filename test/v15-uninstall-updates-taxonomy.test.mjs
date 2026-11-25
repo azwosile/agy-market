@@ -1398,8 +1398,8 @@ test('v1.5 batch update-all: updates catalog + github-upstream + github-url toge
   }
 });
 
-test('v1.5.3 UI, taxonomy, version anchors & pure LF byte-purity assertions', () => {
-  // 1. Built sidecars/market_pane/index.html MUST contain ZERO \r bytes (0 CRLF, 0 bare CR), 0 UTF-8 BOM, and inline PLUGIN_VERSION = '1.5.3'
+test('v1.5.4 UI, taxonomy, version anchors & pure LF byte-purity assertions', () => {
+  // 1. Built sidecars/market_pane/index.html MUST contain ZERO \r bytes (0 CRLF, 0 bare CR), 0 UTF-8 BOM, and inline PLUGIN_VERSION = '1.5.4'
   const builtHtmlPath = join(REPO_ROOT, 'sidecars', 'market_pane', 'index.html');
   const htmlBuf = readFileSync(builtHtmlPath);
   let crCount = 0;
@@ -1416,20 +1416,31 @@ test('v1.5.3 UI, taxonomy, version anchors & pure LF byte-purity assertions', ()
   assert.doesNotMatch(builtHtmlText, /btn-upstream/, 'Built index.html must contain 0 btn-upstream external buttons');
   assert.match(
     builtHtmlText,
-    /const\s+PLUGIN_VERSION\s*=\s*'1\.5\.3'/,
-    'Built sidecars/market_pane/index.html must inline PLUGIN_VERSION = \'1.5.3\'',
+    /const\s+PLUGIN_VERSION\s*=\s*'1\.5\.4'/,
+    'Built sidecars/market_pane/index.html must inline PLUGIN_VERSION = \'1.5.4\'',
   );
   assert.match(builtHtmlText, /function\s+isPluginConfirmedLatest\s*\(/, 'Built index.html must include isPluginConfirmedLatest');
   assert.match(builtHtmlText, /function\s+isUpdateActionLocked\s*\(/, 'Built index.html must include isUpdateActionLocked');
+  assert.match(builtHtmlText, /function\s+reconcileUpdatesWithServerState\s*\(/, 'Built index.html must include reconcileUpdatesWithServerState');
+  assert.match(builtHtmlText, /function\s+isUpdateEffectiveForLocal\s*\(/, 'Built index.html must include isUpdateEffectiveForLocal');
+  assert.match(builtHtmlText, /function\s+findUpdateForLocal\s*\(/, 'Built index.html must include findUpdateForLocal');
+  assert.match(builtHtmlText, /function\s+formatV\s*\(/, 'Built index.html must include formatV');
+  assert.match(builtHtmlText, /data-force-resync="1"/, 'Built index.html must include data-force-resync="1" on Re-sync buttons');
   assert.match(builtHtmlText, /state-pill is-latest/, 'Built index.html must include state-pill is-latest markup');
   assert.match(builtHtmlText, /\.state-pill\.is-latest\b/, 'Built index.html must include .state-pill.is-latest style');
   assert.match(builtHtmlText, /\.btn-update:disabled\b/, 'Built index.html must include .btn-update:disabled style');
   assert.match(builtHtmlText, /\.dock-btn:disabled\b/, 'Built index.html must include .dock-btn:disabled style');
 
-  // 2. Static scan src/ui/app.mjs & src/ui/styles.css for v1.5.3 UI controls, lock helpers and zero btn-upstream
+  // 2. Static scan src/ui/app.mjs & src/ui/styles.css for v1.5.4 UI controls, lock & reconcile helpers and zero btn-upstream
   const appSrc = readFileSync(join(REPO_ROOT, 'src', 'ui', 'app.mjs'), 'utf8');
   const cssSrc = readFileSync(join(REPO_ROOT, 'src', 'ui', 'styles.css'), 'utf8');
 
+  assert.match(appSrc, /from\s+['"]\.\.\/shared\/semver\.mjs['"]/, 'src/ui/app.mjs must import shared semver module');
+  assert.match(appSrc, /function\s+reconcileUpdatesWithServerState\s*\(/, 'src/ui/app.mjs must define reconcileUpdatesWithServerState');
+  assert.match(appSrc, /function\s+applyServerState\s*\(/, 'src/ui/app.mjs must define applyServerState');
+  assert.match(appSrc, /function\s+isUpdateEffectiveForLocal\s*\(/, 'src/ui/app.mjs must define isUpdateEffectiveForLocal');
+  assert.match(appSrc, /function\s+findUpdateForLocal\s*\(/, 'src/ui/app.mjs must define findUpdateForLocal');
+  assert.match(appSrc, /function\s+formatV\s*\(/, 'src/ui/app.mjs must define formatV');
   assert.match(appSrc, /data-action="prompt-uninstall"/, 'Installed card/drawer must render prompt-uninstall button');
   assert.match(
     appSrc,
@@ -1480,12 +1491,12 @@ test('v1.5.3 UI, taxonomy, version anchors & pure LF byte-purity assertions', ()
     assert.ok(CATEGORY_LABELS[key].zh && CATEGORY_LABELS[key].en, `Category "${key}" must define zh and en labels`);
   }
 
-  // 4. Version 1.5.3 anchors, pure LF / 0 BOM bootstrap scripts, & 10-field plugin.json purity
+  // 4. Version 1.5.4 anchors, pure LF / 0 BOM bootstrap scripts, & 10-field plugin.json purity
   const pkgJson = JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf8'));
   const pluginJson = JSON.parse(readFileSync(join(REPO_ROOT, 'plugin.json'), 'utf8'));
-  assert.equal(PLUGIN_VERSION, '1.5.3');
-  assert.equal(pkgJson.version, '1.5.3');
-  assert.equal(pluginJson.version, '1.5.3');
+  assert.equal(PLUGIN_VERSION, '1.5.4');
+  assert.equal(pkgJson.version, '1.5.4');
+  assert.equal(pluginJson.version, '1.5.4');
   assert.equal(pluginJson.name, PLUGIN_ID);
   for (const key of Object.keys(pluginJson)) {
     assert.ok(PLUGIN_JSON_ALLOWED_KEYS.has(key), `Disallowed key "${key}" in plugin.json`);
@@ -1494,13 +1505,14 @@ test('v1.5.3 UI, taxonomy, version anchors & pure LF byte-purity assertions', ()
   const ps1Buf = readFileSync(join(REPO_ROOT, 'scripts', 'install.ps1'));
   const shBuf = readFileSync(join(REPO_ROOT, 'scripts', 'install.sh'));
   assert.equal(ps1Buf[0] === 0xef && ps1Buf[1] === 0xbb && ps1Buf[2] === 0xbf, false, 'install.ps1 must have 0 UTF-8 BOM');
+  assert.equal(shBuf[0] === 0xef && shBuf[1] === 0xbb && shBuf[2] === 0xbf, false, 'install.sh must have 0 UTF-8 BOM');
   assert.equal(ps1Buf.includes(0x0d), false, 'install.ps1 must be pure LF (0 CR)');
   assert.equal(shBuf.includes(0x0d), false, 'install.sh must be pure LF (0 CR)');
-  assert.match(ps1Buf.toString('utf8'), /else\s*\{\s*"1\.5\.3"\s*\}/);
-  assert.match(shBuf.toString('utf8'), /INSTALLED_VER="1\.5\.3"/);
+  assert.match(ps1Buf.toString('utf8'), /else\s*\{\s*"1\.5\.4"\s*\}/);
+  assert.match(shBuf.toString('utf8'), /INSTALLED_VER="1\.5\.4"/);
 
   const siteHtml = readFileSync(join(REPO_ROOT, 'site', 'index.html'), 'utf8');
-  assert.match(siteHtml, /v1\.5\.3/);
+  assert.match(siteHtml, /v1\.5\.4/);
   const docsIndexPath = join(REPO_ROOT, 'docs', 'index.html');
   if (existsSync(docsIndexPath)) {
     const docsBuf = readFileSync(docsIndexPath);
@@ -1510,7 +1522,7 @@ test('v1.5.3 UI, taxonomy, version anchors & pure LF byte-purity assertions', ()
       'docs/index.html must have 0 UTF-8 BOM',
     );
     assert.equal(docsBuf.includes(0x0d), false, 'docs/index.html must be pure LF (0 CR)');
-    assert.match(docsBuf.toString('utf8'), /v1\.5\.3/);
+    assert.match(docsBuf.toString('utf8'), /v1\.5\.4/);
   }
 });
 
@@ -3328,4 +3340,650 @@ test('v1.5.3 conditional Update All visibility across Scenarios A–F & selfUpda
   assert.match(filteredHtml, /class="empty-state"/);
   const filteredCheckBtn = filteredBtns.find((b) => b.action === 'check-updates');
   assert.ok(filteredCheckBtn && !filteredCheckBtn.disabled, '[Filter:updatable] check-updates must remain clickable');
+});
+
+test('v1.5.4 UI regressions: cross-snapshot desync, checkUpdates(true) failure, scope/dir isolation, forceResync & ALREADY_UP_TO_DATE, RC-7 commit escalation & formatV', async () => {
+  const bundled = bundleZeroDepEsm(join(REPO_ROOT, 'src', 'ui', 'app.mjs'));
+  const bootMarker = 'void loadState(false);\nvoid checkUpdates(false, { silent: true });';
+  assert.ok(bundled.includes(bootMarker), 'Bundled app.mjs must contain auto-boot marker');
+
+  const instrumented = bundled.replace(
+    bootMarker,
+    [
+      'globalThis.__V154_UI__ = {',
+      '  state,',
+      '  formatV,',
+      '  applyServerState,',
+      '  reconcileUpdatesWithServerState,',
+      '  isUpdateEffectiveForLocal,',
+      '  findUpdateForLocal,',
+      '  getEffectiveUpdateItems,',
+      '  getUpdateMaps,',
+      '  getCatalogMaps,',
+      '  getInstalledByDirMap,',
+      '  isPluginConfirmedLatest,',
+      '  markPluginVerifiedLatest,',
+      '  checkUpdates,',
+      '  triggerInstall,',
+      '  triggerDirectPluginUpdate,',
+      '  triggerTogglePlugin,',
+      '  triggerFixConflict,',
+      '  updatePrefs,',
+      '  renderInstalledCard,',
+      '  renderInstalledView,',
+      '  renderPluginCard,',
+      '  renderDetailDrawer,',
+      '  renderSelfUpdateBanner,',
+      '  renderModals,',
+      '};',
+    ].join('\n'),
+  );
+
+  const fetchCalls = [];
+  let mockFetchHandler = async () => jsonResp({ ok: true });
+  const mockFetchFn = async (url, opts = {}) => {
+    fetchCalls.push({
+      url: String(url),
+      method: String(opts.method || 'GET'),
+      body: opts.body ? JSON.parse(String(opts.body)) : null,
+    });
+    return mockFetchHandler(String(url), opts);
+  };
+
+  let rootHtml = '';
+  const mockRoot = {
+    get innerHTML() {
+      return rootHtml;
+    },
+    set innerHTML(val) {
+      rootHtml = String(val || '');
+    },
+    querySelectorAll: () => [],
+    querySelector: () => null,
+  };
+  const storageMap = new Map();
+  const mockWindow = {
+    localStorage: {
+      getItem: (k) => (storageMap.has(k) ? storageMap.get(k) : null),
+      setItem: (k, v) => storageMap.set(k, String(v)),
+      removeItem: (k) => storageMap.delete(k),
+    },
+    addEventListener: () => {},
+    location: { reload: () => {}, origin: 'http://127.0.0.1:43210', search: '' },
+    matchMedia: () => ({ matches: false, addEventListener: () => {} }),
+    __SIDECAR_BOOT__: { token: 'test-token-v154' },
+    sidecar: null,
+    fetch: mockFetchFn,
+  };
+  const mockDocument = {
+    getElementById: (id) => (id === 'app' ? mockRoot : null),
+    querySelector: () => null,
+    querySelectorAll: () => [],
+    activeElement: null,
+    documentElement: { setAttribute: () => {}, classList: { toggle: () => {} } },
+    body: { classList: { toggle: () => {} } },
+    addEventListener: () => {},
+  };
+
+  const sandbox = {
+    window: mockWindow,
+    document: mockDocument,
+    fetch: mockFetchFn,
+    URL,
+    URLSearchParams,
+    Headers,
+    Response,
+    console,
+    setTimeout: () => 1,
+    clearTimeout: () => {},
+    requestAnimationFrame: (cb) => {
+      cb();
+      return 1;
+    },
+  };
+  sandbox.globalThis = sandbox;
+  sandbox.self = mockWindow;
+
+  vm.runInNewContext(instrumented, sandbox, { filename: 'agy-market-v154-ui-regressions.js' });
+  const ui = sandbox.__V154_UI__;
+  assert.ok(ui, 'Instrumented UI harness must expose __V154_UI__');
+
+  const makeNekoLoc = ({ dir = 'gemini-neko-cockpit', scope = 'global', version = '1.3.0', enabled = true } = {}) => ({
+    dir,
+    name: dir,
+    displayName: 'Gemini 猫娘观察台 · Antigravity Observer',
+    version,
+    scope,
+    enabled,
+    canUninstall: scope === 'global',
+    repositoryUrl: 'https://github.com/azwosile/gemini-neko-cockpit',
+    receipt: {
+      id: 'azwosile__gemini-neko-cockpit',
+      track: 'verified',
+      repositoryUrl: 'https://github.com/azwosile/gemini-neko-cockpit',
+      installedVersion: version,
+      gitTag: `v${version.replace(/^v+/i, '')}`,
+    },
+    capabilities: { badges: ['sidecar-ui'] },
+  });
+
+  const makeNekoCat = ({ version = '1.3.0', installedDir = 'gemini-neko-cockpit', installedVersion = '1.3.0', hasUpdate = false } = {}) => ({
+    id: 'azwosile__gemini-neko-cockpit',
+    canonicalName: 'gemini-neko-cockpit',
+    scopedName: 'azwosile--gemini-neko-cockpit',
+    displayName: 'Gemini 猫娘观察台 · Antigravity Observer',
+    version,
+    description: { zh: '猫娘观察台', en: 'Neko Observer' },
+    repository: { url: 'https://github.com/azwosile/gemini-neko-cockpit', stars: 42 },
+    capabilities: { badges: ['sidecar-ui'] },
+    taxonomy: { categories: ['monitoring-quota'], tags: [] },
+    installStatus: {
+      installed: true,
+      installedDir,
+      installedVersion,
+      hasUpdate,
+      enabled: true,
+      scope: 'global',
+      canUninstall: true,
+    },
+  });
+
+  const selfLoc154 = {
+    dir: 'agy-market',
+    name: 'agy-market',
+    displayName: 'AGY Market',
+    version: '1.5.4',
+    scope: 'global',
+    enabled: true,
+    canUninstall: false,
+    uninstallDisabledReason: 'self',
+    repositoryUrl: 'https://github.com/azwosile/agy-market',
+    receipt: { id: 'azwosile__agy-market', track: 'verified', repositoryUrl: 'https://github.com/azwosile/agy-market' },
+    capabilities: { badges: ['sidecar-ui'] },
+  };
+
+  const makeState = ({ installed = [makeNekoLoc({ version: '1.3.0' }), selfLoc154], plugins = [makeNekoCat()], updatesAvailable = [] } = {}) => ({
+    plugin: { id: 'agy-market', version: '1.5.4' },
+    prefs: { locale: 'zh', favorites: [], enableExperimentalTrack2: false },
+    catalog: { plugins, channelUsed: 'primary' },
+    installed,
+    updatesAvailable,
+    conflictsSummary: { total: 0, critical: 0, warning: 0, info: 0 },
+  });
+
+  const staleNekoUpdateItem = () => ({
+    id: 'azwosile__gemini-neko-cockpit',
+    dir: 'gemini-neko-cockpit',
+    displayName: 'Gemini 猫娘观察台 · Antigravity Observer',
+    installedVersion: '1.2.0',
+    latestVersion: '1.3.0',
+    installable: true,
+    source: 'catalog',
+    updateChannel: 'catalog',
+    targetRef: 'v1.3.0',
+    changelog: '## v1.3.0\n- Added wait.webp & docs',
+    repositoryUrl: 'https://github.com/azwosile/gemini-neko-cockpit',
+  });
+
+  // -------------------------------------------------------------------------
+  // Case 1A: UI Cross-Snapshot Desync (gemini-neko-cockpit v1.3.0 -> v1.3.0 reproduction)
+  // across applyServerState (onWorkspaceChange/loadState), triggerTogglePlugin,
+  // triggerFixConflict, and updatePrefs
+  // -------------------------------------------------------------------------
+  const seedStaleDesync = () => {
+    ui.state.verifiedLatestDirs.clear();
+    ui.state.restartBanner = null;
+    ui.state.toast = null;
+    ui.state.busyId = '';
+    ui.state.batchUpdating = false;
+    ui.state.updates = {
+      loading: false,
+      checkedAt: '2026-11-25T05:00:00Z',
+      items: [staleNekoUpdateItem()],
+      selfUpdate: null,
+      rateLimited: false,
+      warnings: [],
+      error: '',
+    };
+    ui.state.serverState = makeState({
+      installed: [makeNekoLoc({ version: '1.2.0' }), selfLoc154],
+      plugins: [makeNekoCat({ version: '1.3.0', installedVersion: '1.2.0', hasUpdate: true })],
+      updatesAvailable: [staleNekoUpdateItem()],
+    });
+  };
+
+  const assertNekoCardCleanLatest = (label) => {
+    assert.equal(ui.state.updates.items.length, 0, `[${label}] reconcileUpdatesWithServerState must purge stale 1.3.0 item`);
+    assert.equal(
+      (ui.state.serverState?.updatesAvailable || []).length,
+      0,
+      `[${label}] serverState.updatesAvailable must purge stale 1.3.0 item`,
+    );
+    const { byId: updById, byDir: updByDir } = ui.getUpdateMaps();
+    const { byId: catById, byDir: catByDir } = ui.getCatalogMaps();
+    const loc = ui.state.serverState.installed.find((x) => x.dir === 'gemini-neko-cockpit');
+    const html = ui.renderInstalledCard(loc, updById, updByDir, catById, catByDir);
+    assert.equal(html.includes('v1.3.0 → v1.3.0'), false, `[${label}] Card MUST NEVER render v1.3.0 → v1.3.0`);
+    assert.equal(html.includes('更新内容'), false, `[${label}] Card MUST NEVER render stale 更新内容 › button`);
+    assert.equal(html.includes('更新 v1.3.0'), false, `[${label}] Card MUST NEVER render stale 更新 v1.3.0 button`);
+    assert.equal(html.includes('has-update'), false, `[${label}] Card must not carry has-update class`);
+    assert.match(html, /<span class="version-tag">v1\.3\.0<\/span>/, `[${label}] Card must render plain v1.3.0 tag`);
+    assert.match(html, /state-pill is-latest[\s\S]*最新/, `[${label}] Card must render 最新 pill`);
+  };
+
+  // (i) Direct applyServerState (onWorkspaceChange / loadState)
+  seedStaleDesync();
+  ui.applyServerState(
+    makeState({
+      installed: [makeNekoLoc({ version: '1.3.0' }), selfLoc154],
+      plugins: [makeNekoCat({ version: '1.3.0', installedVersion: '1.3.0', hasUpdate: false })],
+      updatesAvailable: [staleNekoUpdateItem()],
+    }),
+  );
+  assertNekoCardCleanLatest('applyServerState');
+
+  // (ii) triggerTogglePlugin returning fresh state with loc.version=1.3.0
+  seedStaleDesync();
+  mockFetchHandler = async (url) => {
+    if (url === '/api/toggle-plugin') {
+      return jsonResp({
+        ok: true,
+        state: makeState({
+          installed: [makeNekoLoc({ version: '1.3.0', enabled: true }), selfLoc154],
+          plugins: [makeNekoCat({ version: '1.3.0', installedVersion: '1.3.0', hasUpdate: false })],
+        }),
+      });
+    }
+    return jsonResp({ ok: true });
+  };
+  await ui.triggerTogglePlugin('gemini-neko-cockpit', true);
+  assertNekoCardCleanLatest('triggerTogglePlugin');
+
+  // (iii) triggerFixConflict returning fresh state with loc.version=1.3.0
+  seedStaleDesync();
+  mockFetchHandler = async (url) => {
+    if (url === '/api/fix-conflict') {
+      return jsonResp({
+        ok: true,
+        conflicts: { items: [], summary: { total: 0, critical: 0, warning: 0, info: 0 } },
+        state: makeState({
+          installed: [makeNekoLoc({ version: '1.3.0' }), selfLoc154],
+          plugins: [makeNekoCat({ version: '1.3.0', installedVersion: '1.3.0', hasUpdate: false })],
+        }),
+      });
+    }
+    return jsonResp({ ok: true });
+  };
+  await ui.triggerFixConflict('duplicate', 'gemini-neko-cockpit');
+  assertNekoCardCleanLatest('triggerFixConflict');
+
+  // (iv) updatePrefs returning fresh state with loc.version=1.3.0
+  seedStaleDesync();
+  mockFetchHandler = async (url) => {
+    if (url === '/api/prefs') {
+      return jsonResp(
+        makeState({
+          installed: [makeNekoLoc({ version: '1.3.0' }), selfLoc154],
+          plugins: [makeNekoCat({ version: '1.3.0', installedVersion: '1.3.0', hasUpdate: false })],
+        }),
+      );
+    }
+    return jsonResp({ ok: true });
+  };
+  await ui.updatePrefs({ locale: 'zh' });
+  assertNekoCardCleanLatest('updatePrefs');
+
+  // (v) Defense-in-depth: even if stale item is manually injected into state.updates.items without applyServerState,
+  // getEffectiveUpdateItems / findUpdateForLocal / renderInstalledCard / renderPluginCard / renderDetailDrawer ALL block v1.3.0 -> v1.3.0
+  ui.state.updates.items = [staleNekoUpdateItem()];
+  assert.deepEqual(ui.getEffectiveUpdateItems(), [], 'getEffectiveUpdateItems secondary defense must filter same-version item');
+  {
+    const { byId: updById, byDir: updByDir } = ui.getUpdateMaps();
+    const { byId: catById, byDir: catByDir } = ui.getCatalogMaps();
+    const nekoLoc = ui.state.serverState.installed.find((x) => x.dir === 'gemini-neko-cockpit');
+    const nekoCat = ui.state.serverState.catalog.plugins[0];
+    assert.equal(ui.findUpdateForLocal(nekoLoc, updById, updByDir), null);
+    const cardHtml = ui.renderInstalledCard(nekoLoc, updById, updByDir, catById, catByDir);
+    assert.equal(cardHtml.includes('v1.3.0 → v1.3.0'), false);
+    const discoverCardHtml = ui.renderPluginCard(nekoCat, updById, ui.getInstalledByDirMap(), updByDir);
+    assert.equal(discoverCardHtml.includes('v1.3.0 → v1.3.0'), false);
+    ui.state.detailPlugin = nekoCat;
+    const drawerHtml = ui.renderDetailDrawer();
+    assert.equal(drawerHtml.includes('v1.3.0 → v1.3.0'), false);
+    assert.match(
+      drawerHtml,
+      /data-action="install"[^>]*data-force-resync="1"/,
+      'Catalog detail drawer Re-sync button must carry data-force-resync="1"',
+    );
+    ui.state.detailPlugin = { ...nekoCat, _localOnly: true };
+    const localDrawerHtml = ui.renderDetailDrawer();
+    assert.match(
+      localDrawerHtml,
+      /data-action="update-plugin-direct"[^>]*data-force-resync="1"/,
+      'Local-only detail drawer Re-sync button must carry data-force-resync="1"',
+    );
+    ui.state.detailPlugin = null;
+  }
+
+  // (vi) forceResync payload propagation & ALREADY_UP_TO_DATE gentle toast with NO restartBanner
+  fetchCalls.length = 0;
+  ui.state.verifiedLatestDirs.clear();
+  ui.state.restartBanner = null;
+  ui.state.toast = null;
+  mockFetchHandler = async (url) => {
+    if (url === '/api/update') {
+      return jsonResp({
+        ok: true,
+        status: 'ALREADY_UP_TO_DATE',
+        alreadyUpToDate: true,
+        noop: true,
+        installedDir: 'gemini-neko-cockpit',
+        version: '1.3.0',
+        restartRequired: false,
+        reloadRequired: false,
+        state: makeState(),
+      });
+    }
+    return jsonResp({ ok: true });
+  };
+  await ui.triggerInstall(makeNekoCat(), { forceResync: true, dir: 'gemini-neko-cockpit' });
+  const installCall = fetchCalls.find((c) => c.url === '/api/update');
+  assert.ok(installCall, 'triggerInstall on installed plugin must POST /api/update');
+  assert.equal(installCall.body?.dir, 'gemini-neko-cockpit');
+  assert.equal(installCall.body?.forceResync, true);
+  assert.equal(ui.state.verifiedLatestDirs.has('gemini-neko-cockpit'), true);
+  assert.equal(ui.state.restartBanner, null, 'ALREADY_UP_TO_DATE must NOT trigger restartBanner');
+  assert.match(String(ui.state.toast?.message || ''), /当前已是最新版本.*v1\.3\.0/);
+
+  fetchCalls.length = 0;
+  ui.state.verifiedLatestDirs.clear();
+  ui.state.restartBanner = null;
+  ui.state.toast = null;
+  await ui.triggerDirectPluginUpdate({
+    id: 'azwosile__gemini-neko-cockpit',
+    dir: 'gemini-neko-cockpit',
+    displayName: 'Gemini 猫娘观察台',
+    forceResync: true,
+  });
+  const directCall = fetchCalls.find((c) => c.url === '/api/update');
+  assert.equal(directCall?.body?.forceResync, true);
+  assert.equal(ui.state.verifiedLatestDirs.has('gemini-neko-cockpit'), true);
+  assert.equal(ui.state.restartBanner, null);
+  assert.match(String(ui.state.toast?.message || ''), /当前已是最新版本.*v1\.3\.0/);
+
+  // -------------------------------------------------------------------------
+  // Case 1B: checkUpdates(true) failure preserves verifiedLatestDirs, does NOT resurrect
+  // stale 1.3.0 update item, and makes 0 extra /api/state requests
+  // -------------------------------------------------------------------------
+  for (const failureMode of ['http-503', 'network-throw']) {
+    fetchCalls.length = 0;
+    ui.state.serverState = makeState({ installed: [makeNekoLoc({ version: '1.3.0' }), selfLoc154] });
+    ui.state.verifiedLatestDirs.clear();
+    ui.state.verifiedLatestDirs.add('gemini-neko-cockpit');
+    ui.state.updates = {
+      loading: false,
+      checkedAt: '2026-11-25T05:00:00Z',
+      items: [staleNekoUpdateItem()],
+      selfUpdate: null,
+      rateLimited: false,
+      warnings: [],
+      error: '',
+    };
+    mockFetchHandler = async (url) => {
+      if (url.startsWith('/api/state')) {
+        throw new Error('Unexpected API call to /api/state inside checkUpdates');
+      }
+      if (url.startsWith('/api/updates')) {
+        if (failureMode === 'network-throw') throw new Error('NETWORK_DOWN');
+        return jsonResp({ ok: false, error: 'UPSTREAM_503' }, 503);
+      }
+      throw new Error(`Unexpected API call: ${url}`);
+    };
+
+    await ui.checkUpdates(true);
+
+    assert.equal(
+      fetchCalls.filter((c) => c.url.startsWith('/api/state')).length,
+      0,
+      `[${failureMode}] checkUpdates must NEVER call /api/state`,
+    );
+    assert.equal(
+      ui.state.verifiedLatestDirs.has('gemini-neko-cockpit'),
+      true,
+      `[${failureMode}] Failed checkUpdates(true) must NOT prematurely clear verifiedLatestDirs`,
+    );
+    assert.equal(
+      ui.state.updates.items.length,
+      0,
+      `[${failureMode}] Failed checkUpdates(true) must reconcile and NOT resurrect stale 1.3.0 item`,
+    );
+    const { byId: updById, byDir: updByDir } = ui.getUpdateMaps();
+    const { byId: catById, byDir: catByDir } = ui.getCatalogMaps();
+    const cardHtml = ui.renderInstalledCard(
+      ui.state.serverState.installed[0],
+      updById,
+      updByDir,
+      catById,
+      catByDir,
+    );
+    assert.equal(cardHtml.includes('v1.3.0 → v1.3.0'), false, `[${failureMode}] No stale v1.3.0 → v1.3.0 resurrection`);
+    assert.match(cardHtml, /state-pill is-latest[\s\S]*最新/, `[${failureMode}] Must preserve 最新 pill`);
+  }
+
+  // -------------------------------------------------------------------------
+  // Case 2: UI Cross-Scope (workspace) & Dual Global Directory Isolation (RC-2)
+  // -------------------------------------------------------------------------
+  const globalMain130 = makeNekoLoc({ dir: 'gemini-neko-cockpit', scope: 'global', version: '1.3.0' });
+  const globalIso120 = makeNekoLoc({ dir: 'azwosile--gemini-neko-cockpit', scope: 'global', version: '1.2.0' });
+  const workspace130 = makeNekoLoc({ dir: 'gemini-neko-cockpit', scope: 'workspace', version: '1.3.0' });
+  const workspace120 = makeNekoLoc({ dir: 'azwosile--gemini-neko-cockpit', scope: 'workspace', version: '1.2.0' });
+
+  ui.state.verifiedLatestDirs.clear();
+  ui.state.updates = {
+    loading: false,
+    checkedAt: '2026-11-25T05:30:00Z',
+    items: [
+      {
+        ...staleNekoUpdateItem(),
+        dir: 'azwosile--gemini-neko-cockpit',
+        installedVersion: '1.2.0',
+        latestVersion: '1.3.0',
+      },
+    ],
+    selfUpdate: null,
+    rateLimited: false,
+    warnings: [],
+    error: '',
+  };
+  ui.applyServerState(
+    makeState({
+      installed: [globalMain130, globalIso120, workspace130, workspace120, selfLoc154],
+      plugins: [makeNekoCat({ version: '1.3.0', installedDir: 'gemini-neko-cockpit', installedVersion: '1.3.0', hasUpdate: false })],
+    }),
+  );
+
+  {
+    const { byId: updById, byDir: updByDir } = ui.getUpdateMaps();
+    const { byId: catById, byDir: catByDir } = ui.getCatalogMaps();
+
+    // Only global isolated 1.2.0 dir gets the update
+    assert.ok(ui.findUpdateForLocal(globalIso120, updById, updByDir), 'Global isolated 1.2.0 dir must match its update');
+    const isoHtml = ui.renderInstalledCard(globalIso120, updById, updByDir, catById, catByDir);
+    assert.ok(isoHtml.includes('v1.2.0 → v1.3.0'), 'Global isolated 1.2.0 card must render v1.2.0 → v1.3.0');
+    assert.ok(isoHtml.includes('更新 v1.3.0'), 'Global isolated 1.2.0 card must render 更新 v1.3.0');
+    assert.ok(isoHtml.includes('更新内容'), 'Global isolated 1.2.0 card must render 更新内容');
+
+    // Global main 1.3.0 dir sharing same receipt.id MUST NOT borrow isolated dir's update
+    assert.equal(ui.findUpdateForLocal(globalMain130, updById, updByDir), null, 'Global main 1.3.0 dir must NOT borrow isolated update');
+    const mainHtml = ui.renderInstalledCard(globalMain130, updById, updByDir, catById, catByDir);
+    assert.equal(mainHtml.includes('→'), false, 'Global main 1.3.0 card must NOT render version delta arrow');
+    assert.equal(mainHtml.includes('更新 v1.3.0'), false);
+    assert.match(mainHtml, /<span class="version-tag">v1\.3\.0<\/span>/);
+    assert.match(mainHtml, /state-pill is-latest[\s\S]*最新/);
+
+    // Workspace 1.3.0 and Workspace 1.2.0 sharing same receipt.id/dir MUST NEVER borrow global updates
+    assert.equal(ui.findUpdateForLocal(workspace130, updById, updByDir), null);
+    assert.equal(ui.findUpdateForLocal(workspace120, updById, updByDir), null);
+    for (const wsLoc of [workspace130, workspace120]) {
+      const wsHtml = ui.renderInstalledCard(wsLoc, updById, updByDir, catById, catByDir);
+      assert.equal(wsHtml.includes('→'), false, 'Workspace plugin must never render version delta');
+      assert.equal(wsHtml.includes('更新 v1.3.0'), false, 'Workspace plugin must never render update button');
+      assert.ok(wsHtml.includes('工作区'), 'Workspace plugin must render 工作区 pill');
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Case 6 (RC-7): formatV anti-vv1.3.0, escalationModal commit SHA display,
+  // renderSelfUpdateBanner / selfChangelogModal SemVer guard
+  // -------------------------------------------------------------------------
+  assert.equal(ui.formatV('1.3.0'), 'v1.3.0');
+  assert.equal(ui.formatV('v1.3.0'), 'v1.3.0');
+  assert.equal(ui.formatV('vv1.3.0'), 'v1.3.0');
+  assert.equal(ui.formatV('VVV1.3.0'), 'v1.3.0');
+  assert.equal(ui.formatV(''), '?');
+  assert.equal(ui.formatV('?'), '?');
+
+  // Card version rendering with v-prefixed inputs must never produce vv1.x
+  {
+    const prefixedLoc = makeNekoLoc({ dir: 'prefixed-plug', scope: 'global', version: 'v1.2.0' });
+    const prefixedUpd = {
+      ...staleNekoUpdateItem(),
+      id: 'alice__prefixed-plug',
+      dir: 'prefixed-plug',
+      installedVersion: 'v1.2.0',
+      latestVersion: 'vv1.3.0',
+    };
+    const updById = new Map([['alice__prefixed-plug', prefixedUpd]]);
+    const updByDir = new Map([['prefixed-plug', prefixedUpd]]);
+    const html = ui.renderInstalledCard(prefixedLoc, updById, updByDir, new Map(), new Map());
+    assert.ok(html.includes('v1.2.0 → v1.3.0'), 'formatV must normalize v-prefixed versions cleanly');
+    assert.equal(html.includes('vv1.'), false, 'Rendered card must contain 0 vv1.x duplicates');
+  }
+
+  // Escalation modal for commit update must display v2.1.1 (1111111 → 2222222) and NEVER v2.1.1 → v2.1.1 or vv2.1.1
+  {
+    const commitLoc = {
+      dir: 'branch-plug',
+      name: 'branch-plug',
+      displayName: 'Branch Plug',
+      version: 'v2.1.1',
+      scope: 'global',
+      enabled: true,
+      canUninstall: true,
+      repositoryUrl: 'https://github.com/zou/branch-plug',
+      receipt: {
+        id: 'gh-url__zou__branch-plug',
+        track: 'github-url',
+        commitSha: '1111111111111111111111111111111111111111',
+      },
+      capabilities: { badges: ['declarative-only'] },
+    };
+    const commitUpd = {
+      id: 'gh-url__zou__branch-plug',
+      dir: 'branch-plug',
+      displayName: 'Branch Plug',
+      installedVersion: 'v2.1.1',
+      latestVersion: 'v2.1.1',
+      installedCommitSha: '1111111',
+      latestCommitSha: '2222222',
+      updateKind: 'commit',
+      source: 'github-branch',
+      updateChannel: 'github-url',
+      targetRef: '2222222222222222222222222222222222222222',
+      installable: true,
+    };
+    ui.state.escalationModal = null;
+    ui.state.updates = {
+      loading: false,
+      checkedAt: '2026-11-25T05:35:00Z',
+      items: [commitUpd],
+      selfUpdate: null,
+      rateLimited: false,
+      warnings: [],
+      error: '',
+    };
+    ui.applyServerState(makeState({ installed: [commitLoc, selfLoc154], plugins: [] }));
+
+    mockFetchHandler = async (url) => {
+      if (url === '/api/update') {
+        return jsonResp({
+          ok: false,
+          status: 'CAPABILITY_ESCALATION_CONFIRM_REQUIRED',
+          installedVersion: 'v2.1.1',
+          targetVersion: 'v2.1.1',
+          escalation: {
+            addedBadges: ['mcp-remote'],
+            addedRemoteDomains: ['api.example.com'],
+            addedHookEvents: [],
+          },
+        });
+      }
+      return jsonResp({ ok: true });
+    };
+
+    await ui.triggerDirectPluginUpdate({
+      id: commitUpd.id,
+      dir: commitUpd.dir,
+      displayName: commitUpd.displayName,
+      source: commitUpd.source,
+      updateChannel: commitUpd.updateChannel,
+      targetRef: commitUpd.targetRef,
+      updateKind: 'commit',
+    });
+
+    assert.ok(ui.state.escalationModal, 'CAPABILITY_ESCALATION_CONFIRM_REQUIRED must open escalationModal');
+    assert.equal(ui.state.escalationModal.items[0].updateKind, 'commit');
+    assert.equal(ui.state.escalationModal.items[0].installedCommitSha, '1111111');
+    assert.equal(ui.state.escalationModal.items[0].latestCommitSha, '2222222');
+
+    const modalHtml = ui.renderModals();
+    assert.ok(
+      modalHtml.includes('v2.1.1 (1111111 → 2222222)'),
+      `Commit escalation modal must display commit SHA delta, got snippet: ${modalHtml.slice(0, 500)}`,
+    );
+    assert.equal(modalHtml.includes('v2.1.1 → v2.1.1'), false, 'Commit escalation modal must NEVER render v2.1.1 → v2.1.1');
+    assert.equal(modalHtml.includes('vv2.1.1'), false, 'Commit escalation modal must NEVER render vv2.1.1');
+    ui.state.escalationModal = null;
+  }
+
+  // Self-update banner & selfChangelogModal guard against same-version and vv-prefix
+  {
+    ui.state.dismissedSelfVersion = '';
+    ui.state.updates.selfUpdate = {
+      id: 'azwosile__agy-market',
+      installedVersion: '1.5.4',
+      latestVersion: 'v1.5.4',
+      installable: true,
+      changelog: 'Same version notes',
+    };
+    assert.equal(ui.renderSelfUpdateBanner(), '', 'Same-version selfUpdate must NOT render banner');
+    ui.reconcileUpdatesWithServerState();
+    assert.equal(ui.state.updates.selfUpdate, null, 'reconcileUpdatesWithServerState must clear same-version selfUpdate');
+
+    ui.state.updates.selfUpdate = {
+      id: 'azwosile__agy-market',
+      installedVersion: 'v1.5.4',
+      latestVersion: 'v1.6.0',
+      installable: true,
+      changelog: '## v1.6.0\n- Real update',
+    };
+    const bannerHtml = ui.renderSelfUpdateBanner();
+    assert.ok(bannerHtml.includes('v1.5.4 → v1.6.0'), 'Valid selfUpdate banner must normalize with formatV');
+    assert.equal(bannerHtml.includes('vv1.'), false, 'Banner must never render vv1.x');
+    ui.state.selfChangelogModal = true;
+    const selfModalHtml = ui.renderModals();
+    assert.ok(selfModalHtml.includes('v1.5.4 → v1.6.0'), 'selfChangelogModal must normalize with formatV');
+    assert.equal(selfModalHtml.includes('vv1.'), false, 'selfChangelogModal must never render vv1.x');
+
+    // Even malformed double-v latestVersion must normalize to single v in visible version-delta span
+    ui.state.updates.selfUpdate = {
+      id: 'azwosile__agy-market',
+      installedVersion: 'vv1.5.4',
+      latestVersion: 'vv1.6.0',
+      installable: true,
+      changelog: '## v1.6.0\n- Real update',
+    };
+    assert.match(ui.renderSelfUpdateBanner(), /<span class="version-delta">v1\.5\.4 → v1\.6\.0<\/span>/);
+    assert.match(ui.renderModals(), /<span class="version-delta">v1\.5\.4 → v1\.6\.0<\/span>/);
+  }
 });

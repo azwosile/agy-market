@@ -16,6 +16,7 @@ import {
   resolvePluginsDir,
 } from '../shared/paths.mjs';
 import { parseJsonc, sanitizeNativePluginManifest } from '../shared/schemas.mjs';
+import { compareSemver, parseSemver } from '../shared/semver.mjs';
 
 const HOOK_META_KEYS = new Set(['$schema', 'version', 'description', 'enabled']);
 const IGNORED_SCAN_DIRS = new Set(['node_modules', '.git', 'test', 'tests', '__tests__', 'docs', 'site', 'dist']);
@@ -694,6 +695,17 @@ function scanSinglePluginFolder(
 
   const activation = classifyActivationRequirement(components.capabilities);
 
+  const receiptVersion = receipt?.installedVersion ? String(receipt.installedVersion).trim() : '';
+  const manifestVersion = manifest.version ? String(manifest.version).trim() : '';
+  const resolvedVersion =
+    receiptVersion &&
+    manifestVersion &&
+    parseSemver(manifestVersion) &&
+    parseSemver(receiptVersion) &&
+    compareSemver(manifestVersion, receiptVersion) > 0
+      ? manifestVersion
+      : String(receipt?.installedVersion || manifest.version || '0.0.0');
+
   return {
     dir: dirName,
     path: fullDir,
@@ -703,7 +715,7 @@ function scanSinglePluginFolder(
     name: manifestName,
     displayName,
     description: String(manifest.description || ''),
-    version: String(receipt?.installedVersion || manifest.version || '0.0.0'),
+    version: resolvedVersion,
     author: normalizeAuthorDisplay(manifest.author),
     logo: typeof manifest.logo === 'string' ? manifest.logo.trim().replace(/\\/g, '/').replace(/^\.\/+/, '') : '',
     repositoryUrl: resolveLocalPluginRepoUrl(fullDir, manifest, receipt),
@@ -818,7 +830,7 @@ export function scanLocalPluginInventory({
  * Resolves exact install target & collision strategy for `plugin` against `inventory`.
  * `conflictStrategy`: `'prompt'` (default) | `'isolate'` | `'replace'`
  */
-export function resolveInstallPreflight(plugin, inventory, { conflictStrategy = 'prompt' } = {}) {
+export function resolveInstallPreflight(plugin, inventory, { conflictStrategy = 'prompt', preferredDir = '' } = {}) {
   const repoId = Number(plugin?.repository?.repositoryId || 0);
   const repoUrlNorm = normalizeRepoUrl(plugin?.repository?.url);
   const canonicalName = String(plugin.canonicalName || '').trim();
@@ -839,7 +851,7 @@ export function resolveInstallPreflight(plugin, inventory, { conflictStrategy = 
   const scopedName = plugin.scopedName || toScopedPluginName(ownerFromId, canonicalName);
 
   // 1. Check if SAME plugin is already installed locally (active OR parked in `disabled-plugins/<dir>`)
-  const sameSource = (inventory.installed || []).find((loc) => {
+  const sameSourceMatches = (inventory.installed || []).filter((loc) => {
     if (loc.scope !== 'global') return false;
     if (loc.receipt) {
       if (repoId > 0 && Number(loc.receipt.repositoryId || 0) > 0) {
@@ -852,6 +864,11 @@ export function resolveInstallPreflight(plugin, inventory, { conflictStrategy = 
     }
     return false;
   });
+  const normPreferredDir = String(preferredDir || '').trim();
+  const sameSource =
+    (normPreferredDir && sameSourceMatches.find((loc) => loc.dir === normPreferredDir)) ||
+    sameSourceMatches[0] ||
+    null;
 
   if (sameSource) {
     const isScoped = Boolean(sameSource.receipt?.scopedRewriteApplied) || sameSource.dir === scopedName;

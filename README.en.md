@@ -20,7 +20,7 @@ Sidebar Panel UI · Lock-Safe One-Click Uninstall · Direct In-Sidebar Upstream 
 
 ---
 
-## ✨ Highlights (v1.5.3)
+## ✨ Highlights (v1.5.4)
 
 ### 1. Sidebar Panel UI, 15 Precision Categories & Navigation
 - **Native Right Sidebar Panel**: Runs inside Antigravity's native `AUX_PANE` extension view (`sidecars/market_pane/sidecar.json`) with no bundled MCP servers, keeping the panel lightweight and responsive.
@@ -31,6 +31,7 @@ Sidebar Panel UI · Lock-Safe One-Click Uninstall · Direct In-Sidebar Upstream 
 - **Direct One-Click Sidebar Launcher**: Replaces raw `<a href="sidecar://...">` links blocked inside isolated iframes. Inside the host panel, clicking a sibling plugin's **Panel** button invokes host `window.sidecar.ui.toggleAuxPane` (`tabType: "sidecarView"`) directly to open or focus its Sidebar panel—no manual copy prompts.
 
 ### 2. Lock-Safe Uninstall, Direct In-Sidebar Updates & On-Demand Update All
+- **Zero Same-Version No-Op Updates (v1.5.4)**: Shared SemVer reconciliation across backend and UI plus server-authoritative catalog resolution eliminate stale-snapshot `vX.Y.Z → vX.Y.Z` ghost updates and stale payload downgrades; standard updates matching the installed version or Git tag/commit short-circuit cleanly with `ALREADY_UP_TO_DATE` (zero downloads), while the Detail Drawer preserves explicit **Re-sync** (`forceResync: true`) on demand.
 - **Lock-Safe Plugin Uninstall (Sidebar Card/Drawer + `npx agy-market uninstall <dir>`)**:
   - Every removable global plugin card and Detail Drawer exposes an **Uninstall** (`卸载`) button backed by `POST /api/uninstall` (with `POST /api/remove-files` compatibility) and a confirmation modal with an optional *Also remove from favorites* checkbox.
   - Handles both active (`~/.gemini/config/plugins/<dir>`) and Vault-Parked (`${PLUGIN_DATA}/disabled-plugins/<dir>`) directories; never writes `config.json` or calls restricted RPCs; unlinks symlinks/NTFS junctions without touching target source directories; retires Windows `EBUSY`-locked binaries to `.old.<ts>` while immediately deleting `plugin.json` (with `sweepRetiredBinaries` later removing empty orphan shells); strictly blocks self-deletion of `agy-market` (`ERR_CANNOT_SELF_DELETE`) as well as `workspace` and `builtin` plugins.

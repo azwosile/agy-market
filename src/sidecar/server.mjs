@@ -48,8 +48,8 @@ import {
   savePrefsToDisk,
   toPublicPrefs,
 } from '../shared/schemas.mjs';
-import { isNewerVersion } from '../shared/semver.mjs';
-import { checkPluginUpdates, isCatalogPluginInstallable } from '../updates/index.mjs';
+import { isNewerVersion, parseSemver } from '../shared/semver.mjs';
+import { checkPluginUpdates, isCatalogPluginInstallable, isSameInstalledRelease } from '../updates/index.mjs';
 import { openSiblingSidecarPane } from './open-pane.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -463,6 +463,26 @@ export async function createMarketSidecarServer(options = {}) {
     return /^https:\/\/github\.com\/[^/]+\/[^/]+$/i.test(norm) ? norm : '';
   }
 
+  function resolveCatalogPluginForMutation(catalogPlugins, explicitPlugin, { targetId = '', targetDir = '' } = {}) {
+    const list = Array.isArray(catalogPlugins) ? catalogPlugins : [];
+    const validExplicit = explicitPlugin && typeof explicitPlugin === 'object' ? explicitPlugin : null;
+    const serverMatch =
+      list.find(
+        (p) =>
+          (targetId && p.id === targetId) ||
+          (validExplicit?.id && p.id === validExplicit.id) ||
+          (targetDir && ((!p.forceScopedInstall && p.canonicalName === targetDir) || p.scopedName === targetDir)),
+      ) || null;
+
+    if (serverMatch && validExplicit) {
+      if (isCatalogPluginInstallable(validExplicit) && isNewerVersion(validExplicit.version, serverMatch.version)) {
+        return validExplicit;
+      }
+      return serverMatch;
+    }
+    return serverMatch || validExplicit || null;
+  }
+
   async function buildEnrichedState({ forceCatalogRefresh = false, workspaceUris = [] } = {}) {
     await ensureCatalogLoaded({ forceCatalogRefresh, includeReadmes: false });
 
@@ -513,7 +533,12 @@ export async function createMarketSidecarServer(options = {}) {
     const enrichedCatalogPlugins = catalogPlugins.map((p) => {
       const preflight = resolveInstallPreflight(p, enrichedInventory, { conflictStrategy: 'prompt' });
       const localMatch = preflight.action === 'update' ? preflight.existingInstall : null;
-      const hasUpdate = Boolean(localMatch && isNewerVersion(p.version, localMatch.version));
+      const hasUpdate = Boolean(
+        localMatch &&
+          isCatalogPluginInstallable(p) &&
+          !isSameInstalledRelease(localMatch.receipt, { gitTag: p.gitTag, commitSha: p.commitSha }) &&
+          isNewerVersion(p.version, localMatch.version),
+      );
       const escalation = localMatch ? computeCapabilityEscalation(localMatch.receipt, p) : null;
       const catalogActivation = classifyActivationRequirement(p.capabilities || {});
 
@@ -1157,10 +1182,8 @@ export async function createMarketSidecarServer(options = {}) {
         const catalogPlugins = lastCatalog?.plugins || [];
 
         if (pathname === '/api/install') {
-          const plugin =
-            body.plugin && typeof body.plugin === 'object'
-              ? body.plugin
-              : catalogPlugins.find((p) => p.id === targetId);
+          const explicitPlugin = body.plugin && typeof body.plugin === 'object' ? body.plugin : null;
+          const plugin = resolveCatalogPluginForMutation(catalogPlugins, explicitPlugin, { targetId, targetDir });
           if (!plugin) {
             sendJson(res, 404, { ok: false, error: `Plugin "${targetId || targetDir}" not found in active catalog` });
             return;
@@ -1170,6 +1193,7 @@ export async function createMarketSidecarServer(options = {}) {
             track: plugin._track || (plugin.forceScopedInstall ? 'unverified' : 'verified'),
             prefs,
             conflictStrategy: body.conflictStrategy || 'prompt',
+            preferredDir: targetDir,
             confirmEscalation: Boolean(body.confirmEscalation),
             configDir,
             dataDir,
@@ -1192,30 +1216,65 @@ export async function createMarketSidecarServer(options = {}) {
         // POST /api/update
         const reqChannel = String(body.updateChannel || '').trim();
         const reqSource = String(body.source || '').trim();
+        const forceResync = Boolean(body.forceResync);
         const preferUpstream = Boolean(
           body.preferUpstream ||
             reqChannel === 'github-upstream' ||
             reqChannel === 'github-url' ||
-            reqSource === 'github-url',
+            reqSource === 'github-url' ||
+            reqSource === 'github-release' ||
+            reqSource === 'github-tag' ||
+            reqSource === 'github-branch',
         );
 
         const explicitPlugin = body.plugin && typeof body.plugin === 'object' ? body.plugin : null;
-        const catPlugin =
-          explicitPlugin ||
-          catalogPlugins.find(
-            (p) =>
-              (targetId && p.id === targetId) ||
-              (targetDir && ((!p.forceScopedInstall && p.canonicalName === targetDir) || p.scopedName === targetDir)),
-          ) ||
-          null;
+        const catPlugin = resolveCatalogPluginForMutation(catalogPlugins, explicitPlugin, { targetId, targetDir });
 
         // (i) Direct catalog update / re-sync when catalog package is installable and upstream wasn't explicitly requested
         if (!preferUpstream && catPlugin && isCatalogPluginInstallable(catPlugin)) {
+          const preflightInventory = scanLocalPluginInventory({
+            configDir,
+            dataDir,
+            workspaceUris,
+            builtinPluginsDir,
+            linkInfoOverride,
+          });
+          const preflight = resolveInstallPreflight(catPlugin, preflightInventory, {
+            conflictStrategy: 'prompt',
+            preferredDir: targetDir,
+          });
+          if (
+            !forceResync &&
+            preflight.action === 'update' &&
+            preflight.existingInstall &&
+            (!isNewerVersion(catPlugin.version, preflight.existingInstall.version) ||
+              isSameInstalledRelease(preflight.existingInstall.receipt, {
+                gitTag: catPlugin.gitTag,
+                commitSha: catPlugin.commitSha,
+              }))
+          ) {
+            const state = await buildEnrichedState({ forceCatalogRefresh: false, workspaceUris });
+            sendJson(res, 200, {
+              ok: true,
+              status: 'ALREADY_UP_TO_DATE',
+              alreadyUpToDate: true,
+              noop: true,
+              installedDir: preflight.existingInstall.dir,
+              version: preflight.existingInstall.version,
+              parkedByMarket: Boolean(preflight.existingInstall.parkedByMarket),
+              restartRequired: false,
+              reloadRequired: false,
+              state,
+            });
+            return;
+          }
+
           const result = await installOrUpdateCatalogPlugin({
             plugin: catPlugin,
             track: catPlugin._track || (catPlugin.forceScopedInstall ? 'unverified' : 'verified'),
             prefs,
             conflictStrategy: body.conflictStrategy || (isSelfPluginCandidate(catPlugin, targetDir) ? 'replace' : 'prompt'),
+            preferredDir: targetDir,
             confirmEscalation: Boolean(body.confirmEscalation),
             configDir,
             dataDir,
@@ -1244,23 +1303,24 @@ export async function createMarketSidecarServer(options = {}) {
           linkInfoOverride,
         });
         const localPlugin =
+          (targetDir && inventory.installed.find((loc) => loc.scope === 'global' && loc.dir === targetDir)) ||
           inventory.installed.find(
             (loc) =>
               loc.scope === 'global' &&
-              ((targetDir && loc.dir === targetDir) ||
-                (targetId && (loc.receipt?.id === targetId || loc.dir === targetId || loc.name === targetId)) ||
+              ((targetId && (loc.receipt?.id === targetId || loc.dir === targetId || loc.name === targetId)) ||
                 (catPlugin &&
                   (loc.receipt?.id === catPlugin.id ||
                     loc.dir === catPlugin.canonicalName ||
                     loc.dir === catPlugin.scopedName))),
-          ) || null;
+          ) ||
+          null;
 
         if (!localPlugin) {
-          const nonGlobal = inventory.installed.find(
-            (loc) =>
-              loc.scope !== 'global' &&
-              ((targetDir && loc.dir === targetDir) || (targetId && (loc.dir === targetId || loc.name === targetId))),
-          );
+          const nonGlobal =
+            (targetDir && inventory.installed.find((loc) => loc.scope !== 'global' && loc.dir === targetDir)) ||
+            inventory.installed.find(
+              (loc) => loc.scope !== 'global' && targetId && (loc.dir === targetId || loc.name === targetId),
+            );
           if (nonGlobal) {
             sendJson(res, 400, {
               ok: false,
@@ -1306,6 +1366,44 @@ export async function createMarketSidecarServer(options = {}) {
             error: `ERR_NO_UPDATE_SOURCE: Plugin "${localPlugin.dir}" has neither an installable catalog entry nor a GitHub repository URL`,
           });
           return;
+        }
+
+        if (!forceResync && updateHint) {
+          const hintTargetRef = String(updateHint.targetRef || '').trim();
+          let upstreamAlreadyCurrent = false;
+          if (updateHint.updateKind === 'commit') {
+            const localSha = String(localPlugin.receipt?.commitSha || '').trim().toLowerCase();
+            const targetSha = hintTargetRef.toLowerCase();
+            if (localSha && targetSha && (localSha === targetSha || localSha.startsWith(targetSha))) {
+              upstreamAlreadyCurrent = true;
+            }
+          } else if (hintTargetRef) {
+            const localTag = String(localPlugin.receipt?.gitTag || '').trim().toLowerCase();
+            const targetTag = hintTargetRef.toLowerCase();
+            const targetSem = parseSemver(hintTargetRef);
+            if (
+              (localTag && localTag === targetTag) ||
+              (targetSem && !isNewerVersion(targetSem.version, localPlugin.version))
+            ) {
+              upstreamAlreadyCurrent = true;
+            }
+          }
+          if (upstreamAlreadyCurrent) {
+            const state = await buildEnrichedState({ forceCatalogRefresh: false, workspaceUris });
+            sendJson(res, 200, {
+              ok: true,
+              status: 'ALREADY_UP_TO_DATE',
+              alreadyUpToDate: true,
+              noop: true,
+              installedDir: localPlugin.dir,
+              version: localPlugin.version,
+              parkedByMarket: Boolean(localPlugin.parkedByMarket),
+              restartRequired: false,
+              reloadRequired: false,
+              state,
+            });
+            return;
+          }
         }
 
         const rawResult = await resolveAndStageGithubUpdate({
@@ -1383,16 +1481,18 @@ export async function createMarketSidecarServer(options = {}) {
             if (!reqId || seenReqIds.has(reqId)) continue;
             seenReqIds.add(reqId);
 
-            const upd = updById.get(reqId) || updByDir.get(reqId) || null;
+            const upd = updByDir.get(reqId) || updById.get(reqId) || null;
             const plugin = catalogPlugins.find((p) => p.id === reqId || p.canonicalName === reqId) || null;
             const localLoc =
+              (upd?.dir && globalInstalled.find((loc) => loc.dir === upd.dir)) ||
+              globalInstalled.find((loc) => loc.dir === reqId) ||
               globalInstalled.find(
                 (loc) =>
                   loc.receipt?.id === reqId ||
-                  loc.dir === reqId ||
                   loc.name === reqId ||
                   (plugin && (loc.dir === plugin.canonicalName || loc.dir === plugin.scopedName)),
-              ) || null;
+              ) ||
+              null;
             const isSelf = Boolean(upd?.isSelf || isSelfPluginCandidate(plugin, localLoc?.dir || reqId));
 
             // Prefer GitHub direct update when update check found a newer github-upstream / github-url build
@@ -1409,8 +1509,32 @@ export async function createMarketSidecarServer(options = {}) {
             }
 
             if (plugin && isCatalogPluginInstallable(plugin)) {
-              const preflight = resolveInstallPreflight(plugin, inventory, { conflictStrategy: 'prompt' });
+              const preflight = resolveInstallPreflight(plugin, inventory, {
+                conflictStrategy: 'prompt',
+                preferredDir: localLoc?.dir || '',
+              });
               const localDir = preflight.existingInstall?.dir || localLoc?.dir || plugin.canonicalName;
+              if (
+                !upd &&
+                preflight.action === 'update' &&
+                preflight.existingInstall &&
+                (!isNewerVersion(plugin.version, preflight.existingInstall.version) ||
+                  isSameInstalledRelease(preflight.existingInstall.receipt, {
+                    gitTag: plugin.gitTag,
+                    commitSha: plugin.commitSha,
+                  }))
+              ) {
+                queue.push({
+                  id: plugin.id,
+                  dir: localDir,
+                  displayName: plugin.displayName || plugin.canonicalName,
+                  alreadyUpToDate: true,
+                  version: preflight.existingInstall.version,
+                  parkedByMarket: Boolean(preflight.existingInstall.parkedByMarket),
+                  isSelf: false,
+                });
+                continue;
+              }
               queue.push({
                 id: plugin.id,
                 dir: localDir,
@@ -1551,6 +1675,24 @@ export async function createMarketSidecarServer(options = {}) {
             });
             continue;
           }
+          if (item.alreadyUpToDate) {
+            results.push({
+              id: item.id,
+              dir: item.dir,
+              installedDir: item.dir,
+              displayName: item.displayName || item.dir,
+              ok: true,
+              status: 'ALREADY_UP_TO_DATE',
+              alreadyUpToDate: true,
+              noop: true,
+              version: item.version,
+              parkedByMarket: Boolean(item.parkedByMarket),
+              restartRequired: false,
+              reloadRequired: false,
+              isSelf: false,
+            });
+            continue;
+          }
 
           if (item.githubLoc) {
             const ghLoc = item.githubLoc;
@@ -1615,6 +1757,7 @@ export async function createMarketSidecarServer(options = {}) {
               track: plugin._track || (plugin.forceScopedInstall ? 'unverified' : 'verified'),
               prefs,
               conflictStrategy: item.isSelf ? 'replace' : 'prompt',
+              preferredDir: item.dir || '',
               confirmEscalation,
               configDir,
               dataDir,

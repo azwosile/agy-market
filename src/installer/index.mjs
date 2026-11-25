@@ -637,6 +637,7 @@ export async function installOrUpdateCatalogPlugin({
   track = plugin?.forceScopedInstall ? 'unverified' : 'verified',
   prefs = {},
   conflictStrategy = 'prompt', // 'prompt' | 'isolate' | 'replace'
+  preferredDir = '',
   confirmEscalation = false,
   configDir = resolveAntigravityConfigDir(),
   pluginsDir: explicitPluginsDir = '',
@@ -666,7 +667,7 @@ export async function installOrUpdateCatalogPlugin({
     workspaceUris,
     builtinPluginsDir,
   });
-  const preflight = resolveInstallPreflight(plugin, inventory, { conflictStrategy });
+  const preflight = resolveInstallPreflight(plugin, inventory, { conflictStrategy, preferredDir });
 
   // Pause & ask user if Track-1 collides with a foreign local plugin
   if (preflight.action === 'conflict-prompt') {

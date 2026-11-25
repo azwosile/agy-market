@@ -20,7 +20,7 @@ Sidebar 侧边栏界面 · 锁安全一键卸载 · Sidebar 上游直装与一�
 
 ---
 
-## ✨ 核心特性（v1.5.3）
+## ✨ 核心特性（v1.5.4）
 
 ### 1. Sidebar 侧边栏界面、15 大精准分类与导航体验
 - **原生右侧 Sidebar 侧边栏**：基于 Antigravity 原生 `AUX_PANE` 扩展视图（`sidecars/market_pane/sidecar.json`），不捆绑常驻 MCP 服务，打开即用、轻量流畅。
@@ -31,6 +31,7 @@ Sidebar 侧边栏界面 · 锁安全一键卸载 · Sidebar 上游直装与一�
 - **点击「面板」一键直开目标 Sidebar 侧边栏**：移除会被 Chromium 拦截的裸 `<a href="sidecar://...">` 链接；在宿主侧边栏内点击其他 Sidebar 插件卡片上的「面板」按钮时，直接调用宿主 `window.sidecar.ui.toggleAuxPane`（`tabType: "sidecarView"`）拉起或聚焦对应侧边栏，无需手动复制提示。
 
 ### 2. 锁安全一键卸载、Sidebar 全通道直装更新与按需「一键更新」
+- **彻底杜绝同版本无效更新（v1.5.4）**：前后端共享 SemVer 严格对账与服务端最新目录源优先机制，消除跨快照状态失步导致的 `vX.Y.Z → vX.Y.Z` 误报与陈旧数据降级重装；常规更新命中已最新或同 Tag/Commit 时免下载短路返回 `ALREADY_UP_TO_DATE`，详情抽屉保留显式「重新同步（`forceResync`）」能力。
 - **锁安全插件卸载（Sidebar 卡片/详情抽屉 + `npx agy-market uninstall <dir>`）**：
   - 每张可卸载全局已安装插件卡片与详情抽屉均内置 **「卸载」** 按钮（`POST /api/uninstall`，同时兼容 `/api/remove-files`），确认弹窗支持可选勾选「同时从收藏夹移除」。
   - 统一覆盖活跃目录（`~/.gemini/config/plugins/<dir>`）与停放仓（`${PLUGIN_DATA}/disabled-plugins/<dir>`）；绝不写 `config.json` 或调用受限 RPC；遇到符号链接/NTFS Junction 仅删除链接本身绝不误删源目录；Windows 下遇到 `EBUSY` 文件锁自动 `.old.<ts>` 改名退避并立即摘除 `plugin.json`，下次启动由 `sweepRetiredBinaries` 自动清扫残留空壳目录；硬性拦截 `agy-market` 自删（`ERR_CANNOT_SELF_DELETE`）及 `workspace` / `builtin` 插件误删。
