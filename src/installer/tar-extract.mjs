@@ -1,6 +1,11 @@
 // Pure-Node POSIX ustar/pax .tar.gz extractor & deterministic archive builder (`src/installer/tar-extract.mjs`).
-// Rejects Zip-Slip (`..`, absolute paths, NUL bytes) AND rejects symlinks ('2') / hardlinks ('1')
-// because Antigravity's GetAllPlugins silently skips NTFS junctions/symlinks on Windows.
+// Rejects Zip-Slip (`..`, absolute paths, NUL bytes) AND enforces scoped symlink/hardlink rejection:
+//   - Hard-throws `ERR_TAR_SYMLINK_FORBIDDEN` whenever ANY symlink/hardlink exists inside `pluginRoot`
+//     (including anywhere in the archive when `pluginRoot === '.'` or unscoped), is an ancestor of
+//     `pluginRoot`, or has a path/target that traverses into `pluginRoot`.
+//   - Allows and skips symlinks strictly outside a subdirectory `pluginRoot` (e.g. dual-host `.claude/`
+//     or `docs/` symlinks) without ever creating links on disk, because Antigravity's GetAllPlugins
+//     silently skips NTFS junctions/symlinks on Windows.
 
 import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, posix, resolve } from 'node:path';
@@ -80,14 +85,130 @@ export function validateSafeRelPath(rawPath) {
   return clean.join('/');
 }
 
+function normalizeTarPluginRoot(rawRoot = '.') {
+  const s = String(rawRoot ?? '.')
+    .trim()
+    .replace(/\\/g, '/')
+    .replace(/^\.\/+/, '')
+    .replace(/\/+$/, '');
+  if (!s || s === '.') return '.';
+  return validateSafeRelPath(s) || '.';
+}
+
+function doesLinkTargetTraversePluginRoot(linkPath, rawTarget, normRoot, strippedTopDir = '', typeFlag = '2') {
+  const target = String(rawTarget || '')
+    .replace(/\\/g, '/')
+    .trim();
+  if (!target) return false;
+
+  const rootPrefix = `${normRoot}/`;
+  const entersPluginRoot = (relPath) => {
+    const clean = String(relPath || '')
+      .replace(/^\/+/, '')
+      .replace(/\/+$/, '');
+    if (!clean) return false;
+    return clean === normRoot || clean.startsWith(rootPrefix);
+  };
+
+  const candidates = [target];
+  if (strippedTopDir && target.startsWith(`${strippedTopDir}/`)) {
+    candidates.push(target.slice(strippedTopDir.length + 1));
+  }
+
+  for (const cand of candidates) {
+    const isAbs = cand.startsWith('/') || /^[A-Za-z]:/.test(cand);
+    const strippedAbs = cand.replace(/^[A-Za-z]:/, '').replace(/^\/+/, '');
+    if (entersPluginRoot(strippedAbs)) return true;
+
+    const startSegs =
+      isAbs || typeFlag === '1'
+        ? []
+        : linkPath.includes('/')
+          ? linkPath.slice(0, linkPath.lastIndexOf('/')).split('/').filter(Boolean)
+          : [];
+    const segs = [...startSegs];
+    let escapedAboveRoot = false;
+    const parts = cand.replace(/^[A-Za-z]:/, '').split('/');
+    for (const part of parts) {
+      if (!part || part === '.') continue;
+      if (part === '..') {
+        if (segs.length === 0) {
+          escapedAboveRoot = true;
+        } else {
+          segs.pop();
+        }
+      } else {
+        segs.push(part);
+      }
+      if (!escapedAboveRoot && segs.length > 0 && entersPluginRoot(segs.join('/'))) {
+        return true;
+      }
+    }
+    if (!escapedAboveRoot && segs.length > 0 && entersPluginRoot(segs.join('/'))) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /**
- * Parses a `.tar.gz` / `.tgz` buffer into `{ files, globalPax, strippedTopDir }`.
+ * Enforces the strict scoped symlink security invariant:
+ * - When `pluginRoot` is `'.'` or unscoped: ANY symlink/hardlink anywhere in the archive throws `ERR_TAR_SYMLINK_FORBIDDEN`.
+ * - When `pluginRoot` is a subdirectory: hard-throws `ERR_TAR_SYMLINK_FORBIDDEN` if ANY symlink/hardlink is
+ *   inside `pluginRoot`, is an ancestor directory of `pluginRoot`, or has a target traversing into `pluginRoot`.
+ */
+export function assertNoScopedSymlinks(symlinks = [], pluginRoot = '.', strippedTopDir = '') {
+  if (!Array.isArray(symlinks) || symlinks.length === 0) return;
+
+  const normRoot = normalizeTarPluginRoot(pluginRoot);
+  if (normRoot === '.') {
+    const first = symlinks[0];
+    throw new Error(
+      `ERR_TAR_SYMLINK_FORBIDDEN: Link entry "${first.path || first.rawName || ''}" (typeflag=${first.typeFlag}) is forbidden`,
+    );
+  }
+
+  const rootPrefix = `${normRoot}/`;
+  for (const link of symlinks) {
+    const linkPath = String(link?.path || '').replace(/\\/g, '/').replace(/^\/+/, '').replace(/\/+$/, '');
+    const typeFlag = String(link?.typeFlag || '2');
+    const linkTarget = String(link?.linkTarget || '');
+
+    if (!linkPath || linkPath === normRoot || linkPath.startsWith(rootPrefix)) {
+      throw new Error(
+        `ERR_TAR_SYMLINK_FORBIDDEN: Link entry "${linkPath || link?.rawName || ''}" (typeflag=${typeFlag}) inside pluginRoot "${normRoot}" is forbidden`,
+      );
+    }
+    if (normRoot.startsWith(`${linkPath}/`)) {
+      throw new Error(
+        `ERR_TAR_SYMLINK_FORBIDDEN: Ancestor link entry "${linkPath}" (typeflag=${typeFlag}) enclosing pluginRoot "${normRoot}" is forbidden`,
+      );
+    }
+    if (doesLinkTargetTraversePluginRoot(linkPath, linkTarget, normRoot, strippedTopDir, typeFlag)) {
+      throw new Error(
+        `ERR_TAR_SYMLINK_FORBIDDEN: Link entry "${linkPath}" -> "${linkTarget}" (typeflag=${typeFlag}) traverses into pluginRoot "${normRoot}"`,
+      );
+    }
+  }
+}
+
+/**
+ * Parses a `.tar.gz` / `.tgz` buffer into `{ files, symlinks, globalPax, strippedTopDir }`.
  * Exposes POSIX PAX global header attributes (e.g. `globalPax.comment` containing 40-hex commitSha
  * from `git archive` / GitHub `codeload`) and the stripped single top-level directory name.
+ *
+ * Security: By default (`pluginRoot = '.'`, `allowDeferredSymlinkCheck = false`), any symlink/hardlink
+ * anywhere in the archive throws `ERR_TAR_SYMLINK_FORBIDDEN`. When scoped to a subdirectory `pluginRoot`,
+ * symlinks strictly outside `pluginRoot` (and not traversing into it) are skipped and never placed in `files`.
  */
 export function parseTarGzWithMeta(
   compressedBuf,
-  { maxUncompressedBytes = MAX_TARBALL_BYTES, stripSingleTopDir = true } = {},
+  {
+    maxUncompressedBytes = MAX_TARBALL_BYTES,
+    stripSingleTopDir = true,
+    pluginRoot = '.',
+    allowDeferredSymlinkCheck = false,
+  } = {},
 ) {
   if (!Buffer.isBuffer(compressedBuf) || compressedBuf.length === 0) {
     throw new Error('ERR_TAR_EMPTY: Archive buffer is empty');
@@ -101,10 +222,12 @@ export function parseTarGzWithMeta(
   }
 
   const rawFiles = new Map();
+  const rawSymlinks = [];
   let offset = 0;
   let nextPax = {};
   let globalPax = {};
   let nextLongName = '';
+  let nextLongLinkName = '';
 
   while (offset + 512 <= tarBuf.length) {
     const header = tarBuf.subarray(offset, offset + 512);
@@ -120,6 +243,7 @@ export function parseTarGzWithMeta(
     if (allZero) continue;
 
     const namePart = readCleanString(header, 0, 100);
+    const linkNamePart = readCleanString(header, 157, 100);
     const prefixPart = readCleanString(header, 345, 155);
     const typeFlag = header[156] === 0 ? '0' : String.fromCharCode(header[156]);
     let size = parseTarOctal(header, 124, 12);
@@ -144,14 +268,30 @@ export function parseTarGzWithMeta(
       nextLongName = readCleanString(payload, 0, payload.length);
       continue;
     }
+    if (typeFlag === 'K') {
+      nextLongLinkName = readCleanString(payload, 0, payload.length);
+      continue;
+    }
 
     const mergedPax = { ...globalPax, ...nextPax };
     nextPax = {};
     const entryName = nextLongName || mergedPax.path || (prefixPart ? `${prefixPart}/${namePart}` : namePart);
+    const linkTarget = nextLongLinkName || mergedPax.linkpath || linkNamePart;
     nextLongName = '';
+    nextLongLinkName = '';
 
     if (typeFlag === '1' || typeFlag === '2') {
-      throw new Error(`ERR_TAR_SYMLINK_FORBIDDEN: Link entry "${entryName}" (typeflag=${typeFlag}) is forbidden`);
+      const safeLinkPath = validateSafeRelPath(entryName);
+      if (!safeLinkPath) {
+        throw new Error(`ERR_TAR_SYMLINK_FORBIDDEN: Link entry "${entryName}" (typeflag=${typeFlag}) is forbidden`);
+      }
+      rawSymlinks.push({
+        path: safeLinkPath,
+        rawName: entryName,
+        linkTarget,
+        typeFlag,
+      });
+      continue;
     }
     if (typeFlag !== '0' && typeFlag !== '5') {
       throw new Error(`ERR_TAR_UNSUPPORTED_TYPE: Disallowed entry type "${typeFlag}" for "${entryName}"`);
@@ -162,6 +302,8 @@ export function parseTarGzWithMeta(
     rawFiles.set(safe, Buffer.from(payload));
   }
 
+  let files = rawFiles;
+  let symlinks = rawSymlinks;
   let strippedTopDir = '';
   if (stripSingleTopDir && !rawFiles.has('plugin.json') && rawFiles.size > 0) {
     const roots = new Set();
@@ -174,6 +316,16 @@ export function parseTarGzWithMeta(
       }
       roots.add(p.slice(0, idx));
     }
+    if (allNested) {
+      for (const s of rawSymlinks) {
+        const idx = s.path.indexOf('/');
+        if (idx === -1) {
+          allNested = false;
+          break;
+        }
+        roots.add(s.path.slice(0, idx));
+      }
+    }
     if (allNested && roots.size === 1) {
       const [onlyRoot] = roots;
       strippedTopDir = onlyRoot;
@@ -181,11 +333,19 @@ export function parseTarGzWithMeta(
       for (const [p, buf] of rawFiles.entries()) {
         unwrapped.set(p.slice(onlyRoot.length + 1), buf);
       }
-      return { files: unwrapped, globalPax, strippedTopDir };
+      files = unwrapped;
+      symlinks = rawSymlinks.map((s) => ({
+        ...s,
+        path: s.path.slice(onlyRoot.length + 1),
+      }));
     }
   }
 
-  return { files: rawFiles, globalPax, strippedTopDir };
+  if (!allowDeferredSymlinkCheck) {
+    assertNoScopedSymlinks(symlinks, pluginRoot, strippedTopDir);
+  }
+
+  return { files, symlinks, globalPax, strippedTopDir };
 }
 
 /**
@@ -193,9 +353,9 @@ export function parseTarGzWithMeta(
  */
 export function parseTarGzToMap(
   compressedBuf,
-  { maxUncompressedBytes = MAX_TARBALL_BYTES, stripSingleTopDir = true } = {},
+  { maxUncompressedBytes = MAX_TARBALL_BYTES, stripSingleTopDir = true, pluginRoot = '.' } = {},
 ) {
-  return parseTarGzWithMeta(compressedBuf, { maxUncompressedBytes, stripSingleTopDir }).files;
+  return parseTarGzWithMeta(compressedBuf, { maxUncompressedBytes, stripSingleTopDir, pluginRoot }).files;
 }
 
 /**
@@ -204,12 +364,9 @@ export function parseTarGzToMap(
  */
 export function extractTarGzToDir(archiveSource, destDir, { pluginRoot = '.' } = {}) {
   const compressedBuf = Buffer.isBuffer(archiveSource) ? archiveSource : readFileSync(archiveSource);
-  const filesMap = parseTarGzToMap(compressedBuf, { stripSingleTopDir: true });
+  const filesMap = parseTarGzToMap(compressedBuf, { stripSingleTopDir: true, pluginRoot });
 
-  const normRoot = String(pluginRoot || '.')
-    .replace(/\\/g, '/')
-    .replace(/^\.\/+/, '')
-    .replace(/\/+$/, '');
+  const normRoot = normalizeTarPluginRoot(pluginRoot);
   const useSubroot = normRoot && normRoot !== '.';
   const prefix = useSubroot ? `${normRoot}/` : '';
 

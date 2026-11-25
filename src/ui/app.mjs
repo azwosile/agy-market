@@ -7,6 +7,7 @@ import {
   PLUGIN_VERSION,
   formatBadgeLabel,
 } from '../shared/constants.mjs';
+import { sortCatalogPlugins } from '../shared/ranking.mjs';
 import { compareSemver, isNewerVersion, stripLeadingV } from '../shared/semver.mjs';
 import { BRAND_LOGO_SVG, badgeIcon, icon } from './icons.mjs';
 import { escapeHtml, renderSafeMarkdown } from './markdown.mjs';
@@ -129,7 +130,7 @@ const state = {
   activeTab: 'discover', // 'discover' | 'favorites' | 'installed' | 'conflicts' | 'sources'
   search: '',
   category: 'all',
-  sortBy: 'stars', // 'stars' | 'updated' | 'name'
+  sortBy: 'recommended', // 'recommended' | 'stars' | 'updated' | 'name'
   heroCollapsed: readStorage(HERO_COLLAPSED_KEY, '0') === '1',
 
   // Favorites state (synced with `prefs.favorites` via `POST /api/favorites`)
@@ -171,6 +172,9 @@ const state = {
 
   // Dismissible Smart Restart / Reload Banner (shown ONLY after a completed install/update/uninstall/toggle)
   restartBanner: null, // null | { level: 'host-restart'|'reload-pane', operation: 'install'|'update'|'uninstall'|'toggle', plugins: string[], reasons: string[] }
+
+  // Dismissible Tier-0 Opt-In Public-Repo Nomination Banner (zero PII; shown only after unlisted public GitHub URL install)
+  nominationBanner: null, // null | { displayName, repo, pluginRoot, issueUrl }
 
   // Prominent Red Error Alert Banner (shown whenever install / update / update-all / self-update / uninstall fails)
   errorBanner: null, // null | { title, items: [{ pluginName, message }], retryAction }
@@ -2150,6 +2154,21 @@ async function triggerGithubUrlInstall() {
       state.errorBanner = null;
       const installedDir = res.installedDir || pluginInfo.canonicalName || '';
       const installedVer = res.version || pluginInfo.version || '';
+      const nom = res.nomination || m.inspectResult?.nomination || null;
+      const isPublicUnlisted = Boolean(
+        (res.isPublicRepo ?? m.inspectResult?.isPublicRepo) &&
+          !(res.catalogMatch ?? m.inspectResult?.catalogMatch) &&
+          nom?.issueUrl &&
+          isSafeHttpUrl(nom.issueUrl),
+      );
+      state.nominationBanner = isPublicUnlisted
+        ? {
+            displayName: pluginInfo.displayName || installedDir || pluginLabel,
+            repo: nom.repo || '',
+            pluginRoot: nom.pluginRoot || pluginInfo.pluginRoot || '.',
+            issueUrl: nom.issueUrl,
+          }
+        : null;
       markPluginVerifiedLatest(installedDir, res.id || pluginInfo.id || '');
       const act = res.activation || resolveActivationInfo(pluginInfo);
       const restartInfo = maybeTriggerRestartBanner({
@@ -2981,17 +3000,45 @@ function getFilteredPlugins() {
     return hay.includes(q);
   });
 
-  filtered.sort((a, b) => {
-    if (state.sortBy === 'updated') {
-      return String(b.updatedAt || '').localeCompare(String(a.updatedAt || ''));
-    }
-    if (state.sortBy === 'name') {
-      return String(a.displayName || a.canonicalName).localeCompare(String(b.displayName || b.canonicalName), loc);
-    }
-    return Number(b.repository?.stars || 0) - Number(a.repository?.stars || 0);
-  });
+  return sortCatalogPlugins(filtered, { sortBy: state.sortBy, locale: loc });
+}
 
-  return filtered;
+function renderRankingMetaPillsHtml(p) {
+  const r = p?.ranking;
+  const archived = Boolean(
+    r?.archived ||
+      p?.archived ||
+      p?.repository?.archived ||
+      p?.status === 'ARCHIVED' ||
+      r?.status === 'ARCHIVED',
+  );
+  const stale =
+    !archived &&
+    Boolean(
+      r?.stale ||
+        p?.stale ||
+        p?.status === 'STALE_WARNING' ||
+        p?.status === 'STALE' ||
+        r?.status === 'STALE_WARNING' ||
+        r?.status === 'STALE',
+    );
+  const compatTier = typeof r?.compatTier === 'string' ? r.compatTier.toLowerCase() : '';
+  const parts = [];
+  if (archived) {
+    parts.push(
+      `<span class="meta-status-pill is-archived" title="${escapeHtml(t('上游 GitHub 仓库已归档（只读）', 'Upstream GitHub repository is archived'))}">ARCHIVED</span>`,
+    );
+  } else if (stale) {
+    parts.push(
+      `<span class="meta-status-pill is-stale" title="${escapeHtml(t('该插件较长时间未有新提交', 'No recent upstream updates'))}">STALE</span>`,
+    );
+  }
+  if (compatTier === 'compatible') {
+    parts.push(
+      `<span class="meta-status-pill is-compat" title="${escapeHtml(t('多宿主兼容插件（可运行于 Antigravity）', 'Multi-host compatible plugin'))}">${escapeHtml(t('兼容', 'Compat'))}</span>`,
+    );
+  }
+  return parts.join('');
 }
 
 function getCategoryCounts() {
@@ -3128,6 +3175,38 @@ function renderRestartBanner() {
       </div>
       <div class="self-update-actions">
         <button type="button" class="icon-btn is-square" data-action="dismiss-restart-banner" title="${escapeHtml(t('知道了，收起提示', 'Dismiss notice'))}">${icon('close', 13)}</button>
+      </div>
+    </div>
+  `;
+}
+
+function renderNominationBanner() {
+  const nb = state.nominationBanner;
+  if (!nb || !isSafeHttpUrl(nb.issueUrl)) return '';
+  return `
+    <div class="nomination-notice-banner" role="region" aria-label="${escapeHtml(t('分享公开插件到社区目录', 'Share public plugin with AGY Market'))}" data-agy-nomination-banner="1">
+      <div class="nomination-notice-main">
+        <div class="nomination-notice-icon">${icon('sparkle', 14)}</div>
+        <div class="nomination-notice-copy">
+          <div class="nomination-notice-title">
+            <span>${escapeHtml(t('分享此公开插件到 AGY Market？', 'Share this public plugin with AGY Market?'))}</span>
+            ${nb.repo ? `<span class="restart-plugin-chip">${escapeHtml(nb.repo)}${nb.pluginRoot && nb.pluginRoot !== '.' ? ` (${escapeHtml(nb.pluginRoot)})` : ''}</span>` : ''}
+          </div>
+          <div class="nomination-notice-reason">${escapeHtml(
+            t(
+              '仅预填公开仓库名与插件子目录至 GitHub 提名表单，不包含任何本机路径、用户名或 Token。',
+              'Opens a pre-filled GitHub Issue with only owner/repo and pluginRoot — zero user, machine, or token info.',
+            ),
+          )}</div>
+        </div>
+      </div>
+      <div class="self-update-actions">
+        <a class="btn btn-primary btn-sm" href="${escapeHtml(nb.issueUrl)}" target="_blank" rel="noopener noreferrer">
+          ${icon('plus', 12)}
+          <span>${escapeHtml(t('去 GitHub 分享', 'Share on GitHub'))}</span>
+          ${icon('external', 11)}
+        </a>
+        <button type="button" class="icon-btn is-square" data-action="dismiss-nomination-banner" title="${escapeHtml(t('关闭提示', 'Dismiss'))}">${icon('close', 13)}</button>
       </div>
     </div>
   `;
@@ -3541,6 +3620,7 @@ function renderPluginCard(p, updateById, installedByDir, updateByDir = null) {
             ${relUpdated ? `<span class="meta-sep">·</span><span style="white-space:nowrap">${escapeHtml(relUpdated)}</span>` : ''}
             ${upd?.changelog ? `<span class="meta-sep">·</span><button type="button" class="notes-link" data-action="detail" data-id="${escapeHtml(p.id)}" data-detail-tab="changelog">${escapeHtml(t('更新内容 ›', 'Notes ›'))}</button>` : ''}
             ${p.forceScopedInstall ? `<span class="track-tag" title="Track 2 Experimental Topic">Track 2</span>` : ''}
+            ${renderRankingMetaPillsHtml(p)}
           </div>
         </div>
       </div>
@@ -3647,6 +3727,7 @@ function renderDiscoverView() {
         </div>
 
         <select id="market-sort-select" class="select-input" aria-label="${escapeHtml(t('排序方式', 'Sort by'))}">
+          <option value="recommended" ${state.sortBy === 'recommended' ? 'selected' : ''}>${escapeHtml(t('综合推荐', 'Recommended'))}</option>
           <option value="stars" ${state.sortBy === 'stars' ? 'selected' : ''}>${escapeHtml(t('按星标排序', 'Most Stars'))}</option>
           <option value="updated" ${state.sortBy === 'updated' ? 'selected' : ''}>${escapeHtml(t('最近更新', 'Recently Updated'))}</option>
           <option value="name" ${state.sortBy === 'name' ? 'selected' : ''}>${escapeHtml(t('按名称排序', 'Name A–Z'))}</option>
@@ -5375,7 +5456,24 @@ function renderGithubUrlModal() {
                 ),
               )}</div>
             </div>`
-          : ''
+          : res.isPublicRepo && res.nomination?.issueUrl && isSafeHttpUrl(res.nomination.issueUrl)
+            ? `<div class="gh-notice-box is-nomination" data-agy-nomination-banner="1">
+                <div class="gh-notice-head">${icon('sparkle', 13)} <span>${escapeHtml(t('分享此公开插件到 AGY Market？', 'Share this public plugin with AGY Market?'))}</span></div>
+                <div>${escapeHtml(
+                  t(
+                    '该公开插件尚未收录于社区目录。点击下方按钮将打开 GitHub 提名表单（仅预填 owner/repo 与插件子目录，不含任何本机或账号信息）。',
+                    'This public plugin is not yet listed in the community catalog. Opens a pre-filled GitHub Issue with only owner/repo and pluginRoot (zero local or account data).',
+                  ),
+                )}</div>
+                <div class="gh-nomination-actions">
+                  <a class="btn btn-sm gh-nominate-btn" href="${escapeHtml(res.nomination.issueUrl)}" target="_blank" rel="noopener noreferrer">
+                    ${icon('plus', 12)}
+                    <span>${escapeHtml(t('分享到社区目录', 'Share to AGY Market'))}</span>
+                    ${icon('external', 11)}
+                  </a>
+                </div>
+              </div>`
+            : ''
       }
 
       ${
@@ -5856,6 +5954,7 @@ function render() {
       ${renderErrorAlertBanner()}
       ${renderSelfUpdateBanner()}
       ${renderRestartBanner()}
+      ${renderNominationBanner()}
 
       ${viewHtml}
 
@@ -6210,6 +6309,9 @@ function bindDomEvents(root) {
         if (dir) void triggerUninstallPlugin(dir, { removeFavorite, displayName });
       } else if (action === 'dismiss-restart-banner') {
         state.restartBanner = null;
+        render();
+      } else if (action === 'dismiss-nomination-banner') {
+        state.nominationBanner = null;
         render();
       } else if (action === 'dismiss-error-banner') {
         state.errorBanner = null;

@@ -23,7 +23,7 @@ import { recoverInterruptedJournal } from '../installer/journal.mjs';
 import { sweepRetiredBinaries } from '../installer/sync-dir.mjs';
 import { scanLocalConflicts } from '../preflight/conflicts.mjs';
 import { normalizeRepoUrl, resolveInstallPreflight, scanLocalPluginInventory } from '../preflight/index.mjs';
-import { resolveMarketCatalog } from '../registry/index.mjs';
+import { fetchPluginReadme, resolveMarketCatalog } from '../registry/index.mjs';
 import { classifyActivationRequirement } from '../shared/activation.mjs';
 import {
   CUSTOMIZATION_URI,
@@ -814,9 +814,24 @@ export async function createMarketSidecarServer(options = {}) {
       return;
     }
 
-    if (req.method === 'GET' && pathname === '/api/readme') {
-      const pluginId = String(urlObj.searchParams.get('id') || '').trim();
+    const pluginReadmeMatch =
+      req.method === 'GET' ? /^\/api\/plugin\/([^/]+)\/readme$/.exec(pathname) : null;
+
+    if (req.method === 'GET' && (pathname === '/api/readme' || pluginReadmeMatch)) {
+      let pluginId = '';
+      if (pluginReadmeMatch) {
+        try {
+          pluginId = decodeURIComponent(pluginReadmeMatch[1]).trim();
+        } catch {
+          sendJson(res, 400, { ok: false, error: 'Malformed plugin id in URL path' });
+          return;
+        }
+      } else {
+        pluginId = String(urlObj.searchParams.get('id') || '').trim();
+      }
       const requestedDir = String(urlObj.searchParams.get('dir') || '').trim();
+      const forceReadmeRefresh =
+        urlObj.searchParams.get('refresh') === '1' || urlObj.searchParams.get('force') === '1';
       const rawLocale = String(urlObj.searchParams.get('locale') || prefs.locale || 'zh')
         .trim()
         .toLowerCase();
@@ -827,16 +842,43 @@ export async function createMarketSidecarServer(options = {}) {
         return;
       }
 
-      if (pluginId && !hasLoadedReadmes(lastCatalog)) {
+      // Lazy per-plugin README fetch (`dist/readmes/<id>.json` w/ per-plugin ETag cache),
+      // seamlessly falling back to monolithic `readmes.json`, npm mirror, or offline cache.
+      let fetchedReadme = null;
+      if (pluginId) {
         try {
-          lastCatalog = await resolveMarketCatalog({
+          fetchedReadme = await fetchPluginReadme({
+            id: pluginId,
             dataDir,
             prefs,
-            forceRefresh: false,
-            includeReadmes: true,
+            primaryBaseUrl: lastCatalog?.primaryBaseUrl || '',
+            cachedCatalog: lastCatalog,
+            forceRefresh: forceReadmeRefresh,
             fetchImpl,
             mirrors,
           });
+          if (fetchedReadme?.monolithicReadmes && typeof fetchedReadme.monolithicReadmes === 'object') {
+            const mono = fetchedReadme.monolithicReadmes;
+            if (!lastCatalog) {
+              lastCatalog = {
+                channelUsed: fetchedReadme.channel || 'monolithic',
+                primaryBaseUrl: prefs.primaryCatalogUrl || '',
+                catalogVersion: '',
+                generatedAt: null,
+                plugins: [],
+                readmes: mono.entries && typeof mono.entries === 'object' ? mono.entries : {},
+                readmesZh: mono.entriesZh && typeof mono.entriesZh === 'object' ? mono.entriesZh : {},
+                readmesEn: mono.entriesEn && typeof mono.entriesEn === 'object' ? mono.entriesEn : {},
+                warnings: [],
+              };
+            } else {
+              lastCatalog.readmes = mono.entries && typeof mono.entries === 'object' ? mono.entries : lastCatalog.readmes || {};
+              lastCatalog.readmesZh =
+                mono.entriesZh && typeof mono.entriesZh === 'object' ? mono.entriesZh : lastCatalog.readmesZh || {};
+              lastCatalog.readmesEn =
+                mono.entriesEn && typeof mono.entriesEn === 'object' ? mono.entriesEn : lastCatalog.readmesEn || {};
+            }
+          }
         } catch {
           /* continue with local fallback */
         }
@@ -867,9 +909,9 @@ export async function createMarketSidecarServer(options = {}) {
         }
       }
 
-      const catZh = pluginId ? String(lastCatalog?.readmesZh?.[pluginId] || '') : '';
-      const catEn = pluginId ? String(lastCatalog?.readmesEn?.[pluginId] || '') : '';
-      const catDefault = pluginId ? String(lastCatalog?.readmes?.[pluginId] || '') : '';
+      const catZh = pluginId ? String(fetchedReadme?.zh || lastCatalog?.readmesZh?.[pluginId] || '') : '';
+      const catEn = pluginId ? String(fetchedReadme?.en || lastCatalog?.readmesEn?.[pluginId] || '') : '';
+      const catDefault = pluginId ? String(fetchedReadme?.default || lastCatalog?.readmes?.[pluginId] || '') : '';
 
       const localZh = localPluginPath ? readFirstExistingReadme(localPluginPath, ZH_README_FILENAMES) : '';
       const localEn = localPluginPath ? readFirstExistingReadme(localPluginPath, EN_README_FILENAMES) : '';
@@ -877,52 +919,68 @@ export async function createMarketSidecarServer(options = {}) {
 
       let markdown = '';
       let isTranslatedOrNativeZh = false;
+      let readmeSource = 'none';
+      const catalogSourceLabel = fetchedReadme?.channel ? `catalog:${fetchedReadme.channel}` : 'catalog:cached';
 
       if (locale === 'zh') {
         if (catZh.trim()) {
           markdown = catZh;
           isTranslatedOrNativeZh = true;
+          readmeSource = catalogSourceLabel;
         } else if (localZh.trim()) {
           markdown = localZh;
           isTranslatedOrNativeZh = true;
+          readmeSource = 'local';
         } else if (catDefault.trim() && CJK_CHAR_RE.test(catDefault)) {
           markdown = catDefault;
           isTranslatedOrNativeZh = true;
+          readmeSource = catalogSourceLabel;
         } else if (localDefault.trim() && CJK_CHAR_RE.test(localDefault)) {
           markdown = localDefault;
           isTranslatedOrNativeZh = true;
+          readmeSource = 'local';
         } else if (catDefault.trim()) {
           markdown = catDefault;
           isTranslatedOrNativeZh = false;
+          readmeSource = catalogSourceLabel;
         } else if (catEn.trim()) {
           markdown = catEn;
           isTranslatedOrNativeZh = false;
+          readmeSource = catalogSourceLabel;
         } else if (localDefault.trim()) {
           markdown = localDefault;
           isTranslatedOrNativeZh = CJK_CHAR_RE.test(localDefault);
+          readmeSource = 'local';
         } else if (localEn.trim()) {
           markdown = localEn;
           isTranslatedOrNativeZh = false;
+          readmeSource = 'local';
         }
       } else {
         if (catEn.trim()) {
           markdown = catEn;
           isTranslatedOrNativeZh = CJK_CHAR_RE.test(catEn);
+          readmeSource = catalogSourceLabel;
         } else if (localEn.trim()) {
           markdown = localEn;
           isTranslatedOrNativeZh = CJK_CHAR_RE.test(localEn);
+          readmeSource = 'local';
         } else if (catDefault.trim()) {
           markdown = catDefault;
           isTranslatedOrNativeZh = CJK_CHAR_RE.test(catDefault);
+          readmeSource = catalogSourceLabel;
         } else if (localDefault.trim()) {
           markdown = localDefault;
           isTranslatedOrNativeZh = CJK_CHAR_RE.test(localDefault);
+          readmeSource = 'local';
         } else if (catZh.trim()) {
           markdown = catZh;
           isTranslatedOrNativeZh = true;
+          readmeSource = catalogSourceLabel;
         } else if (localZh.trim()) {
           markdown = localZh;
           isTranslatedOrNativeZh = true;
+          readmeSource = 'local';
         }
       }
 
@@ -933,6 +991,7 @@ export async function createMarketSidecarServer(options = {}) {
         locale,
         isTranslatedOrNativeZh,
         markdown,
+        source: readmeSource,
       });
       return;
     }

@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>AGY Market v1.5.4 — Google Antigravity 社区插件市场</title>
+  <title>AGY Market v1.6.0 — Google Antigravity 社区插件市场</title>
   <link rel="stylesheet" href="./styles.css" />
 </head>
 <body>
@@ -14,7 +14,7 @@
     <div class="hero-inner">
       <div class="hero-badge">
         <span class="badge-dot" aria-hidden="true"></span>
-        <span>v1.5.4 · Sidebar 侧边栏 · 一键更新与卸载 · GitHub 链接预检安装 · SHA-256 校验</span>
+        <span>v1.6.0 · 综合推荐排序 · 按需 README 缓存 · Sidebar 侧边栏 · GitHub 链接预检安装 · SHA-256 校验</span>
       </div>
       <h1>AGY Market · 反重力插件市场</h1>
       <p class="hero-lead">
@@ -100,6 +100,12 @@
         <option value="automation">定时与守护任务</option>
         <option value="security">安全与审计</option>
         <option value="other">其他扩展</option>
+      </select>
+      <select id="site-sort" aria-label="排序方式">
+        <option value="recommended" selected>综合推荐</option>
+        <option value="stars">按星标排序</option>
+        <option value="updated">最近更新</option>
+        <option value="name">按名称排序</option>
       </select>
       <input id="site-feed-url" type="url" value="https://azwosile.github.io/agy-market-catalog/index.json" title="目录 index.json 地址" />
       <button type="button" id="site-load-btn" class="load-btn">同步目录</button>

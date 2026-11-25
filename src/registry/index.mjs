@@ -25,6 +25,57 @@ function getCacheDir(dataDir) {
   return d;
 }
 
+function getPerPluginReadmesCacheDir(dataDir) {
+  const d = join(getCacheDir(dataDir), 'readmes');
+  mkdirSync(d, { recursive: true });
+  return d;
+}
+
+function toSafeReadmeCacheKey(rawId) {
+  const clean = String(rawId || '').trim();
+  if (
+    !clean ||
+    clean === '.' ||
+    clean === '..' ||
+    clean.includes('/') ||
+    clean.includes('\\') ||
+    clean.includes('..') ||
+    clean.includes('\0')
+  ) {
+    return '';
+  }
+  return clean.replace(/[^A-Za-z0-9._-]/g, '_');
+}
+
+function normalizePerPluginReadmePayload(raw, fallbackId = '') {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const hasKnownField =
+    typeof raw.default === 'string' || typeof raw.zh === 'string' || typeof raw.en === 'string';
+  if (!hasKnownField) return null;
+  const def = typeof raw.default === 'string' ? raw.default : '';
+  const zh = typeof raw.zh === 'string' ? raw.zh : '';
+  const en = typeof raw.en === 'string' ? raw.en : '';
+  if (!def.trim() && !zh.trim() && !en.trim() && raw.id !== fallbackId) return null;
+  return {
+    id: typeof raw.id === 'string' && raw.id.trim() ? raw.id.trim() : fallbackId,
+    default: def,
+    zh,
+    en,
+  };
+}
+
+function extractPluginFromMonolithicReadmes(doc, id) {
+  if (!doc || typeof doc !== 'object' || !id) return null;
+  const entries = doc.entries && typeof doc.entries === 'object' ? doc.entries : doc.readmes || {};
+  const entriesZh = doc.entriesZh && typeof doc.entriesZh === 'object' ? doc.entriesZh : doc.readmesZh || {};
+  const entriesEn = doc.entriesEn && typeof doc.entriesEn === 'object' ? doc.entriesEn : doc.readmesEn || {};
+  const def = typeof entries[id] === 'string' ? entries[id] : '';
+  const zh = typeof entriesZh[id] === 'string' ? entriesZh[id] : '';
+  const en = typeof entriesEn[id] === 'string' ? entriesEn[id] : '';
+  if (!def.trim() && !zh.trim() && !en.trim()) return null;
+  return { id, default: def, zh, en };
+}
+
 function readCachedJson(cacheDir, key) {
   const filePath = join(cacheDir, `${key}.json`);
   const metaPath = join(cacheDir, `${key}.meta.json`);
@@ -152,6 +203,36 @@ export async function loadCatalogFromNpmMirror(
       };
       const readmesJson = pickJson('readmes.json') || { schemaVersion: 1, entries: {}, entriesZh: {}, entriesEn: {} };
 
+      // Also extract any per-plugin `dist/readmes/<id>.json` files shipped in v1.6+ catalog tarballs
+      const perPluginReadmes = {};
+      const perPluginCacheDir = join(cacheDir, 'readmes');
+      let ensuredPerPluginDir = false;
+      for (const [relPath, buf] of filesMap.entries()) {
+        const m = /^(?:dist\/)?readmes\/([^/]+)\.json$/.exec(relPath);
+        if (!m) continue;
+        try {
+          const parsedItem = JSON.parse(buf.toString('utf8'));
+          const norm = normalizePerPluginReadmePayload(parsedItem, m[1]);
+          if (norm) {
+            perPluginReadmes[norm.id] = norm;
+            const safeKey = toSafeReadmeCacheKey(norm.id);
+            if (safeKey) {
+              if (!ensuredPerPluginDir) {
+                mkdirSync(perPluginCacheDir, { recursive: true });
+                ensuredPerPluginDir = true;
+              }
+              writeCachedJson(perPluginCacheDir, safeKey, norm, {
+                channel: 'npm-mirror',
+                mirrorBase,
+                version: packument.version,
+              });
+            }
+          }
+        } catch {
+          /* skip malformed per-plugin readme entry */
+        }
+      }
+
       writeCachedJson(cacheDir, 'index', indexJson, { channel: 'npm-mirror', mirrorBase, version: packument.version });
       writeCachedJson(cacheDir, 'unverified-index', unverifiedIndexJson, {
         channel: 'npm-mirror',
@@ -164,6 +245,7 @@ export async function loadCatalogFromNpmMirror(
         indexJson,
         unverifiedIndexJson,
         readmesJson,
+        perPluginReadmes,
         channel: `npm-mirror (${mirrorBase})`,
         catalogVersion: packument.version || indexJson.catalogVersion || '',
       };
@@ -380,6 +462,7 @@ export async function resolveMarketCatalog({
 
   return {
     channelUsed,
+    primaryBaseUrl: activePrimaryBase || baseUrl,
     catalogVersion: verifiedFeed?.catalogVersion || '',
     generatedAt: verifiedFeed?.generatedAt || null,
     plugins: mergedPlugins,
@@ -389,5 +472,255 @@ export async function resolveMarketCatalog({
     readmesEn:
       resolvedReadmes.entriesEn && typeof resolvedReadmes.entriesEn === 'object' ? resolvedReadmes.entriesEn : {},
     warnings,
+  };
+}
+
+/**
+ * Lazy per-plugin README loader (`dist/readmes/<id>.json`) with per-plugin ETag caching at
+ * `${dataDir}/cache/readmes/<id>.json` and seamless fallback to cached/monolithic `readmes.json`,
+ * China `@agy-market/catalog` npm mirror, and offline disk cache.
+ */
+export async function fetchPluginReadme({
+  id,
+  dataDir,
+  prefs = {},
+  primaryBaseUrl = '',
+  cachedCatalog = null,
+  forceRefresh = false,
+  fetchImpl = fetch,
+  mirrors = CHINA_NPM_MIRRORS,
+  timeoutMs = PRIMARY_FETCH_TIMEOUT_MS,
+}) {
+  const pluginId = String(id || '').trim();
+  const safeKey = toSafeReadmeCacheKey(pluginId);
+  if (!safeKey) {
+    return { ok: false, id: pluginId, default: '', zh: '', en: '', fromCache: false, channel: 'invalid-id' };
+  }
+
+  const cleanPrefs = sanitizePrefs(prefs);
+  const cacheDir = getCacheDir(dataDir);
+  const perPluginCacheDir = getPerPluginReadmesCacheDir(dataDir);
+  const baseUrl = (primaryBaseUrl || cleanPrefs.primaryCatalogUrl || PRIMARY_CATALOG_BASE_URL).replace(/\/+$/, '');
+
+  const tryPrimary = cleanPrefs.networkMode !== 'china-mirror';
+  const tryChinaMirror = cleanPrefs.networkMode !== 'direct';
+
+  const primaryCandidates = [];
+  const pushCandidate = (url, channelLabel) => {
+    const clean = String(url || '').replace(/\/+$/, '');
+    if (!clean || primaryCandidates.some((c) => c.url === clean)) return;
+    primaryCandidates.push({ url: clean, channelLabel });
+  };
+  pushCandidate(
+    baseUrl,
+    baseUrl === RAW_GH_PAGES_CATALOG_BASE_URL ? 'github-raw-gh-pages' : 'github-pages',
+  );
+  if (baseUrl === PRIMARY_CATALOG_BASE_URL || cleanPrefs.primaryCatalogUrl === PRIMARY_CATALOG_BASE_URL) {
+    pushCandidate(PRIMARY_CATALOG_BASE_URL, 'github-pages');
+    pushCandidate(RAW_GH_PAGES_CATALOG_BASE_URL, 'github-raw-gh-pages');
+  }
+
+  let anyPrimaryReachable = false;
+  let monolithicData = null;
+
+  // 1. Primary lazy per-plugin endpoint: `${base}/readmes/${encodeURIComponent(id)}.json` with ETag cache
+  if (tryPrimary) {
+    const cachedPerPlugin = readCachedJson(perPluginCacheDir, safeKey);
+    for (const candidate of primaryCandidates) {
+      const perUrl = `${candidate.url}/readmes/${encodeURIComponent(pluginId)}.json`;
+      try {
+        if (perUrl.startsWith('file://')) {
+          const local = fileUriToLocalPath(perUrl);
+          if (local && existsSync(local)) {
+            const norm = normalizePerPluginReadmePayload(JSON.parse(readFileSync(local, 'utf8')), pluginId);
+            if (norm) {
+              writeCachedJson(perPluginCacheDir, safeKey, norm, { source: 'file', url: perUrl });
+              return { ok: true, ...norm, fromCache: false, channel: 'local-file-per-plugin' };
+            }
+          }
+          continue;
+        }
+
+        const headers = { Accept: 'application/json' };
+        if (
+          !forceRefresh &&
+          cachedPerPlugin.data &&
+          (!cachedPerPlugin.meta.url || cachedPerPlugin.meta.url === perUrl)
+        ) {
+          if (cachedPerPlugin.meta.etag) headers['If-None-Match'] = cachedPerPlugin.meta.etag;
+          if (cachedPerPlugin.meta.lastModified) headers['If-Modified-Since'] = cachedPerPlugin.meta.lastModified;
+        }
+
+        const res = await fetchImpl(perUrl, {
+          headers,
+          signal: AbortSignal.timeout(timeoutMs),
+        });
+
+        if (res.status === 304 && cachedPerPlugin.data) {
+          const norm = normalizePerPluginReadmePayload(cachedPerPlugin.data, pluginId);
+          if (norm) {
+            return { ok: true, ...norm, fromCache: true, channel: `${candidate.channelLabel}-per-plugin-304` };
+          }
+        }
+
+        if (res.ok) {
+          anyPrimaryReachable = true;
+          const rawJson = await res.json().catch(() => null);
+          const norm = normalizePerPluginReadmePayload(rawJson, pluginId);
+          if (norm) {
+            const etag = res.headers?.get?.('etag') || '';
+            const lastModified = res.headers?.get?.('last-modified') || '';
+            writeCachedJson(perPluginCacheDir, safeKey, norm, { etag, lastModified, url: perUrl });
+            return { ok: true, ...norm, fromCache: false, channel: `${candidate.channelLabel}-per-plugin` };
+          }
+        } else if (res.status >= 400 && res.status < 500) {
+          // 404 on per-plugin endpoint may simply mean legacy catalog only serves monolithic readmes.json
+          anyPrimaryReachable = true;
+        }
+      } catch {
+        /* try next primary candidate */
+      }
+    }
+  }
+
+  // 2. Fallback to in-memory monolithic catalog readmes (already loaded)
+  if (!forceRefresh && cachedCatalog) {
+    const fromMem = extractPluginFromMonolithicReadmes(cachedCatalog, pluginId);
+    if (fromMem) {
+      return { ok: true, ...fromMem, fromCache: true, channel: 'monolithic-memory' };
+    }
+  }
+
+  // 3. Fallback to primary monolithic `readmes.json` with conditional ETag cache
+  if (tryPrimary) {
+    let monolithicSucceeded = false;
+    for (const candidate of primaryCandidates) {
+      try {
+        const rRes = await fetchJsonWithConditionalCache(`${candidate.url}/readmes.json`, cacheDir, 'readmes', {
+          timeoutMs,
+          forceRefresh,
+          fetchImpl,
+          channelLabel: candidate.channelLabel,
+        });
+        if (rRes?.data && typeof rRes.data === 'object') {
+          anyPrimaryReachable = true;
+          monolithicSucceeded = true;
+          monolithicData = rRes.data;
+          const found = extractPluginFromMonolithicReadmes(rRes.data, pluginId);
+          if (found) {
+            return {
+              ok: true,
+              ...found,
+              fromCache: Boolean(rRes.fromCache),
+              channel: rRes.fromCache ? `${candidate.channelLabel}-monolithic-304` : `${candidate.channelLabel}-monolithic`,
+              monolithicReadmes: rRes.data,
+            };
+          }
+          break;
+        }
+      } catch {
+        /* try next primary candidate */
+      }
+    }
+    if (monolithicSucceeded) {
+      // Primary monolithic readmes loaded cleanly and does not contain this id — check local per-plugin cache before returning
+      const cachedPer = normalizePerPluginReadmePayload(readCachedJson(perPluginCacheDir, safeKey).data, pluginId);
+      if (cachedPer) {
+        return {
+          ok: true,
+          ...cachedPer,
+          fromCache: true,
+          channel: 'disk-cache-per-plugin',
+          ...(monolithicData ? { monolithicReadmes: monolithicData } : {}),
+        };
+      }
+      return {
+        ok: false,
+        id: pluginId,
+        default: '',
+        zh: '',
+        en: '',
+        fromCache: false,
+        channel: 'not-found',
+        ...(monolithicData ? { monolithicReadmes: monolithicData } : {}),
+      };
+    }
+  }
+
+  // 4. Fallback to China `@agy-market/catalog` npm mirror (in china-mirror mode or when primary is unreachable)
+  if (tryChinaMirror && (!tryPrimary || !anyPrimaryReachable)) {
+    if (!forceRefresh) {
+      const diskPer = normalizePerPluginReadmePayload(readCachedJson(perPluginCacheDir, safeKey).data, pluginId);
+      if (diskPer) {
+        return { ok: true, ...diskPer, fromCache: true, channel: 'disk-cache-per-plugin' };
+      }
+      const diskMono = readCachedJson(cacheDir, 'readmes');
+      if (diskMono.data && diskMono.meta?.channel === 'npm-mirror') {
+        const fromDiskMono = extractPluginFromMonolithicReadmes(diskMono.data, pluginId);
+        if (fromDiskMono) {
+          return {
+            ok: true,
+            ...fromDiskMono,
+            fromCache: true,
+            channel: 'npm-mirror-cache',
+            monolithicReadmes: diskMono.data,
+          };
+        }
+      }
+    }
+
+    try {
+      const mirrorOut = await loadCatalogFromNpmMirror(cacheDir, { mirrors, fetchImpl });
+      monolithicData = mirrorOut.readmesJson;
+      if (mirrorOut.perPluginReadmes?.[pluginId]) {
+        return {
+          ok: true,
+          ...mirrorOut.perPluginReadmes[pluginId],
+          fromCache: false,
+          channel: `${mirrorOut.channel}-per-plugin`,
+          monolithicReadmes: mirrorOut.readmesJson,
+        };
+      }
+      const fromMirrorMono = extractPluginFromMonolithicReadmes(mirrorOut.readmesJson, pluginId);
+      if (fromMirrorMono) {
+        return {
+          ok: true,
+          ...fromMirrorMono,
+          fromCache: false,
+          channel: `${mirrorOut.channel}-monolithic`,
+          monolithicReadmes: mirrorOut.readmesJson,
+        };
+      }
+    } catch {
+      /* fall through to offline disk cache */
+    }
+  }
+
+  // 5. Offline disk cache fallback (per-plugin cache first, then monolithic cache)
+  const offlinePer = normalizePerPluginReadmePayload(readCachedJson(perPluginCacheDir, safeKey).data, pluginId);
+  if (offlinePer) {
+    return { ok: true, ...offlinePer, fromCache: true, channel: 'disk-cache-per-plugin' };
+  }
+  const offlineMono = readCachedJson(cacheDir, 'readmes').data;
+  const fromOfflineMono = extractPluginFromMonolithicReadmes(offlineMono, pluginId);
+  if (fromOfflineMono) {
+    return {
+      ok: true,
+      ...fromOfflineMono,
+      fromCache: true,
+      channel: 'disk-cache-monolithic',
+      monolithicReadmes: offlineMono,
+    };
+  }
+
+  return {
+    ok: false,
+    id: pluginId,
+    default: '',
+    zh: '',
+    en: '',
+    fromCache: false,
+    channel: 'not-found',
+    ...(monolithicData ? { monolithicReadmes: monolithicData } : {}),
   };
 }

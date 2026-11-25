@@ -20,7 +20,13 @@ Sidebar 侧边栏界面 · 锁安全一键卸载 · Sidebar 上游直装与一�
 
 ---
 
-## ✨ 核心特性（v1.5.4）
+## ✨ 核心特性（v1.6.0）
+
+### 0. v1.6.0 升级亮点
+- **默认「综合推荐」排序 + Monorepo 视口展位阻尼**：默认按目录质量评分（`ranking.score`，旧目录/自定义源自动回退 `stars`）排序，并对同一 `repositoryId` 的 Monorepo 子插件应用 `1 / (1 + 0.15 * (k - 1))` 阻尼，避免单一多插件仓库霸占首页前排；保留按星标、最近更新、名称排序。
+- **按需单插件 README 懒加载与本地 ETag 缓存**：详情抽屉与 `GET /api/readme` / `GET /api/plugin/:id/readme` 优先按需拉取 `dist/readmes/<id>.json`（独立 ETag 缓存于 `${PLUGIN_DATA}/cache/readmes/<id>.json`），无缝回退至传统 `readmes.json`、中国大陆 npm 镜像或已安装本地 README。
+- **子目录作用域符号链接兼容（不降级安全红线）**：对位于所选 `pluginRoot` 之外的仓库符号链接（如双宿主 `.claude/` 或 `docs/` 软链）自动跳过不再误报阻断；`pluginRoot` 内部、祖先目录、目标穿越进入 `pluginRoot` 或根目录插件（`pluginRoot === '.'`）的任何符号链接仍一律硬拦截 `ERR_TAR_SYMLINK_FORBIDDEN`。
+- **零 PII 公开插件一键社区提名**：通过「链接添加」安装未收录的公开 GitHub 仓库时，经无鉴权 `HEAD` 确认公开后展示非阻塞的「分享此公开插件到 AGY Market？」引导（私有/404 仓库永不提示），预填 GitHub Issue 仅包含 `owner/repo` 与 `plugin_root`。
 
 ### 1. Sidebar 侧边栏界面、15 大精准分类与导航体验
 - **原生右侧 Sidebar 侧边栏**：基于 Antigravity 原生 `AUX_PANE` 扩展视图（`sidecars/market_pane/sidecar.json`），不捆绑常驻 MCP 服务，打开即用、轻量流畅。

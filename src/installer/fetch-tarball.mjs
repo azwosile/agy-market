@@ -424,12 +424,17 @@ export async function fetchVerifiedPluginTarball({
           try {
             meta = parseTarGzWithMeta(readFileSync(stagingArchivePath), {
               maxUncompressedBytes: maxBytes,
-              stripSingleTopDir: false,
+              stripSingleTopDir: true,
+              pluginRoot: plugin?.repository?.pluginRoot || '.',
             });
           } catch (parseErr) {
             rmSync(stagingArchivePath, { force: true });
+            const parseMsg = parseErr?.message || String(parseErr);
+            if (parseMsg.includes('ERR_TAR_SYMLINK_FORBIDDEN')) {
+              throw parseErr;
+            }
             throw new Error(
-              `INTEGRITY_SHA256_MISMATCH: Failed to verify commit-fallback archive PAX header (${parseErr?.message || String(parseErr)})`,
+              `INTEGRITY_SHA256_MISMATCH: Failed to verify commit-fallback archive PAX header (${parseMsg})`,
             );
           }
           const paxComment = String(meta?.globalPax?.comment || '').trim().toLowerCase();

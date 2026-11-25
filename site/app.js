@@ -78,12 +78,88 @@
     return /^https?:\/\/[^\s]+$/i.test(String(u || '').trim());
   }
 
+  function getFiniteRankingScore(p) {
+    const raw = p && p.ranking ? p.ranking.score : null;
+    if (raw === null || raw === undefined || raw === '') return null;
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  function sortPluginsList(items, sortBy) {
+    const list = Array.isArray(items) ? items.slice() : [];
+    if (sortBy === 'updated') {
+      return list.sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
+    }
+    if (sortBy === 'name') {
+      return list.sort((a, b) =>
+        String(a.displayName || a.canonicalName || a.id || '').localeCompare(
+          String(b.displayName || b.canonicalName || b.id || ''),
+          'zh',
+        ),
+      );
+    }
+    if (sortBy === 'stars') {
+      return list.sort((a, b) => Number(b.repository?.stars || 0) - Number(a.repository?.stars || 0));
+    }
+
+    // Default: 'recommended' (ranking.score fallback to stars + Monorepo viewport slot dampening 1 / (1 + 0.15 * (k - 1)))
+    const hasAnyScore = list.some((p) => getFiniteRankingScore(p) !== null);
+    const scored = list.map((p, idx) => {
+      const explicit = getFiniteRankingScore(p);
+      const stars = Math.max(0, Number(p.repository?.stars || 0));
+      const baseKey =
+        explicit !== null
+          ? explicit
+          : !hasAnyScore
+            ? stars
+            : stars > 0
+              ? Math.min(85, (85 * Math.log1p(stars)) / Math.log1p(500))
+              : 0;
+      const repoId = Number(p.repository?.repositoryId || 0);
+      return {
+        plugin: p,
+        idx,
+        baseKey,
+        stars,
+        repoKey: Number.isFinite(repoId) && repoId > 0 ? String(Math.trunc(repoId)) : '',
+      };
+    });
+
+    scored.sort((a, b) => {
+      if (b.baseKey !== a.baseKey) return b.baseKey - a.baseKey;
+      if (b.stars !== a.stars) return b.stars - a.stars;
+      return a.idx - b.idx;
+    });
+
+    const repoCounts = new Map();
+    const dampened = scored.map((entry) => {
+      let factor = 1;
+      if (entry.repoKey) {
+        const k = (repoCounts.get(entry.repoKey) || 0) + 1;
+        repoCounts.set(entry.repoKey, k);
+        factor = 1 / (1 + 0.15 * (k - 1));
+      }
+      return { ...entry, dampenedKey: entry.baseKey * factor };
+    });
+
+    dampened.sort((a, b) => {
+      if (b.dampenedKey !== a.dampenedKey) return b.dampenedKey - a.dampenedKey;
+      if (b.baseKey !== a.baseKey) return b.baseKey - a.baseKey;
+      if (b.stars !== a.stars) return b.stars - a.stars;
+      return a.idx - b.idx;
+    });
+
+    return dampened.map((entry) => entry.plugin);
+  }
+
   function renderGrid() {
     const grid = document.getElementById('site-grid');
     const q = (document.getElementById('site-search').value || '').trim().toLowerCase();
     const cat = document.getElementById('site-category').value || 'all';
+    const sortEl = document.getElementById('site-sort');
+    const sortBy = (sortEl && sortEl.value) || 'recommended';
 
-    const list = plugins.filter((p) => {
+    const filtered = plugins.filter((p) => {
       if (cat !== 'all' && !(p.taxonomy?.categories || []).includes(cat)) return false;
       if (!q) return true;
       const desc = typeof p.description === 'object' ? `${p.description.zh || ''} ${p.description.en || ''}` : String(p.description || '');
@@ -92,6 +168,7 @@
         .join(' ');
       return `${p.displayName || ''} ${p.canonicalName || ''} ${desc} ${catTerms} ${(p.taxonomy?.tags || []).join(' ')} ${(p.capabilities?.badges || []).join(' ')}`.toLowerCase().includes(q);
     });
+    const list = sortPluginsList(filtered, sortBy);
 
     const totalEl = document.getElementById('stat-total');
     if (totalEl) totalEl.textContent = `${plugins.length} 款`;
@@ -225,6 +302,8 @@
 
   document.getElementById('site-search').addEventListener('input', renderGrid);
   document.getElementById('site-category').addEventListener('change', renderGrid);
+  const siteSortEl = document.getElementById('site-sort');
+  if (siteSortEl) siteSortEl.addEventListener('change', renderGrid);
   document.getElementById('site-load-btn').addEventListener('click', fetchCatalog);
 
   void fetchCatalog();

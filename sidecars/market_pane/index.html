@@ -2623,6 +2623,34 @@ html[data-theme="light"] .fav-btn.is-favorited {
   border-color: var(--m-sky-border);
 }
 
+.meta-status-pill {
+  font-size: 9.5px;
+  font-weight: 640;
+  letter-spacing: 0.02em;
+  padding: 1px 5.5px;
+  border-radius: var(--m-r-pill);
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.meta-status-pill.is-stale {
+  background: var(--b-subtle-bg);
+  color: var(--m-muted);
+  border: 1px solid var(--m-hairline);
+}
+
+.meta-status-pill.is-archived {
+  background: var(--b-subtle-bg);
+  color: var(--m-faint);
+  border: 1px dashed var(--m-hairline-strong);
+}
+
+.meta-status-pill.is-compat {
+  background: var(--m-accent-soft);
+  color: var(--m-accent-bright);
+  border: 1px solid var(--m-accent-border);
+}
+
 .self-running-pill {
   display: inline-flex;
   align-items: center;
@@ -4490,6 +4518,82 @@ html[data-theme="light"] .fav-btn.is-favorited {
   color: var(--m-text-2);
 }
 
+.gh-notice-box.is-nomination {
+  background: linear-gradient(135deg, var(--m-accent-soft), var(--m-ok-soft));
+  border: 1px solid var(--m-accent-border);
+  color: var(--m-text-2);
+}
+
+.gh-nomination-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.gh-nominate-btn {
+  border-color: var(--m-accent-border);
+  color: var(--m-accent-bright);
+  background: var(--m-ctl-bg);
+}
+
+.nomination-notice-banner {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 14px;
+  background: linear-gradient(96deg, var(--m-accent-soft) 0%, var(--m-ok-soft) 100%);
+  border-bottom: 1px solid var(--m-accent-border);
+  flex-shrink: 0;
+  z-index: 21;
+}
+
+.nomination-notice-main {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  min-width: 0;
+  flex: 1;
+}
+
+.nomination-notice-icon {
+  width: 24px;
+  height: 24px;
+  border-radius: 7px;
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  background: var(--m-accent-soft);
+  border: 1px solid var(--m-accent-border);
+  color: var(--m-accent-bright);
+  margin-top: 1px;
+}
+
+.nomination-notice-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.nomination-notice-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.2px;
+  font-weight: 700;
+  color: var(--m-text);
+}
+
+.nomination-notice-reason {
+  font-size: 11.2px;
+  color: var(--m-muted);
+  line-height: 1.44;
+}
+
 .gh-notice-head {
   display: flex;
   align-items: center;
@@ -5141,8 +5245,10 @@ const SELF_CATALOG_ID = 'azwosile__agy-market';
 const SELF_REPO_URL = 'https://github.com/azwosile/agy-market';
 const SUBMIT_PLUGIN_GUIDE_URL =
   'https://github.com/azwosile/agy-market-catalog/blob/main/docs/SUBMISSION_GUIDE.md';
+const NOMINATE_PLUGIN_ISSUE_BASE_URL =
+  'https://github.com/azwosile/agy-market-catalog/issues/new';
 const PLUGIN_DISPLAY_NAME = 'AGY Market · 反重力插件市场';
-const PLUGIN_VERSION = '1.5.4';
+const PLUGIN_VERSION = '1.6.0';
 const SIDECAR_ID = 'market_pane';
 const SIDECAR_URI = 'sidecar://agy-market/market_pane/';
 const CUSTOMIZATION_URI = 'customization://agy-market';
@@ -5303,10 +5409,155 @@ function scrubChildProcessEnv(baseEnv = process.env) {
   return clean;
 }
 
-return { formatBadgeLabel: formatBadgeLabel, toScopedPluginName: toScopedPluginName, scrubChildProcessEnv: scrubChildProcessEnv, PLUGIN_ID: PLUGIN_ID, SELF_CATALOG_ID: SELF_CATALOG_ID, SELF_REPO_URL: SELF_REPO_URL, SUBMIT_PLUGIN_GUIDE_URL: SUBMIT_PLUGIN_GUIDE_URL, PLUGIN_DISPLAY_NAME: PLUGIN_DISPLAY_NAME, PLUGIN_VERSION: PLUGIN_VERSION, SIDECAR_ID: SIDECAR_ID, SIDECAR_URI: SIDECAR_URI, CUSTOMIZATION_URI: CUSTOMIZATION_URI, MAX_TARBALL_BYTES: MAX_TARBALL_BYTES, MAX_FAVORITES: MAX_FAVORITES, PRIMARY_CATALOG_BASE_URL: PRIMARY_CATALOG_BASE_URL, RAW_GH_PAGES_CATALOG_BASE_URL: RAW_GH_PAGES_CATALOG_BASE_URL, PRIMARY_FETCH_TIMEOUT_MS: PRIMARY_FETCH_TIMEOUT_MS, GITHUB_API_BASE_URL: GITHUB_API_BASE_URL, UPDATE_CHECK_CACHE_TTL_MS: UPDATE_CHECK_CACHE_TTL_MS, DISCUSSIONS_CACHE_TTL_MS: DISCUSSIONS_CACHE_TTL_MS, CHINA_NPM_MIRRORS: CHINA_NPM_MIRRORS, CATALOG_NPM_PACKAGE: CATALOG_NPM_PACKAGE, PLUGIN_JSON_ALLOWED_KEYS: PLUGIN_JSON_ALLOWED_KEYS, PRIVILEGE_ESCALATION_BADGES: PRIVILEGE_ESCALATION_BADGES, CAPABILITY_BADGE_SPECS: CAPABILITY_BADGE_SPECS, CATEGORY_LABELS: CATEGORY_LABELS, DEFAULT_PREFS: DEFAULT_PREFS };
+return { formatBadgeLabel: formatBadgeLabel, toScopedPluginName: toScopedPluginName, scrubChildProcessEnv: scrubChildProcessEnv, PLUGIN_ID: PLUGIN_ID, SELF_CATALOG_ID: SELF_CATALOG_ID, SELF_REPO_URL: SELF_REPO_URL, SUBMIT_PLUGIN_GUIDE_URL: SUBMIT_PLUGIN_GUIDE_URL, NOMINATE_PLUGIN_ISSUE_BASE_URL: NOMINATE_PLUGIN_ISSUE_BASE_URL, PLUGIN_DISPLAY_NAME: PLUGIN_DISPLAY_NAME, PLUGIN_VERSION: PLUGIN_VERSION, SIDECAR_ID: SIDECAR_ID, SIDECAR_URI: SIDECAR_URI, CUSTOMIZATION_URI: CUSTOMIZATION_URI, MAX_TARBALL_BYTES: MAX_TARBALL_BYTES, MAX_FAVORITES: MAX_FAVORITES, PRIMARY_CATALOG_BASE_URL: PRIMARY_CATALOG_BASE_URL, RAW_GH_PAGES_CATALOG_BASE_URL: RAW_GH_PAGES_CATALOG_BASE_URL, PRIMARY_FETCH_TIMEOUT_MS: PRIMARY_FETCH_TIMEOUT_MS, GITHUB_API_BASE_URL: GITHUB_API_BASE_URL, UPDATE_CHECK_CACHE_TTL_MS: UPDATE_CHECK_CACHE_TTL_MS, DISCUSSIONS_CACHE_TTL_MS: DISCUSSIONS_CACHE_TTL_MS, CHINA_NPM_MIRRORS: CHINA_NPM_MIRRORS, CATALOG_NPM_PACKAGE: CATALOG_NPM_PACKAGE, PLUGIN_JSON_ALLOWED_KEYS: PLUGIN_JSON_ALLOWED_KEYS, PRIVILEGE_ESCALATION_BADGES: PRIVILEGE_ESCALATION_BADGES, CAPABILITY_BADGE_SPECS: CAPABILITY_BADGE_SPECS, CATEGORY_LABELS: CATEGORY_LABELS, DEFAULT_PREFS: DEFAULT_PREFS };
 })();
 
 const __market_mod_3 = (function() {
+// Catalog ranking, default "Recommended" sort & Monorepo viewport slot dampening (`src/shared/ranking.mjs`).
+// Pure browser/Node compatible ESM module (zero external dependencies).
+const MONOREPO_SLOT_DAMPENING_STEP = 0.15;
+
+/**
+ * Computes the Monorepo viewport slot dampening multiplier for the k-th (1-indexed) entry
+ * sharing the same `repository.repositoryId`: `1 / (1 + 0.15 * (k - 1))`.
+ */
+function computeMonorepoDampeningFactor(occurrenceIndex) {
+  const k = Math.max(1, Math.floor(Number(occurrenceIndex) || 1));
+  return 1 / (1 + MONOREPO_SLOT_DAMPENING_STEP * (k - 1));
+}
+
+function getFiniteRankingScore(plugin) {
+  const raw = plugin?.ranking?.score;
+  if (raw === null || raw === undefined || raw === '') return null;
+  const num = Number(raw);
+  return Number.isFinite(num) ? num : null;
+}
+
+function getStarsCount(plugin) {
+  const num = Number(plugin?.repository?.stars || 0);
+  return Number.isFinite(num) && num > 0 ? num : 0;
+}
+
+function getMonorepoGroupKey(plugin) {
+  const repoId = Number(plugin?.repository?.repositoryId || 0);
+  return Number.isFinite(repoId) && repoId > 0 ? String(Math.trunc(repoId)) : '';
+}
+
+function compareFallbackTieBreak(a, b, locale = 'zh') {
+  const starDiff = getStarsCount(b) - getStarsCount(a);
+  if (starDiff !== 0) return starDiff;
+  const updDiff = String(b?.updatedAt || '').localeCompare(String(a?.updatedAt || ''));
+  if (updDiff !== 0) return updDiff;
+  const nameDiff = String(a?.displayName || a?.canonicalName || a?.id || '').localeCompare(
+    String(b?.displayName || b?.canonicalName || b?.id || ''),
+    locale,
+  );
+  if (nameDiff !== 0) return nameDiff;
+  return String(a?.id || '').localeCompare(String(b?.id || ''));
+}
+
+/**
+ * Computes the base recommended sort key for a catalog plugin:
+ * - Uses `plugin.ranking.score` when present.
+ * - Falls back gracefully to `stars` when `ranking.score` is absent (e.g. custom feeds or older catalogs).
+ *   When mixed with scored entries on the `[0, 100]` ranking scale, maps unranked `stars` monotonically
+ *   into `[0, 85]` so unranked feeds remain smoothly ordered without blowing past scored Track-1 entries.
+ */
+function resolveRecommendedBaseKey(plugin, { hasAnyRankingScore = false } = {}) {
+  const explicitScore = getFiniteRankingScore(plugin);
+  if (explicitScore !== null) return explicitScore;
+  const stars = getStarsCount(plugin);
+  if (!hasAnyRankingScore) return stars;
+  if (stars <= 0) return 0;
+  return Math.min(85, (85 * Math.log1p(stars)) / Math.log1p(500));
+}
+
+/**
+ * Applies viewport Monorepo slot dampening to a list of plugins under Recommended sort:
+ *   1. Pre-orders entries by their base recommended score descending.
+ *   2. For entries sharing a positive `repository.repositoryId`, multiplies the k-th entry's
+ *      display sort key by `1 / (1 + 0.15 * (k - 1))`.
+ *   3. Re-orders by dampened display sort key descending so no monorepo hogs top viewport slots.
+ */
+function sortPluginsRecommendedWithDampening(plugins, { locale = 'zh' } = {}) {
+  const list = Array.isArray(plugins) ? plugins : [];
+  if (list.length <= 1) return [...list];
+
+  const hasAnyRankingScore = list.some((p) => getFiniteRankingScore(p) !== null);
+
+  const scored = list.map((plugin, idx) => ({
+    plugin,
+    origIdx: idx,
+    baseKey: resolveRecommendedBaseKey(plugin, { hasAnyRankingScore }),
+    repoKey: getMonorepoGroupKey(plugin),
+  }));
+
+  // Step 1: Base order determines each plugin's rank k within its monorepo
+  scored.sort((a, b) => {
+    if (b.baseKey !== a.baseKey) return b.baseKey - a.baseKey;
+    const tb = compareFallbackTieBreak(a.plugin, b.plugin, locale);
+    return tb !== 0 ? tb : a.origIdx - b.origIdx;
+  });
+
+  // Step 2: Apply 1 / (1 + 0.15 * (k - 1)) per shared repository.repositoryId
+  const repoOccurrence = new Map();
+  const dampened = scored.map((item) => {
+    let factor = 1;
+    if (item.repoKey) {
+      const k = (repoOccurrence.get(item.repoKey) || 0) + 1;
+      repoOccurrence.set(item.repoKey, k);
+      factor = computeMonorepoDampeningFactor(k);
+    }
+    return {
+      ...item,
+      dampenedKey: item.baseKey * factor,
+    };
+  });
+
+  // Step 3: Final viewport display order
+  dampened.sort((a, b) => {
+    if (b.dampenedKey !== a.dampenedKey) return b.dampenedKey - a.dampenedKey;
+    if (b.baseKey !== a.baseKey) return b.baseKey - a.baseKey;
+    const tb = compareFallbackTieBreak(a.plugin, b.plugin, locale);
+    return tb !== 0 ? tb : a.origIdx - b.origIdx;
+  });
+
+  return dampened.map((item) => item.plugin);
+}
+
+/**
+ * Sorts catalog plugins according to `sortBy` (`'recommended' | 'stars' | 'updated' | 'name'`).
+ */
+function sortCatalogPlugins(plugins, { sortBy = 'recommended', locale = 'zh' } = {}) {
+  const list = Array.isArray(plugins) ? [...plugins] : [];
+  if (sortBy === 'updated') {
+    return list.sort((a, b) => {
+      const cmp = String(b?.updatedAt || '').localeCompare(String(a?.updatedAt || ''));
+      return cmp !== 0 ? cmp : compareFallbackTieBreak(a, b, locale);
+    });
+  }
+  if (sortBy === 'name') {
+    return list.sort((a, b) =>
+      String(a?.displayName || a?.canonicalName || a?.id || '').localeCompare(
+        String(b?.displayName || b?.canonicalName || b?.id || ''),
+        locale,
+      ),
+    );
+  }
+  if (sortBy === 'stars') {
+    return list.sort((a, b) => {
+      const diff = getStarsCount(b) - getStarsCount(a);
+      if (diff !== 0) return diff;
+      return compareFallbackTieBreak(a, b, locale);
+    });
+  }
+  return sortPluginsRecommendedWithDampening(list, { locale });
+}
+
+return { computeMonorepoDampeningFactor: computeMonorepoDampeningFactor, resolveRecommendedBaseKey: resolveRecommendedBaseKey, sortPluginsRecommendedWithDampening: sortPluginsRecommendedWithDampening, sortCatalogPlugins: sortCatalogPlugins, MONOREPO_SLOT_DAMPENING_STEP: MONOREPO_SLOT_DAMPENING_STEP };
+})();
+
+const __market_mod_4 = (function() {
 // Zero-dependency SemVer parser & comparator (`src/shared/semver.mjs`).
 function parseSemver(raw) {
   const clean = String(raw || '').trim().replace(/^v/i, '');
@@ -5363,7 +5614,7 @@ function stripLeadingV(raw) {
 return { parseSemver: parseSemver, compareSemver: compareSemver, isNewerVersion: isNewerVersion, stripLeadingV: stripLeadingV };
 })();
 
-const __market_mod_4 = (function() {
+const __market_mod_5 = (function() {
 // Crisp zero-dependency inline SVG icons for AGY Market Sidebar UI (`src/ui/icons.mjs`).
 // Keeps all iconography sharp at every DPI across Dark, Light, and Wallpaper Prism glass surfaces.
 const BRAND_LOGO_SVG = `<svg viewBox="0 0 256 256" fill="none" aria-hidden="true">
@@ -5457,7 +5708,7 @@ function badgeIcon(badgeId, size = 11) {
 return { icon: icon, badgeIcon: badgeIcon, BRAND_LOGO_SVG: BRAND_LOGO_SVG, BADGE_ICON_MAP: BADGE_ICON_MAP };
 })();
 
-const __market_mod_5 = (function() {
+const __market_mod_6 = (function() {
 // Safe zero-dependency Markdown-to-HTML renderer for plugin README & changelog previews (`src/ui/markdown.mjs`).
 // Escapes all raw HTML first so untrusted READMEs and release notes cannot inject scripts or event handlers.
 // Converts internal `sidecar://` URIs into Sidebar opener buttons so zero raw
@@ -5657,16 +5908,18 @@ const CAPABILITY_BADGE_SPECS = __market_mod_2.CAPABILITY_BADGE_SPECS;
 const CATEGORY_LABELS = __market_mod_2.CATEGORY_LABELS;
 const PLUGIN_VERSION = __market_mod_2.PLUGIN_VERSION;
 const formatBadgeLabel = __market_mod_2.formatBadgeLabel;
-const compareSemver = __market_mod_3.compareSemver;
-const isNewerVersion = __market_mod_3.isNewerVersion;
-const stripLeadingV = __market_mod_3.stripLeadingV;
-const BRAND_LOGO_SVG = __market_mod_4.BRAND_LOGO_SVG;
-const badgeIcon = __market_mod_4.badgeIcon;
-const icon = __market_mod_4.icon;
-const escapeHtml = __market_mod_5.escapeHtml;
-const renderSafeMarkdown = __market_mod_5.renderSafeMarkdown;
+const sortCatalogPlugins = __market_mod_3.sortCatalogPlugins;
+const compareSemver = __market_mod_4.compareSemver;
+const isNewerVersion = __market_mod_4.isNewerVersion;
+const stripLeadingV = __market_mod_4.stripLeadingV;
+const BRAND_LOGO_SVG = __market_mod_5.BRAND_LOGO_SVG;
+const badgeIcon = __market_mod_5.badgeIcon;
+const icon = __market_mod_5.icon;
+const escapeHtml = __market_mod_6.escapeHtml;
+const renderSafeMarkdown = __market_mod_6.renderSafeMarkdown;
 // Visual AGY Market Sidebar Application (`src/ui/app.mjs`).
 // Zero external dependencies; bundled into `sidecars/market_pane/index.html` by `scripts/build.mjs`.
+
 
 
 
@@ -5790,7 +6043,7 @@ const state = {
   activeTab: 'discover', // 'discover' | 'favorites' | 'installed' | 'conflicts' | 'sources'
   search: '',
   category: 'all',
-  sortBy: 'stars', // 'stars' | 'updated' | 'name'
+  sortBy: 'recommended', // 'recommended' | 'stars' | 'updated' | 'name'
   heroCollapsed: readStorage(HERO_COLLAPSED_KEY, '0') === '1',
 
   // Favorites state (synced with `prefs.favorites` via `POST /api/favorites`)
@@ -5832,6 +6085,9 @@ const state = {
 
   // Dismissible Smart Restart / Reload Banner (shown ONLY after a completed install/update/uninstall/toggle)
   restartBanner: null, // null | { level: 'host-restart'|'reload-pane', operation: 'install'|'update'|'uninstall'|'toggle', plugins: string[], reasons: string[] }
+
+  // Dismissible Tier-0 Opt-In Public-Repo Nomination Banner (zero PII; shown only after unlisted public GitHub URL install)
+  nominationBanner: null, // null | { displayName, repo, pluginRoot, issueUrl }
 
   // Prominent Red Error Alert Banner (shown whenever install / update / update-all / self-update / uninstall fails)
   errorBanner: null, // null | { title, items: [{ pluginName, message }], retryAction }
@@ -7811,6 +8067,21 @@ async function triggerGithubUrlInstall() {
       state.errorBanner = null;
       const installedDir = res.installedDir || pluginInfo.canonicalName || '';
       const installedVer = res.version || pluginInfo.version || '';
+      const nom = res.nomination || m.inspectResult?.nomination || null;
+      const isPublicUnlisted = Boolean(
+        (res.isPublicRepo ?? m.inspectResult?.isPublicRepo) &&
+          !(res.catalogMatch ?? m.inspectResult?.catalogMatch) &&
+          nom?.issueUrl &&
+          isSafeHttpUrl(nom.issueUrl),
+      );
+      state.nominationBanner = isPublicUnlisted
+        ? {
+            displayName: pluginInfo.displayName || installedDir || pluginLabel,
+            repo: nom.repo || '',
+            pluginRoot: nom.pluginRoot || pluginInfo.pluginRoot || '.',
+            issueUrl: nom.issueUrl,
+          }
+        : null;
       markPluginVerifiedLatest(installedDir, res.id || pluginInfo.id || '');
       const act = res.activation || resolveActivationInfo(pluginInfo);
       const restartInfo = maybeTriggerRestartBanner({
@@ -8642,17 +8913,45 @@ function getFilteredPlugins() {
     return hay.includes(q);
   });
 
-  filtered.sort((a, b) => {
-    if (state.sortBy === 'updated') {
-      return String(b.updatedAt || '').localeCompare(String(a.updatedAt || ''));
-    }
-    if (state.sortBy === 'name') {
-      return String(a.displayName || a.canonicalName).localeCompare(String(b.displayName || b.canonicalName), loc);
-    }
-    return Number(b.repository?.stars || 0) - Number(a.repository?.stars || 0);
-  });
+  return sortCatalogPlugins(filtered, { sortBy: state.sortBy, locale: loc });
+}
 
-  return filtered;
+function renderRankingMetaPillsHtml(p) {
+  const r = p?.ranking;
+  const archived = Boolean(
+    r?.archived ||
+      p?.archived ||
+      p?.repository?.archived ||
+      p?.status === 'ARCHIVED' ||
+      r?.status === 'ARCHIVED',
+  );
+  const stale =
+    !archived &&
+    Boolean(
+      r?.stale ||
+        p?.stale ||
+        p?.status === 'STALE_WARNING' ||
+        p?.status === 'STALE' ||
+        r?.status === 'STALE_WARNING' ||
+        r?.status === 'STALE',
+    );
+  const compatTier = typeof r?.compatTier === 'string' ? r.compatTier.toLowerCase() : '';
+  const parts = [];
+  if (archived) {
+    parts.push(
+      `<span class="meta-status-pill is-archived" title="${escapeHtml(t('上游 GitHub 仓库已归档（只读）', 'Upstream GitHub repository is archived'))}">ARCHIVED</span>`,
+    );
+  } else if (stale) {
+    parts.push(
+      `<span class="meta-status-pill is-stale" title="${escapeHtml(t('该插件较长时间未有新提交', 'No recent upstream updates'))}">STALE</span>`,
+    );
+  }
+  if (compatTier === 'compatible') {
+    parts.push(
+      `<span class="meta-status-pill is-compat" title="${escapeHtml(t('多宿主兼容插件（可运行于 Antigravity）', 'Multi-host compatible plugin'))}">${escapeHtml(t('兼容', 'Compat'))}</span>`,
+    );
+  }
+  return parts.join('');
 }
 
 function getCategoryCounts() {
@@ -8789,6 +9088,38 @@ function renderRestartBanner() {
       </div>
       <div class="self-update-actions">
         <button type="button" class="icon-btn is-square" data-action="dismiss-restart-banner" title="${escapeHtml(t('知道了，收起提示', 'Dismiss notice'))}">${icon('close', 13)}</button>
+      </div>
+    </div>
+  `;
+}
+
+function renderNominationBanner() {
+  const nb = state.nominationBanner;
+  if (!nb || !isSafeHttpUrl(nb.issueUrl)) return '';
+  return `
+    <div class="nomination-notice-banner" role="region" aria-label="${escapeHtml(t('分享公开插件到社区目录', 'Share public plugin with AGY Market'))}" data-agy-nomination-banner="1">
+      <div class="nomination-notice-main">
+        <div class="nomination-notice-icon">${icon('sparkle', 14)}</div>
+        <div class="nomination-notice-copy">
+          <div class="nomination-notice-title">
+            <span>${escapeHtml(t('分享此公开插件到 AGY Market？', 'Share this public plugin with AGY Market?'))}</span>
+            ${nb.repo ? `<span class="restart-plugin-chip">${escapeHtml(nb.repo)}${nb.pluginRoot && nb.pluginRoot !== '.' ? ` (${escapeHtml(nb.pluginRoot)})` : ''}</span>` : ''}
+          </div>
+          <div class="nomination-notice-reason">${escapeHtml(
+            t(
+              '仅预填公开仓库名与插件子目录至 GitHub 提名表单，不包含任何本机路径、用户名或 Token。',
+              'Opens a pre-filled GitHub Issue with only owner/repo and pluginRoot — zero user, machine, or token info.',
+            ),
+          )}</div>
+        </div>
+      </div>
+      <div class="self-update-actions">
+        <a class="btn btn-primary btn-sm" href="${escapeHtml(nb.issueUrl)}" target="_blank" rel="noopener noreferrer">
+          ${icon('plus', 12)}
+          <span>${escapeHtml(t('去 GitHub 分享', 'Share on GitHub'))}</span>
+          ${icon('external', 11)}
+        </a>
+        <button type="button" class="icon-btn is-square" data-action="dismiss-nomination-banner" title="${escapeHtml(t('关闭提示', 'Dismiss'))}">${icon('close', 13)}</button>
       </div>
     </div>
   `;
@@ -9202,6 +9533,7 @@ function renderPluginCard(p, updateById, installedByDir, updateByDir = null) {
             ${relUpdated ? `<span class="meta-sep">·</span><span style="white-space:nowrap">${escapeHtml(relUpdated)}</span>` : ''}
             ${upd?.changelog ? `<span class="meta-sep">·</span><button type="button" class="notes-link" data-action="detail" data-id="${escapeHtml(p.id)}" data-detail-tab="changelog">${escapeHtml(t('更新内容 ›', 'Notes ›'))}</button>` : ''}
             ${p.forceScopedInstall ? `<span class="track-tag" title="Track 2 Experimental Topic">Track 2</span>` : ''}
+            ${renderRankingMetaPillsHtml(p)}
           </div>
         </div>
       </div>
@@ -9308,6 +9640,7 @@ function renderDiscoverView() {
         </div>
 
         <select id="market-sort-select" class="select-input" aria-label="${escapeHtml(t('排序方式', 'Sort by'))}">
+          <option value="recommended" ${state.sortBy === 'recommended' ? 'selected' : ''}>${escapeHtml(t('综合推荐', 'Recommended'))}</option>
           <option value="stars" ${state.sortBy === 'stars' ? 'selected' : ''}>${escapeHtml(t('按星标排序', 'Most Stars'))}</option>
           <option value="updated" ${state.sortBy === 'updated' ? 'selected' : ''}>${escapeHtml(t('最近更新', 'Recently Updated'))}</option>
           <option value="name" ${state.sortBy === 'name' ? 'selected' : ''}>${escapeHtml(t('按名称排序', 'Name A–Z'))}</option>
@@ -11036,7 +11369,24 @@ function renderGithubUrlModal() {
                 ),
               )}</div>
             </div>`
-          : ''
+          : res.isPublicRepo && res.nomination?.issueUrl && isSafeHttpUrl(res.nomination.issueUrl)
+            ? `<div class="gh-notice-box is-nomination" data-agy-nomination-banner="1">
+                <div class="gh-notice-head">${icon('sparkle', 13)} <span>${escapeHtml(t('分享此公开插件到 AGY Market？', 'Share this public plugin with AGY Market?'))}</span></div>
+                <div>${escapeHtml(
+                  t(
+                    '该公开插件尚未收录于社区目录。点击下方按钮将打开 GitHub 提名表单（仅预填 owner/repo 与插件子目录，不含任何本机或账号信息）。',
+                    'This public plugin is not yet listed in the community catalog. Opens a pre-filled GitHub Issue with only owner/repo and pluginRoot (zero local or account data).',
+                  ),
+                )}</div>
+                <div class="gh-nomination-actions">
+                  <a class="btn btn-sm gh-nominate-btn" href="${escapeHtml(res.nomination.issueUrl)}" target="_blank" rel="noopener noreferrer">
+                    ${icon('plus', 12)}
+                    <span>${escapeHtml(t('分享到社区目录', 'Share to AGY Market'))}</span>
+                    ${icon('external', 11)}
+                  </a>
+                </div>
+              </div>`
+            : ''
       }
 
       ${
@@ -11517,6 +11867,7 @@ function render() {
       ${renderErrorAlertBanner()}
       ${renderSelfUpdateBanner()}
       ${renderRestartBanner()}
+      ${renderNominationBanner()}
 
       ${viewHtml}
 
@@ -11871,6 +12222,9 @@ function bindDomEvents(root) {
         if (dir) void triggerUninstallPlugin(dir, { removeFavorite, displayName });
       } else if (action === 'dismiss-restart-banner') {
         state.restartBanner = null;
+        render();
+      } else if (action === 'dismiss-nomination-banner') {
+        state.nominationBanner = null;
         render();
       } else if (action === 'dismiss-error-banner') {
         state.errorBanner = null;

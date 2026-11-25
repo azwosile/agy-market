@@ -22,6 +22,7 @@ import {
 import {
   GITHUB_API_BASE_URL,
   MAX_TARBALL_BYTES,
+  NOMINATE_PLUGIN_ISSUE_BASE_URL,
   PLUGIN_ID,
   SELF_CATALOG_ID,
   SELF_REPO_URL,
@@ -45,9 +46,10 @@ import {
 } from '../updates/index.mjs';
 import { isOfficialGithubTokenHost, streamUrlToFileAndHash } from './fetch-tarball.mjs';
 import { installOrUpdateCatalogPlugin } from './index.mjs';
-import { parseTarGzWithMeta, validateSafeRelPath } from './tar-extract.mjs';
+import { assertNoScopedSymlinks, parseTarGzWithMeta, validateSafeRelPath } from './tar-extract.mjs';
 
 export const INSPECT_STAGING_TTL_MS = 15 * 60 * 1000; // 15 minutes
+export const PUBLIC_REPO_PROBE_TIMEOUT_MS = 3_000; // 3 seconds
 export const MAX_RULE_FILE_BYTES = 24_000; // Aligned with agy-market-catalog/scripts/lib/constants.mjs:9
 export const INVISIBLE_SMUGGLING_RE = /[\u{E0000}-\u{E007F}\u202A-\u202E\u2066-\u2069]/u;
 
@@ -125,6 +127,56 @@ function normalizePluginRoot(rawRoot = '.') {
     .replace(/\/+$/, '');
   if (!s || s === '.') return '.';
   return validateSafeRelPath(s) || '.';
+}
+
+/**
+ * Tier-0 Zero-PII public-repo check via unauthenticated `HEAD https://github.com/<owner>/<repo>`.
+ * Never sends Authorization tokens; private repos (404 / 302 login redirect) or timeouts return `false`.
+ */
+export async function probeIsPublicGithubRepo(
+  owner,
+  repo,
+  { fetchImpl = fetch, timeoutMs = PUBLIC_REPO_PROBE_TIMEOUT_MS } = {},
+) {
+  const cleanOwner = String(owner || '').trim();
+  const cleanRepo = String(repo || '').trim();
+  if (!OWNER_RE.test(cleanOwner) || !cleanRepo || cleanRepo === '.' || cleanRepo === '..' || !REPO_RE.test(cleanRepo)) {
+    return false;
+  }
+  const repoUrl = `https://github.com/${encodeURIComponent(cleanOwner)}/${encodeURIComponent(cleanRepo)}`;
+  try {
+    const res = await fetchImpl(repoUrl, {
+      method: 'HEAD',
+      headers: { 'User-Agent': 'agy-market-installer/1.0' },
+      redirect: 'manual',
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    return res?.status === 200;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Builds the pre-filled Tier-0 community nomination GitHub Issue URL.
+ * Strictly contains `owner/repo` and `pluginRoot` ONLY — zero user, machine, path, or token PII.
+ */
+export function buildPluginNominationUrl({ owner, repo, pluginRoot = '.' } = {}) {
+  const cleanOwner = String(owner || '').trim();
+  const cleanRepo = String(repo || '').trim();
+  if (!OWNER_RE.test(cleanOwner) || !cleanRepo || cleanRepo === '.' || cleanRepo === '..' || !REPO_RE.test(cleanRepo)) {
+    return '';
+  }
+  const repoSlug = `${cleanOwner}/${cleanRepo}`;
+  const normRoot = normalizePluginRoot(pluginRoot);
+  const titleSuffix = normRoot !== '.' ? `${repoSlug} (${normRoot})` : repoSlug;
+  const params = new URLSearchParams();
+  params.set('template', 'nominate-plugin.yml');
+  params.set('labels', 'community-discovery');
+  params.set('title', `[Nominate] ${titleSuffix}`);
+  params.set('repo', repoSlug);
+  params.set('plugin_root', normRoot);
+  return `${NOMINATE_PLUGIN_ISSUE_BASE_URL}?${params.toString()}`;
 }
 
 function encodePathSegments(rawPath) {
@@ -1913,11 +1965,14 @@ export async function inspectGithubPluginUrl({
     writeFileSync(join(stagingRootDir, 'meta.json'), `${JSON.stringify(stageMeta, null, 2)}\n`, 'utf8');
   }
 
-  // Parse archive safely (rejects symlinks, hardlinks, Zip-Slip, extracts globalPax.comment commitSha)
+  // Parse archive safely (enforces Zip-Slip & typeFlag gates; defers symlink scope check until `selectedRoot` is known)
   let tarParsed;
   try {
     const archiveBuf = readFileSync(archivePath);
-    tarParsed = parseTarGzWithMeta(archiveBuf, { stripSingleTopDir: true });
+    tarParsed = parseTarGzWithMeta(archiveBuf, {
+      stripSingleTopDir: true,
+      allowDeferredSymlinkCheck: true,
+    });
   } catch (err) {
     rmSync(stagingRootDir, { recursive: true, force: true });
     const secBlock = classifySecurityError(err, stageMeta.resolution.repoUrl);
@@ -2035,8 +2090,12 @@ export async function inspectGithubPluginUrl({
   const selectedRoot = selectedCandidate.pluginRoot;
   const scopedFiles = extractScopedFiles(allFiles, selectedRoot);
 
-  // Hard security gates on selected plugin files (Unicode smuggling, rules exfiltration, >24KB rules)
+  // Hard security gates on selected plugin files:
+  //   1. Scoped symlink/hardlink invariant (rejects any symlink inside `selectedRoot`, enclosing it,
+  //      traversing into it, or anywhere in archive when `selectedRoot === '.'`)
+  //   2. Unicode smuggling, rules exfiltration, >24KB rules
   try {
+    assertNoScopedSymlinks(tarParsed.symlinks, selectedRoot, tarParsed.strippedTopDir);
     assertLocalStaticSafety(scopedFiles);
   } catch (err) {
     rmSync(stagingRootDir, { recursive: true, force: true });
@@ -2141,6 +2200,47 @@ export async function inspectGithubPluginUrl({
       }
     : null;
 
+  // Tier-0 Opt-In Nomination Hook: ONLY probe unauthenticated public accessibility when unlisted (`catalogMatch === null`).
+  // Strictly NEVER prompts on private, 404, redirected, or unreachable repos.
+  let isPublicRepo = false;
+  let nomination = null;
+  if (catalogMatch === null) {
+    const repoKey = `${parsed.owner}/${parsed.repo}`;
+    if (
+      stageMeta.publicRepoProbe &&
+      stageMeta.publicRepoProbe.repo === repoKey &&
+      typeof stageMeta.publicRepoProbe.isPublic === 'boolean'
+    ) {
+      isPublicRepo = stageMeta.publicRepoProbe.isPublic;
+    } else {
+      isPublicRepo = await probeIsPublicGithubRepo(parsed.owner, parsed.repo, {
+        fetchImpl,
+        timeoutMs: Math.min(PUBLIC_REPO_PROBE_TIMEOUT_MS, timeoutMs),
+      });
+      stageMeta.publicRepoProbe = { repo: repoKey, isPublic: isPublicRepo };
+      try {
+        writeFileSync(join(stagingRootDir, 'meta.json'), `${JSON.stringify(stageMeta, null, 2)}\n`, 'utf8');
+      } catch {
+        /* non-fatal */
+      }
+    }
+    if (isPublicRepo) {
+      const issueUrl = buildPluginNominationUrl({
+        owner: parsed.owner,
+        repo: parsed.repo,
+        pluginRoot: selectedRoot,
+      });
+      if (issueUrl) {
+        nomination = {
+          eligible: true,
+          repo: repoKey,
+          pluginRoot: selectedRoot,
+          issueUrl,
+        };
+      }
+    }
+  }
+
   const defaultInstallMode =
     preflight.action === 'conflict-prompt' || isForeignSelfCollision ? 'isolate' : 'native';
 
@@ -2218,6 +2318,8 @@ export async function inspectGithubPluginUrl({
     warnings: prebuiltWarnings,
     componentWarnings,
     catalogMatch,
+    isPublicRepo,
+    nomination,
     _internal: {
       stagingRootDir,
       archivePath,
@@ -2353,6 +2455,9 @@ export async function installGithubPlugin({
       repoUrl: inspectRes.plugin.repoUrl,
       commitSha: inspectRes.plugin.commitSha,
       sha256: inspectRes.plugin.sha256,
+      catalogMatch: inspectRes.catalogMatch,
+      isPublicRepo: Boolean(inspectRes.isPublicRepo),
+      nomination: inspectRes.nomination || null,
     };
   }
 
@@ -2360,6 +2465,9 @@ export async function installGithubPlugin({
   return {
     ...installRes,
     inspectToken: activeToken,
+    catalogMatch: inspectRes.catalogMatch,
+    isPublicRepo: Boolean(inspectRes.isPublicRepo),
+    nomination: inspectRes.nomination || null,
   };
 }
 

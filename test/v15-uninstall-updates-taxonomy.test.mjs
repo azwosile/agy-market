@@ -1398,8 +1398,8 @@ test('v1.5 batch update-all: updates catalog + github-upstream + github-url toge
   }
 });
 
-test('v1.5.4 UI, taxonomy, version anchors & pure LF byte-purity assertions', () => {
-  // 1. Built sidecars/market_pane/index.html MUST contain ZERO \r bytes (0 CRLF, 0 bare CR), 0 UTF-8 BOM, and inline PLUGIN_VERSION = '1.5.4'
+test('v1.6.0 UI, taxonomy, version anchors & pure LF byte-purity assertions', () => {
+  // 1. Built sidecars/market_pane/index.html MUST contain ZERO \r bytes (0 CRLF, 0 bare CR), 0 UTF-8 BOM, and inline PLUGIN_VERSION = '1.6.0'
   const builtHtmlPath = join(REPO_ROOT, 'sidecars', 'market_pane', 'index.html');
   const htmlBuf = readFileSync(builtHtmlPath);
   let crCount = 0;
@@ -1416,8 +1416,8 @@ test('v1.5.4 UI, taxonomy, version anchors & pure LF byte-purity assertions', ()
   assert.doesNotMatch(builtHtmlText, /btn-upstream/, 'Built index.html must contain 0 btn-upstream external buttons');
   assert.match(
     builtHtmlText,
-    /const\s+PLUGIN_VERSION\s*=\s*'1\.5\.4'/,
-    'Built sidecars/market_pane/index.html must inline PLUGIN_VERSION = \'1.5.4\'',
+    /const\s+PLUGIN_VERSION\s*=\s*'1\.6\.0'/,
+    'Built sidecars/market_pane/index.html must inline PLUGIN_VERSION = \'1.6.0\'',
   );
   assert.match(builtHtmlText, /function\s+isPluginConfirmedLatest\s*\(/, 'Built index.html must include isPluginConfirmedLatest');
   assert.match(builtHtmlText, /function\s+isUpdateActionLocked\s*\(/, 'Built index.html must include isUpdateActionLocked');
@@ -1491,12 +1491,12 @@ test('v1.5.4 UI, taxonomy, version anchors & pure LF byte-purity assertions', ()
     assert.ok(CATEGORY_LABELS[key].zh && CATEGORY_LABELS[key].en, `Category "${key}" must define zh and en labels`);
   }
 
-  // 4. Version 1.5.4 anchors, pure LF / 0 BOM bootstrap scripts, & 10-field plugin.json purity
+  // 4. Version 1.6.0 anchors, pure LF / 0 BOM bootstrap scripts, & 10-field plugin.json purity
   const pkgJson = JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf8'));
   const pluginJson = JSON.parse(readFileSync(join(REPO_ROOT, 'plugin.json'), 'utf8'));
-  assert.equal(PLUGIN_VERSION, '1.5.4');
-  assert.equal(pkgJson.version, '1.5.4');
-  assert.equal(pluginJson.version, '1.5.4');
+  assert.equal(PLUGIN_VERSION, '1.6.0');
+  assert.equal(pkgJson.version, '1.6.0');
+  assert.equal(pluginJson.version, '1.6.0');
   assert.equal(pluginJson.name, PLUGIN_ID);
   for (const key of Object.keys(pluginJson)) {
     assert.ok(PLUGIN_JSON_ALLOWED_KEYS.has(key), `Disallowed key "${key}" in plugin.json`);
@@ -1508,11 +1508,11 @@ test('v1.5.4 UI, taxonomy, version anchors & pure LF byte-purity assertions', ()
   assert.equal(shBuf[0] === 0xef && shBuf[1] === 0xbb && shBuf[2] === 0xbf, false, 'install.sh must have 0 UTF-8 BOM');
   assert.equal(ps1Buf.includes(0x0d), false, 'install.ps1 must be pure LF (0 CR)');
   assert.equal(shBuf.includes(0x0d), false, 'install.sh must be pure LF (0 CR)');
-  assert.match(ps1Buf.toString('utf8'), /else\s*\{\s*"1\.5\.4"\s*\}/);
-  assert.match(shBuf.toString('utf8'), /INSTALLED_VER="1\.5\.4"/);
+  assert.match(ps1Buf.toString('utf8'), /else\s*\{\s*"1\.6\.0"\s*\}/);
+  assert.match(shBuf.toString('utf8'), /INSTALLED_VER="1\.6\.0"/);
 
   const siteHtml = readFileSync(join(REPO_ROOT, 'site', 'index.html'), 'utf8');
-  assert.match(siteHtml, /v1\.5\.4/);
+  assert.match(siteHtml, /v1\.6\.0/);
   const docsIndexPath = join(REPO_ROOT, 'docs', 'index.html');
   if (existsSync(docsIndexPath)) {
     const docsBuf = readFileSync(docsIndexPath);
@@ -1522,7 +1522,7 @@ test('v1.5.4 UI, taxonomy, version anchors & pure LF byte-purity assertions', ()
       'docs/index.html must have 0 UTF-8 BOM',
     );
     assert.equal(docsBuf.includes(0x0d), false, 'docs/index.html must be pure LF (0 CR)');
-    assert.match(docsBuf.toString('utf8'), /v1\.5\.4/);
+    assert.match(docsBuf.toString('utf8'), /v1\.6\.0/);
   }
 });
 

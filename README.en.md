@@ -20,7 +20,13 @@ Sidebar Panel UI · Lock-Safe One-Click Uninstall · Direct In-Sidebar Upstream 
 
 ---
 
-## ✨ Highlights (v1.5.4)
+## ✨ Highlights (v1.6.0)
+
+### 0. What's New in v1.6.0
+- **Default "Recommended" Sort + Monorepo Viewport Slot Dampening**: Sorts Discover by catalog quality score (`ranking.score`, gracefully falling back to `stars` for custom feeds or older catalogs) with `1 / (1 + 0.15 * (k - 1))` dampening across entries sharing `repository.repositoryId`, while keeping `stars`, `updated`, and `name` sort options intact.
+- **Lazy Per-Plugin README Loading & ETag Cache**: `GET /api/readme` and `GET /api/plugin/:id/readme` fetch `dist/readmes/<id>.json` on demand with per-plugin ETag caching under `${PLUGIN_DATA}/cache/readmes/<id>.json`, seamlessly falling back to monolithic `readmes.json`, China npm mirrors, or local installed READMEs.
+- **Security-Preserving Scoped Symlink Support**: Tarballs containing symlinks strictly outside a selected subdirectory `pluginRoot` (such as dual-host `.claude/` or `docs/` links) are skipped cleanly instead of failing installation, while any symlink inside `pluginRoot`, enclosing `pluginRoot`, targeting into `pluginRoot`, or anywhere in a root plugin (`pluginRoot === '.'`) still hard-throws `ERR_TAR_SYMLINK_FORBIDDEN`.
+- **Opt-In Zero-PII Public Plugin Nomination**: When Add-URL inspects or installs an unlisted public GitHub repository (verified via unauthenticated `HEAD` with 3s timeout; private/404/unreachable repos are never prompted), surfaces a non-blocking prompt opening a pre-filled GitHub Issue carrying only `owner/repo` and `plugin_root`.
 
 ### 1. Sidebar Panel UI, 15 Precision Categories & Navigation
 - **Native Right Sidebar Panel**: Runs inside Antigravity's native `AUX_PANE` extension view (`sidecars/market_pane/sidecar.json`) with no bundled MCP servers, keeping the panel lightweight and responsive.
