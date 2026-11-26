@@ -17,22 +17,32 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: agy-market
     steps:
-      - name: Checkout repository
+      - name: Checkout agy-market
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag || github.ref }}
+          path: agy-market
+
+      - name: Checkout sibling agy-market-catalog
+        uses: actions/checkout@v4
+        with:
+          repository: azwosile/agy-market-catalog
+          path: agy-market-catalog
 
       - name: Setup Node.js 22
         uses: actions/setup-node@v4
         with:
           node-version: '22'
 
-      - name: Run unit and integration tests
-        run: node --test test/*.test.mjs
-
       - name: Build sidecar UI and static site
         run: node scripts/build.mjs --site
+
+      - name: Run unit and integration tests
+        run: node --test test/*.test.mjs
 
       - name: Pack deterministic release tarball
         run: node scripts/pack-release.mjs
@@ -49,10 +59,11 @@ jobs:
             TAG_NAME="v${MANIFEST_VER}"
           fi
           echo "Publishing release for tag: ${TAG_NAME}"
-          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
-            gh release upload "$TAG_NAME" dist/agy-market.tar.gz dist/agy-market.tar.gz.sha256 --clobber
+          if gh release view "$TAG_NAME" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "$TAG_NAME" dist/agy-market.tar.gz dist/agy-market.tar.gz.sha256 --clobber --repo "${{ github.repository }}"
           else
             gh release create "$TAG_NAME" dist/agy-market.tar.gz dist/agy-market.tar.gz.sha256 \
+              --repo "${{ github.repository }}" \
               --title "AGY Market ${TAG_NAME}" \
               --generate-notes
           fi
