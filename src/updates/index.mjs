@@ -19,6 +19,7 @@ import {
   SELF_REPO_URL,
   UPDATE_CHECK_CACHE_TTL_MS,
 } from '../shared/constants.mjs';
+import { defaultProxyFetch } from '../shared/proxy-fetch.mjs';
 import { computeCapabilityEscalation, parseJsonc, sanitizePrefs } from '../shared/schemas.mjs';
 import { compareSemver, isNewerVersion, parseSemver } from '../shared/semver.mjs';
 
@@ -27,6 +28,14 @@ const DEFAULT_GITHUB_TIMEOUT_MS = 8000;
 const MIN_RATELIMIT_BACKOFF_MS = 60 * 1000;
 const DEFAULT_RATELIMIT_BACKOFF_MS = 5 * 60 * 1000;
 const MAX_RATELIMIT_BACKOFF_MS = 60 * 60 * 1000;
+
+function resolveEffectiveFetch(fetchImpl) {
+  return !fetchImpl || fetchImpl === fetch ? defaultProxyFetch : fetchImpl;
+}
+
+export function isUnmanagedNonUpdatableLocal(loc) {
+  return Boolean(loc && (loc.isGitManaged || (!loc.receipt && loc.hasDeclaredVersion === false)));
+}
 
 export function redactSecret(text, secret = '') {
   const msg = String(text || '');
@@ -220,12 +229,13 @@ function isRateLimitBackoffActive(rateLimitState, { nowMs, authenticated }) {
 export async function probeGithubLatestReleaseRedirect({
   owner,
   repo,
-  fetchImpl = fetch,
+  fetchImpl = defaultProxyFetch,
   timeoutMs = DEFAULT_GITHUB_TIMEOUT_MS,
 }) {
+  const activeFetch = resolveEffectiveFetch(fetchImpl);
   const url = `https://github.com/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/releases/latest`;
   try {
-    const res = await fetchImpl(url, {
+    const res = await activeFetch(url, {
       method: 'HEAD',
       redirect: 'manual',
       headers: { 'User-Agent': 'agy-market-updater/1.0' },
@@ -369,12 +379,13 @@ export function parseGitUploadPackRefs(rawText) {
 export async function probeGithubGitRefs({
   owner,
   repo,
-  fetchImpl = fetch,
+  fetchImpl = defaultProxyFetch,
   timeoutMs = DEFAULT_GITHUB_TIMEOUT_MS,
 }) {
+  const activeFetch = resolveEffectiveFetch(fetchImpl);
   const url = `https://github.com/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}.git/info/refs?service=git-upload-pack`;
   try {
-    const res = await fetchImpl(url, {
+    const res = await activeFetch(url, {
       headers: { 'User-Agent': 'git/2.45.0 agy-market-updater/1.0' },
       signal: AbortSignal.timeout(timeoutMs),
     });
@@ -397,9 +408,10 @@ export async function probeGithubBranchAtom({
   branch = 'HEAD',
   pluginRoot = '.',
   etag = '',
-  fetchImpl = fetch,
+  fetchImpl = defaultProxyFetch,
   timeoutMs = DEFAULT_GITHUB_TIMEOUT_MS,
 }) {
+  const activeFetch = resolveEffectiveFetch(fetchImpl);
   const normRoot = normalizePluginRootForUpdate(pluginRoot);
   const subPart = normRoot !== '.' ? `/${encodePathSegments(normRoot)}` : '';
   const refSeg = encodePathSegments(branch || 'HEAD');
@@ -410,7 +422,7 @@ export async function probeGithubBranchAtom({
   };
   if (etag) headers['If-None-Match'] = etag;
   try {
-    const res = await fetchImpl(url, {
+    const res = await activeFetch(url, {
       headers,
       signal: AbortSignal.timeout(timeoutMs),
     });
@@ -438,36 +450,127 @@ export async function probeGithubBranchAtom({
   }
 }
 
-async function probeRawManifestVersion({
+async function probeRawPluginManifest({
   owner,
   repo,
-  commitSha,
+  ref,
   pluginRoot = '.',
-  fetchImpl = fetch,
+  fetchImpl = defaultProxyFetch,
   timeoutMs = 4000,
 }) {
+  const activeFetch = resolveEffectiveFetch(fetchImpl);
   const normRoot = normalizePluginRootForUpdate(pluginRoot);
   const candidates =
     normRoot !== '.'
       ? [`${normRoot}/plugin.json`, `${normRoot}/.antigravity-plugin/plugin.json`]
       : ['plugin.json', '.antigravity-plugin/plugin.json'];
 
+  let saw404 = false;
+  let sawError = false;
   for (const relPath of candidates) {
-    const url = `https://raw.githubusercontent.com/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${encodeURIComponent(commitSha)}/${encodePathSegments(relPath)}`;
+    const url = `https://raw.githubusercontent.com/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${encodeURIComponent(ref)}/${encodePathSegments(relPath)}`;
     try {
-      const res = await fetchImpl(url, {
+      const res = await activeFetch(url, {
         headers: { 'User-Agent': 'agy-market-updater/1.0' },
         signal: AbortSignal.timeout(timeoutMs),
       });
-      if (!res.ok) continue;
+      if (res.status === 404 || res.status === 410) {
+        saw404 = true;
+        continue;
+      }
+      if (!res.ok) {
+        sawError = true;
+        continue;
+      }
       const manifest = parseJsonc(await res.text());
+      if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
+        return { found: false, status: 200, name: '', version: '', invalid: true };
+      }
       const sem = parseSemver(manifest?.version);
-      if (sem) return sem.version;
+      return {
+        found: true,
+        status: 200,
+        name: typeof manifest.name === 'string' ? manifest.name.trim() : '',
+        version: sem ? sem.version : '',
+        rawVersion: typeof manifest.version === 'string' ? manifest.version.trim() : '',
+      };
     } catch {
-      /* non-fatal */
+      sawError = true;
     }
   }
-  return '';
+  return {
+    found: false,
+    status: saw404 && !sawError ? 404 : 0,
+    name: '',
+    version: '',
+    transientError: sawError,
+  };
+}
+
+async function probeRawManifestVersion({
+  owner,
+  repo,
+  commitSha,
+  pluginRoot = '.',
+  fetchImpl = defaultProxyFetch,
+  timeoutMs = 4000,
+}) {
+  const res = await probeRawPluginManifest({
+    owner,
+    repo,
+    ref: commitSha,
+    pluginRoot,
+    fetchImpl,
+    timeoutMs,
+  });
+  return res?.found && res.version ? res.version : '';
+}
+
+async function probeRawManifestForTagCached({
+  owner,
+  repo,
+  tagName,
+  pluginRoot = '.',
+  dataDir,
+  force = false,
+  fetchImpl = defaultProxyFetch,
+  nowMs = Date.now(),
+  ttlMs = UPDATE_CHECK_CACHE_TTL_MS,
+  timeoutMs = DEFAULT_GITHUB_TIMEOUT_MS,
+  shouldPersistCache = () => true,
+}) {
+  const normRoot = normalizePluginRootForUpdate(pluginRoot);
+  const cacheDir = dataDir ? getGithubCacheDir(dataDir) : '';
+  const tagSlug = `${tagName}__${normRoot}`.toLowerCase().replace(/[^a-z0-9_.-]/gi, '_');
+  const cachePath = cacheDir ? join(cacheDir, `raw-${safeGithubCacheKey(owner, repo)}-${tagSlug}.json`) : '';
+  const cached = cachePath ? readJsonSafe(cachePath) : null;
+
+  if (!force && cached && Number.isFinite(cached.checkedAtMs) && nowMs - cached.checkedAtMs < ttlMs) {
+    return cached.result || { found: false, status: 404, name: '', version: '' };
+  }
+
+  const result = await probeRawPluginManifest({
+    owner,
+    repo,
+    ref: tagName,
+    pluginRoot: normRoot,
+    fetchImpl,
+    timeoutMs: Math.min(timeoutMs, 5000),
+  });
+
+  if (cachePath && !result.transientError && shouldPersistCache()) {
+    writeJsonSafe(cachePath, {
+      schemaVersion: 1,
+      repo: `${owner}/${repo}`,
+      tagName,
+      pluginRoot: normRoot,
+      checkedAt: new Date(nowMs).toISOString(),
+      checkedAtMs: nowMs,
+      result,
+    });
+  }
+
+  return result;
 }
 
 /**
@@ -484,7 +587,7 @@ export async function probeGithubBranchHead({
   dataDir,
   prefs = {},
   force = false,
-  fetchImpl = fetch,
+  fetchImpl = defaultProxyFetch,
   nowMs = Date.now(),
   ttlMs = UPDATE_CHECK_CACHE_TTL_MS,
   githubApiBaseUrl = GITHUB_API_BASE_URL,
@@ -492,6 +595,7 @@ export async function probeGithubBranchHead({
   skipNetworkBecauseRateLimited = false,
   shouldPersistCache = () => true,
 }) {
+  const activeFetch = resolveEffectiveFetch(fetchImpl);
   const cleanPrefs = sanitizePrefs(prefs);
   const token = cleanPrefs.githubToken;
   const authenticated = Boolean(token);
@@ -531,7 +635,7 @@ export async function probeGithubBranchHead({
         ? `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/commits?sha=${encodeURIComponent(requestedBranch)}&path=${encodeURIComponent(normRoot)}&per_page=1`
         : `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/commits/${encodeURIComponent(requestedBranch)}`;
     try {
-      const res = await fetchImpl(apiUrl, {
+      const res = await activeFetch(apiUrl, {
         headers: buildGithubHeaders(token, apiEtag),
         signal: AbortSignal.timeout(timeoutMs),
       });
@@ -575,7 +679,7 @@ export async function probeGithubBranchHead({
       branch: resolvedBranch || requestedBranch,
       pluginRoot: normRoot,
       etag: atomEtag,
-      fetchImpl,
+      fetchImpl: activeFetch,
       timeoutMs,
     });
     if (atomRes?.notModified) {
@@ -591,7 +695,7 @@ export async function probeGithubBranchHead({
       atomEtag = atomRes.etag || '';
       anySuccess = true;
     } else {
-      const gitRefs = await probeGithubGitRefs({ owner, repo, fetchImpl, timeoutMs });
+      const gitRefs = await probeGithubGitRefs({ owner, repo, fetchImpl: activeFetch, timeoutMs });
       if (gitRefs) {
         const targetBranch =
           requestedBranch !== 'HEAD' ? requestedBranch : gitRefs.defaultBranch || 'main';
@@ -623,7 +727,7 @@ export async function probeGithubBranchHead({
       repo,
       commitSha: head.commitSha,
       pluginRoot: normRoot,
-      fetchImpl,
+      fetchImpl: activeFetch,
       timeoutMs: Math.min(4000, timeoutMs),
     });
     if (remoteVer) {
@@ -664,7 +768,7 @@ export async function probeGithubRepoUpdates({
   dataDir,
   prefs = {},
   force = false,
-  fetchImpl = fetch,
+  fetchImpl = defaultProxyFetch,
   nowMs = Date.now(),
   ttlMs = UPDATE_CHECK_CACHE_TTL_MS,
   githubApiBaseUrl = GITHUB_API_BASE_URL,
@@ -672,6 +776,7 @@ export async function probeGithubRepoUpdates({
   skipNetworkBecauseRateLimited = false,
   shouldPersistCache = () => true,
 }) {
+  const activeFetch = resolveEffectiveFetch(fetchImpl);
   const cleanPrefs = sanitizePrefs(prefs);
   const token = cleanPrefs.githubToken;
   const authenticated = Boolean(token);
@@ -696,7 +801,7 @@ export async function probeGithubRepoUpdates({
   if (skipNetworkBecauseRateLimited || (!force && isRateLimitBackoffActive(rlState, { nowMs, authenticated }))) {
     const redirectFallback =
       apiBase === GITHUB_API_BASE_URL
-        ? await probeGithubLatestReleaseRedirect({ owner, repo, fetchImpl, timeoutMs })
+        ? await probeGithubLatestReleaseRedirect({ owner, repo, fetchImpl: activeFetch, timeoutMs })
         : null;
     const mergedRelease =
       redirectFallback && (!cached?.latestRelease || compareSemver(redirectFallback.version, cached.latestRelease.version) > 0)
@@ -722,7 +827,7 @@ export async function probeGithubRepoUpdates({
   // 3. Query `/repos/{owner}/{repo}/releases/latest`
   const releaseUrl = `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/releases/latest`;
   try {
-    const res = await fetchImpl(releaseUrl, {
+    const res = await activeFetch(releaseUrl, {
       headers: buildGithubHeaders(token, releaseEtag),
       signal: AbortSignal.timeout(timeoutMs),
     });
@@ -771,7 +876,7 @@ export async function probeGithubRepoUpdates({
 
   // Zero-quota HEAD redirect fallback if `api.github.com` returned 403/429 rate-limit
   if (rateLimited && apiBase === GITHUB_API_BASE_URL) {
-    const redirectFallback = await probeGithubLatestReleaseRedirect({ owner, repo, fetchImpl, timeoutMs });
+    const redirectFallback = await probeGithubLatestReleaseRedirect({ owner, repo, fetchImpl: activeFetch, timeoutMs });
     if (
       redirectFallback &&
       (!latestRelease || compareSemver(redirectFallback.version, latestRelease.version) > 0)
@@ -784,7 +889,7 @@ export async function probeGithubRepoUpdates({
   if (!rateLimited) {
     const tagsUrl = `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/tags?per_page=30`;
     try {
-      const res = await fetchImpl(tagsUrl, {
+      const res = await activeFetch(tagsUrl, {
         headers: buildGithubHeaders(token, tagsEtag),
         signal: AbortSignal.timeout(timeoutMs),
       });
@@ -1068,7 +1173,7 @@ export async function checkPluginUpdates({
   dataDir,
   prefs = {},
   force = false,
-  fetchImpl = fetch,
+  fetchImpl = defaultProxyFetch,
   nowMs = Date.now(),
   ttlMs = UPDATE_CHECK_CACHE_TTL_MS,
   currentSelfVersion = PLUGIN_VERSION,
@@ -1076,12 +1181,14 @@ export async function checkPluginUpdates({
   timeoutMs = DEFAULT_GITHUB_TIMEOUT_MS,
   shouldPersistCache = () => true,
 }) {
+  const activeFetch = resolveEffectiveFetch(fetchImpl);
   const checkedAt = new Date(nowMs).toISOString();
   const catalogPlugins = Array.isArray(catalog?.plugins) ? catalog.plugins : [];
   const globalInstalled = (inventory?.installed || []).filter((loc) => loc.scope === 'global');
 
   const probeMemo = new Map();
   const branchProbeMemo = new Map();
+  const rawManifestMemo = new Map();
   const warnings = [];
   let rateLimited = false;
 
@@ -1094,7 +1201,7 @@ export async function checkPluginUpdates({
       dataDir,
       prefs,
       force,
-      fetchImpl,
+      fetchImpl: activeFetch,
       nowMs,
       ttlMs,
       githubApiBaseUrl,
@@ -1129,7 +1236,7 @@ export async function checkPluginUpdates({
       dataDir,
       prefs,
       force,
-      fetchImpl,
+      fetchImpl: activeFetch,
       nowMs,
       ttlMs,
       githubApiBaseUrl,
@@ -1143,6 +1250,28 @@ export async function checkPluginUpdates({
     return res.head;
   }
 
+  async function probeRawManifestOnce(ghSlug, tagName, pluginRoot = '.') {
+    if (!ghSlug || !tagName) return null;
+    const normRoot = normalizePluginRootForUpdate(pluginRoot);
+    const memoKey = `${ghSlug.fullName}|${tagName}|${normRoot}`;
+    if (rawManifestMemo.has(memoKey)) return rawManifestMemo.get(memoKey);
+    const res = await probeRawManifestForTagCached({
+      owner: ghSlug.owner,
+      repo: ghSlug.repo,
+      tagName,
+      pluginRoot: normRoot,
+      dataDir,
+      force,
+      fetchImpl: activeFetch,
+      nowMs,
+      ttlMs,
+      timeoutMs,
+      shouldPersistCache,
+    });
+    rawManifestMemo.set(memoKey, res);
+    return res;
+  }
+
   const items = [];
   let sawInstalledSelf = false;
   let selfUpdate = null;
@@ -1151,6 +1280,11 @@ export async function checkPluginUpdates({
     const isSelf = loc.dir === PLUGIN_ID || loc.name === PLUGIN_ID || loc.receipt?.id === SELF_CATALOG_ID;
     if (isSelf) sawInstalledSelf = true;
 
+    // Issue #3A: Exclude native `.git` clones and unversioned unmanaged plugins from update checks
+    if (!isSelf && isUnmanagedNonUpdatableLocal(loc)) {
+      continue;
+    }
+
     const catPlugin = findMatchingCatalogPlugin(loc, catalogPlugins);
     const ghSlug =
       parseGithubRepoSlug(catPlugin?.repository?.url) ||
@@ -1158,7 +1292,33 @@ export async function checkPluginUpdates({
       inferRepoSlugFromReceiptId(loc.receipt?.id) ||
       (isSelf ? parseGithubRepoSlug(SELF_REPO_URL) : null);
 
-    const ghLatest = await probeOnce(ghSlug);
+    const rawGhLatest = await probeOnce(ghSlug);
+    let ghLatest = rawGhLatest;
+
+    // Issue #2B: For unreceipted & non-catalog plugins (e.g. monorepo plugins like upstash/context7),
+    // verify raw `<tag>/<resolvedPluginRoot>/plugin.json` exists, matches plugin name, and declares a newer version.
+    if (
+      ghLatest &&
+      !loc.receipt &&
+      !catPlugin &&
+      !isSelf &&
+      ghSlug &&
+      isNewerVersion(ghLatest.version, loc.version)
+    ) {
+      const resolvedRoot = normalizePluginRootForUpdate(loc.receipt?.pluginRoot || '.');
+      const rawMeta = await probeRawManifestOnce(ghSlug, ghLatest.tagName, resolvedRoot);
+      const localNames = new Set(
+        [loc.name, loc.dir].filter(Boolean).map((s) => String(s).trim().toLowerCase()),
+      );
+      const remoteName = String(rawMeta?.name || '').trim().toLowerCase();
+      const remoteVersion = String(rawMeta?.version || '').trim();
+      const nameMatches = Boolean(remoteName && localNames.has(remoteName));
+      const versionIsNewer = Boolean(remoteVersion && isNewerVersion(remoteVersion, loc.version));
+      if (!rawMeta?.found || !nameMatches || !versionIsNewer) {
+        ghLatest = null;
+      }
+    }
+
     const shouldProbeBranch = Boolean(
       loc.receipt?.track === 'github-url' &&
         !isSelf &&

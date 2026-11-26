@@ -2,11 +2,160 @@
 // Enforces mandatory SHA-256 verification against the catalog index BEFORE extraction.
 
 import { createHash } from 'node:crypto';
-import { copyFileSync, createWriteStream, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  copyFileSync,
+  createReadStream,
+  createWriteStream,
+  existsSync,
+  mkdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { dirname } from 'node:path';
 import { CHINA_NPM_MIRRORS, MAX_TARBALL_BYTES } from '../shared/constants.mjs';
 import { fileUriToLocalPath } from '../shared/paths.mjs';
-import { parseTarGzWithMeta } from './tar-extract.mjs';
+import { defaultProxyFetch } from '../shared/proxy-fetch.mjs';
+import { inspectTarGzStream } from './tar-extract.mjs';
+
+function resolveEffectiveFetch(fetchImpl) {
+  return !fetchImpl || fetchImpl === fetch ? defaultProxyFetch : fetchImpl;
+}
+
+function hasMaxBytesLimit(maxBytes) {
+  return Number.isFinite(maxBytes) && maxBytes > 0;
+}
+
+async function writeChunkToStream(stream, buf, getStreamError) {
+  const existingErr = getStreamError();
+  if (existingErr) throw existingErr;
+  if (!stream.write(buf)) {
+    await new Promise((resolveDrain, rejectDrain) => {
+      const onDrain = () => {
+        stream.off('error', onErr);
+        resolveDrain();
+      };
+      const onErr = (e) => {
+        stream.off('drain', onDrain);
+        rejectDrain(e);
+      };
+      stream.once('drain', onDrain);
+      stream.once('error', onErr);
+    });
+  }
+  const afterErr = getStreamError();
+  if (afterErr) throw afterErr;
+}
+
+function waitStreamClosed(stream) {
+  return new Promise((resolveClose) => {
+    if (!stream || stream.closed) {
+      resolveClose();
+      return;
+    }
+    stream.once('close', () => resolveClose());
+  });
+}
+
+async function closeWriteStreamSafe(fileStream, getStreamError) {
+  const err = getStreamError();
+  if (err) throw err;
+  const closedPromise = waitStreamClosed(fileStream);
+  await new Promise((resolveEnd, rejectEnd) => {
+    const onErr = (e) => rejectEnd(e);
+    fileStream.once('error', onErr);
+    fileStream.end((endErr) => {
+      fileStream.off('error', onErr);
+      if (endErr) rejectEnd(endErr);
+      else resolveEnd();
+    });
+  });
+  await closedPromise;
+  const afterErr = getStreamError();
+  if (afterErr) throw afterErr;
+}
+
+async function streamLocalFileAndHash(
+  srcPath,
+  destFilePath = null,
+  { maxBytes = MAX_TARBALL_BYTES, requireGzipMagic = true, notGzipError = '' } = {},
+) {
+  const st = statSync(srcPath);
+  if (hasMaxBytesLimit(maxBytes) && st.size > maxBytes) {
+    throw new Error(`ERR_DOWNLOAD_TOO_LARGE: Archive exceeds ${maxBytes} bytes`);
+  }
+
+  const hash = createHash('sha256');
+  const magicBytes = [];
+  let magicChecked = !requireGzipMagic;
+  let totalBytes = 0;
+  let fileStream = null;
+  let streamError = null;
+  const getStreamError = () => streamError;
+
+  if (destFilePath) {
+    mkdirSync(dirname(destFilePath), { recursive: true });
+  }
+
+  const readStream = createReadStream(srcPath);
+  try {
+    for await (const rawChunk of readStream) {
+      const chunk = Buffer.isBuffer(rawChunk) ? rawChunk : Buffer.from(rawChunk);
+      if (chunk.length === 0) continue;
+      totalBytes += chunk.length;
+      if (hasMaxBytesLimit(maxBytes) && totalBytes > maxBytes) {
+        throw new Error(`ERR_DOWNLOAD_TOO_LARGE: Archive exceeds ${maxBytes} bytes`);
+      }
+
+      if (!magicChecked) {
+        for (let i = 0; i < chunk.length && magicBytes.length < 2; i += 1) {
+          magicBytes.push(chunk[i]);
+        }
+        if (magicBytes.length >= 2) {
+          if (magicBytes[0] !== 0x1f || magicBytes[1] !== 0x8b) {
+            throw new Error(notGzipError || `ERR_NOT_GZIP_ARCHIVE: Local file "${srcPath}" is not a valid gzip tarball`);
+          }
+          magicChecked = true;
+        }
+      }
+
+      hash.update(chunk);
+      if (destFilePath) {
+        if (!fileStream) {
+          fileStream = createWriteStream(destFilePath);
+          fileStream.on('error', (e) => {
+            streamError = e;
+          });
+        }
+        await writeChunkToStream(fileStream, chunk, getStreamError);
+      }
+    }
+
+    if (!magicChecked) {
+      throw new Error(notGzipError || `ERR_NOT_GZIP_ARCHIVE: Local file "${srcPath}" is not a valid gzip tarball`);
+    }
+
+    if (destFilePath) {
+      if (!fileStream) {
+        writeFileSync(destFilePath, Buffer.alloc(0));
+      } else {
+        await closeWriteStreamSafe(fileStream, getStreamError);
+      }
+    }
+
+    return { sha256: hash.digest('hex'), bytes: totalBytes };
+  } catch (err) {
+    if (fileStream) {
+      const closedPromise = waitStreamClosed(fileStream);
+      fileStream.destroy();
+      await closedPromise;
+      if (destFilePath) rmSync(destFilePath, { force: true });
+    }
+    throw err;
+  } finally {
+    readStream.destroy();
+  }
+}
 
 const OFFICIAL_GITHUB_TOKEN_HOSTS = new Set([
   'github.com',
@@ -64,15 +213,16 @@ export function buildCandidateDownloadUrls(plugin, prefs = {}) {
   return urls;
 }
 
-async function resolveOptionalNpmMirrorTarballUrl(npmMirrorPkg, version, fetchImpl = fetch) {
+async function resolveOptionalNpmMirrorTarballUrl(npmMirrorPkg, version, fetchImpl = defaultProxyFetch) {
   if (!npmMirrorPkg || !version) return [];
+  const activeFetch = resolveEffectiveFetch(fetchImpl);
   const found = [];
   const encoded = npmMirrorPkg.startsWith('@')
     ? `@${encodeURIComponent(npmMirrorPkg.slice(1))}`
     : encodeURIComponent(npmMirrorPkg);
   for (const mirrorBase of CHINA_NPM_MIRRORS) {
     try {
-      const res = await fetchImpl(`${mirrorBase}/${encoded}/${encodeURIComponent(version)}`, {
+      const res = await activeFetch(`${mirrorBase}/${encoded}/${encodeURIComponent(version)}`, {
         headers: { Accept: 'application/json' },
         signal: AbortSignal.timeout(4000),
       });
@@ -107,26 +257,32 @@ function sanitizeDownloadHeaders(url, extraHeaders = null) {
 export async function streamUrlToFileAndHash(
   url,
   destFilePath,
-  { maxBytes = MAX_TARBALL_BYTES, fetchImpl = fetch, extraHeaders = null, requireGzipMagic = true, timeoutMs = 60_000 } = {},
+  options = {},
 ) {
+  const hasExplicitTimeout = options?.timeoutMs !== undefined && options?.timeoutMs !== null;
+  const {
+    maxBytes = MAX_TARBALL_BYTES,
+    fetchImpl = defaultProxyFetch,
+    extraHeaders = null,
+    requireGzipMagic = true,
+    timeoutMs = 60_000,
+  } = options || {};
+  const activeFetch = resolveEffectiveFetch(fetchImpl);
+  const enforceMaxBytes = hasMaxBytesLimit(maxBytes);
   mkdirSync(dirname(destFilePath), { recursive: true });
 
   // Support `file://` URLs for deterministic offline tests & enterprise local mirrors
   if (url.startsWith('file://')) {
     const localPath = fileUriToLocalPath(url);
     if (!localPath) throw new Error(`Invalid file:// URL: ${url}`);
-    const buf = readFileSync(localPath);
-    if (buf.length > maxBytes) {
-      throw new Error(`ERR_DOWNLOAD_TOO_LARGE: Archive exceeds ${maxBytes} bytes`);
-    }
-    if (requireGzipMagic && (buf.length < 2 || buf[0] !== 0x1f || buf[1] !== 0x8b)) {
-      throw new Error(`ERR_NOT_GZIP_ARCHIVE: Local file "${url}" is not a valid gzip tarball`);
-    }
-    const sha256 = createHash('sha256').update(buf).digest('hex');
-    writeFileSync(destFilePath, buf);
+    const { sha256, bytes } = await streamLocalFileAndHash(localPath, destFilePath, {
+      maxBytes,
+      requireGzipMagic,
+      notGzipError: `ERR_NOT_GZIP_ARCHIVE: Local file "${url}" is not a valid gzip tarball`,
+    });
     return {
       sha256,
-      bytes: buf.length,
+      bytes,
       contentDisposition: '',
       contentType: 'application/gzip',
       finalUrl: url,
@@ -134,157 +290,170 @@ export async function streamUrlToFileAndHash(
   }
 
   const headers = sanitizeDownloadHeaders(url, extraHeaders);
-  const res = await fetchImpl(url, {
-    headers,
-    signal: AbortSignal.timeout(timeoutMs),
+  const effectiveTimeoutMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 60_000;
+  const controller = new AbortController();
+  let abortTimer = null;
+  let rejectAbort = null;
+  const abortPromise = new Promise((_, reject) => {
+    rejectAbort = reject;
   });
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status} downloading ${url}`);
-  }
+  abortPromise.catch(() => {});
 
-  const contentDisposition = String(res.headers?.get?.('content-disposition') || '');
-  const contentType = String(res.headers?.get?.('content-type') || '');
-  const finalUrl = String(res.url || url);
+  const onAbort = () => {
+    const err =
+      controller.signal.reason instanceof Error
+        ? controller.signal.reason
+        : new DOMException(`The operation was aborted due to timeout (${effectiveTimeoutMs}ms)`, 'TimeoutError');
+    rejectAbort?.(err);
+  };
+  controller.signal.addEventListener('abort', onAbort, { once: true });
 
-  const hash = createHash('sha256');
-  let totalBytes = 0;
+  const armOrResetTimer = () => {
+    if (abortTimer) clearTimeout(abortTimer);
+    abortTimer = setTimeout(() => {
+      controller.abort(
+        new DOMException(
+          hasExplicitTimeout
+            ? `Download timed out after ${effectiveTimeoutMs}ms`
+            : `Download stalled with no data for ${effectiveTimeoutMs}ms`,
+          'TimeoutError',
+        ),
+      );
+    }, effectiveTimeoutMs);
+    abortTimer.unref?.();
+  };
 
-  if (res.body && typeof res.body.getReader === 'function') {
-    const reader = res.body.getReader();
-    const magicBytes = [];
-    const pendingChunks = [];
-    let magicChecked = !requireGzipMagic;
-    let fileStream = null;
-    let streamError = null;
+  armOrResetTimer();
 
-    const waitStreamClosed = (stream) =>
-      new Promise((resolveClose) => {
-        if (!stream || stream.closed) {
-          resolveClose();
-          return;
-        }
-        stream.once('close', () => resolveClose());
-      });
+  try {
+    const res = await Promise.race([
+      activeFetch(url, {
+        headers,
+        signal: controller.signal,
+      }),
+      abortPromise,
+    ]);
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status} downloading ${url}`);
+    }
 
-    const openFileStream = () => {
-      if (fileStream) return fileStream;
-      fileStream = createWriteStream(destFilePath);
-      fileStream.on('error', (e) => {
-        streamError = e;
-      });
-      return fileStream;
-    };
+    if (!hasExplicitTimeout) {
+      armOrResetTimer();
+    }
 
-    const writeChunk = async (stream, buf) => {
-      if (streamError) throw streamError;
-      if (!stream.write(buf)) {
-        await new Promise((resolveDrain, rejectDrain) => {
-          const onDrain = () => {
-            stream.off('error', onErr);
-            resolveDrain();
-          };
-          const onErr = (e) => {
-            stream.off('drain', onDrain);
-            rejectDrain(e);
-          };
-          stream.once('drain', onDrain);
-          stream.once('error', onErr);
+    const contentDisposition = String(res.headers?.get?.('content-disposition') || '');
+    const contentType = String(res.headers?.get?.('content-type') || '');
+    const finalUrl = String(res.url || url);
+
+    const hash = createHash('sha256');
+    let totalBytes = 0;
+
+    if (res.body && typeof res.body.getReader === 'function') {
+      const reader = res.body.getReader();
+      const magicBytes = [];
+      const pendingChunks = [];
+      let magicChecked = !requireGzipMagic;
+      let fileStream = null;
+      let streamError = null;
+      const getStreamError = () => streamError;
+
+      const openFileStream = () => {
+        if (fileStream) return fileStream;
+        fileStream = createWriteStream(destFilePath);
+        fileStream.on('error', (e) => {
+          streamError = e;
         });
-      }
-      if (streamError) throw streamError;
-    };
+        return fileStream;
+      };
 
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        const chunk = Buffer.from(value);
-        if (chunk.length === 0) continue;
-        totalBytes += chunk.length;
-        if (totalBytes > maxBytes) {
-          await reader.cancel();
-          throw new Error(`ERR_DOWNLOAD_TOO_LARGE: Archive exceeds ${maxBytes} bytes`);
+      try {
+        while (true) {
+          const { done, value } = await Promise.race([reader.read(), abortPromise]);
+          if (done) break;
+          if (!hasExplicitTimeout) {
+            armOrResetTimer();
+          }
+          const chunk = Buffer.from(value);
+          if (chunk.length === 0) continue;
+          totalBytes += chunk.length;
+          if (enforceMaxBytes && totalBytes > maxBytes) {
+            await reader.cancel().catch(() => {});
+            throw new Error(`ERR_DOWNLOAD_TOO_LARGE: Archive exceeds ${maxBytes} bytes`);
+          }
+          hash.update(chunk);
+
+          if (!magicChecked) {
+            pendingChunks.push(chunk);
+            for (let i = 0; i < chunk.length && magicBytes.length < 2; i += 1) {
+              magicBytes.push(chunk[i]);
+            }
+            if (magicBytes.length >= 2) {
+              if (magicBytes[0] !== 0x1f || magicBytes[1] !== 0x8b) {
+                await reader.cancel().catch(() => {});
+                throw new Error(
+                  `ERR_NOT_GZIP_ARCHIVE: Response from ${url} is not a valid gzip tarball (content-type: ${contentType || 'unknown'})`,
+                );
+              }
+              magicChecked = true;
+              const stream = openFileStream();
+              for (const pending of pendingChunks) {
+                await writeChunkToStream(stream, pending, getStreamError);
+              }
+              pendingChunks.length = 0;
+            }
+            continue;
+          }
+
+          const stream = openFileStream();
+          await writeChunkToStream(stream, chunk, getStreamError);
         }
-        hash.update(chunk);
-
         if (!magicChecked) {
-          pendingChunks.push(chunk);
-          for (let i = 0; i < chunk.length && magicBytes.length < 2; i += 1) {
-            magicBytes.push(chunk[i]);
-          }
-          if (magicBytes.length >= 2) {
-            if (magicBytes[0] !== 0x1f || magicBytes[1] !== 0x8b) {
-              await reader.cancel();
-              throw new Error(
-                `ERR_NOT_GZIP_ARCHIVE: Response from ${url} is not a valid gzip tarball (content-type: ${contentType || 'unknown'})`,
-              );
-            }
-            magicChecked = true;
-            const stream = openFileStream();
-            for (const pending of pendingChunks) {
-              await writeChunk(stream, pending);
-            }
-            pendingChunks.length = 0;
-          }
-          continue;
+          throw new Error(
+            `ERR_NOT_GZIP_ARCHIVE: Response from ${url} is empty or truncated (<2 bytes, content-type: ${contentType || 'unknown'})`,
+          );
         }
-
-        const stream = openFileStream();
-        await writeChunk(stream, chunk);
+        if (!fileStream) {
+          writeFileSync(destFilePath, Buffer.alloc(0));
+        } else {
+          await closeWriteStreamSafe(fileStream, getStreamError);
+        }
+      } catch (err) {
+        await reader.cancel().catch(() => {});
+        if (fileStream) {
+          const closedPromise = waitStreamClosed(fileStream);
+          fileStream.destroy();
+          await closedPromise;
+          rmSync(destFilePath, { force: true });
+        }
+        throw err;
       }
-      if (!magicChecked) {
+    } else {
+      const ab = await Promise.race([res.arrayBuffer(), abortPromise]);
+      const buf = Buffer.from(ab);
+      totalBytes = buf.length;
+      if (enforceMaxBytes && totalBytes > maxBytes) {
+        throw new Error(`ERR_DOWNLOAD_TOO_LARGE: Archive exceeds ${maxBytes} bytes`);
+      }
+      if (requireGzipMagic && (buf.length < 2 || buf[0] !== 0x1f || buf[1] !== 0x8b)) {
         throw new Error(
-          `ERR_NOT_GZIP_ARCHIVE: Response from ${url} is empty or truncated (<2 bytes, content-type: ${contentType || 'unknown'})`,
+          `ERR_NOT_GZIP_ARCHIVE: Response from ${url} is not a valid gzip tarball (content-type: ${contentType || 'unknown'})`,
         );
       }
-      if (!fileStream) {
-        writeFileSync(destFilePath, Buffer.alloc(0));
-      } else {
-        if (streamError) throw streamError;
-        const closedPromise = waitStreamClosed(fileStream);
-        await new Promise((resolveEnd, rejectEnd) => {
-          const onErr = (e) => rejectEnd(e);
-          fileStream.once('error', onErr);
-          fileStream.end((err) => {
-            fileStream.off('error', onErr);
-            if (err) rejectEnd(err);
-            else resolveEnd();
-          });
-        });
-        await closedPromise;
-        if (streamError) throw streamError;
-      }
-    } catch (err) {
-      if (fileStream) {
-        const closedPromise = waitStreamClosed(fileStream);
-        fileStream.destroy();
-        await closedPromise;
-        rmSync(destFilePath, { force: true });
-      }
-      throw err;
+      hash.update(buf);
+      writeFileSync(destFilePath, buf);
     }
-  } else {
-    const buf = Buffer.from(await res.arrayBuffer());
-    totalBytes = buf.length;
-    if (totalBytes > maxBytes) {
-      throw new Error(`ERR_DOWNLOAD_TOO_LARGE: Archive exceeds ${maxBytes} bytes`);
-    }
-    if (requireGzipMagic && (buf.length < 2 || buf[0] !== 0x1f || buf[1] !== 0x8b)) {
-      throw new Error(
-        `ERR_NOT_GZIP_ARCHIVE: Response from ${url} is not a valid gzip tarball (content-type: ${contentType || 'unknown'})`,
-      );
-    }
-    hash.update(buf);
-    writeFileSync(destFilePath, buf);
-  }
 
-  return {
-    sha256: hash.digest('hex'),
-    bytes: totalBytes,
-    contentDisposition,
-    contentType,
-    finalUrl,
-  };
+    return {
+      sha256: hash.digest('hex'),
+      bytes: totalBytes,
+      contentDisposition,
+      contentType,
+      finalUrl,
+    };
+  } finally {
+    if (abortTimer) clearTimeout(abortTimer);
+    controller.signal.removeEventListener('abort', onAbort);
+  }
 }
 
 /**
@@ -298,10 +467,11 @@ export async function fetchVerifiedPluginTarball({
   stagingDir,
   stagingArchivePath,
   prefs = {},
-  fetchImpl = fetch,
+  fetchImpl = defaultProxyFetch,
   maxBytes = MAX_TARBALL_BYTES,
   preverifiedArchivePath = '',
 }) {
+  const activeFetch = resolveEffectiveFetch(fetchImpl);
   const expectedSha256 = String(plugin?.distribution?.sha256 || '')
     .trim()
     .toLowerCase();
@@ -309,28 +479,23 @@ export async function fetchVerifiedPluginTarball({
     throw new Error(`ERR_MISSING_EXPECTED_SHA256: Catalog entry "${plugin?.id}" lacks valid 64-hex sha256`);
   }
 
-  // Zero-redownload fast path: reuse pre-staged inspect archive if its SHA-256 matches `expectedSha256`
+  // Zero-redownload fast path: reuse pre-staged inspect archive if its streaming SHA-256 matches `expectedSha256`
   if (preverifiedArchivePath && existsSync(preverifiedArchivePath)) {
     try {
-      const stagedBuf = readFileSync(preverifiedArchivePath);
-      if (
-        stagedBuf.length >= 2 &&
-        stagedBuf.length <= maxBytes &&
-        stagedBuf[0] === 0x1f &&
-        stagedBuf[1] === 0x8b
-      ) {
-        const stagedSha = createHash('sha256').update(stagedBuf).digest('hex');
-        if (stagedSha.toLowerCase() === expectedSha256) {
-          mkdirSync(dirname(stagingArchivePath), { recursive: true });
-          copyFileSync(preverifiedArchivePath, stagingArchivePath);
-          return {
-            archivePath: stagingArchivePath,
-            sha256: stagedSha,
-            bytes: stagedBuf.length,
-            channelUsed: 'staged-inspect',
-            urlUsed: preverifiedArchivePath,
-          };
-        }
+      const stagedInfo = await streamLocalFileAndHash(preverifiedArchivePath, null, {
+        maxBytes,
+        requireGzipMagic: true,
+      });
+      if (stagedInfo.sha256.toLowerCase() === expectedSha256) {
+        mkdirSync(dirname(stagingArchivePath), { recursive: true });
+        copyFileSync(preverifiedArchivePath, stagingArchivePath);
+        return {
+          archivePath: stagingArchivePath,
+          sha256: stagedInfo.sha256,
+          bytes: stagedInfo.bytes,
+          channelUsed: 'staged-inspect',
+          urlUsed: preverifiedArchivePath,
+        };
       }
     } catch {
       /* fall back to network candidates */
@@ -342,7 +507,7 @@ export async function fetchVerifiedPluginTarball({
     const npmCandidates = await resolveOptionalNpmMirrorTarballUrl(
       plugin.distribution.npmMirrorPkg,
       plugin.version,
-      fetchImpl,
+      activeFetch,
     );
     candidates.push(...npmCandidates);
   }
@@ -359,7 +524,7 @@ export async function fetchVerifiedPluginTarball({
           : null;
       const { sha256, bytes } = await streamUrlToFileAndHash(cand.url, stagingArchivePath, {
         maxBytes,
-        fetchImpl,
+        fetchImpl: activeFetch,
         extraHeaders,
       });
 
@@ -401,7 +566,7 @@ export async function fetchVerifiedPluginTarball({
             : null;
         const { sha256, bytes } = await streamUrlToFileAndHash(commitFallbackUrl, stagingArchivePath, {
           maxBytes,
-          fetchImpl,
+          fetchImpl: activeFetch,
           extraHeaders: fallbackHeaders,
         });
 
@@ -422,10 +587,11 @@ export async function fetchVerifiedPluginTarball({
           const expectedCommitSha = String(plugin?.commitSha || '').trim().toLowerCase();
           let meta;
           try {
-            meta = parseTarGzWithMeta(readFileSync(stagingArchivePath), {
+            meta = await inspectTarGzStream(stagingArchivePath, {
               maxUncompressedBytes: maxBytes,
               stripSingleTopDir: true,
               pluginRoot: plugin?.repository?.pluginRoot || '.',
+              shouldBufferFile: () => false,
             });
           } catch (parseErr) {
             rmSync(stagingArchivePath, { force: true });

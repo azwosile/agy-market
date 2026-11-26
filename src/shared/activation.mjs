@@ -69,11 +69,19 @@ export function classifyActivationRequirement(capabilities = {}, runtime = {}) {
     const reasonsEn = [];
 
     if (hasAsar && hasCdp) {
-      reasonsZh.push(`${ASAR_LABEL} 界面补丁与全窗口 CDP 皮肤需重启客户端生效`);
-      reasonsEn.push(`${ASAR_LABEL} workbench patch and CDP window skin require restarting Antigravity`);
+      reasonsZh.push(
+        `${ASAR_LABEL} 界面补丁与全窗口 CDP 皮肤需先按插件文档执行自带补丁脚本（如 node setup.cjs）再重启客户端生效；市场更新后亦需重新运行补丁脚本`,
+      );
+      reasonsEn.push(
+        `${ASAR_LABEL} workbench patch and CDP window skin require running the plugin's bundled patch script (e.g. node setup.cjs per plugin docs) before restarting Antigravity, and re-running it after market updates`,
+      );
     } else if (hasAsar) {
-      reasonsZh.push(`${ASAR_LABEL} 界面补丁需重启客户端生效`);
-      reasonsEn.push(`${ASAR_LABEL} workbench patch requires restarting Antigravity to take effect`);
+      reasonsZh.push(
+        `${ASAR_LABEL} 界面补丁需先按插件文档执行自带补丁脚本（如 node setup.cjs）再重启客户端生效；后续通过市场更新后亦需重新运行补丁脚本同步注入代码`,
+      );
+      reasonsEn.push(
+        `${ASAR_LABEL} workbench patch requires running the plugin's bundled patch script (e.g. node setup.cjs per plugin docs) before restarting Antigravity, and re-running it after market updates`,
+      );
     } else if (hasCdp) {
       reasonsZh.push('全窗口 CDP 皮肤需带调试端口重启生效');
       reasonsEn.push('Full-window CDP skin requires restarting Antigravity with the debugging port enabled');
@@ -96,6 +104,7 @@ export function classifyActivationRequirement(capabilities = {}, runtime = {}) {
       badgeEn: '🚀 Restart Required',
       reasonZh: reasonsZh.join('；'),
       reasonEn: reasonsEn.join('; '),
+      ...(hasAsar ? { requiresPatchScript: true } : {}),
     };
   }
 

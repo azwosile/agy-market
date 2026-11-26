@@ -309,6 +309,9 @@ test('GET /api/updates detects catalog updates, GitHub-only releases/tags awaiti
           { status: 200, headers: { etag: '"gamma-tags-1"' } },
         );
       }
+      if (u === 'https://raw.githubusercontent.com/carol/gamma-plug/v1.0.5/plugin.json') {
+        return new Response(JSON.stringify({ name: 'gamma-plug', version: '1.0.5' }), { status: 200 });
+      }
       if (u === 'https://api.github.com/repos/azwosile/agy-market/releases/latest') {
         return new Response(
           JSON.stringify({
@@ -434,6 +437,9 @@ test('GitHub update check honors 30-min TTL, ETag If-None-Match 304 reuse, and f
           status: 200,
           headers: { etag: `"tags-v${remoteVersion.replace(/\./g, '')}"` },
         });
+      }
+      if (u === `https://raw.githubusercontent.com/alice/cache-plug/v${remoteVersion}/plugin.json`) {
+        return new Response(JSON.stringify({ name: 'cache-plug', version: remoteVersion }), { status: 200 });
       }
       // Self repo probe
       if (u.includes('/azwosile/agy-market/')) {
@@ -1428,6 +1434,9 @@ test('Zero-quota HEAD /releases/latest redirect fallback on 403 rate limit and s
           headers: { location: 'https://github.com/alice/redir-plug/releases/tag/v1.6.0' },
         });
       }
+      if (u === 'https://raw.githubusercontent.com/alice/redir-plug/v1.6.0/plugin.json') {
+        return new Response(JSON.stringify({ name: 'redir-plug', version: '1.6.0' }), { status: 200 });
+      }
       return new Response('{}', { status: 404 });
     };
 
@@ -1528,6 +1537,9 @@ test('Concurrent GET /api/updates?force=1 coalesces within the same generation a
           }),
           { status: 200 },
         );
+      }
+      if (u === 'https://raw.githubusercontent.com/alice/force-plug/v1.8.0/plugin.json') {
+        return new Response(JSON.stringify({ name: 'force-plug', version: '1.8.0' }), { status: 200 });
       }
       return new Response('{}', { status: 404 });
     };

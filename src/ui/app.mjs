@@ -452,20 +452,80 @@ function resolveCardAccent(pluginOrLocal, catEntry = null) {
   return CATEGORY_ACCENTS.other;
 }
 
-function resolveActivationInfo(sourceObj, capabilitiesFallback = {}) {
-  const act = sourceObj?.activation;
-  if (act && typeof act === 'object' && act.level) {
-    return act;
+function hasAppAsarCapability(...objs) {
+  for (const obj of objs) {
+    if (!obj || typeof obj !== 'object') continue;
+    if (obj.requiresPatchScript === true || obj.activation?.requiresPatchScript === true) {
+      return true;
+    }
+    const kinds = Array.isArray(obj.hostEnhancementKind)
+      ? obj.hostEnhancementKind
+      : Array.isArray(obj.capabilities?.hostEnhancementKind)
+        ? obj.capabilities.hostEnhancementKind
+        : Array.isArray(obj.receipt?.grantedCapabilities?.hostEnhancementKind)
+          ? obj.receipt.grantedCapabilities.hostEnhancementKind
+          : [];
+    if (kinds.some((k) => String(k || '').toLowerCase() === 'app-asar')) {
+      return true;
+    }
   }
+  return false;
+}
+
+function buildAsarPatchGuidanceText(operation = 'install') {
+  if (operation === 'update') {
+    return {
+      zh: `修改 ${ASAR_LABEL} 的插件需按插件文档运行其自带补丁脚本（如 node setup.cjs）后再重启 Antigravity；在市场更新此类插件后，请重新运行补丁脚本并重启客户端以同步注入的客户端代码。`,
+      en: `Plugins modifying ${ASAR_LABEL} require running their bundled patch script (e.g. node setup.cjs per plugin docs) before restarting Antigravity. After updating in AGY Market, re-run the patch script and restart Antigravity to sync injected client code.`,
+    };
+  }
+  return {
+    zh: `修改 ${ASAR_LABEL} 需先按插件文档运行其自带补丁脚本（如 node setup.cjs）后再重启 Antigravity；后续在市场更新该插件后，也需重新运行补丁脚本并重启客户端以同步注入的客户端代码。`,
+    en: `Modifying ${ASAR_LABEL} requires running the plugin's bundled patch script (e.g. node setup.cjs per plugin docs) before restarting Antigravity; after updating it in AGY Market, re-run the patch script and restart Antigravity to sync injected client code.`,
+  };
+}
+
+function resolvePluginLocalDirPath(dir, loc = null) {
+  const cleanDir = String(dir || loc?.dir || '').trim();
+  if (!cleanDir) return '';
+  if (loc?.path) return String(loc.path);
+  const pluginsDir = String(state.serverState?.paths?.pluginsDir || '').trim();
+  if (pluginsDir) {
+    const sep = pluginsDir.includes('\\') && !pluginsDir.includes('/') ? '\\' : '/';
+    return `${pluginsDir.replace(/[\\/]+$/, '')}${sep}${cleanDir}`;
+  }
+  return `~/.gemini/config/plugins/${cleanDir}`;
+}
+
+function resolveActivationInfo(sourceObj, capabilitiesFallback = {}, { operation = 'update' } = {}) {
+  const act = sourceObj?.activation;
   const cap = sourceObj?.capabilities || capabilitiesFallback || {};
   const badges = Array.isArray(cap.badges) ? cap.badges : [];
-  const hostKinds = Array.isArray(cap.hostEnhancementKind) ? cap.hostEnhancementKind : [];
+  const hostKinds = Array.isArray(cap.hostEnhancementKind)
+    ? cap.hostEnhancementKind.map((k) => String(k || '').toLowerCase())
+    : [];
+  const hasAsar = Boolean(act?.requiresPatchScript || hostKinds.includes('app-asar'));
 
-  if (hostKinds.includes('app-asar')) {
+  if (act && typeof act === 'object' && act.level) {
+    if (!hasAsar || operation === 'uninstall') return act;
+    const patchText = buildAsarPatchGuidanceText(operation);
+    const hasPatchHintZh = /setup\.cjs|补丁脚本/.test(String(act.reasonZh || ''));
+    const hasPatchHintEn = /setup\.cjs|patch script/i.test(String(act.reasonEn || ''));
+    return {
+      ...act,
+      requiresPatchScript: true,
+      reasonZh: hasPatchHintZh ? act.reasonZh : patchText.zh,
+      reasonEn: hasPatchHintEn ? act.reasonEn : patchText.en,
+    };
+  }
+
+  if (hasAsar) {
+    const patchText = buildAsarPatchGuidanceText(operation);
     return {
       level: 'host-restart',
-      reasonZh: `包含 ${ASAR_LABEL} 界面补丁，更新后需重启 Antigravity 客户端生效`,
-      reasonEn: `Includes ${ASAR_LABEL} UI patch; restart Antigravity to take effect`,
+      requiresPatchScript: true,
+      reasonZh: patchText.zh,
+      reasonEn: patchText.en,
     };
   }
   if (hostKinds.includes('cdp') || badges.includes('host-enhancement')) {
@@ -496,6 +556,8 @@ function resolveActivationInfo(sourceObj, capabilitiesFallback = {}) {
 
 function maybeTriggerRestartBanner({
   pluginName = '',
+  pluginDir = '',
+  pluginId = '',
   operation = 'update',
   restartRequired = false,
   reloadRequired = false,
@@ -503,14 +565,16 @@ function maybeTriggerRestartBanner({
   lockedOnDisable = false,
   lockedOnRemove = false,
   activation = null,
+  requiresPatchScript = false,
 } = {}) {
   const hasRetired = Array.isArray(retiredBinaries) && retiredBinaries.length > 0;
   const isLocked = Boolean(lockedOnDisable || lockedOnRemove || hasRetired);
   const op = operation || 'update';
+  const needsPatchScript = Boolean(op !== 'uninstall' && (requiresPatchScript || activation?.requiresPatchScript));
   let level = '';
   let reason = '';
 
-  if (restartRequired || isLocked || activation?.level === 'host-restart') {
+  if (restartRequired || isLocked || needsPatchScript || activation?.level === 'host-restart') {
     level = 'host-restart';
     if (isLocked) {
       reason =
@@ -524,6 +588,13 @@ function maybeTriggerRestartBanner({
               'Windows 后台进程句柄占用（已安全退役旧二进制），重启 Antigravity 客户端后即可完全释放生效。',
               'Windows background binary handle lock detected; restart Antigravity to fully release and apply.',
             ));
+    } else if (needsPatchScript) {
+      const patchText = buildAsarPatchGuidanceText(op);
+      const actReason = getLocale() === 'en' ? activation?.reasonEn : activation?.reasonZh;
+      const hasPatchDetail = Boolean(
+        actReason && (getLocale() === 'en' ? /setup\.cjs|patch script/i : /setup\.cjs|补丁脚本/).test(actReason),
+      );
+      reason = hasPatchDetail ? actReason : getLocale() === 'en' ? patchText.en : patchText.zh;
     } else {
       reason =
         (getLocale() === 'en' ? activation?.reasonEn : activation?.reasonZh) ||
@@ -560,8 +631,31 @@ function maybeTriggerRestartBanner({
     (sameOp && existing.level === 'host-restart') || level === 'host-restart' ? 'host-restart' : 'reload-pane';
   const plugins = [...new Set([...(sameOp ? existing.plugins || [] : []), ...(pluginName ? [pluginName] : [])])];
   const reasons = [...new Set([...(sameOp ? existing.reasons || [] : []), ...(reason ? [reason] : [])])];
-  state.restartBanner = { level: nextLevel, operation: op, plugins, reasons };
-  return { level, reason };
+  const prevTargets = sameOp && Array.isArray(existing.patchTargets) ? existing.patchTargets : [];
+  const nextTargets = [...prevTargets];
+  if (needsPatchScript && (pluginDir || pluginName || pluginId)) {
+    const cleanDir = String(pluginDir || '').trim();
+    const loc = cleanDir ? getInstalledByDirMap().get(cleanDir) || null : null;
+    const localPath = cleanDir ? resolvePluginLocalDirPath(cleanDir, loc) : '';
+    const targetKey = cleanDir || pluginId || pluginName;
+    if (!nextTargets.some((item) => (item.dir || item.id || item.name) === targetKey)) {
+      nextTargets.push({
+        dir: cleanDir,
+        id: String(pluginId || '').trim(),
+        name: String(pluginName || cleanDir || pluginId).trim(),
+        path: localPath,
+      });
+    }
+  }
+  state.restartBanner = {
+    level: nextLevel,
+    operation: op,
+    plugins,
+    reasons,
+    requiresPatchScript: Boolean((sameOp && existing.requiresPatchScript) || needsPatchScript),
+    patchTargets: nextTargets,
+  };
+  return { level, reason, requiresPatchScript: needsPatchScript };
 }
 
 function isSelfPluginIdentity(pluginOrCat, loc = null) {
@@ -623,11 +717,19 @@ function getGlobalInstalledByDirMap() {
   return byDir;
 }
 
+function isLocalPluginUpdateManagedExternally(loc) {
+  if (!loc) return false;
+  if (loc.isGitManaged) return true;
+  if (!loc.receipt && loc.hasDeclaredVersion === false) return true;
+  return false;
+}
+
 function isUpdateEffectiveForLocal(upd, loc = null) {
   if (!upd) return false;
   if (loc) {
     if (loc.scope && loc.scope !== 'global') return false;
     if (upd.dir && loc.dir && upd.dir !== loc.dir) return false;
+    if (isLocalPluginUpdateManagedExternally(loc)) return false;
   }
   const isCommit = upd.updateKind === 'commit';
   if (isCommit) {
@@ -695,6 +797,7 @@ function findUpdateForLocal(loc, updById, updByDir) {
 
 function hasStaleSafeCatalogUpdate(catEntry, loc = null) {
   if (!catEntry) return false;
+  if (isLocalPluginUpdateManagedExternally(loc)) return false;
   if (state.updates.checkedAt && !state.updates.error) return false;
   const st = catEntry.installStatus || {};
   if (!st.hasUpdate) return false;
@@ -752,6 +855,7 @@ function reconcileUpdatesWithServerState() {
       const uDir = String(u.installedDir || u.dir || '').trim();
       const loc = uDir ? globalByDir.get(uDir) || null : null;
       if (uDir && !loc) return false;
+      if (loc && isLocalPluginUpdateManagedExternally(loc)) return false;
       const curVer = stripV(loc?.version || u.installedVersion || '');
       const latestVer = stripV(u.latestVersion || '');
       return Boolean(latestVer && curVer && latestVer !== '?' && curVer !== '?' && isNewerVersion(latestVer, curVer));
@@ -951,6 +1055,10 @@ function buildLocalDetailModel(loc, catEntry) {
         uninstallDisabledReason:
           loc.uninstallDisabledReason ??
           (loc.dir === 'agy-market' ? 'self' : loc.scope !== 'global' ? loc.scope : ''),
+        isGitManaged: Boolean(loc.isGitManaged),
+        hasDeclaredVersion: loc.hasDeclaredVersion,
+        unmanagedReason: loc.unmanagedReason || null,
+        hasReceipt: Boolean(loc.receipt),
         sidecarPane: loc.sidecarPane || catEntry.installStatus?.sidecarPane || null,
       },
       _track: loc.receipt?.track || catEntry._track || 'verified',
@@ -999,6 +1107,10 @@ function buildLocalDetailModel(loc, catEntry) {
       uninstallDisabledReason:
         loc.uninstallDisabledReason ??
         (loc.dir === 'agy-market' ? 'self' : loc.scope !== 'global' ? loc.scope : ''),
+      isGitManaged: Boolean(loc.isGitManaged),
+      hasDeclaredVersion: loc.hasDeclaredVersion,
+      unmanagedReason: loc.unmanagedReason || null,
+      hasReceipt: Boolean(loc.receipt),
       hasUpdate: false,
       sidecarPane: loc.sidecarPane || null,
     },
@@ -1556,14 +1668,23 @@ async function triggerInstall(
         return;
       }
 
-      const act = res.activation || resolveActivationInfo(plugin);
+      const opKind = isUpdate ? 'update' : 'install';
+      const act = resolveActivationInfo(
+        res.activation ? { ...plugin, activation: res.activation } : plugin,
+        plugin.capabilities || {},
+        { operation: opKind },
+      );
+      const needsPatchScript = hasAppAsarCapability(res, act, plugin);
       const restartInfo = maybeTriggerRestartBanner({
         pluginName: plugin.displayName || installedDir || plugin.canonicalName,
-        operation: isUpdate ? 'update' : 'install',
+        pluginDir: installedDir,
+        pluginId: plugin.id || res.id || '',
+        operation: opKind,
         restartRequired: Boolean(res.restartRequired),
         reloadRequired: Boolean(res.reloadRequired),
         retiredBinaries: res.retiredBinaries || [],
         activation: act,
+        requiresPatchScript: needsPatchScript,
       });
 
       const noteSuffix = res.compatibilityNotes?.length ? ` (${res.compatibilityNotes[0]})` : '';
@@ -1572,7 +1693,7 @@ async function triggerInstall(
         {
           subtext: restartInfo?.reason || '',
           tone: 'ok',
-          durationMs: restartInfo ? 6500 : 4500,
+          durationMs: needsPatchScript ? 9000 : restartInfo ? 6500 : 4500,
         },
       );
       await checkUpdates(false, { silent: true, allowWhileBusy: true });
@@ -1673,24 +1794,37 @@ async function triggerUpdateAll(ids = null, { confirmEscalation = false, _intern
       state.batchResults = results;
     }
 
+    const { byId: updById } = getUpdateMaps();
+    const { byId: catById, byDir: catByDir } = getCatalogMaps();
+    const globalByDir = getGlobalInstalledByDirMap();
+
     for (const r of results) {
       if (r.ok) {
         markPluginVerifiedLatest(r.installedDir || r.dir || '', r.id || '');
         if (!r.alreadyUpToDate && r.status !== 'ALREADY_UP_TO_DATE') {
+          const rDir = r.installedDir || r.dir || '';
+          const rLoc = rDir ? globalByDir.get(rDir) || null : null;
+          const rCat = (r.id && catById.get(r.id)) || (rDir && catByDir.get(rDir)) || null;
+          const act = resolveActivationInfo(
+            r.activation ? { ...(rCat || rLoc || {}), activation: r.activation } : rCat || rLoc || {},
+            rCat?.capabilities || rLoc?.capabilities || {},
+            { operation: 'update' },
+          );
+          const needsPatchScript = hasAppAsarCapability(r, act, rCat, rLoc);
           maybeTriggerRestartBanner({
-            pluginName: r.displayName || r.installedDir || r.id,
+            pluginName: r.displayName || rDir || r.id,
+            pluginDir: rDir,
+            pluginId: r.id || rCat?.id || '',
             operation: 'update',
             restartRequired: Boolean(r.restartRequired),
             reloadRequired: Boolean(r.reloadRequired),
             retiredBinaries: r.retiredBinaries || [],
-            activation: r.activation || null,
+            activation: act,
+            requiresPatchScript: needsPatchScript,
           });
         }
       }
     }
-
-    const { byId: updById } = getUpdateMaps();
-    const { byId: catById } = getCatalogMaps();
 
     const escalated = results.filter((r) => r.status === 'CAPABILITY_ESCALATION_CONFIRM_REQUIRED');
     if (escalated.length > 0 && !confirmEscalation) {
@@ -1899,7 +2033,8 @@ function formatBytesCompact(bytes) {
   if (!Number.isFinite(n) || n <= 0) return '';
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  return `${(n / (1024 * 1024)).toFixed(2)} MB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(2)} MB`;
+  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
 function normalizeInspectEscalation(esc) {
@@ -2170,14 +2305,23 @@ async function triggerGithubUrlInstall() {
           }
         : null;
       markPluginVerifiedLatest(installedDir, res.id || pluginInfo.id || '');
-      const act = res.activation || resolveActivationInfo(pluginInfo);
+      const opKind = isUpdate ? 'update' : 'install';
+      const act = resolveActivationInfo(
+        res.activation ? { ...pluginInfo, activation: res.activation } : pluginInfo,
+        pluginInfo.capabilities || {},
+        { operation: opKind },
+      );
+      const needsPatchScript = hasAppAsarCapability(res, act, pluginInfo);
       const restartInfo = maybeTriggerRestartBanner({
         pluginName: pluginInfo.displayName || installedDir || pluginLabel,
-        operation: isUpdate ? 'update' : 'install',
+        pluginDir: installedDir,
+        pluginId: res.id || pluginInfo.id || '',
+        operation: opKind,
         restartRequired: Boolean(res.restartRequired),
         reloadRequired: Boolean(res.reloadRequired),
         retiredBinaries: res.retiredBinaries || [],
         activation: act,
+        requiresPatchScript: needsPatchScript,
       });
 
       showToast(
@@ -2185,7 +2329,7 @@ async function triggerGithubUrlInstall() {
         {
           subtext: restartInfo?.reason || '',
           tone: 'ok',
-          durationMs: restartInfo ? 6500 : 4500,
+          durationMs: needsPatchScript ? 9000 : restartInfo ? 6500 : 4500,
         },
       );
       state.activeTab = 'installed';
@@ -2359,20 +2503,32 @@ async function triggerDirectPluginUpdate({
         );
         return;
       }
+      const loc = getGlobalInstalledByDirMap().get(installedDir) || getInstalledByDirMap().get(installedDir) || null;
+      const { byId: catById, byDir: catByDir } = getCatalogMaps();
+      const catEntry = (targetId && catById.get(targetId)) || (installedDir && catByDir.get(installedDir)) || null;
+      const act = resolveActivationInfo(
+        res.activation ? { ...(catEntry || loc || {}), activation: res.activation } : catEntry || loc || {},
+        catEntry?.capabilities || loc?.capabilities || {},
+        { operation: 'update' },
+      );
+      const needsPatchScript = hasAppAsarCapability(res, act, catEntry, loc);
       const restartInfo = maybeTriggerRestartBanner({
         pluginName: label,
+        pluginDir: installedDir,
+        pluginId: targetId || catEntry?.id || '',
         operation: 'update',
         restartRequired: Boolean(res.restartRequired),
         reloadRequired: Boolean(res.reloadRequired),
         retiredBinaries: res.retiredBinaries || [],
-        activation: res.activation || null,
+        activation: act,
+        requiresPatchScript: needsPatchScript,
       });
       showToast(
         `${t('更新已完成', 'Updated')}: ${installedDir}${res.version ? ` ${formatV(res.version)}` : ''}`,
         {
           subtext: restartInfo?.reason || '',
           tone: 'ok',
-          durationMs: restartInfo ? 6500 : 4500,
+          durationMs: needsPatchScript ? 9000 : restartInfo ? 6500 : 4500,
         },
       );
       await checkUpdates(false, { silent: true, allowWhileBusy: true });
@@ -3137,6 +3293,8 @@ function renderRestartBanner() {
   if (!rn) return '';
   const isHostRestart = rn.level === 'host-restart';
   const op = rn.operation || 'update';
+  const hasPatchTargets = Boolean(rn.requiresPatchScript && op !== 'uninstall');
+  const patchTargets = Array.isArray(rn.patchTargets) ? rn.patchTargets : [];
   let bannerTitle = '';
   if (op === 'uninstall') {
     bannerTitle = isHostRestart
@@ -3148,6 +3306,17 @@ function renderRestartBanner() {
           '插件已卸载：建议关闭目标侧边栏或刷新 MCP',
           'Plugin uninstalled: close target Sidebar or refresh MCP',
         );
+  } else if (hasPatchTargets) {
+    bannerTitle =
+      op === 'install'
+        ? t(
+            '安装已完成：请先运行插件自带补丁脚本再重启 Antigravity',
+            'Installed: run bundled patch script before restarting Antigravity',
+          )
+        : t(
+            '更新已就绪：请重新运行插件补丁脚本并重启 Antigravity',
+            'Update applied: re-run bundled patch script and restart Antigravity',
+          );
   } else if (op === 'install') {
     bannerTitle = isHostRestart
       ? t('安装已完成：请重启 Antigravity 客户端以生效', 'Installed: restart Antigravity to take effect')
@@ -3164,13 +3333,49 @@ function renderRestartBanner() {
   return `
     <div class="restart-notice-banner ${isHostRestart ? 'is-host-restart' : 'is-reload-pane'}" role="status" aria-live="polite" data-agy-restart-banner="1">
       <div class="restart-notice-main">
-        <div class="restart-notice-icon">${icon(isHostRestart ? 'rocket' : 'refresh', 14)}</div>
+        <div class="restart-notice-icon">${icon(hasPatchTargets ? 'terminal' : isHostRestart ? 'rocket' : 'refresh', 14)}</div>
         <div class="restart-notice-copy">
           <div class="restart-notice-title">
             <span>${escapeHtml(bannerTitle)}</span>
             ${rn.plugins.length ? `<span class="restart-notice-tags">${rn.plugins.map((n) => `<span class="restart-plugin-chip">${escapeHtml(n)}</span>`).join('')}</span>` : ''}
           </div>
           <div class="restart-notice-reason">${escapeHtml(rn.reasons.join(' · '))}</div>
+          ${
+            hasPatchTargets && patchTargets.length > 0
+              ? `<div class="restart-patch-actions">
+                  ${patchTargets
+                    .map((pt) => {
+                      const copyKey = `banner-asar-${pt.dir || pt.id || pt.name}`;
+                      const isCopied = state.copiedKey === copyKey;
+                      const copyToast = t(
+                        `已复制插件目录：${pt.path}（请按文档运行补丁脚本如 node setup.cjs）`,
+                        `Copied plugin folder: ${pt.path} (run bundled patch script e.g. node setup.cjs)`,
+                      );
+                      const copyBtn = pt.path
+                        ? `<button type="button" class="btn btn-sm" data-action="copy-text" data-copy-key="${escapeHtml(copyKey)}" data-copy-val="${escapeHtml(pt.path)}" data-copy-toast="${escapeHtml(copyToast)}">
+                            ${icon(isCopied ? 'check' : 'copy', 11)}
+                            <span>${escapeHtml(
+                              isCopied
+                                ? t('已复制目录', 'Copied')
+                                : patchTargets.length > 1
+                                  ? t(`复制 ${pt.name} 目录`, `Copy ${pt.name} Path`)
+                                  : t('复制插件目录', 'Copy Plugin Folder'),
+                            )}</span>
+                          </button>`
+                        : '';
+                      const docsBtn =
+                        pt.dir || pt.id
+                          ? `<button type="button" class="btn btn-sm" data-action="open-patch-docs" data-dir="${escapeHtml(pt.dir || '')}" data-id="${escapeHtml(pt.id || '')}">
+                              ${icon('book', 11)}
+                              <span>${escapeHtml(t('查看补丁文档', 'Patch Docs'))}</span>
+                            </button>`
+                          : '';
+                      return `${copyBtn}${docsBtn}`;
+                    })
+                    .join('')}
+                </div>`
+              : ''
+          }
         </div>
       </div>
       <div class="self-update-actions">
@@ -3932,6 +4137,8 @@ function renderFavoritesView() {
 function renderBatchResultsPanel() {
   if (!Array.isArray(state.batchResults) || state.batchResults.length === 0) return '';
   const updateActionLocked = isUpdateActionLocked();
+  const { byId: catById, byDir: catByDir } = getCatalogMaps();
+  const globalByDir = getGlobalInstalledByDirMap();
   return `
     <div class="batch-results">
       <div class="batch-results-head">
@@ -3956,6 +4163,14 @@ function renderBatchResultsPanel() {
               : r.error || r.status || t('更新失败', 'Update failed');
 
           const dir = r.installedDir || r.dir || '';
+          const rLoc = dir ? globalByDir.get(dir) || null : null;
+          const rCat = (r.id && catById.get(r.id)) || (dir && catByDir.get(dir)) || null;
+          const rNeedsPatch = Boolean(
+            r.ok &&
+              !r.alreadyUpToDate &&
+              r.status !== 'ALREADY_UP_TO_DATE' &&
+              hasAppAsarCapability(r, r.activation, rCat, rLoc),
+          );
           const openPaneBtn =
             r.ok && r.sidecarPane?.uri && dir !== 'agy-market'
               ? renderOpenPaneButtonHtml({
@@ -3975,7 +4190,15 @@ function renderBatchResultsPanel() {
                 <span class="batch-row-msg" title="${escapeHtml(statusMsg)}">${escapeHtml(statusMsg)}</span>
               </div>
               <div class="batch-row-right">
-                ${r.ok && r.restartRequired ? `<span class="batch-act-pill is-host-restart">${icon('rocket', 10)} ${escapeHtml(t('请重启客户端', 'Restart App'))}</span>` : r.ok && r.reloadRequired ? `<span class="batch-act-pill is-reload-pane">${icon('refresh', 10)} ${escapeHtml(t('建议重开侧边栏', 'Reopen Sidebar'))}</span>` : ''}
+                ${
+                  r.ok && rNeedsPatch
+                    ? `<span class="batch-act-pill is-host-restart">${icon('terminal', 10)} ${escapeHtml(t('需重跑补丁脚本并重启', 'Re-run Patch & Restart'))}</span>`
+                    : r.ok && r.restartRequired
+                      ? `<span class="batch-act-pill is-host-restart">${icon('rocket', 10)} ${escapeHtml(t('请重启客户端', 'Restart App'))}</span>`
+                      : r.ok && r.reloadRequired
+                        ? `<span class="batch-act-pill is-reload-pane">${icon('refresh', 10)} ${escapeHtml(t('建议重开侧边栏', 'Reopen Sidebar'))}</span>`
+                        : ''
+                }
                 ${openPaneBtn}
                 ${!r.ok && !isEscalated ? `<button type="button" class="btn btn-sm" data-action="retry-batch-one" data-id="${escapeHtml(r.id)}"${updateActionLocked ? ' disabled aria-disabled="true"' : ''}>${escapeHtml(t('重试', 'Retry'))}</button>` : ''}
               </div>
@@ -4019,8 +4242,12 @@ function renderInstalledCard(loc, updById, updByDir, catById, catByDir) {
     loc.toggleDisabledReason ||
     (isSelf ? 'self' : loc.hostDisabled ? 'host-disabled' : loc.scope !== 'global' ? loc.scope : '');
   const canUninstall = loc.canUninstall !== false && loc.scope === 'global' && loc.dir !== 'agy-market';
+  const isGitManaged = Boolean(loc.isGitManaged);
+  const isUnversionedExternal = Boolean(!loc.receipt && loc.hasDeclaredVersion === false);
+  const isExternalUnmanaged = isGitManaged || isUnversionedExternal;
   const hasRemoteSource =
     loc.scope === 'global' &&
+    !isExternalUnmanaged &&
     (loc.dir === 'agy-market' || Boolean(catEntry) || Boolean(loc.repositoryUrl || loc.receipt?.repositoryUrl));
   const isConfirmedLatest = hasRemoteSource && isPluginConfirmedLatest(loc, upd);
 
@@ -4031,6 +4258,18 @@ function renderInstalledCard(loc, updById, updByDir, catById, catByDir) {
   if (isBusy) {
     const busyLabel = upd || state.batchUpdating ? t('更新中…', 'Updating…') : t('检查中…', 'Checking…');
     actionHtml = `<button type="button" class="btn btn-primary btn-sm" disabled aria-disabled="true">${icon('refresh', 12, 'spin')} ${escapeHtml(busyLabel)}</button>`;
+  } else if (isExternalUnmanaged) {
+    const extLabel = isGitManaged ? t('Git 原生', 'Git Native') : t('无版本号', 'Unversioned');
+    const extTip = isGitManaged
+      ? t(
+          '通过 Git 原生克隆安装（含 .git 目录且无 AGY Market 安装凭据），由外部 Git 自行管理更新，不纳入市场自动更新',
+          'Managed outside AGY Market via native Git clone (.git present without market receipt); excluded from AGY Market updates',
+        )
+      : t(
+          '未通过 AGY Market 安装且 plugin.json 未声明版本号，由外部维护并已跳过自动更新检测以避免误判',
+          'Managed outside AGY Market with no declared version in plugin.json; automatic update checks are skipped',
+        );
+    actionHtml = `<span class="state-pill is-external ${isGitManaged ? 'is-git-native' : 'is-unversioned'}" title="${escapeHtml(extTip)}">${icon(isGitManaged ? 'lock' : 'info', 10)} <span>${escapeHtml(extLabel)}</span></span>`;
   } else if (upd) {
     const updLabel = isCommitUpdate
       ? t(`更新 ${upd.latestCommitSha}`, `Update ${upd.latestCommitSha}`)
@@ -4076,7 +4315,9 @@ function renderInstalledCard(loc, updById, updByDir, catById, catByDir) {
     ? isCommitUpdate
       ? `<span class="version-delta">${escapeHtml(formatV(loc.version))} (${escapeHtml(upd.installedCommitSha || String(loc.receipt?.commitSha || '').slice(0, 7) || 'HEAD')} → ${escapeHtml(upd.latestCommitSha)})</span>`
       : `<span class="version-delta">${escapeHtml(formatV(loc.version))} → ${escapeHtml(formatV(upd.latestVersion))}</span>`
-    : `<span class="version-tag">${escapeHtml(formatV(loc.version))}</span>`;
+    : isUnversionedExternal && (!loc.version || loc.version === '0.0.0' || loc.version === '?')
+      ? `<span class="version-tag is-unversioned-tag">${escapeHtml(t('无版本号', 'Unversioned'))}</span>`
+      : `<span class="version-tag">${escapeHtml(formatV(loc.version))}</span>`;
 
   return `
     <article class="plugin-card ${upd ? 'has-update' : ''} ${isParked ? 'is-parked' : ''}" style="--card-accent:${accent.a1};--card-accent-2:${accent.a2}">
@@ -4738,8 +4979,19 @@ function renderDetailDrawer() {
           receipt: { id: p.id },
         }
       : null);
-  const upd = effectiveLoc ? findUpdateForLocal(effectiveLoc, updById, updByDir) : null;
-  const hasAnyUpdate = Boolean(upd || (st.installed && hasStaleSafeCatalogUpdate(p, effectiveLoc)));
+  const isGitManaged = Boolean(localItem?.isGitManaged ?? st.isGitManaged);
+  const hasReceipt = Boolean(localItem?.receipt ?? st.hasReceipt);
+  const hasDeclaredVersionVal = localItem ? localItem.hasDeclaredVersion : st.hasDeclaredVersion;
+  const isUnversionedExternal = Boolean(!hasReceipt && hasDeclaredVersionVal === false);
+  const isExternalUnmanaged = isGitManaged || isUnversionedExternal;
+  const isAsarPlugin = Boolean(
+    st.installed && hasAppAsarCapability(p, localItem, st, localItem?.activation, st.activation),
+  );
+  const localPluginFolderPath = installedDir ? resolvePluginLocalDirPath(installedDir, localItem) : '';
+  const upd = effectiveLoc && !isExternalUnmanaged ? findUpdateForLocal(effectiveLoc, updById, updByDir) : null;
+  const hasAnyUpdate = Boolean(
+    !isExternalUnmanaged && (upd || (st.installed && hasStaleSafeCatalogUpdate(p, effectiveLoc))),
+  );
   const isSelfUpdate = Boolean(upd?.isSelf || isSelf);
   const isDirectGhUpdate = Boolean(upd && isDirectGithubUpdateItem(upd));
   const isGithubUrlLocal = Boolean(
@@ -4774,7 +5026,8 @@ function renderDetailDrawer() {
       localItem?.canUninstall !== false &&
       st.canUninstall !== false,
   );
-  const hasRemoteSource = localScope === 'global' && (isSelf || !p._localOnly || Boolean(repoUrl));
+  const hasRemoteSource =
+    localScope === 'global' && !isExternalUnmanaged && (isSelf || !p._localOnly || Boolean(repoUrl));
   const isConfirmedLatest = Boolean(
     st.installed &&
       !hasAnyUpdate &&
@@ -4803,7 +5056,19 @@ function renderDetailDrawer() {
       primaryBtn = `<button type="button" class="btn btn-update btn-sm" data-action="install" data-id="${escapeHtml(p.id)}" data-dir="${escapeHtml(installedDir)}"${lockAttr}>${icon('update', 12)} ${escapeHtml(updLabel)}</button>`;
     }
   } else if (st.installed) {
-    if (isConfirmedLatest) {
+    if (isExternalUnmanaged) {
+      const extLabel = isGitManaged ? t('Git 原生', 'Git Native') : t('无版本号', 'Unversioned');
+      const extTip = isGitManaged
+        ? t(
+            '检测到 .git 目录且无 AGY Market 安装凭据，由外部 Git 管理更新，不纳入 AGY Market 自动更新或重新同步',
+            'Managed outside AGY Market via native Git (.git detected without market receipt); excluded from AGY Market updates and re-sync',
+          )
+        : t(
+            '未通过 AGY Market 安装且 plugin.json 未声明版本号，已屏蔽自动更新以避免误判',
+            'Unmanaged plugin with no declared version in plugin.json; excluded from AGY Market update checks',
+          );
+      primaryBtn = `<span class="state-pill is-external ${isGitManaged ? 'is-git-native' : 'is-unversioned'}" title="${escapeHtml(extTip)}">${icon(isGitManaged ? 'lock' : 'info', 11)} <span>${escapeHtml(extLabel)}</span></span>`;
+    } else if (isConfirmedLatest) {
       const latestPillHtml = `<span class="state-pill is-latest" title="${escapeHtml(t('已检查为最新版本', 'Up to date'))}">${icon('check', 12)} ${escapeHtml(t('已是最新版本', 'Up to Date'))}</span>`;
       if (isSelf) {
         primaryBtn = latestPillHtml;
@@ -4867,11 +5132,45 @@ function renderDetailDrawer() {
         : '';
 
     const drawerCatTagsHtml = renderCategoryTagsHtml(p.taxonomy?.categories, { maxCount: 0, clickable: false });
+    const asarGuideHtml = isAsarPlugin
+      ? (() => {
+          const patchGuide = buildAsarPatchGuidanceText('install');
+          const guideCopy = loc === 'en' ? patchGuide.en : patchGuide.zh;
+          const copyKey = `drawer-asar-${installedDir || p.id}`;
+          const isCopied = state.copiedKey === copyKey;
+          const copyToast = t(
+            `已复制插件目录：${localPluginFolderPath}（请进入目录按文档运行补丁脚本如 node setup.cjs）`,
+            `Copied plugin folder: ${localPluginFolderPath} (open folder and run bundled patch script e.g. node setup.cjs)`,
+          );
+          return `
+            <div class="asar-patch-guide-box" data-agy-asar-guide="1">
+              <div class="asar-patch-guide-head">
+                ${icon('terminal', 13)}
+                <span>${escapeHtml(t(`${ASAR_LABEL} 补丁脚本说明`, `${ASAR_LABEL} Patch Script Guide`))}</span>
+              </div>
+              <p class="asar-patch-guide-text">${escapeHtml(guideCopy)}</p>
+              ${
+                localPluginFolderPath
+                  ? `<div class="asar-patch-guide-actions">
+                      <code class="mono asar-patch-path" title="${escapeHtml(localPluginFolderPath)}">${escapeHtml(localPluginFolderPath)}</code>
+                      <button type="button" class="btn btn-sm" data-action="copy-text" data-copy-key="${escapeHtml(copyKey)}" data-copy-val="${escapeHtml(localPluginFolderPath)}" data-copy-toast="${escapeHtml(copyToast)}">
+                        ${icon(isCopied ? 'check' : 'copy', 11)}
+                        <span>${escapeHtml(isCopied ? t('已复制路径', 'Copied') : t('复制插件目录', 'Copy Folder Path'))}</span>
+                      </button>
+                    </div>`
+                  : ''
+              }
+            </div>
+          `;
+        })()
+      : '';
+    const archiveSizeText = formatBytesCompact(p.distribution?.sizeBytes);
     bodyHtml = `
       <div class="badge-row">
         ${drawerCatTagsHtml}
         ${renderBadgesHtml(p.capabilities)}
       </div>
+      ${asarGuideHtml}
       ${langTag}
       <div class="md-body">
         ${
@@ -4910,6 +5209,12 @@ function renderDetailDrawer() {
           p.gitTag || p.commitSha
             ? `<span class="muted">Tag / Commit</span>
                <span class="mono">${escapeHtml(p.gitTag || (p.commitSha ? 'commit' : 'n/a'))}${p.commitSha ? ` · ${escapeHtml(String(p.commitSha).slice(0, 12))}` : ''}</span>`
+            : ''
+        }
+        ${
+          archiveSizeText
+            ? `<span class="muted">${escapeHtml(t('归档大小', 'Archive Size'))}</span>
+               <span class="mono">${escapeHtml(archiveSizeText)}</span>`
             : ''
         }
         ${
@@ -4968,7 +5273,11 @@ function renderDetailDrawer() {
                 .map((id) => {
                   const spec = getUiBadgeSpec(id);
                   const label = cleanBadgeText(id, cap);
-                  const desc = loc === 'en' ? spec.descEn : spec.descZh;
+                  const baseDesc = loc === 'en' ? spec.descEn : spec.descZh;
+                  const desc =
+                    id === 'host-enhancement' && hasAppAsarCapability(p, cap, localItem, st)
+                      ? `${baseDesc} ${loc === 'en' ? buildAsarPatchGuidanceText('install').en : buildAsarPatchGuidanceText('install').zh}`
+                      : baseDesc;
                   return `
                     <div class="cap-detail-card">
                       <div><span class="cap-badge tone-${escapeHtml(spec.tone)}">${badgeIcon(id, 11)}<span>${escapeHtml(label)}</span></span></div>
@@ -5017,7 +5326,10 @@ function renderDetailDrawer() {
                       })()
                     : hasAnyUpdate && st.installed
                       ? `<span class="version-delta">${escapeHtml(formatV(localItem?.version || st.installedVersion || '?'))} → ${escapeHtml(formatV(p.version))}</span>`
-                      : `<span class="version-tag">${escapeHtml(formatV(localItem?.version || p.version))}</span>`
+                      : isUnversionedExternal &&
+                          (!localItem?.version || localItem.version === '0.0.0' || localItem.version === '?')
+                        ? `<span class="version-tag is-unversioned-tag">${escapeHtml(t('无版本号', 'Unversioned'))}</span>`
+                        : `<span class="version-tag">${escapeHtml(formatV(localItem?.version || p.version))}</span>`
                 }
                 ${isGithubUrlLocal ? `<span class="track-tag is-github-url">GitHub URL</span>` : ''}
                 ${Number(p.repository?.stars || 0) > 0 ? `<span class="meta-star">${icon('star', 11)} ${Number(p.repository.stars)}</span>` : ''}
@@ -5483,6 +5795,15 @@ function renderGithubUrlModal() {
               <ul class="gh-notice-list">
                 ${allWarnings.map((w) => `<li>${escapeHtml(w)}</li>`).join('')}
               </ul>
+            </div>`
+          : ''
+      }
+
+      ${
+        hasAppAsarCapability(plugin)
+          ? `<div class="gh-notice-box is-info">
+              <div class="gh-notice-head">${icon('terminal', 13)} <span>${escapeHtml(t(`${ASAR_LABEL} 补丁脚本提示`, `${ASAR_LABEL} Patch Script Note`))}</span></div>
+              <div>${escapeHtml(loc === 'en' ? buildAsarPatchGuidanceText('install').en : buildAsarPatchGuidanceText('install').zh)}</div>
             </div>`
           : ''
       }
@@ -6585,7 +6906,21 @@ function bindDomEvents(root) {
         e.stopPropagation();
         const val = el.getAttribute('data-copy-val') || '';
         const key = el.getAttribute('data-copy-key') || 'copy';
-        if (val) void copyText(val, key);
+        const toastMsg = el.getAttribute('data-copy-toast') || '';
+        if (val) void copyText(val, key, toastMsg);
+      } else if (action === 'open-patch-docs') {
+        e.stopPropagation();
+        const dir = el.getAttribute('data-dir') || '';
+        const id = el.getAttribute('data-id') || '';
+        const { byId: catById, byDir: catByDir } = getCatalogMaps();
+        const loc = dir ? getInstalledByDirMap().get(dir) || null : null;
+        const catEntry =
+          (id && catById.get(id)) || (loc?.receipt?.id && catById.get(loc.receipt.id)) || (dir && catByDir.get(dir)) || null;
+        if (catEntry) {
+          void openPluginDetail(catEntry, 'overview');
+        } else if (loc) {
+          void openPluginDetail(buildLocalDetailModel(loc, null), 'overview');
+        }
       } else if (action === 'dismiss-toast') {
         state.toast = null;
         render();

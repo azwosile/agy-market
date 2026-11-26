@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>AGY Market v1.6.0 — Google Antigravity 社区插件市场</title>
+  <title>AGY Market v1.7.0 — Google Antigravity 社区插件市场</title>
   <link rel="stylesheet" href="./styles.css" />
 </head>
 <body>
@@ -14,11 +14,11 @@
     <div class="hero-inner">
       <div class="hero-badge">
         <span class="badge-dot" aria-hidden="true"></span>
-        <span>v1.6.0 · 综合推荐排序 · 按需 README 缓存 · Sidebar 侧边栏 · GitHub 链接预检安装 · SHA-256 校验</span>
+        <span>v1.7.0 · 本地系统代理自动识别 · 无上限流式大插件安装 · Git/Monorepo 精准更新校验 · app.asar 补丁引导 · SHA-256 校验</span>
       </div>
       <h1>AGY Market · 反重力插件市场</h1>
       <p class="hero-lead">
-        在 Google Antigravity 右侧 Sidebar 侧边栏内浏览、收藏、安装、直装更新、卸载与启停社区插件（支持 Markdown 纯声明式技能、Python / Rust / Go / Node MCP 服务与侧边栏扩展），支持粘贴任意 GitHub 完整链接预检安装（兼容子目录 / Monorepo / 分支提交）或运行 <code>npx agy-market add &lt;github-url&gt;</code>，并提供本地冲突检查与国内双通道镜像加速。
+        在 Google Antigravity 右侧 Sidebar 侧边栏内浏览、收藏、安装、直装更新、卸载与启停社区插件（支持 Markdown 纯声明式技能、Python / Rust / Go / Node MCP 服务、大体积本地模型/二进制资源包与侧边栏扩展），支持粘贴任意 GitHub 完整链接预检安装（兼容子目录 / Monorepo / 分支提交）或运行 <code>npx --yes github:azwosile/agy-market add &lt;github-url&gt;</code>，并提供本地代理自动适配、冲突检查与国内双通道镜像加速。
       </p>
 
       <div class="feature-pills" aria-label="核心特性">
@@ -48,13 +48,13 @@
 
       <div class="bootstrap-box">
         <div class="boot-tabs">
-          <button type="button" class="boot-tab active" data-cmd="npx agy-market@latest">npx 一行安装</button>
+          <button type="button" class="boot-tab active" data-cmd="npx --yes github:azwosile/agy-market">npx 一行安装</button>
           <button type="button" class="boot-tab" data-cmd="irm https://raw.githubusercontent.com/azwosile/agy-market/main/scripts/install.ps1 | iex">Windows PowerShell（零 npm）</button>
           <button type="button" class="boot-tab" data-cmd="curl -fsSL https://raw.githubusercontent.com/azwosile/agy-market/main/scripts/install.sh | sh">macOS / Linux Shell</button>
-          <button type="button" class="boot-tab" data-cmd="npx agy-market add &lt;github-url&gt;">GitHub 链接添加（npx agy-market add）</button>
+          <button type="button" class="boot-tab" data-cmd="npx --yes github:azwosile/agy-market add &lt;github-url&gt;">GitHub 链接添加（npx add）</button>
         </div>
         <div class="boot-code-row">
-          <code id="boot-cmd-text">npx agy-market@latest</code>
+          <code id="boot-cmd-text">npx --yes github:azwosile/agy-market</code>
           <button type="button" id="copy-boot-btn" class="copy-btn">复制命令</button>
         </div>
       </div>

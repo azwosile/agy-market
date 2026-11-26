@@ -1,0 +1,58 @@
+name: Release AGY Market
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing git tag to build and publish (e.g. v1.7.0); defaults to tag ref or v<plugin.json.version>'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Run unit and integration tests
+        run: node --test test/*.test.mjs
+
+      - name: Build sidecar UI and static site
+        run: node scripts/build.mjs --site
+
+      - name: Pack deterministic release tarball
+        run: node scripts/pack-release.mjs
+
+      - name: Publish or update GitHub Release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          TAG_NAME="${INPUT_TAG:-${GITHUB_REF_NAME:-}}"
+          if [[ ! "$TAG_NAME" =~ ^v[0-9] ]]; then
+            MANIFEST_VER="$(node -e "process.stdout.write(JSON.parse(require('node:fs').readFileSync('plugin.json','utf8')).version)")"
+            TAG_NAME="v${MANIFEST_VER}"
+          fi
+          echo "Publishing release for tag: ${TAG_NAME}"
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release upload "$TAG_NAME" dist/agy-market.tar.gz dist/agy-market.tar.gz.sha256 --clobber
+          else
+            gh release create "$TAG_NAME" dist/agy-market.tar.gz dist/agy-market.tar.gz.sha256 \
+              --title "AGY Market ${TAG_NAME}" \
+              --generate-notes
+          fi

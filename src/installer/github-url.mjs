@@ -29,6 +29,7 @@ import {
   toScopedPluginName,
 } from '../shared/constants.mjs';
 import { resolveAntigravityConfigDir, resolveMarketDataDir } from '../shared/paths.mjs';
+import { defaultProxyFetch } from '../shared/proxy-fetch.mjs';
 import {
   computeCapabilityEscalation,
   parseJsonc,
@@ -46,7 +47,35 @@ import {
 } from '../updates/index.mjs';
 import { isOfficialGithubTokenHost, streamUrlToFileAndHash } from './fetch-tarball.mjs';
 import { installOrUpdateCatalogPlugin } from './index.mjs';
-import { assertNoScopedSymlinks, parseTarGzWithMeta, validateSafeRelPath } from './tar-extract.mjs';
+import { assertNoScopedSymlinks, inspectTarGzStream, validateSafeRelPath } from './tar-extract.mjs';
+
+function resolveEffectiveFetch(fetchImpl) {
+  return !fetchImpl || fetchImpl === fetch ? defaultProxyFetch : fetchImpl;
+}
+
+const MAX_INSPECT_TEXT_BYTES = 2 * 1024 * 1024;
+const MAX_INSPECT_SCRIPT_BYTES = 512 * 1024;
+const IGNORED_INSPECT_SCRIPT_DIR_RE = /(?:^|\/)(?:node_modules|\.git|test|tests|__tests__|docs|site|dist)\//i;
+
+function shouldBufferInspectFile(relPath, byteSize = 0) {
+  const norm = String(relPath || '').replace(/\\/g, '/');
+  if (/(?:^|\/)(?:plugin\.json|agy-market\.json|package\.json|mcp_config\.json|hooks\.json|sidecar\.json|sidecars\.json)$/.test(norm)) {
+    return byteSize <= MAX_INSPECT_TEXT_BYTES;
+  }
+  if (/(?:^|\/)readme(?:\.[^/]+)?\.md$/i.test(norm)) {
+    return byteSize <= MAX_INSPECT_TEXT_BYTES;
+  }
+  if (/(?:^|\/)(?:skills\/[^/]+\/SKILL\.md|agents\/[^/]+\.md)$/i.test(norm)) {
+    return byteSize <= MAX_INSPECT_TEXT_BYTES;
+  }
+  if (/(?:^|\/)rules\/[^/]+\.md$/i.test(norm)) {
+    return byteSize <= MAX_RULE_FILE_BYTES;
+  }
+  if (/\.(?:mjs|cjs|js|ts|py|ps1|sh|cmd|bat)$/i.test(norm) && !IGNORED_INSPECT_SCRIPT_DIR_RE.test(norm)) {
+    return byteSize <= MAX_INSPECT_SCRIPT_BYTES;
+  }
+  return false;
+}
 
 export const INSPECT_STAGING_TTL_MS = 15 * 60 * 1000; // 15 minutes
 export const PUBLIC_REPO_PROBE_TIMEOUT_MS = 3_000; // 3 seconds
@@ -136,8 +165,9 @@ function normalizePluginRoot(rawRoot = '.') {
 export async function probeIsPublicGithubRepo(
   owner,
   repo,
-  { fetchImpl = fetch, timeoutMs = PUBLIC_REPO_PROBE_TIMEOUT_MS } = {},
+  { fetchImpl = defaultProxyFetch, timeoutMs = PUBLIC_REPO_PROBE_TIMEOUT_MS } = {},
 ) {
+  const activeFetch = resolveEffectiveFetch(fetchImpl);
   const cleanOwner = String(owner || '').trim();
   const cleanRepo = String(repo || '').trim();
   if (!OWNER_RE.test(cleanOwner) || !cleanRepo || cleanRepo === '.' || cleanRepo === '..' || !REPO_RE.test(cleanRepo)) {
@@ -145,7 +175,7 @@ export async function probeIsPublicGithubRepo(
   }
   const repoUrl = `https://github.com/${encodeURIComponent(cleanOwner)}/${encodeURIComponent(cleanRepo)}`;
   try {
-    const res = await fetchImpl(repoUrl, {
+    const res = await activeFetch(repoUrl, {
       method: 'HEAD',
       headers: { 'User-Agent': 'agy-market-installer/1.0' },
       redirect: 'manual',
@@ -260,12 +290,29 @@ export function checkRulesExfiltration(relPath, contentText) {
   }
 }
 
-function assertLocalStaticSafety(scopedFiles) {
-  for (const [relPath, buf] of scopedFiles.entries()) {
+function assertLocalStaticSafety(scopedFiles, scopedFileSizes = null) {
+  const seen = new Set();
+  for (const relPath of scopedFiles.keys()) {
+    seen.add(relPath);
+  }
+  if (scopedFileSizes) {
+    for (const relPath of scopedFileSizes.keys()) {
+      seen.add(relPath);
+    }
+  }
+
+  for (const relPath of seen) {
+    const buf = scopedFiles.get(relPath) || Buffer.alloc(0);
+    const actualBytes = scopedFileSizes?.get(relPath) ?? buf.length;
     if (/^rules\/[^/]+\.md$/i.test(relPath)) {
-      if (buf.length > MAX_RULE_FILE_BYTES) {
+      if (actualBytes > MAX_RULE_FILE_BYTES) {
         throw new Error(
-          `ERR_RULE_SIZE_EXCEEDED: "${relPath}" is ${buf.length} bytes (Antigravity ceiling is ${MAX_RULE_FILE_BYTES} bytes)`,
+          `ERR_RULE_SIZE_EXCEEDED: "${relPath}" is ${actualBytes} bytes (Antigravity ceiling is ${MAX_RULE_FILE_BYTES} bytes)`,
+        );
+      }
+      if (actualBytes > 0 && buf.length === 0) {
+        throw new Error(
+          `ERR_RULE_SIZE_EXCEEDED: "${relPath}" (${actualBytes} bytes) was omitted from inspection buffer`,
         );
       }
       const text = buf.toString('utf8');
@@ -276,6 +323,11 @@ function assertLocalStaticSafety(scopedFiles) {
       }
       checkRulesExfiltration(relPath, text);
     } else if (/^skills\/[^/]+\/SKILL\.md$/.test(relPath) || /^agents\/[^/]+\.md$/i.test(relPath)) {
+      if (actualBytes > 0 && buf.length === 0) {
+        throw new Error(
+          `ERR_INVISIBLE_PROMPT_INJECTION: "${relPath}" (${actualBytes} bytes) exceeded text inspection buffer ceiling (${MAX_INSPECT_TEXT_BYTES} bytes)`,
+        );
+      }
       const text = buf.toString('utf8');
       if (INVISIBLE_SMUGGLING_RE.test(text)) {
         throw new Error(
@@ -384,7 +436,7 @@ function classifySecurityError(err, repoUrl) {
   const raw = String(err?.message || err || '');
   if (raw.includes('ERR_TAR_SYMLINK_FORBIDDEN')) {
     return {
-      ok: true,
+      ok: false,
       status: 'SECURITY_BLOCKED',
       reasonCode: 'ERR_TAR_SYMLINK_FORBIDDEN',
       reasonZh: '该归档包含符号链接或硬链接（Windows 下 Antigravity 会跳过符号链接且存在路径逃逸风险），已按安全策略拦截安装。',
@@ -401,7 +453,7 @@ function classifySecurityError(err, repoUrl) {
     raw.includes('ERR_TAR_ESCAPE')
   ) {
     return {
-      ok: true,
+      ok: false,
       status: 'SECURITY_BLOCKED',
       reasonCode: 'ERR_TAR_PATH_TRAVERSAL',
       reasonZh: '归档包含非法路径穿越（`..` 或绝对路径），存在 Zip-Slip 安全风险，已拦截安装。',
@@ -414,7 +466,7 @@ function classifySecurityError(err, repoUrl) {
   }
   if (raw.includes('ERR_RULES_PATH_EXFILTRATION')) {
     return {
-      ok: true,
+      ok: false,
       status: 'SECURITY_BLOCKED',
       reasonCode: 'ERR_RULES_PATH_EXFILTRATION',
       reasonZh: '检测到 rules/*.md 存在越界本地文件引用（`@[...](../...)` / 绝对路径 / 家目录引用），已拦截安装。',
@@ -427,7 +479,7 @@ function classifySecurityError(err, repoUrl) {
   }
   if (raw.includes('ERR_INVISIBLE_PROMPT_INJECTION')) {
     return {
-      ok: true,
+      ok: false,
       status: 'SECURITY_BLOCKED',
       reasonCode: 'ERR_INVISIBLE_PROMPT_INJECTION',
       reasonZh: '检测到规则或技能文档中包含不可见 Unicode Tag / Bidi 控制字符（潜在隐藏提示词注入），已拦截安装。',
@@ -440,7 +492,7 @@ function classifySecurityError(err, repoUrl) {
   }
   if (raw.includes('ERR_RULE_SIZE_EXCEEDED')) {
     return {
-      ok: true,
+      ok: false,
       status: 'SECURITY_BLOCKED',
       reasonCode: 'ERR_RULE_SIZE_EXCEEDED',
       reasonZh: `检测到 rules/*.md 单文件超过 ${MAX_RULE_FILE_BYTES} 字节安全上限，已拦截安装。`,
@@ -992,12 +1044,13 @@ export async function resolveGithubArchiveCandidates(
   {
     dataDir = '',
     prefs = {},
-    fetchImpl = fetch,
+    fetchImpl = defaultProxyFetch,
     githubApiBaseUrl = GITHUB_API_BASE_URL,
     timeoutMs = DEFAULT_API_TIMEOUT_MS,
     nowMs = Date.now(),
   } = {},
 ) {
+  const activeFetch = resolveEffectiveFetch(fetchImpl);
   const cleanPrefs = sanitizePrefs(prefs);
   const token = cleanPrefs.githubToken;
   const mirrorPrefix = cleanPrefs.githubReleaseMirrorPrefix;
@@ -1101,7 +1154,7 @@ export async function resolveGithubArchiveCandidates(
 
     if (!inCooldown) {
       try {
-        const res = await fetchImpl(`${apiBase}/repos/${o}/${r}/releases/tags/${encodeURIComponent(parsed.ref)}`, {
+        const res = await activeFetch(`${apiBase}/repos/${o}/${r}/releases/tags/${encodeURIComponent(parsed.ref)}`, {
           headers: buildGithubApiHeaders(token),
           signal: AbortSignal.timeout(timeoutMs),
         });
@@ -1147,7 +1200,7 @@ export async function resolveGithubArchiveCandidates(
   if (!rateLimited) {
     // 3a. Repo metadata
     try {
-      const repoRes = await fetchImpl(`${apiBase}/repos/${o}/${r}`, {
+      const repoRes = await activeFetch(`${apiBase}/repos/${o}/${r}`, {
         headers: buildGithubApiHeaders(token),
         signal: AbortSignal.timeout(timeoutMs),
       });
@@ -1190,7 +1243,7 @@ export async function resolveGithubArchiveCandidates(
     // 3b. Latest stable release
     let foundRelease = false;
     try {
-      const relRes = await fetchImpl(`${apiBase}/repos/${o}/${r}/releases/latest`, {
+      const relRes = await activeFetch(`${apiBase}/repos/${o}/${r}/releases/latest`, {
         headers: buildGithubApiHeaders(token),
         signal: AbortSignal.timeout(timeoutMs),
       });
@@ -1236,7 +1289,7 @@ export async function resolveGithubArchiveCandidates(
     if (!foundRelease && !rateLimited) {
       let foundTag = false;
       try {
-        const tagsRes = await fetchImpl(`${apiBase}/repos/${o}/${r}/tags?per_page=30`, {
+        const tagsRes = await activeFetch(`${apiBase}/repos/${o}/${r}/tags?per_page=30`, {
           headers: buildGithubApiHeaders(token),
           signal: AbortSignal.timeout(timeoutMs),
         });
@@ -1289,14 +1342,14 @@ export async function resolveGithubArchiveCandidates(
   // Zero-API-Quota Fallback Path (when API is 403/429 rate-limited, in cooldown, or yielded no candidates)
   if (candidates.length === 0) {
     meta.rateLimitedFallback = true;
-    const redirectHit = await probeGithubLatestReleaseRedirect({ owner, repo, fetchImpl, timeoutMs });
+    const redirectHit = await probeGithubLatestReleaseRedirect({ owner, repo, fetchImpl: activeFetch, timeoutMs });
     if (redirectHit?.tagName) {
       meta.gitTag = redirectHit.tagName;
       meta.ref = redirectHit.tagName;
       meta.refType = 'release';
       candidates.push(...buildTagCandidates(owner, repo, redirectHit.tagName, { mirrorPrefix }));
     } else {
-      const gitRefs = await probeGithubGitRefs({ owner, repo, fetchImpl, timeoutMs });
+      const gitRefs = await probeGithubGitRefs({ owner, repo, fetchImpl: activeFetch, timeoutMs });
       if (gitRefs?.defaultBranch && !meta.defaultBranch) {
         meta.defaultBranch = gitRefs.defaultBranch;
       }
@@ -1723,12 +1776,17 @@ export function sweepExpiredInspectStaging(dataDir, nowMs = Date.now(), { preser
   return { removed };
 }
 
-function writePreviewFilesToDisk(previewDir, scopedFiles, selectedCandidate, cleanManifest) {
+function writePreviewFilesToDisk(previewDir, scopedFiles, selectedCandidate, cleanManifest, scopedFileSizes = null) {
   rmSync(previewDir, { recursive: true, force: true });
   mkdirSync(previewDir, { recursive: true });
   const absPreview = resolve(previewDir);
 
   for (const [relPath, buf] of scopedFiles.entries()) {
+    const actualSize = scopedFileSizes?.get(relPath) ?? buf.length;
+    if (buf.length === 0 && actualSize > 0) {
+      // Unbuffered non-metadata binary/asset/oversized-script skipped during streaming inspection
+      continue;
+    }
     const safeRel = validateSafeRelPath(relPath);
     const outPath = resolve(absPreview, safeRel);
     if (!outPath.startsWith(absPreview)) {
@@ -1856,11 +1914,12 @@ export async function inspectGithubPluginUrl({
   workspaceUris = [],
   builtinPluginsDir = '',
   catalogPlugins = [],
-  fetchImpl = fetch,
+  fetchImpl = defaultProxyFetch,
   githubApiBaseUrl = GITHUB_API_BASE_URL,
   timeoutMs = DEFAULT_API_TIMEOUT_MS,
   nowMs = Date.now(),
 } = {}) {
+  const activeFetch = resolveEffectiveFetch(fetchImpl);
   const cleanPrefs = sanitizePrefs(prefs);
   const token = cleanPrefs.githubToken;
   mkdirSync(dataDir, { recursive: true });
@@ -1886,7 +1945,7 @@ export async function inspectGithubPluginUrl({
     const resolved = await resolveGithubArchiveCandidates(parsed, {
       dataDir,
       prefs: cleanPrefs,
-      fetchImpl,
+      fetchImpl: activeFetch,
       githubApiBaseUrl,
       timeoutMs,
       nowMs,
@@ -1911,7 +1970,7 @@ export async function inspectGithubPluginUrl({
               : null;
           dlResult = await streamUrlToFileAndHash(cand.url, archivePath, {
             maxBytes: MAX_TARBALL_BYTES,
-            fetchImpl,
+            fetchImpl: activeFetch,
             extraHeaders,
             requireGzipMagic: true,
           });
@@ -1965,13 +2024,15 @@ export async function inspectGithubPluginUrl({
     writeFileSync(join(stagingRootDir, 'meta.json'), `${JSON.stringify(stageMeta, null, 2)}\n`, 'utf8');
   }
 
-  // Parse archive safely (enforces Zip-Slip & typeFlag gates; defers symlink scope check until `selectedRoot` is known)
+  // Parse archive safely via streaming gunzip + tar parser (O(MB) RAM even for 200MB–2GB+ archives;
+  // enforces Zip-Slip & typeFlag gates; defers symlink scope check until `selectedRoot` is known)
   let tarParsed;
   try {
-    const archiveBuf = readFileSync(archivePath);
-    tarParsed = parseTarGzWithMeta(archiveBuf, {
+    tarParsed = await inspectTarGzStream(archivePath, {
       stripSingleTopDir: true,
       allowDeferredSymlinkCheck: true,
+      maxUncompressedBytes: MAX_TARBALL_BYTES,
+      shouldBufferFile: shouldBufferInspectFile,
     });
   } catch (err) {
     rmSync(stagingRootDir, { recursive: true, force: true });
@@ -1981,6 +2042,7 @@ export async function inspectGithubPluginUrl({
   }
 
   const allFiles = tarParsed.files;
+  const allFileSizes = tarParsed.fileSizes;
   const paxComment = String(tarParsed.globalPax?.comment || '').trim();
   let commitSha = stageMeta.resolution.commitSha || '';
   if (!commitSha && FULL_SHA_RE.test(paxComment)) {
@@ -2089,6 +2151,7 @@ export async function inspectGithubPluginUrl({
 
   const selectedRoot = selectedCandidate.pluginRoot;
   const scopedFiles = extractScopedFiles(allFiles, selectedRoot);
+  const scopedFileSizes = allFileSizes ? extractScopedFiles(allFileSizes, selectedRoot) : null;
 
   // Hard security gates on selected plugin files:
   //   1. Scoped symlink/hardlink invariant (rejects any symlink inside `selectedRoot`, enclosing it,
@@ -2096,7 +2159,7 @@ export async function inspectGithubPluginUrl({
   //   2. Unicode smuggling, rules exfiltration, >24KB rules
   try {
     assertNoScopedSymlinks(tarParsed.symlinks, selectedRoot, tarParsed.strippedTopDir);
-    assertLocalStaticSafety(scopedFiles);
+    assertLocalStaticSafety(scopedFiles, scopedFileSizes);
   } catch (err) {
     rmSync(stagingRootDir, { recursive: true, force: true });
     const secBlock = classifySecurityError(err, effectiveResolution.repoUrl);
@@ -2133,7 +2196,7 @@ export async function inspectGithubPluginUrl({
   const previewDir = join(stagingRootDir, 'preview');
   let components;
   try {
-    writePreviewFilesToDisk(previewDir, scopedFiles, selectedCandidate, cleanManifest);
+    writePreviewFilesToDisk(previewDir, scopedFiles, selectedCandidate, cleanManifest, scopedFileSizes);
     components = scanLocalPluginComponents(previewDir, canonicalName, cleanManifest.name, null);
   } finally {
     rmSync(previewDir, { recursive: true, force: true });
@@ -2214,7 +2277,7 @@ export async function inspectGithubPluginUrl({
       isPublicRepo = stageMeta.publicRepoProbe.isPublic;
     } else {
       isPublicRepo = await probeIsPublicGithubRepo(parsed.owner, parsed.repo, {
-        fetchImpl,
+        fetchImpl: activeFetch,
         timeoutMs: Math.min(PUBLIC_REPO_PROBE_TIMEOUT_MS, timeoutMs),
       });
       stageMeta.publicRepoProbe = { repo: repoKey, isPublic: isPublicRepo };
@@ -2347,7 +2410,7 @@ export async function installGithubPlugin({
   workspaceUris = [],
   builtinPluginsDir = '',
   catalogPlugins = [],
-  fetchImpl = fetch,
+  fetchImpl = defaultProxyFetch,
   githubApiBaseUrl = GITHUB_API_BASE_URL,
   timeoutMs = DEFAULT_API_TIMEOUT_MS,
   nowMs = Date.now(),
@@ -2356,6 +2419,7 @@ export async function installGithubPlugin({
   _preserveReceiptId = '',
   _preserveTrackBranch = '',
 } = {}) {
+  const activeFetch = resolveEffectiveFetch(fetchImpl);
   let activeToken = inspectToken;
   const staged = inspectToken ? loadValidStagedInspect(dataDir, inspectToken, nowMs) : null;
 
@@ -2375,7 +2439,7 @@ export async function installGithubPlugin({
     workspaceUris,
     builtinPluginsDir,
     catalogPlugins,
-    fetchImpl,
+    fetchImpl: activeFetch,
     githubApiBaseUrl,
     timeoutMs,
     nowMs,
@@ -2441,7 +2505,7 @@ export async function installGithubPlugin({
     dataDir,
     workspaceUris,
     builtinPluginsDir,
-    fetchImpl,
+    fetchImpl: activeFetch,
     preverifiedArchivePath: archivePath,
     writeOverride,
   });
@@ -2522,12 +2586,13 @@ export async function resolveAndStageGithubUpdate({
   workspaceUris = [],
   builtinPluginsDir = '',
   catalogPlugins = [],
-  fetchImpl = fetch,
+  fetchImpl = defaultProxyFetch,
   githubApiBaseUrl = GITHUB_API_BASE_URL,
   timeoutMs = DEFAULT_API_TIMEOUT_MS,
   nowMs = Date.now(),
   writeOverride = null,
 }) {
+  const activeFetch = resolveEffectiveFetch(fetchImpl);
   if (loc?.scope && loc.scope !== 'global') {
     throw new Error(
       `ERR_CANNOT_UPDATE_NON_GLOBAL: Plugin "${loc?.dir || ''}" has scope="${loc.scope}" and cannot be updated in-place`,
@@ -2623,7 +2688,7 @@ export async function resolveAndStageGithubUpdate({
     workspaceUris,
     builtinPluginsDir,
     catalogPlugins,
-    fetchImpl,
+    fetchImpl: activeFetch,
     githubApiBaseUrl,
     timeoutMs,
     nowMs,

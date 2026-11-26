@@ -1,6 +1,6 @@
 # AGY Market Client & Showcase — Engineering Specification (`agy-market/AGENTS.md`)
 
-> **Repository**: `agy-market` (Antigravity visual plugin marketplace client, lock-safe tarball installer, `npx agy-market` bootstrap CLI, and static web showcase)  
+> **Repository**: `agy-market` (Antigravity visual plugin marketplace client, lock-safe tarball installer, `npx --yes github:azwosile/agy-market` bootstrap CLI, and static web showcase)  
 > **Cross-Repo Contracts**: Read [`../AGENTS.md`](../AGENTS.md) for shared JSON schemas (`index.json`, `unverified-index.json`, `agy-market.json`, `.agy-market-receipt.json`) and anti-collision invariants.  
 > **Anti-Goal**: This repository is the **client app and showcase**, NOT the catalog registry. Never add plugin listing PRs here and never bundle a static snapshot of catalog entries inside the client package.
 
@@ -14,7 +14,7 @@
   - **Why Pure Sidecar Default**: Consumes **0 Agent Tokens** on idle turns, opens in ~1s inside Antigravity's maximizable right Auxiliary Pane, inherits host theme tokens via `/preload.js`, and runs a local Node backend capable of verifying SHA-256 digests and writing directly to `~/.gemini/config/plugins/`.
   - **No Active MCP Server by Default**: Do NOT ship an active `mcp_config.json` in the root bundle (every enabled MCP tool burns context tokens on every turn, and `global` MCP App views are not consistently rendered across Antigravity 2.x builds).
 - **Runtime Engine**: `Node >= 22.0.0` (`"type": "module"`), **zero runtime `npm` dependencies**.
-  - HTTP server & network requests: `node:http`, `node:https`, global `fetch`.
+  - HTTP server & network requests: `node:http`, `node:https`, global `fetch`, and zero-dependency proxy-aware fetch (`src/shared/proxy-fetch.mjs` supporting `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`, `NO_PROXY`, and Windows registry system proxy settings).
   - Hashing & tokens: `node:crypto` (`createHash('sha256')`, `randomBytes(32)`).
   - Tarball decompression & unpacking: `node:zlib` (`createGunzip`) + internal pure-JS POSIX `ustar` / `pax` stream tar parser (`src/installer/tar-extract.mjs`) with strict Zip-Slip (`..`, absolute path, symlink/hardlink) rejection.
   - UI bundling (`scripts/build.mjs`): Compiles `src/ui/*` + `src/shared/*` into a single self-contained `sidecars/market_pane/index.html` (prefers `esbuild` if present locally; automatically falls back to a deterministic zero-dependency ESM-to-IIFE bundler + `node:vm` syntax verification so `node scripts/build.mjs` always works 100% offline).
@@ -33,7 +33,7 @@ agy-market/
 ├── assets/
 │   └── logo.svg                     # Square >=128x128 high-contrast SVG with ~10% safe margin
 ├── bin/
-│   └── agy-market.mjs               # `npx agy-market` bootstrap installer, self-updater & CLI diagnostics
+│   └── agy-market.mjs               # `npx --yes github:azwosile/agy-market` bootstrap installer, self-updater & CLI diagnostics
 ├── scripts/
 │   ├── build.mjs                    # Offline-capable single-file HTML bundler + site builder
 │   ├── install-local.mjs            # Real-copy dev installer into ~/.gemini/config/plugins/agy-market
@@ -95,7 +95,7 @@ When installing or updating a plugin `P`:
    - Direct GitHub Release asset URL (`https://github.com/<owner>/<repo>/releases/download/<tag>/<asset>.tar.gz`), OR
    - User-configured GitHub Release acceleration prefix (e.g., `mirrorPrefix + rawGithubReleaseUrl` in China network mode), OR
    - Verified `npmMirrorPkg` tarball **only if** `P.distribution.npmMirrorPkg` is non-null in `index.json` (meaning `agy-market-catalog` already proved bidirectional repo ownership).
-2. Stream the archive to `${PLUGIN_DATA}/staging/<uuid>/archive.tar.gz` (enforcing max size limit, default `100 MB`) while computing `crypto.createHash('sha256')`.
+2. Stream the archive to `${PLUGIN_DATA}/staging/<uuid>/archive.tar.gz` via streaming SHA-256 staging with no artificial 100 MB archive cap (`MAX_TARBALL_BYTES = 0`, 60s per-chunk inactivity stall timeout, and streaming `extractTarGzStreamToDir`) while computing `crypto.createHash('sha256')`.
 3. **Mandatory Digest Gate**: Compare computed hex digest against `P.distribution.sha256`. On any mismatch, immediately delete staging directory and abort with `INTEGRITY_SHA256_MISMATCH`—even a compromised download proxy cannot inject a single modified byte.
 
 ---
@@ -163,7 +163,7 @@ Before writing to `~/.gemini/config/plugins/`, `src/preflight/` runs a pure read
   - Bind Sidecar HTTP server strictly to `127.0.0.1` on port `0` (ephemeral OS-assigned port, reported to Antigravity via stdout handshake).
   - Generate a 256-bit random `SIDE_TOKEN` on boot; inject it into the served `index.html` runtime meta/bootstrap and require `X-Sidecar-Token: <SIDE_TOKEN>` (plus `Origin` validation) on every `POST`/`DELETE` endpoint (`/api/install`, `/api/update`, `/api/remove-files`, `/api/sources`, `/api/prefs`).
 - **One-Line Bootstrap (`bin/agy-market.mjs`)**:
-  - `npx agy-market` (or `npx agy-market@latest`) downloads/copies `agy-market` into `~/.gemini/config/plugins/agy-market/` using real files (no symlinks), writes `.agy-market-receipt.json`, and prints the exact `[Open AGY Market](sidecar://agy-market/market_pane/)` and `[Manage](customization://agy-market)` instructions.
-  - Also maintain zero-npm `scripts/install.ps1` and `scripts/install.sh` wrappers that pull the latest verified GitHub Release tarball of `agy-market`.
+  - `npx --yes github:azwosile/agy-market` downloads/copies `agy-market` into `~/.gemini/config/plugins/agy-market/` using real files (no symlinks; filtering `node_modules` only relative to `repoRoot` so `_npx` caches work cleanly), writes `.agy-market-receipt.json`, and prints the exact `[Open AGY Market](sidecar://agy-market/market_pane/)` and `[Manage](customization://agy-market)` instructions.
+  - Also maintain zero-npm `scripts/install.ps1` and `scripts/install.sh` wrappers (plus `.github/workflows/release.yml`) that pull/publish the latest verified GitHub Release tarball of `agy-market`.
 - **Static Web Showcase (`site/`)**:
-  - Consumes `index.json` + `readmes.json` at build/runtime to render a fast searchable web catalog with category filters, capability badges, and copyable one-click `npx agy-market` bootstrap snippets.
+  - Consumes `index.json` + `readmes.json` at build/runtime to render a fast searchable web catalog with category filters, capability badges, and copyable one-click `npx --yes github:azwosile/agy-market` bootstrap snippets.

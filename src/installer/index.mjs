@@ -15,7 +15,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { join, relative, resolve } from 'node:path';
 import {
   applyScopedIsolationRewrite,
   isDirectorySymlinkOrJunction,
@@ -27,6 +27,7 @@ import {
 } from '../preflight/index.mjs';
 import { classifyActivationRequirement } from '../shared/activation.mjs';
 import { PLUGIN_ID, toScopedPluginName } from '../shared/constants.mjs';
+import { defaultProxyFetch } from '../shared/proxy-fetch.mjs';
 import {
   resolveAntigravityConfigDir,
   resolveDisabledPluginsDir,
@@ -45,7 +46,17 @@ import { parseGithubRepoSlug, safeGithubCacheKey } from '../updates/index.mjs';
 import { fetchVerifiedPluginTarball } from './fetch-tarball.mjs';
 import { clearPendingJournal, writePendingJournal } from './journal.mjs';
 import { recordRetiredBinaries, sweepRetiredBinaries, syncDirectoryLockSafe } from './sync-dir.mjs';
-import { extractTarGzToDir } from './tar-extract.mjs';
+import { extractTarGzStreamToDir } from './tar-extract.mjs';
+
+function resolveEffectiveFetch(fetchImpl) {
+  return !fetchImpl || fetchImpl === fetch ? defaultProxyFetch : fetchImpl;
+}
+
+function hasNodeModulesSegment(baseRoot, targetPath) {
+  const rel = relative(baseRoot, targetPath);
+  if (!rel || rel === '.') return false;
+  return rel.split(/[\\/]/).includes('node_modules');
+}
 
 const LOCK_ERROR_CODES = new Set(['EBUSY', 'EPERM', 'EACCES']);
 const MOVE_FALLBACK_CODES = new Set(['EXDEV', 'EBUSY', 'EPERM', 'EACCES', 'EEXIST', 'ENOTEMPTY']);
@@ -219,7 +230,8 @@ function cleanupLockedPluginDir({
  * Opportunistically calls read/reload `RefreshMcpServers` ONLY when LS address & CSRF token are available.
  * Never calls restricted `InstallCustomization`, `DeletePlugin`, or `JetboxWriteState`.
  */
-export async function tryOpportunisticMcpRefresh(pluginName, mcpServers = [], fetchImpl = fetch) {
+export async function tryOpportunisticMcpRefresh(pluginName, mcpServers = [], fetchImpl = defaultProxyFetch) {
+  const activeFetch = resolveEffectiveFetch(fetchImpl);
   const addr = process.env.ANTIGRAVITY_LS_ADDRESS || '';
   const csrf = process.env.ANTIGRAVITY_CSRF_TOKEN || '';
   if (!addr || !csrf || !Array.isArray(mcpServers) || mcpServers.length === 0) {
@@ -230,7 +242,7 @@ export async function tryOpportunisticMcpRefresh(pluginName, mcpServers = [], fe
   for (const serverName of mcpServers) {
     const fullServer = serverName.includes('_') ? serverName : `${pluginName}_${serverName}`;
     try {
-      const res = await fetchImpl(
+      const res = await activeFetch(
         `http://${addr}/exa.language_server_pb.LanguageServerService/RefreshMcpServers`,
         {
           method: 'POST',
@@ -644,10 +656,11 @@ export async function installOrUpdateCatalogPlugin({
   dataDir = resolveMarketDataDir(),
   workspaceUris = [],
   builtinPluginsDir = '',
-  fetchImpl = fetch,
+  fetchImpl = defaultProxyFetch,
   preverifiedArchivePath = '',
   writeOverride = null,
 }) {
+  const activeFetch = resolveEffectiveFetch(fetchImpl);
   if (!plugin || typeof plugin !== 'object' || !plugin.id) {
     throw new Error('ERR_INVALID_PLUGIN_ENTRY: Missing valid catalog plugin object');
   }
@@ -721,12 +734,12 @@ export async function installOrUpdateCatalogPlugin({
       stagingDir: stagingRootDir,
       stagingArchivePath,
       prefs,
-      fetchImpl,
+      fetchImpl: activeFetch,
       preverifiedArchivePath,
     });
 
-    // Safe stream extraction (rejects `..` and symlinks/hardlinks)
-    extractTarGzToDir(stagingArchivePath, stagingBundleDir, {
+    // Safe stream extraction (rejects `..` and symlinks/hardlinks) with O(MB) RAM
+    await extractTarGzStreamToDir(stagingArchivePath, stagingBundleDir, {
       pluginRoot: plugin.repository?.pluginRoot || '.',
     });
 
@@ -763,14 +776,19 @@ export async function installOrUpdateCatalogPlugin({
     const targetDir = preflight.targetDir;
     const targetRootDir = isUpdatingParked ? disabledDir : pluginsDir;
     const targetPluginDir = join(targetRootDir, targetDir);
-    const preservePaths = Array.isArray(plugin.distribution?.preservePaths) ? plugin.distribution.preservePaths : [];
+    const preservePaths = [
+      ...new Set([
+        ...(Array.isArray(existingReceipt?.preservePaths) ? existingReceipt.preservePaths : []),
+        ...(Array.isArray(plugin.distribution?.preservePaths) ? plugin.distribution.preservePaths : []),
+      ]),
+    ];
 
     // Snapshot lightweight rollback backup if updating/replacing an existing directory
     if (existsSync(targetPluginDir) && !lstatSync(targetPluginDir).isSymbolicLink()) {
       cpSync(targetPluginDir, backupDir, {
         recursive: true,
         dereference: true,
-        filter: (p) => !p.includes('node_modules') && !RETIRED_BINARY_RE.test(p),
+        filter: (p) => !hasNodeModulesSegment(targetPluginDir, p) && !RETIRED_BINARY_RE.test(p),
       });
     }
 
@@ -782,6 +800,7 @@ export async function installOrUpdateCatalogPlugin({
       scopedRewriteApplied: preflight.applyScopedRewrite,
       previousInstalledAt: existingReceipt?.installedAt || null,
       actualSha256: dlInfo.sha256,
+      preservePaths,
     });
 
     // Write crash-recovery journal BEFORE touching target plugin directory
@@ -822,7 +841,7 @@ export async function installOrUpdateCatalogPlugin({
     let mcpRefreshed = false;
 
     if (preflight.action === 'update' && isEnabled && mcpServers.length > 0) {
-      const refreshRes = await tryOpportunisticMcpRefresh(preflight.effectivePluginName, mcpServers, fetchImpl);
+      const refreshRes = await tryOpportunisticMcpRefresh(preflight.effectivePluginName, mcpServers, activeFetch);
       mcpRefreshed = Boolean(refreshRes.refreshed);
       reloadRequired = !mcpRefreshed;
     }
@@ -1170,11 +1189,12 @@ export function removeMarketPluginFiles(options = {}) {
  * opportunistic `RefreshMcpServers` reload when an MCP plugin was removed.
  */
 export async function uninstallPlugin(options = {}) {
-  const { fetchImpl = fetch, ...rest } = options || {};
+  const { fetchImpl = defaultProxyFetch, ...rest } = options || {};
+  const activeFetch = resolveEffectiveFetch(fetchImpl);
   const { publicResult, mcpServers, effectivePluginName, mergedCaps } = removeMarketPluginFilesInternal(rest);
 
   if (publicResult.removed && publicResult.hadMcp && mcpServers.length > 0) {
-    const refreshRes = await tryOpportunisticMcpRefresh(effectivePluginName, mcpServers, fetchImpl);
+    const refreshRes = await tryOpportunisticMcpRefresh(effectivePluginName, mcpServers, activeFetch);
     if (refreshRes.refreshed) {
       const activation = classifyActivationRequirement(mergedCaps, {
         retiredBinaries: publicResult.retiredBinaries,

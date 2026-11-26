@@ -18,6 +18,7 @@ import {
   SIDECAR_URI,
 } from '../src/shared/constants.mjs';
 import { resolveAntigravityConfigDir, resolveMarketDataDir, resolvePluginsDir } from '../src/shared/paths.mjs';
+import { defaultProxyFetch } from '../src/shared/proxy-fetch.mjs';
 import { loadPrefsFromDisk, parseJsonc } from '../src/shared/schemas.mjs';
 import { redactSecret } from '../src/updates/index.mjs';
 
@@ -123,7 +124,7 @@ export async function runCli(argv = process.argv.slice(2), runtimeOpts = {}) {
         : resolveAntigravityConfigDir());
     const pluginsDir = runtimeOpts.pluginsDir || resolvedDest || '';
     const dataDir = runtimeOpts.dataDir || resolveMarketDataDir();
-    const fetchImpl = runtimeOpts.fetchImpl || fetch;
+    const fetchImpl = runtimeOpts.fetchImpl || defaultProxyFetch;
     const githubApiBaseUrl = runtimeOpts.githubApiBaseUrl || undefined;
     const nowMs = runtimeOpts.nowMs ?? Date.now();
 
@@ -293,7 +294,7 @@ export async function runCli(argv = process.argv.slice(2), runtimeOpts = {}) {
         : resolveAntigravityConfigDir());
     const pluginsDir = runtimeOpts.pluginsDir || resolvedDest || '';
     const dataDir = runtimeOpts.dataDir || resolveMarketDataDir();
-    const fetchImpl = runtimeOpts.fetchImpl || fetch;
+    const fetchImpl = runtimeOpts.fetchImpl || defaultProxyFetch;
     const nowMs = runtimeOpts.nowMs ?? Date.now();
 
     if (targetDir === PLUGIN_ID) {

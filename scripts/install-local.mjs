@@ -4,7 +4,7 @@
 
 import { createHash } from 'node:crypto';
 import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { CUSTOMIZATION_URI, PLUGIN_ID, PLUGIN_VERSION, SIDECAR_URI } from '../src/shared/constants.mjs';
 import { resolvePluginsDir } from '../src/shared/paths.mjs';
@@ -12,6 +12,12 @@ import { buildMarketSidecarHtml } from './build.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(__dirname, '..');
+
+function hasNodeModulesSegment(baseRoot, targetPath) {
+  const rel = relative(baseRoot, targetPath);
+  if (!rel || rel === '.') return false;
+  return rel.split(/[\\/]/).includes('node_modules');
+}
 
 export async function installLocalAgyMarket({ destPluginsDir = '' } = {}) {
   const indexHtmlPath = join(repoRoot, 'sidecars', 'market_pane', 'index.html');
@@ -50,7 +56,7 @@ export async function installLocalAgyMarket({ destPluginsDir = '' } = {}) {
       recursive: true,
       force: true,
       dereference: true,
-      filter: (p) => !p.includes('node_modules') && !p.endsWith('.tmp') && !p.endsWith('.gitkeep'),
+      filter: (p) => !hasNodeModulesSegment(repoRoot, p) && !p.endsWith('.tmp') && !p.endsWith('.gitkeep'),
     });
   }
 

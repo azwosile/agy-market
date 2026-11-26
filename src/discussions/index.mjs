@@ -16,6 +16,7 @@ import {
   SELF_REPO_URL,
   UPDATE_CHECK_CACHE_TTL_MS,
 } from '../shared/constants.mjs';
+import { defaultProxyFetch } from '../shared/proxy-fetch.mjs';
 import { sanitizePrefs } from '../shared/schemas.mjs';
 import {
   getGithubCacheDir,
@@ -99,12 +100,13 @@ async function probeRepoDiscussionsEnabledRest({
   repo,
   dataDir,
   force = false,
-  fetchImpl = fetch,
+  fetchImpl = defaultProxyFetch,
   nowMs = Date.now(),
   ttlMs = UPDATE_CHECK_CACHE_TTL_MS,
   githubApiBaseUrl = GITHUB_API_BASE_URL,
   timeoutMs = DEFAULT_DISCUSSIONS_TIMEOUT_MS,
 }) {
+  const activeFetch = !fetchImpl || fetchImpl === fetch ? defaultProxyFetch : fetchImpl;
   const cacheDir = getGithubCacheDir(dataDir);
   const cachePath = join(cacheDir, `repo-meta-${safeGithubCacheKey(owner, repo)}.json`);
   const cached = readJsonSafe(cachePath);
@@ -130,7 +132,7 @@ async function probeRepoDiscussionsEnabledRest({
   const endpoint = `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
 
   try {
-    const res = await fetchImpl(endpoint, {
+    const res = await activeFetch(endpoint, {
       headers,
       signal: AbortSignal.timeout(timeoutMs),
     });
@@ -193,12 +195,13 @@ export async function fetchPluginDiscussions({
   dataDir,
   prefs = {},
   force = false,
-  fetchImpl = fetch,
+  fetchImpl = defaultProxyFetch,
   nowMs = Date.now(),
   ttlMs = DISCUSSIONS_CACHE_TTL_MS,
   githubApiBaseUrl = GITHUB_API_BASE_URL,
   timeoutMs = DEFAULT_DISCUSSIONS_TIMEOUT_MS,
 }) {
+  const activeFetch = !fetchImpl || fetchImpl === fetch ? defaultProxyFetch : fetchImpl;
   const resolved = resolvePluginGithubRepo({ id, catalog, inventory });
   if (!resolved) {
     return {
@@ -229,7 +232,7 @@ export async function fetchPluginDiscussions({
       repo,
       dataDir,
       force,
-      fetchImpl,
+      fetchImpl: activeFetch,
       nowMs,
       githubApiBaseUrl,
       timeoutMs,
@@ -272,7 +275,7 @@ export async function fetchPluginDiscussions({
   const graphqlEndpoint = `${apiBase}/graphql`;
 
   try {
-    const res = await fetchImpl(graphqlEndpoint, {
+    const res = await activeFetch(graphqlEndpoint, {
       method: 'POST',
       headers: {
         Accept: 'application/json',

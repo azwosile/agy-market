@@ -28,13 +28,13 @@ When the user provides any GitHub repository URL that is not yet indexed in the 
 1. **Sidebar Panel Top Bar (`链接添加` / `Add URL`)**:
    - Emit `[AGY Market](sidecar://agy-market/market_pane/)` and guide the user to click the top-bar **「链接添加」** (`Add URL`) button, paste the full GitHub URL, and run preflight inspection.
    - Preflight automatically detects root `plugin.json`, `.antigravity-plugin/plugin.json`, unique named subdirectories (e.g. `agy-capsule/plugin.json`), or lets the user pick a plugin directory in a Monorepo, then displays capability badges, SHA-256 digest, short commit SHA, and native vs. `<owner>--<slug>` scoped install options before writing files.
-2. **CLI (`npx agy-market add <github-url>`)**:
+2. **CLI (`npx --yes github:azwosile/agy-market add <github-url>`)**:
    ```bash
    # Preflight and install from any GitHub plugin URL (interactive confirmation)
-   npx agy-market add <github-url>
+   npx --yes github:azwosile/agy-market add <github-url>
 
    # Target a specific Monorepo subdirectory or install non-interactively with scoped isolation
-   npx agy-market add <github-url> --subpath <dir> --isolate --yes
+   npx --yes github:azwosile/agy-market add <github-url> --subpath <dir> --isolate --yes
    ```
    - Local installed binary equivalent: `node "<agy-market-plugin-dir>/bin/agy-market.mjs" add <github-url>` (also supports `--replace`, `--dest <plugins-dir>`, `--mirror <prefix>`, `--token <pat>`, and `--json`).
    - If preflight returns `NOT_A_PLUGIN_REPO` or `SECURITY_BLOCKED`, report the exact reason and repository overview to the user instead of bypassing safety checks or manually editing `~/.gemini/config/config.json`.
@@ -46,17 +46,18 @@ When the user provides any GitHub repository URL that is not yet indexed in the 
 ### 3.1 Direct In-Sidebar Updates & One-Click Update All
 - Open `[AGY Market](sidecar://agy-market/market_pane/)` and switch to **已安装 (`Installed`)**:
   - **Per-plugin direct update**: Every installed plugin card provides an **Update (`更新`)** button. Both catalog releases and newer GitHub upstream Release/Tag or GitHub URL builds are downloaded, inspected, and synced directly inside the Sidebar without opening external browser download pages, preserving original catalog verification metadata (`track`, `repositoryId`).
-  - **One-click batch update**: Click the permanent **一键更新 (`Update All`)** button beside **检查更新 (`Check Updates`)** to check and sequentially update all installed plugins across catalog, GitHub upstream, and GitHub URL channels (scheduling `agy-market` self-update last).
+  - **One-click batch update**: Click the permanent **一键更新 (`Update All`)** button beside **检查更新 (`Check Updates`)** to check and sequentially update all installed plugins across catalog, GitHub upstream, and GitHub URL channels (scheduling `agy-market` self-update last; native `.git` clones and unversioned external plugins are excluded with read-only status pills).
+- **`app.asar` patch plugins**: When installing or updating a plugin with `hostEnhancementKind: ["app-asar"]`, remind the user to run its bundled patch script (e.g., `node setup.cjs` per the plugin README) before restarting Antigravity, and re-run it after market updates to sync injected client code.
 
 ### 3.2 Lock-Safe Uninstall (Sidebar & CLI)
 - **Sidebar one-click uninstall**: Every global community plugin card (excluding `agy-market`, `workspace`, and `builtin` plugins) and its Detail Drawer provide a **卸载 (`Uninstall`)** button with confirmation dialog (optionally removing the plugin from favorites). It cleans both active (`~/.gemini/config/plugins/<dir>`) and Vault-Parked (`${PLUGIN_DATA}/disabled-plugins/<dir>`) directories, unlinks symlinks without deleting target source folders, and retires Windows `EBUSY`-locked files to `.old.<ts>` while immediately removing `plugin.json`.
-- **CLI (`npx agy-market uninstall <dir>`)**:
+- **CLI (`npx --yes github:azwosile/agy-market uninstall <dir>`)**:
   ```bash
   # Uninstall a global community plugin safely (interactive confirmation; alias: remove)
-  npx agy-market uninstall <dir>
+  npx --yes github:azwosile/agy-market uninstall <dir>
 
   # Non-interactive uninstall with machine-readable JSON output
-  npx agy-market uninstall <dir> --yes --json
+  npx --yes github:azwosile/agy-market uninstall <dir> --yes --json
   ```
 
 ### 3.3 Host Lifecycle Guardrails (`customization://<dir>`)
@@ -86,11 +87,11 @@ When summarizing plugins from the AGY Market catalog, present capability badges 
 
 ```powershell
 # Preflight and install an unlisted plugin directly from a GitHub URL
-npx agy-market add <github-url>
+npx --yes github:azwosile/agy-market add <github-url>
 
 # Lock-safe uninstall of an installed global plugin (alias: remove; supports --yes, --dest <plugins-dir>, --json)
-npx agy-market uninstall <dir>
-npx agy-market uninstall <dir> --yes --json
+npx --yes github:azwosile/agy-market uninstall <dir>
+npx --yes github:azwosile/agy-market uninstall <dir> --yes --json
 
 # Inspect local installed plugins, market receipts, and config/data paths (read-only)
 node "<agy-market-plugin-dir>/bin/agy-market.mjs" status

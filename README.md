@@ -14,19 +14,30 @@ Sidebar 侧边栏界面 · 锁安全一键卸载 · Sidebar 上游直装与一�
 
 ---
 
-> **仓库边界说明**：本仓库（[`azwosile/agy-market`](https://github.com/azwosile/agy-market)）包含 **AGY Market** 客户端 Sidebar 侧边栏、Windows 锁安全安装器、`npx agy-market` 一行安装 CLI 与静态展示站（`site/`）。
+> **仓库边界说明**：本仓库（[`azwosile/agy-market`](https://github.com/azwosile/agy-market)）包含 **AGY Market** 客户端 Sidebar 侧边栏、Windows 锁安全安装器、`npx --yes github:azwosile/agy-market` 一行安装 CLI 与静态展示站（`site/`）。
 >
 > 如需将你的插件收录至社区插件目录，点击市场顶部的 **`+ 申请收录插件`** 按钮或直接阅读 **[📖 申请收录插件完整教程 (`docs/SUBMISSION_GUIDE.md`)](https://github.com/azwosile/agy-market-catalog/blob/main/docs/SUBMISSION_GUIDE.md)**，向 **[`azwosile/agy-market-catalog`](https://github.com/azwosile/agy-market-catalog)** 提交单文件 YAML Pull Request。
 
 ---
 
-## ✨ 核心特性（v1.6.0）
+## ✨ 核心特性（v1.7.0）
 
-### 0. v1.6.0 升级亮点
+### 0. v1.7.0 升级亮点
+- **零依赖 HTTP/HTTPS 与 Windows 系统代理自动适配**：新增 `src/shared/proxy-fetch.mjs` 代理感知网络层，自动读取 `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`（支持 `NO_PROXY` 并旁路 `127.0.0.1` / `localhost`）以及 Windows 注册表系统代理（`HKCU\...\Internet Settings`），彻底解决仅开启本地代理未开 TUN 时 GitHub 归档拉取超时问题。
+- **取消 100 MB 插件大小门禁与全流式解压校验**：移除 `MAX_TARBALL_BYTES` 人为 `100 MB` 归档上限（设为无限制 `0`），改为全流式 Gunzip + POSIX/PAX Tar 落盘解包（O(MB) 内存占用）、`60s` 分块静默失活超时与 `server.requestTimeout = 0`，并新增 `GB` 体积显示，轻松支持 >100MB 乃至 GB 级含本地二进制/模型资源的插件。
+- **Monorepo / 原生 Git / 无版本插件更新防误判**：更新检测对未收录、无收据的外部 Monorepo 插件（如 `upstash/context7`）核验远端 Tag 对应子目录 `plugin.json` 是否存在及版本是否真正领先；同时自动识别含 `.git` 目录的原生克隆插件（`conductor`、`sepia` 等）及无 `version` 声明插件，将其移出自动与批量更新队列并在卡片/抽屉展示只读「`Git 原生` / `无版本号`」胶囊，杜绝误报降级与软链拦截报错。
+- **`app.asar` 补丁脚本引导与 `preservePaths` 合并保留**：安装或更新含 `app-asar` 宿主增强的插件后，弹窗、顶部横幅与详情抽屉明确提示先按插件文档运行其自带补丁脚本（如 `node setup.cjs`）再重启 Antigravity，并在每次市场更新后重新运行补丁脚本同步注入客户端代码，同时提供一键「复制插件目录」与「查看补丁文档」按钮；目录安装通道同步合并已有 `.agy-market-receipt.json` 与目录声明的 `preservePaths`，升级时保护用户配置不被覆盖。
+- **`npx` GitHub 引导入口修复与 Release 自动化**：将尚未发布至 npm 的旧 `npx` 包名入口统一替换为直接可运行的 `npx --yes github:azwosile/agy-market`，修复 `scripts/install-local.mjs` 在 `_npx/.../node_modules/agy-market` 缓存路径下因全路径匹配 `node_modules` 误过滤全部文件的缺陷；新增 `.github/workflows/release.yml` 在推送 `v*` 标签时自动打包并发布 `agy-market.tar.gz` 与 `.sha256` 至 GitHub Releases。
+
+<details>
+<summary>查看 v1.6.0 既有特性（综合推荐排序 / 按需 README 缓存 / 作用域符号链接 / 零 PII 提名）</summary>
+
 - **默认「综合推荐」排序 + Monorepo 视口展位阻尼**：默认按目录质量评分（`ranking.score`，旧目录/自定义源自动回退 `stars`）排序，并对同一 `repositoryId` 的 Monorepo 子插件应用 `1 / (1 + 0.15 * (k - 1))` 阻尼，避免单一多插件仓库霸占首页前排；保留按星标、最近更新、名称排序。
 - **按需单插件 README 懒加载与本地 ETag 缓存**：详情抽屉与 `GET /api/readme` / `GET /api/plugin/:id/readme` 优先按需拉取 `dist/readmes/<id>.json`（独立 ETag 缓存于 `${PLUGIN_DATA}/cache/readmes/<id>.json`），无缝回退至传统 `readmes.json`、中国大陆 npm 镜像或已安装本地 README。
 - **子目录作用域符号链接兼容（不降级安全红线）**：对位于所选 `pluginRoot` 之外的仓库符号链接（如双宿主 `.claude/` 或 `docs/` 软链）自动跳过不再误报阻断；`pluginRoot` 内部、祖先目录、目标穿越进入 `pluginRoot` 或根目录插件（`pluginRoot === '.'`）的任何符号链接仍一律硬拦截 `ERR_TAR_SYMLINK_FORBIDDEN`。
 - **零 PII 公开插件一键社区提名**：通过「链接添加」安装未收录的公开 GitHub 仓库时，经无鉴权 `HEAD` 确认公开后展示非阻塞的「分享此公开插件到 AGY Market？」引导（私有/404 仓库永不提示），预填 GitHub Issue 仅包含 `owner/repo` 与 `plugin_root`。
+
+</details>
 
 ### 1. Sidebar 侧边栏界面、15 大精准分类与导航体验
 - **原生右侧 Sidebar 侧边栏**：基于 Antigravity 原生 `AUX_PANE` 扩展视图（`sidecars/market_pane/sidecar.json`），不捆绑常驻 MCP 服务，打开即用、轻量流畅。
@@ -38,14 +49,14 @@ Sidebar 侧边栏界面 · 锁安全一键卸载 · Sidebar 上游直装与一�
 
 ### 2. 锁安全一键卸载、Sidebar 全通道直装更新与按需「一键更新」
 - **彻底杜绝同版本无效更新（v1.5.4）**：前后端共享 SemVer 严格对账与服务端最新目录源优先机制，消除跨快照状态失步导致的 `vX.Y.Z → vX.Y.Z` 误报与陈旧数据降级重装；常规更新命中已最新或同 Tag/Commit 时免下载短路返回 `ALREADY_UP_TO_DATE`，详情抽屉保留显式「重新同步（`forceResync`）」能力。
-- **锁安全插件卸载（Sidebar 卡片/详情抽屉 + `npx agy-market uninstall <dir>`）**：
+- **锁安全插件卸载（Sidebar 卡片/详情抽屉 + `npx --yes github:azwosile/agy-market uninstall <dir>`）**：
   - 每张可卸载全局已安装插件卡片与详情抽屉均内置 **「卸载」** 按钮（`POST /api/uninstall`，同时兼容 `/api/remove-files`），确认弹窗支持可选勾选「同时从收藏夹移除」。
   - 统一覆盖活跃目录（`~/.gemini/config/plugins/<dir>`）与停放仓（`${PLUGIN_DATA}/disabled-plugins/<dir>`）；绝不写 `config.json` 或调用受限 RPC；遇到符号链接/NTFS Junction 仅删除链接本身绝不误删源目录；Windows 下遇到 `EBUSY` 文件锁自动 `.old.<ts>` 改名退避并立即摘除 `plugin.json`，下次启动由 `sweepRetiredBinaries` 自动清扫残留空壳目录；硬性拦截 `agy-market` 自删（`ERR_CANNOT_SELF_DELETE`）及 `workspace` / `builtin` 插件误删。
 - **Sidebar 内全通道直装更新（告别外链手动下载）**：
   - 当检测到 GitHub 上游 Release/Tag 领先于目录版本或来源于 GitHub URL 时，`GET /api/updates` 统一标记 `installable: true`（`updateChannel: 'catalog' | 'github-upstream' | 'github-url'`），点击更新直接在 Sidebar 内完成拉取、预检与原位升级，彻底移除跳转外部浏览器的上游外链按钮。
   - 目录认证插件通过 GitHub 上游通道直装更新时，100% 保留原有 `receipt.track`（如 `'verified'`）与 `repositoryId`，并持续执行能力增量确认门禁。
 - **每张已安装卡片配智能「更新 / 最新」状态切换 + 顶栏按需「一键更新」**：
-  - 所有具备远端更新源的已安装插件卡片在发现新版本时展示直装 **「更新 vX.Y.Z」** 按钮，更新完成或检查确认为最新版后自动切换为不可点击的 **「✓ 最新」** 提示胶囊（未检查时点击「更新」先核验，若已是最新不重复下载重装）；纯本地无源插件展示不可点击的「本地 / 工作区 / 内置」状态胶囊（接口返回 `ERR_NO_UPDATE_SOURCE`）。
+  - 所有具备远端更新源的已安装插件卡片在发现新版本时展示直装 **「更新 vX.Y.Z」** 按钮，更新完成或检查确认为最新版后自动切换为不可点击的 **「✓ 最新」** 提示胶囊（未检查时点击「更新」先核验，若已是最新不重复下载重装）；纯本地无源插件展示不可点击的「本地 / 工作区 / 内置」状态胶囊（接口返回 `ERR_NO_UPDATE_SOURCE`）；对未通过市场安装且包含 `.git` 目录的原生克隆插件或未声明 `version` 的外部插件展示只读 **「Git 原生 / 无版本号」** 状态胶囊并自动排除在自动更新与批量更新之外。
   - 「已安装」页签顶栏在 **「检查更新」** 旁按需显示 **「一键更新 (N)」** 按钮：当检测到可安装更新（或批量更新进行中）时显示，按序批量更新 `catalog`、`github-upstream` 与 `github-url` 全部通道（并将 `agy-market` 自身更新严格排在最后触发重启）；全部插件处于最新版本时自动隐藏，保持界面清爽。
 
 ### 3. ⭐ 插件收藏栏、已安装搜索筛选与更新失败告警
@@ -79,7 +90,7 @@ Sidebar 侧边栏界面 · 锁安全一键卸载 · Sidebar 上游直装与一�
 卡片与详情抽屉保持视觉清爽，不再堆叠静态「需重启 / 免重启」标签；**仅当安装、更新、批量更新、卸载完成或 Windows 禁用遇到文件锁时**，依据插件能力与实时句柄状态按需弹出精准提示：
 - **纯声明式技能 / 全局规则（`instant`）**：热加载即刻生效，免重启无打扰。
 - **含 Sidebar 侧边栏 / MCP / 钩子（`reload-pane`）**：更新或安装成功后提示重开侧边栏或刷新 MCP。
-- **含 `app.asar` / 首次配置 `cdp` / Windows 锁定退避文件（`host-restart`）**：操作完成后弹出顶部横幅提醒重启 Antigravity 生效。
+- **含 `app.asar` / 首次配置 `cdp` / Windows 锁定退避文件（`host-restart`）**：操作完成后弹出顶部横幅提醒重启 Antigravity 生效；其中涉及 `app.asar` 补丁的插件会明确提示安装与每次更新后需先按插件文档运行自带补丁脚本（如 `node setup.cjs`）再重启客户端，并提供一键复制插件目录与查看文档按钮。
 
 ### 7. 内置 GitHub Discussions 社区讨论
 - 插件详情抽屉内置 **「讨论」** 标签页（`GET /api/discussions`），无需登录或 Token 即可自动探测目标仓库是否开启 GitHub Discussions，并提供一键直达讨论区与发帖入口。
@@ -98,9 +109,9 @@ Sidebar 侧边栏界面 · 锁安全一键卸载 · Sidebar 上游直装与一�
 
 > 运行环境要求：**Node.js >= 22.0.0**（零外部 npm 运行时依赖）；或使用下方免 npm 系统脚本。
 
-### 方式一：Node / `npx`（推荐，全平台通用）
+### 方式一：Node / `npx`（推荐，全平台通用，直连 GitHub 零 npm 发布依赖）
 ```bash
-npx agy-market@latest
+npx --yes github:azwosile/agy-market
 ```
 
 ### 方式二：Windows PowerShell（免 npm，内置 SHA-256 校验与目录回退）
@@ -136,16 +147,16 @@ curl -fsSL https://raw.githubusercontent.com/azwosile/agy-market/main/scripts/in
    - **预检与安全拦截**：安装前明确展示版本号或短 `commitSha`、SHA-256 摘要、能力徽章及安装方式（原生目录名或 `<owner>--<slug>` 隔离目录名）；若仓库不含有效 `plugin.json` 或命中路径穿越、软硬链接、规则越界注入等安全规则，将提示原因并清理暂存目录，不产生残留。
    - **已安装联动更新**：通过链接安装的插件在「已安装」页带有 `GitHub URL` 来源标签，支持滑块启停、详情抽屉查看，并可按 Release Tag 或分支最新 Commit SHA 一键检查更新。
 
-### 方式二：CLI `npx agy-market add <github-url>`
+### 方式二：CLI `npx --yes github:azwosile/agy-market add <github-url>`
 ```bash
 # 预检并交互确认安装任意 GitHub 插件仓库（兼容子目录与无 Tag 默认分支）
-npx agy-market add https://github.com/<owner>/<repo>
+npx --yes github:azwosile/agy-market add https://github.com/<owner>/<repo>
 
 # 指定 Monorepo 子目录，使用 <owner>--<slug> 隔离目录名并跳过交互确认
-npx agy-market add https://github.com/<owner>/<repo> --subpath plugins/<name> --isolate --yes
+npx --yes github:azwosile/agy-market add https://github.com/<owner>/<repo> --subpath plugins/<name> --isolate --yes
 
 # 可选参数：--replace（替换同源目录）、--dest <plugins-dir>、--mirror <prefix>、--token <pat>、--json
-npx agy-market add https://github.com/<owner>/<repo>/tree/main/<subpath> --yes --json
+npx --yes github:azwosile/agy-market add https://github.com/<owner>/<repo>/tree/main/<subpath> --yes --json
 ```
 
 ---
@@ -175,21 +186,21 @@ npx agy-market add https://github.com/<owner>/<repo>/tree/main/<subpath> --yes -
 
 ```bash
 # 安装或更新 AGY Market 到默认插件目录（支持 --dest <plugins-dir> 自定义路径）
-npx agy-market install
+npx --yes github:azwosile/agy-market install
 
 # 通过任意 GitHub 完整链接预检并安装插件（支持 --subpath / --isolate / --replace / --yes / --dest / --mirror / --token / --json）
-npx agy-market add <github-url>
+npx --yes github:azwosile/agy-market add <github-url>
 
 # 锁安全卸载已安装的全局社区插件（别名 remove；支持 --yes / --dest <plugins-dir> / --json）
-npx agy-market uninstall <dir>
-npx agy-market uninstall <dir> --yes --json
+npx --yes github:azwosile/agy-market uninstall <dir>
+npx --yes github:azwosile/agy-market uninstall <dir> --yes --json
 
 # 查看当前配置路径、数据目录及所有已安装插件状态（支持 --json 机器可读输出）
-npx agy-market status
-npx agy-market status --json
+npx --yes github:azwosile/agy-market status
+npx --yes github:azwosile/agy-market status --json
 
 # 运行安装检查（校验 Node >= 22、非符号链接实体目录、10 字段清单纯净度、UI 产物）并清理 Windows 残留 *.old.<ts> 文件
-npx agy-market doctor
+npx --yes github:azwosile/agy-market doctor
 ```
 
 ### 源码构建与本地开发

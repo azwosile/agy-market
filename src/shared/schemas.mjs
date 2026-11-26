@@ -221,6 +221,7 @@ export function buildInstallReceipt({
   scopedRewriteApplied = false,
   previousInstalledAt = null,
   actualSha256 = '',
+  preservePaths = null,
   nowIso = new Date().toISOString(),
 }) {
   const cap = plugin?.capabilities || {};
@@ -259,7 +260,11 @@ export function buildInstallReceipt({
     pluginRoot,
     ...(githubSource ? { githubSource } : {}),
     sha256: resolvedSha256,
-    preservePaths: Array.isArray(plugin.distribution?.preservePaths) ? [...plugin.distribution.preservePaths] : [],
+    preservePaths: Array.isArray(preservePaths)
+      ? [...preservePaths]
+      : Array.isArray(plugin.distribution?.preservePaths)
+        ? [...plugin.distribution.preservePaths]
+        : [],
     grantedCapabilities: {
       badges: Array.isArray(cap.badges) ? [...cap.badges] : [],
       mcpRemoteDomains: Array.isArray(cap.mcpRemoteDomains) ? [...cap.mcpRemoteDomains] : [],

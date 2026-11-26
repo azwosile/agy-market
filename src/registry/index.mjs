@@ -17,7 +17,12 @@ import {
   RAW_GH_PAGES_CATALOG_BASE_URL,
 } from '../shared/constants.mjs';
 import { fileUriToLocalPath } from '../shared/paths.mjs';
+import { defaultProxyFetch } from '../shared/proxy-fetch.mjs';
 import { sanitizePrefs } from '../shared/schemas.mjs';
+
+function resolveFetch(fetchImpl) {
+  return !fetchImpl || fetchImpl === fetch ? defaultProxyFetch : fetchImpl;
+}
 
 function getCacheDir(dataDir) {
   const d = join(dataDir, 'cache');
@@ -105,10 +110,11 @@ async function fetchJsonWithConditionalCache(
   {
     timeoutMs = PRIMARY_FETCH_TIMEOUT_MS,
     forceRefresh = false,
-    fetchImpl = fetch,
+    fetchImpl = defaultProxyFetch,
     channelLabel = 'github-pages',
   } = {},
 ) {
+  const activeFetch = resolveFetch(fetchImpl);
   if (url.startsWith('file://')) {
     const local = fileUriToLocalPath(url);
     if (!local || !existsSync(local)) throw new Error(`Local feed not found: ${url}`);
@@ -124,7 +130,7 @@ async function fetchJsonWithConditionalCache(
     if (cached.meta.lastModified) headers['If-Modified-Since'] = cached.meta.lastModified;
   }
 
-  const res = await fetchImpl(url, {
+  const res = await activeFetch(url, {
     headers,
     signal: AbortSignal.timeout(timeoutMs),
   });
@@ -150,15 +156,16 @@ async function fetchJsonWithConditionalCache(
  */
 export async function loadCatalogFromNpmMirror(
   cacheDir,
-  { mirrors = CHINA_NPM_MIRRORS, fetchImpl = fetch, timeoutMs = 8000 } = {},
+  { mirrors = CHINA_NPM_MIRRORS, fetchImpl = defaultProxyFetch, timeoutMs = 8000 } = {},
 ) {
+  const activeFetch = resolveFetch(fetchImpl);
   const encodedPkg = `@${encodeURIComponent(CATALOG_NPM_PACKAGE.slice(1))}`;
   const errors = [];
 
   for (const mirrorBase of mirrors) {
     const packumentUrl = `${mirrorBase.replace(/\/+$/, '')}/${encodedPkg}/latest`;
     try {
-      const metaRes = await fetchImpl(packumentUrl, {
+      const metaRes = await activeFetch(packumentUrl, {
         headers: { Accept: 'application/json' },
         signal: AbortSignal.timeout(timeoutMs),
       });
@@ -177,7 +184,7 @@ export async function loadCatalogFromNpmMirror(
       if (tarballUrl.startsWith('file://')) {
         tgzBuf = readFileSync(fileUriToLocalPath(tarballUrl));
       } else {
-        const tgzRes = await fetchImpl(tarballUrl, { signal: AbortSignal.timeout(timeoutMs * 2) });
+        const tgzRes = await activeFetch(tarballUrl, { signal: AbortSignal.timeout(timeoutMs * 2) });
         if (!tgzRes.ok) {
           errors.push(`${tarballUrl} -> HTTP ${tgzRes.status}`);
           continue;
@@ -257,10 +264,10 @@ export async function loadCatalogFromNpmMirror(
   throw new Error(`ERR_MIRROR_FALLBACK_FAILED: ${errors.join(' | ')}`);
 }
 
-async function fetchSingleCustomFeed(feedUrl, index, cacheDir, fetchImpl = fetch) {
+async function fetchSingleCustomFeed(feedUrl, index, cacheDir, fetchImpl = defaultProxyFetch) {
   const res = await fetchJsonWithConditionalCache(feedUrl, cacheDir, `custom-feed-${index}`, {
     timeoutMs: 6000,
-    fetchImpl,
+    fetchImpl: resolveFetch(fetchImpl),
   });
   return {
     feedUrl,
@@ -276,9 +283,10 @@ export async function resolveMarketCatalog({
   prefs = {},
   forceRefresh = false,
   includeReadmes = false,
-  fetchImpl = fetch,
+  fetchImpl = defaultProxyFetch,
   mirrors = CHINA_NPM_MIRRORS,
 }) {
+  const activeFetch = resolveFetch(fetchImpl);
   const cleanPrefs = sanitizePrefs(prefs);
   const cacheDir = getCacheDir(dataDir);
   const baseUrl = (cleanPrefs.primaryCatalogUrl || PRIMARY_CATALOG_BASE_URL).replace(/\/+$/, '');
@@ -307,7 +315,7 @@ export async function resolveMarketCatalog({
       try {
         const vRes = await fetchJsonWithConditionalCache(`${candidate.url}/index.json`, cacheDir, 'index', {
           forceRefresh,
-          fetchImpl,
+          fetchImpl: activeFetch,
           channelLabel: candidate.channelLabel,
         });
         verifiedFeed = vRes.data;
@@ -319,7 +327,7 @@ export async function resolveMarketCatalog({
             `${candidate.url}/unverified-index.json`,
             cacheDir,
             'unverified-index',
-            { forceRefresh, fetchImpl, channelLabel: candidate.channelLabel },
+            { forceRefresh, fetchImpl: activeFetch, channelLabel: candidate.channelLabel },
           ).catch(() => null);
           if (uRes?.data) unverifiedFeed = uRes.data;
         }
@@ -327,7 +335,7 @@ export async function resolveMarketCatalog({
         if (includeReadmes) {
           const rRes = await fetchJsonWithConditionalCache(`${candidate.url}/readmes.json`, cacheDir, 'readmes', {
             forceRefresh,
-            fetchImpl,
+            fetchImpl: activeFetch,
             channelLabel: candidate.channelLabel,
           }).catch(() => null);
           if (rRes?.data) readmesFeed = rRes.data;
@@ -345,7 +353,7 @@ export async function resolveMarketCatalog({
 
   if (!verifiedFeed && tryChinaMirror) {
     try {
-      const mirrorOut = await loadCatalogFromNpmMirror(cacheDir, { mirrors, fetchImpl });
+      const mirrorOut = await loadCatalogFromNpmMirror(cacheDir, { mirrors, fetchImpl: activeFetch });
       verifiedFeed = mirrorOut.indexJson;
       if (cleanPrefs.enableExperimentalTrack2) {
         unverifiedFeed = mirrorOut.unverifiedIndexJson;
@@ -404,7 +412,7 @@ export async function resolveMarketCatalog({
   for (let i = 0; i < cleanPrefs.customFeeds.length; i++) {
     const feedUrl = cleanPrefs.customFeeds[i];
     try {
-      const custom = await fetchSingleCustomFeed(feedUrl, i, cacheDir, fetchImpl);
+      const custom = await fetchSingleCustomFeed(feedUrl, i, cacheDir, activeFetch);
       for (const p of custom.plugins) {
         const repoRootKey = makeRepoRootKey(p);
         if ((repoRootKey && seenRepoRoots.has(repoRootKey)) || seenIds.has(p.id)) continue;
@@ -487,10 +495,11 @@ export async function fetchPluginReadme({
   primaryBaseUrl = '',
   cachedCatalog = null,
   forceRefresh = false,
-  fetchImpl = fetch,
+  fetchImpl = defaultProxyFetch,
   mirrors = CHINA_NPM_MIRRORS,
   timeoutMs = PRIMARY_FETCH_TIMEOUT_MS,
 }) {
+  const activeFetch = resolveFetch(fetchImpl);
   const pluginId = String(id || '').trim();
   const safeKey = toSafeReadmeCacheKey(pluginId);
   if (!safeKey) {
@@ -551,7 +560,7 @@ export async function fetchPluginReadme({
           if (cachedPerPlugin.meta.lastModified) headers['If-Modified-Since'] = cachedPerPlugin.meta.lastModified;
         }
 
-        const res = await fetchImpl(perUrl, {
+        const res = await activeFetch(perUrl, {
           headers,
           signal: AbortSignal.timeout(timeoutMs),
         });
@@ -599,7 +608,7 @@ export async function fetchPluginReadme({
         const rRes = await fetchJsonWithConditionalCache(`${candidate.url}/readmes.json`, cacheDir, 'readmes', {
           timeoutMs,
           forceRefresh,
-          fetchImpl,
+          fetchImpl: activeFetch,
           channelLabel: candidate.channelLabel,
         });
         if (rRes?.data && typeof rRes.data === 'object') {
@@ -670,7 +679,7 @@ export async function fetchPluginReadme({
     }
 
     try {
-      const mirrorOut = await loadCatalogFromNpmMirror(cacheDir, { mirrors, fetchImpl });
+      const mirrorOut = await loadCatalogFromNpmMirror(cacheDir, { mirrors, fetchImpl: activeFetch });
       monolithicData = mirrorOut.readmesJson;
       if (mirrorOut.perPluginReadmes?.[pluginId]) {
         return {

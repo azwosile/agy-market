@@ -14,19 +14,30 @@ Sidebar Panel UI · Lock-Safe One-Click Uninstall · Direct In-Sidebar Upstream 
 
 ---
 
-> **Repository Boundary**: This repository ([`azwosile/agy-market`](https://github.com/azwosile/agy-market)) houses the **AGY Market** Sidebar client plugin, Windows lock-safe tarball installer, `npx agy-market` bootstrap CLI, and static web showcase (`site/`).
+> **Repository Boundary**: This repository ([`azwosile/agy-market`](https://github.com/azwosile/agy-market)) houses the **AGY Market** Sidebar client plugin, Windows lock-safe tarball installer, `npx --yes github:azwosile/agy-market` bootstrap CLI, and static web showcase (`site/`).
 >
 > To list your plugin in the community catalog, click **`+ Submit Plugin`** (`+ 申请收录插件`) in AGY Market or follow the step-by-step **[📖 Plugin Submission Guide (`docs/SUBMISSION_GUIDE.md`)](https://github.com/azwosile/agy-market-catalog/blob/main/docs/SUBMISSION_GUIDE.md)** to open a single-YAML Pull Request in **[`azwosile/agy-market-catalog`](https://github.com/azwosile/agy-market-catalog)**.
 
 ---
 
-## ✨ Highlights (v1.6.0)
+## ✨ Highlights (v1.7.0)
 
-### 0. What's New in v1.6.0
+### 0. What's New in v1.7.0
+- **Zero-Dependency HTTP/HTTPS & Windows System Proxy Support**: Adds `src/shared/proxy-fetch.mjs` respecting `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` (with `NO_PROXY` and automatic bypass for `127.0.0.1` / `localhost`) plus Windows registry system proxy settings (`HKCU\...\Internet Settings`), preventing GitHub archive timeouts when using local proxies without TUN mode.
+- **Unlimited >100 MB Streaming Plugin Installs & Extraction**: Removes the artificial `100 MB` `MAX_TARBALL_BYTES` archive cap (`0 = unlimited`), switching to streaming gunzip + POSIX/PAX tar disk extraction (`extractTarGzStreamToDir`, O(MB) RAM), 60s per-chunk stall timeouts instead of fixed 60s total download ceilings, `server.requestTimeout = 0`, and `GB` size formatting in the UI.
+- **Monorepo, Native `.git` & Unversioned Plugin Update Accuracy**: Verifies raw `<tag>/<pluginRoot>/plugin.json` existence, plugin name, and version for unreceipted/unlisted Monorepo plugins (e.g., `upstash/context7`) to prevent false-positive `github-upstream` upgrades; detects native `.git` clones (`conductor`, `sepia`, etc.) and unversioned external plugins, excluding them from auto/batch updates with read-only **Git Native / Unversioned** status pills.
+- **`app.asar` Patch Script Guidance & `preservePaths` Merge**: Guides users in toast notices, the restart banner, and the installed Detail Drawer to run bundled patch scripts (e.g., `node setup.cjs` per plugin docs) before restarting Antigravity and to re-run them after AGY Market updates, with one-click **Copy Plugin Folder** and **Patch Docs** actions; merges `existingReceipt.preservePaths` with `distribution.preservePaths` on catalog updates to keep user configs intact.
+- **`npx` GitHub Bootstrap Fix & Automated GitHub Releases**: Replaces the unpublished npm `npx` bootstrap command with `npx --yes github:azwosile/agy-market`, fixes `scripts/install-local.mjs` relative-path `node_modules` filtering inside `_npx` caches, and adds `.github/workflows/release.yml` to automatically pack and publish `agy-market.tar.gz` + `.sha256` assets on `v*` tag pushes.
+
+<details>
+<summary>Previous v1.6.0 Highlights (Recommended Sort / Lazy README Cache / Scoped Symlinks / Zero-PII Nomination)</summary>
+
 - **Default "Recommended" Sort + Monorepo Viewport Slot Dampening**: Sorts Discover by catalog quality score (`ranking.score`, gracefully falling back to `stars` for custom feeds or older catalogs) with `1 / (1 + 0.15 * (k - 1))` dampening across entries sharing `repository.repositoryId`, while keeping `stars`, `updated`, and `name` sort options intact.
 - **Lazy Per-Plugin README Loading & ETag Cache**: `GET /api/readme` and `GET /api/plugin/:id/readme` fetch `dist/readmes/<id>.json` on demand with per-plugin ETag caching under `${PLUGIN_DATA}/cache/readmes/<id>.json`, seamlessly falling back to monolithic `readmes.json`, China npm mirrors, or local installed READMEs.
 - **Security-Preserving Scoped Symlink Support**: Tarballs containing symlinks strictly outside a selected subdirectory `pluginRoot` (such as dual-host `.claude/` or `docs/` links) are skipped cleanly instead of failing installation, while any symlink inside `pluginRoot`, enclosing `pluginRoot`, targeting into `pluginRoot`, or anywhere in a root plugin (`pluginRoot === '.'`) still hard-throws `ERR_TAR_SYMLINK_FORBIDDEN`.
 - **Opt-In Zero-PII Public Plugin Nomination**: When Add-URL inspects or installs an unlisted public GitHub repository (verified via unauthenticated `HEAD` with 3s timeout; private/404/unreachable repos are never prompted), surfaces a non-blocking prompt opening a pre-filled GitHub Issue carrying only `owner/repo` and `plugin_root`.
+
+</details>
 
 ### 1. Sidebar Panel UI, 15 Precision Categories & Navigation
 - **Native Right Sidebar Panel**: Runs inside Antigravity's native `AUX_PANE` extension view (`sidecars/market_pane/sidecar.json`) with no bundled MCP servers, keeping the panel lightweight and responsive.
@@ -38,14 +49,14 @@ Sidebar Panel UI · Lock-Safe One-Click Uninstall · Direct In-Sidebar Upstream 
 
 ### 2. Lock-Safe Uninstall, Direct In-Sidebar Updates & On-Demand Update All
 - **Zero Same-Version No-Op Updates (v1.5.4)**: Shared SemVer reconciliation across backend and UI plus server-authoritative catalog resolution eliminate stale-snapshot `vX.Y.Z → vX.Y.Z` ghost updates and stale payload downgrades; standard updates matching the installed version or Git tag/commit short-circuit cleanly with `ALREADY_UP_TO_DATE` (zero downloads), while the Detail Drawer preserves explicit **Re-sync** (`forceResync: true`) on demand.
-- **Lock-Safe Plugin Uninstall (Sidebar Card/Drawer + `npx agy-market uninstall <dir>`)**:
+- **Lock-Safe Plugin Uninstall (Sidebar Card/Drawer + `npx --yes github:azwosile/agy-market uninstall <dir>`)**:
   - Every removable global plugin card and Detail Drawer exposes an **Uninstall** (`卸载`) button backed by `POST /api/uninstall` (with `POST /api/remove-files` compatibility) and a confirmation modal with an optional *Also remove from favorites* checkbox.
   - Handles both active (`~/.gemini/config/plugins/<dir>`) and Vault-Parked (`${PLUGIN_DATA}/disabled-plugins/<dir>`) directories; never writes `config.json` or calls restricted RPCs; unlinks symlinks/NTFS junctions without touching target source directories; retires Windows `EBUSY`-locked binaries to `.old.<ts>` while immediately deleting `plugin.json` (with `sweepRetiredBinaries` later removing empty orphan shells); strictly blocks self-deletion of `agy-market` (`ERR_CANNOT_SELF_DELETE`) as well as `workspace` and `builtin` plugins.
 - **Direct In-Sidebar Updates Across All Channels (Zero External Download Redirects)**:
   - Whenever an upstream GitHub Release/Tag leads the catalog or comes from a GitHub URL install, `GET /api/updates` returns `installable: true` (`updateChannel: 'catalog' | 'github-upstream' | 'github-url'`), eliminating external browser download redirects.
   - Upgrading a verified catalog plugin directly from GitHub upstream preserves its original `receipt.track` (`'verified'`) and `repositoryId` while still enforcing capability-escalation confirmation.
 - **Per-Card Smart `Update` / `Latest` Status Pill & On-Demand Top-Bar `Update All`**:
-  - Every installed plugin card with a catalog or GitHub source renders a clickable **Update vX.Y.Z** button when a newer version is available and automatically transitions into a non-clickable **✓ Latest** status pill once updated or confirmed up to date (before an initial check, clicking **Update** verifies first without re-downloading if already current; pure local plugins display a non-clickable `Local` / `Workspace` / `Built-in` status pill and return `ERR_NO_UPDATE_SOURCE` on API calls).
+  - Every installed plugin card with a catalog or GitHub source renders a clickable **Update vX.Y.Z** button when a newer version is available and automatically transitions into a non-clickable **✓ Latest** status pill once updated or confirmed up to date (before an initial check, clicking **Update** verifies first without re-downloading if already current; pure local plugins display a non-clickable `Local` / `Workspace` / `Built-in` status pill and return `ERR_NO_UPDATE_SOURCE` on API calls; native `.git` clones without a receipt and unversioned external plugins display read-only **Git Native / Unversioned** pills and are excluded from auto/batch updates).
   - The **Installed** tab header displays **Update All (N)** beside **Check Updates** on demand: it appears when installable updates are detected (or while a batch update is running) to sequentially upgrade `catalog`, `github-upstream`, and `github-url` plugins (always scheduling `agy-market` self-update last to trigger clean restart), and automatically hides when all plugins are up to date to keep the header uncluttered.
 
 ### 3. ⭐ Favorites Shelf & Tab, Installed Search/Filters & Update Error Alerts
@@ -79,7 +90,7 @@ Dedicated **Conflicts & Diagnostics** tab (`GET /api/conflicts`) with read-only 
 Cards and the Detail Drawer stay clutter-free without static restart chips. Activation prompts appear **only after an install, update, batch update, or uninstall completes** (or when a Windows disable/uninstall retires a locked binary):
 - **Declarative Skills / Global Rules (`instant`)**: Hot-reloads immediately with no restart required.
 - **Sidebar Panel / MCP / Hooks (`reload-pane`)**: Prompts to reopen the Sidebar panel or refresh MCP after update/install completes.
-- **`app.asar` / First-Time `cdp` / Retired Locked Binaries (`host-restart`)**: Displays a clear banner reminding you to restart Antigravity for changes to take full effect.
+- **`app.asar` / First-Time `cdp` / Retired Locked Binaries (`host-restart`)**: Displays a clear banner reminding you to restart Antigravity for changes to take full effect. For `app.asar` patch plugins, both the banner and Detail Drawer clearly instruct you to run the plugin's bundled patch script (e.g., `node setup.cjs` per plugin docs) before restarting and re-run it after every AGY Market update, with one-click **Copy Plugin Folder** and **Patch Docs** helpers.
 
 ### 7. Built-In GitHub Discussions Integration
 - Every plugin Detail Drawer includes a **Discussions** tab (`GET /api/discussions`) that detects whether Discussions are enabled on the repository without needing a token and provides direct links to browse or start a thread.
@@ -98,9 +109,9 @@ Cards and the Detail Drawer stay clutter-free without static restart chips. Acti
 
 > Requires **Node.js >= 22.0.0** (zero runtime npm dependencies), or use the zero-npm OS installers below.
 
-- **Node / `npx` (Cross-Platform, Recommended)**:
+- **Node / `npx` (Cross-Platform, Recommended — runs directly from GitHub)**:
   ```bash
-  npx agy-market@latest
+  npx --yes github:azwosile/agy-market
   ```
 - **Windows PowerShell (Zero npm, SHA-256 Verified + Catalog Fallback)**:
   ```powershell
@@ -133,16 +144,16 @@ Starting with v1.4.0, you can preflight and install any community plugin directl
    - **Preflight & safety checks**: Displays version or short `commitSha`, SHA-256 digest, capability badges, and install mode (native directory vs. `<owner>--<slug>` scoped isolation). Repositories missing a valid `plugin.json` or failing traversal/symlink/rule-smuggling checks are rejected with clear diagnostics and zero leftover files.
    - **Installed tracking & updates**: Installed items display a `GitHub URL` source badge in *Installed*, work with the Vault-Parking toggle slider, and check for updates via Release Tag or branch commit SHA.
 
-### Option 2: CLI `npx agy-market add <github-url>`
+### Option 2: CLI `npx --yes github:azwosile/agy-market add <github-url>`
 ```bash
 # Inspect and interactively install any GitHub plugin repository (supports subpaths & branch commits)
-npx agy-market add https://github.com/<owner>/<repo>
+npx --yes github:azwosile/agy-market add https://github.com/<owner>/<repo>
 
 # Target a specific Monorepo subdirectory with <owner>--<slug> scoped isolation and non-interactive confirmation
-npx agy-market add https://github.com/<owner>/<repo> --subpath plugins/<name> --isolate --yes
+npx --yes github:azwosile/agy-market add https://github.com/<owner>/<repo> --subpath plugins/<name> --isolate --yes
 
 # Optional flags: --replace, --dest <plugins-dir>, --mirror <prefix>, --token <pat>, --json
-npx agy-market add https://github.com/<owner>/<repo>/tree/main/<subpath> --yes --json
+npx --yes github:azwosile/agy-market add https://github.com/<owner>/<repo>/tree/main/<subpath> --yes --json
 ```
 
 ---
@@ -172,21 +183,21 @@ Every plugin surfaces static capability badges beside the Install button before 
 
 ```bash
 # Install or update AGY Market (optional --dest <plugins-dir>)
-npx agy-market install
+npx --yes github:azwosile/agy-market install
 
 # Preflight and install a plugin from any GitHub URL (--subpath, --isolate, --replace, --yes, --dest, --mirror, --token, --json)
-npx agy-market add <github-url>
+npx --yes github:azwosile/agy-market add <github-url>
 
 # Lock-safe uninstall of an installed global plugin (alias: remove; supports --yes, --dest <plugins-dir>, --json)
-npx agy-market uninstall <dir>
-npx agy-market uninstall <dir> --yes --json
+npx --yes github:azwosile/agy-market uninstall <dir>
+npx --yes github:azwosile/agy-market uninstall <dir> --yes --json
 
 # List local installed plugins, config/data paths & market receipts (--json supported)
-npx agy-market status
-npx agy-market status --json
+npx --yes github:azwosile/agy-market status
+npx --yes github:azwosile/agy-market status --json
 
 # Run local installation checks (Node >= 22, real directory check, 10-field manifest purity, built UI) & sweep retired Windows binaries
-npx agy-market doctor
+npx --yes github:azwosile/agy-market doctor
 ```
 
 ### Build & Test From Source

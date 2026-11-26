@@ -695,8 +695,14 @@ function scanSinglePluginFolder(
 
   const activation = classifyActivationRequirement(components.capabilities);
 
+  const hasGitDir = existsSync(join(fullDir, '.git'));
+  const isGitManaged = Boolean(!receipt && hasGitDir);
+
   const receiptVersion = receipt?.installedVersion ? String(receipt.installedVersion).trim() : '';
   const manifestVersion = manifest.version ? String(manifest.version).trim() : '';
+  const declaredVersion = manifestVersion;
+  const hasDeclaredVersion = Boolean(receiptVersion || declaredVersion);
+  const unmanagedReason = isGitManaged ? 'git-clone' : !receipt && !hasDeclaredVersion ? 'no-version' : null;
   const resolvedVersion =
     receiptVersion &&
     manifestVersion &&
@@ -712,6 +718,9 @@ function scanSinglePluginFolder(
     ...(isSymlink ? { realPath } : {}),
     scope, // 'global' | 'workspace' | 'builtin'
     isSymlink,
+    isGitManaged,
+    hasDeclaredVersion,
+    unmanagedReason,
     name: manifestName,
     displayName,
     description: String(manifest.description || ''),

@@ -8,12 +8,12 @@ export const SUBMIT_PLUGIN_GUIDE_URL =
 export const NOMINATE_PLUGIN_ISSUE_BASE_URL =
   'https://github.com/azwosile/agy-market-catalog/issues/new';
 export const PLUGIN_DISPLAY_NAME = 'AGY Market · 反重力插件市场';
-export const PLUGIN_VERSION = '1.6.0';
+export const PLUGIN_VERSION = '1.7.0';
 export const SIDECAR_ID = 'market_pane';
 export const SIDECAR_URI = 'sidecar://agy-market/market_pane/';
 export const CUSTOMIZATION_URI = 'customization://agy-market';
 
-export const MAX_TARBALL_BYTES = 100 * 1024 * 1024; // 100 MB
+export const MAX_TARBALL_BYTES = 0; // 0 = unlimited
 export const MAX_FAVORITES = 500;
 export const PRIMARY_CATALOG_BASE_URL = 'https://azwosile.github.io/agy-market-catalog';
 export const RAW_GH_PAGES_CATALOG_BASE_URL = 'https://raw.githubusercontent.com/azwosile/agy-market-catalog/gh-pages';

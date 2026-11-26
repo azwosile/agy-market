@@ -41,6 +41,7 @@ import {
   resolveMarketDataDir,
   resolvePluginsDir,
 } from '../shared/paths.mjs';
+import { defaultProxyFetch } from '../shared/proxy-fetch.mjs';
 import {
   computeCapabilityEscalation,
   loadPrefsFromDisk,
@@ -308,6 +309,18 @@ function isSafeDirSlug(raw) {
   return Boolean(s && s !== '.' && s !== '..' && !s.includes('/') && !s.includes('\\') && !s.includes('..'));
 }
 
+function isUnmanagedLocalPlugin(loc) {
+  return Boolean(loc && (loc.isGitManaged || (!loc.receipt && loc.hasDeclaredVersion === false)));
+}
+
+function buildUnmanagedUpdateErrorMessage(loc) {
+  const dir = loc?.dir || '';
+  if (loc?.isGitManaged) {
+    return `ERR_UNMANAGED_GIT_OR_UNVERSIONED: 插件 "${dir}" 为原生 .git 克隆安装（非 AGY Market 托管），已禁止自动更新以免覆盖本地 Git 仓库，请直接使用 git pull 更新。(Plugin "${dir}" is managed via native .git clone outside AGY Market; use git pull instead.)`;
+  }
+  return `ERR_UNMANAGED_GIT_OR_UNVERSIONED: 插件 "${dir}" 未声明 plugin.json version 且无安装收据，无法安全自动更新。(Plugin "${dir}" lacks a declared version in plugin.json and cannot be auto-updated.)`;
+}
+
 export async function createMarketSidecarServer(options = {}) {
   const configDir = resolveAntigravityConfigDir(options.configDir || '');
   const pluginsDir = resolvePluginsDir(configDir);
@@ -315,7 +328,7 @@ export async function createMarketSidecarServer(options = {}) {
   const disabledPluginsDir = resolveDisabledPluginsDir(dataDir);
   const builtinPluginsDir = options.builtinPluginsDir || '';
   const indexHtmlPath = options.indexHtmlPath || DEFAULT_INDEX_HTML_PATH;
-  const fetchImpl = options.fetchImpl || fetch;
+  const fetchImpl = options.fetchImpl || defaultProxyFetch;
   const mirrors = options.mirrors || undefined;
   const nowFn = typeof options.nowFn === 'function' ? options.nowFn : () => Date.now();
   const currentSelfVersion = options.currentSelfVersion || PLUGIN_VERSION;
@@ -533,8 +546,10 @@ export async function createMarketSidecarServer(options = {}) {
     const enrichedCatalogPlugins = catalogPlugins.map((p) => {
       const preflight = resolveInstallPreflight(p, enrichedInventory, { conflictStrategy: 'prompt' });
       const localMatch = preflight.action === 'update' ? preflight.existingInstall : null;
+      const isLocalUnmanaged = isUnmanagedLocalPlugin(localMatch);
       const hasUpdate = Boolean(
         localMatch &&
+          !isLocalUnmanaged &&
           isCatalogPluginInstallable(p) &&
           !isSameInstalledRelease(localMatch.receipt, { gitTag: p.gitTag, commitSha: p.commitSha }) &&
           isNewerVersion(p.version, localMatch.version),
@@ -1302,6 +1317,18 @@ export async function createMarketSidecarServer(options = {}) {
             conflictStrategy: 'prompt',
             preferredDir: targetDir,
           });
+          if (preflight.action === 'update' && isUnmanagedLocalPlugin(preflight.existingInstall)) {
+            sendJson(res, 400, {
+              ok: false,
+              status: 'UNMANAGED_PLUGIN',
+              errorCode: 'ERR_UNMANAGED_GIT_OR_UNVERSIONED',
+              unmanagedReason:
+                preflight.existingInstall.unmanagedReason ||
+                (preflight.existingInstall.isGitManaged ? 'git-clone' : 'no-version'),
+              error: buildUnmanagedUpdateErrorMessage(preflight.existingInstall),
+            });
+            return;
+          }
           if (
             !forceResync &&
             preflight.action === 'update' &&
@@ -1389,6 +1416,17 @@ export async function createMarketSidecarServer(options = {}) {
             return;
           }
           sendJson(res, 404, { ok: false, error: `Plugin "${targetId || targetDir}" not found in active catalog` });
+          return;
+        }
+
+        if (isUnmanagedLocalPlugin(localPlugin)) {
+          sendJson(res, 400, {
+            ok: false,
+            status: 'UNMANAGED_PLUGIN',
+            errorCode: 'ERR_UNMANAGED_GIT_OR_UNVERSIONED',
+            unmanagedReason: localPlugin.unmanagedReason || (localPlugin.isGitManaged ? 'git-clone' : 'no-version'),
+            error: buildUnmanagedUpdateErrorMessage(localPlugin),
+          });
           return;
         }
 
@@ -1554,6 +1592,17 @@ export async function createMarketSidecarServer(options = {}) {
               null;
             const isSelf = Boolean(upd?.isSelf || isSelfPluginCandidate(plugin, localLoc?.dir || reqId));
 
+            if (localLoc && !isSelf && isUnmanagedLocalPlugin(localLoc)) {
+              queue.push({
+                id: reqId,
+                dir: localLoc.dir,
+                displayName: localLoc.displayName || localLoc.dir,
+                unmanagedLoc: localLoc,
+                isSelf: false,
+              });
+              continue;
+            }
+
             // Prefer GitHub direct update when update check found a newer github-upstream / github-url build
             if (upd && (upd.updateChannel === 'github-upstream' || upd.updateChannel === 'github-url') && localLoc) {
               queue.push({
@@ -1664,6 +1713,7 @@ export async function createMarketSidecarServer(options = {}) {
           for (const upd of updateReport.items || []) {
             if (!upd?.installable || queuedDirs.has(upd.dir)) continue;
             const localLoc = globalInstalled.find((loc) => loc.dir === upd.dir) || null;
+            if (localLoc && !upd.isSelf && isUnmanagedLocalPlugin(localLoc)) continue;
             const catPlugin =
               catalogPlugins.find((p) => p.id === upd.id) || findCatalogEntryForLocal(localLoc, catalogPlugins);
             const isSelf = Boolean(upd.isSelf || isSelfPluginCandidate(catPlugin, upd.dir));
@@ -1720,6 +1770,20 @@ export async function createMarketSidecarServer(options = {}) {
               ok: false,
               status: 'NO_UPDATE_SOURCE',
               error: `ERR_NO_UPDATE_SOURCE: Plugin "${item.dir}" has neither an installable catalog entry nor a GitHub repository URL`,
+            });
+            continue;
+          }
+          if (item.unmanagedLoc) {
+            results.push({
+              id: item.id,
+              dir: item.dir,
+              displayName: item.displayName || item.dir,
+              ok: false,
+              status: 'UNMANAGED_PLUGIN',
+              errorCode: 'ERR_UNMANAGED_GIT_OR_UNVERSIONED',
+              unmanagedReason:
+                item.unmanagedLoc.unmanagedReason || (item.unmanagedLoc.isGitManaged ? 'git-clone' : 'no-version'),
+              error: buildUnmanagedUpdateErrorMessage(item.unmanagedLoc),
             });
             continue;
           }
@@ -2024,6 +2088,8 @@ export async function createMarketSidecarServer(options = {}) {
         }
       });
     });
+    // Allow long-running >5min streaming downloads/installs on localhost loopback
+    server.requestTimeout = 0;
 
     await new Promise((resolvePromise, rejectPromise) => {
       server.once('error', rejectPromise);

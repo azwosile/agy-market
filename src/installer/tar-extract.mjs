@@ -7,9 +7,21 @@
 //     or `docs/` symlinks) without ever creating links on disk, because Antigravity's GetAllPlugins
 //     silently skips NTFS junctions/symlinks on Windows.
 
-import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { dirname, join, posix, resolve } from 'node:path';
-import { gunzipSync, gzipSync } from 'node:zlib';
+import { randomUUID } from 'node:crypto';
+import {
+  copyFileSync,
+  createReadStream,
+  createWriteStream,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
+import { dirname, join, posix, resolve, sep } from 'node:path';
+import { createGunzip, gunzipSync, gzipSync } from 'node:zlib';
 import { MAX_TARBALL_BYTES } from '../shared/constants.mjs';
 
 function readCleanString(buf, start, length) {
@@ -216,7 +228,11 @@ export function parseTarGzWithMeta(
 
   let tarBuf;
   try {
-    tarBuf = gunzipSync(compressedBuf, { maxOutputLength: maxUncompressedBytes });
+    const gunzipOpts =
+      Number.isFinite(maxUncompressedBytes) && maxUncompressedBytes > 0
+        ? { maxOutputLength: maxUncompressedBytes }
+        : {};
+    tarBuf = gunzipSync(compressedBuf, gunzipOpts);
   } catch (err) {
     throw new Error(`ERR_TAR_GUNZIP: ${err?.message || String(err)}`);
   }
@@ -395,6 +411,504 @@ export function extractTarGzToDir(archiveSource, destDir, { pluginRoot = '.' } =
   }
 
   return { writtenCount };
+}
+
+const MAX_TAR_METADATA_BYTES = 16 * 1024 * 1024;
+
+function unwrapSingleTopDirectory(rawPaths, rawSymlinks, { stripSingleTopDir = true, hasRootManifest = false } = {}) {
+  let strippedTopDir = '';
+  if (stripSingleTopDir && !hasRootManifest && rawPaths.length > 0) {
+    const roots = new Set();
+    let allNested = true;
+    for (const p of rawPaths) {
+      const idx = p.indexOf('/');
+      if (idx === -1) {
+        allNested = false;
+        break;
+      }
+      roots.add(p.slice(0, idx));
+    }
+    if (allNested) {
+      for (const s of rawSymlinks) {
+        const idx = s.path.indexOf('/');
+        if (idx === -1) {
+          allNested = false;
+          break;
+        }
+        roots.add(s.path.slice(0, idx));
+      }
+    }
+    if (allNested && roots.size === 1) {
+      [strippedTopDir] = roots;
+    }
+  }
+  return strippedTopDir;
+}
+
+function writeZeroByteFileSync(filePath) {
+  mkdirSync(dirname(filePath), { recursive: true });
+  writeFileSync(filePath, Buffer.alloc(0));
+}
+
+function writeStreamChunk(stream, chunk) {
+  return new Promise((resolveChunk, rejectChunk) => {
+    const onErr = (err) => {
+      cleanup();
+      rejectChunk(err);
+    };
+    const cleanup = () => {
+      stream.off('error', onErr);
+      stream.off('drain', onDrain);
+    };
+    const onDrain = () => {
+      cleanup();
+      resolveChunk();
+    };
+    stream.once('error', onErr);
+    if (stream.write(chunk)) {
+      cleanup();
+      resolveChunk();
+    } else {
+      stream.once('drain', onDrain);
+    }
+  });
+}
+
+function finishWriteStream(stream) {
+  return new Promise((resolveFinish, rejectFinish) => {
+    let settled = false;
+    const done = (err) => {
+      if (settled) return;
+      settled = true;
+      stream.off('error', onErr);
+      stream.off('close', onClose);
+      if (err) rejectFinish(err);
+      else resolveFinish();
+    };
+    const onErr = (err) => done(err);
+    const onClose = () => done();
+    stream.once('error', onErr);
+    stream.once('close', onClose);
+    stream.end((err) => {
+      if (err) done(err);
+      else if (stream.closed) done();
+    });
+  });
+}
+
+async function streamParseTarGz(
+  archivePath,
+  {
+    maxUncompressedBytes = MAX_TARBALL_BYTES,
+    onRegularFileStart,
+    onRegularFileChunk,
+    onRegularFileEnd,
+  },
+) {
+  let fileStat;
+  try {
+    fileStat = statSync(archivePath);
+  } catch (err) {
+    throw new Error(`ERR_TAR_READ: ${err?.message || String(err)}`);
+  }
+  if (!fileStat.isFile() || fileStat.size === 0) {
+    throw new Error('ERR_TAR_EMPTY: Archive buffer is empty');
+  }
+
+  const hasMaxUncompressed = Number.isFinite(maxUncompressedBytes) && maxUncompressedBytes > 0;
+  const readStream = createReadStream(archivePath);
+  const gunzip = createGunzip();
+  readStream.on('error', (err) => gunzip.destroy(err));
+  readStream.pipe(gunzip);
+
+  const rawPaths = [];
+  const rawSymlinks = [];
+  let totalUncompressedBytes = 0;
+  let nextPax = {};
+  let globalPax = {};
+  let nextLongName = '';
+  let nextLongLinkName = '';
+
+  let state = 'HEADER';
+  let remainingBytes = 0;
+  let padBytes = 0;
+  let metaType = '';
+  let metaChunks = [];
+  let activeFileCtx = null;
+  let pending = Buffer.alloc(0);
+
+  try {
+    for await (const rawChunk of gunzip) {
+      const chunk = Buffer.isBuffer(rawChunk) ? rawChunk : Buffer.from(rawChunk);
+      if (chunk.length === 0) continue;
+
+      totalUncompressedBytes += chunk.length;
+      if (hasMaxUncompressed && totalUncompressedBytes > maxUncompressedBytes) {
+        throw new Error(`ERR_TAR_GUNZIP: Uncompressed size exceeds ${maxUncompressedBytes} bytes`);
+      }
+
+      pending = pending.length > 0 ? Buffer.concat([pending, chunk]) : chunk;
+
+      while (pending.length > 0) {
+        if (state === 'HEADER') {
+          if (pending.length < 512) break;
+          const header = pending.subarray(0, 512);
+          pending = pending.subarray(512);
+
+          let allZero = true;
+          for (let i = 0; i < 512; i++) {
+            if (header[i] !== 0) {
+              allZero = false;
+              break;
+            }
+          }
+          if (allZero) continue;
+
+          const namePart = readCleanString(header, 0, 100);
+          const linkNamePart = readCleanString(header, 157, 100);
+          const prefixPart = readCleanString(header, 345, 155);
+          const typeFlag = header[156] === 0 ? '0' : String.fromCharCode(header[156]);
+          let size = parseTarOctal(header, 124, 12);
+          if (nextPax.size !== undefined) size = Number(nextPax.size);
+          if (!Number.isFinite(size) || size < 0) {
+            throw new Error(`ERR_TAR_CORRUPT: Invalid entry size "${size}"`);
+          }
+
+          if (typeFlag === 'x' || typeFlag === 'g' || typeFlag === 'L' || typeFlag === 'K') {
+            if (size > MAX_TAR_METADATA_BYTES) {
+              throw new Error(`ERR_TAR_CORRUPT: Metadata entry exceeds ${MAX_TAR_METADATA_BYTES} bytes`);
+            }
+            metaType = typeFlag;
+            metaChunks = [];
+            remainingBytes = size;
+            padBytes = (512 - (size % 512)) % 512;
+            if (size === 0) {
+              if (metaType === 'x') nextPax = {};
+              else if (metaType === 'L') nextLongName = '';
+              else if (metaType === 'K') nextLongLinkName = '';
+              state = padBytes > 0 ? 'SKIP_PAD' : 'HEADER';
+            } else {
+              state = 'META_PAYLOAD';
+            }
+            continue;
+          }
+
+          const mergedPax = { ...globalPax, ...nextPax };
+          nextPax = {};
+          const entryName = nextLongName || mergedPax.path || (prefixPart ? `${prefixPart}/${namePart}` : namePart);
+          const linkTarget = nextLongLinkName || mergedPax.linkpath || linkNamePart;
+          nextLongName = '';
+          nextLongLinkName = '';
+
+          if (typeFlag === '1' || typeFlag === '2') {
+            const safeLinkPath = validateSafeRelPath(entryName);
+            if (!safeLinkPath) {
+              throw new Error(`ERR_TAR_SYMLINK_FORBIDDEN: Link entry "${entryName}" (typeflag=${typeFlag}) is forbidden`);
+            }
+            rawSymlinks.push({
+              path: safeLinkPath,
+              rawName: entryName,
+              linkTarget,
+              typeFlag,
+            });
+            if (size > 0) {
+              remainingBytes = size;
+              padBytes = (512 - (size % 512)) % 512;
+              state = 'SKIP_PAYLOAD';
+            }
+            continue;
+          }
+
+          if (typeFlag !== '0' && typeFlag !== '5') {
+            throw new Error(`ERR_TAR_UNSUPPORTED_TYPE: Disallowed entry type "${typeFlag}" for "${entryName}"`);
+          }
+
+          const safe = validateSafeRelPath(entryName);
+          if (!safe || typeFlag === '5' || entryName.endsWith('/')) {
+            if (size > 0) {
+              remainingBytes = size;
+              padBytes = (512 - (size % 512)) % 512;
+              state = 'SKIP_PAYLOAD';
+            }
+            continue;
+          }
+
+          rawPaths.push(safe);
+          activeFileCtx = await onRegularFileStart(safe, size);
+          if (size === 0) {
+            await onRegularFileEnd(activeFileCtx);
+            activeFileCtx = null;
+            state = 'HEADER';
+          } else {
+            remainingBytes = size;
+            padBytes = (512 - (size % 512)) % 512;
+            state = 'FILE_PAYLOAD';
+          }
+          continue;
+        }
+
+        if (state === 'META_PAYLOAD') {
+          const take = Math.min(remainingBytes, pending.length);
+          if (take > 0) {
+            metaChunks.push(pending.subarray(0, take));
+            pending = pending.subarray(take);
+            remainingBytes -= take;
+          }
+          if (remainingBytes === 0) {
+            const payload = Buffer.concat(metaChunks);
+            metaChunks = [];
+            if (metaType === 'x') nextPax = parsePaxRecords(payload);
+            else if (metaType === 'g') globalPax = { ...globalPax, ...parsePaxRecords(payload) };
+            else if (metaType === 'L') nextLongName = readCleanString(payload, 0, payload.length);
+            else if (metaType === 'K') nextLongLinkName = readCleanString(payload, 0, payload.length);
+            state = padBytes > 0 ? 'SKIP_PAD' : 'HEADER';
+          }
+          continue;
+        }
+
+        if (state === 'FILE_PAYLOAD') {
+          const take = Math.min(remainingBytes, pending.length);
+          if (take > 0) {
+            const slice = pending.subarray(0, take);
+            pending = pending.subarray(take);
+            remainingBytes -= take;
+            await onRegularFileChunk(activeFileCtx, slice);
+          }
+          if (remainingBytes === 0) {
+            await onRegularFileEnd(activeFileCtx);
+            activeFileCtx = null;
+            state = padBytes > 0 ? 'SKIP_PAD' : 'HEADER';
+          }
+          continue;
+        }
+
+        if (state === 'SKIP_PAYLOAD') {
+          const take = Math.min(remainingBytes, pending.length);
+          if (take > 0) {
+            pending = pending.subarray(take);
+            remainingBytes -= take;
+          }
+          if (remainingBytes === 0) {
+            state = padBytes > 0 ? 'SKIP_PAD' : 'HEADER';
+          }
+          continue;
+        }
+
+        if (state === 'SKIP_PAD') {
+          const take = Math.min(padBytes, pending.length);
+          if (take > 0) {
+            pending = pending.subarray(take);
+            padBytes -= take;
+          }
+          if (padBytes === 0) {
+            state = 'HEADER';
+          }
+        }
+      }
+    }
+
+    if (state === 'META_PAYLOAD' || state === 'FILE_PAYLOAD' || state === 'SKIP_PAYLOAD') {
+      throw new Error('ERR_TAR_TRUNCATED: Archive truncated mid-entry');
+    }
+
+    return {
+      rawPaths,
+      rawSymlinks,
+      globalPax,
+    };
+  } catch (err) {
+    if (activeFileCtx?.stream) {
+      try {
+        activeFileCtx.stream.destroy();
+      } catch {
+        /* ignore */
+      }
+    }
+    const msg = err?.message || String(err);
+    if (msg.startsWith('ERR_TAR_')) {
+      throw err;
+    }
+    throw new Error(`ERR_TAR_GUNZIP: ${msg}`);
+  } finally {
+    readStream.destroy();
+    gunzip.destroy();
+  }
+}
+
+/**
+ * Streaming `.tar.gz` inspector with O(MB) RAM usage for large archives.
+ * Only buffers entries matching `shouldBufferFile(relPath, byteLength)`; records all paths & sizes.
+ */
+export async function inspectTarGzStream(
+  archivePath,
+  {
+    maxUncompressedBytes = MAX_TARBALL_BYTES,
+    stripSingleTopDir = true,
+    pluginRoot = '.',
+    allowDeferredSymlinkCheck = false,
+    shouldBufferFile = null,
+  } = {},
+) {
+  const rawFiles = new Map();
+  const rawFileSizes = new Map();
+
+  const parsed = await streamParseTarGz(archivePath, {
+    maxUncompressedBytes,
+    onRegularFileStart(safe, size) {
+      const wantBuffer = typeof shouldBufferFile !== 'function' || Boolean(shouldBufferFile(safe, size));
+      return {
+        safe,
+        size,
+        wantBuffer,
+        chunks: wantBuffer && size > 0 ? [] : null,
+      };
+    },
+    onRegularFileChunk(ctx, slice) {
+      if (ctx.wantBuffer && ctx.chunks) {
+        ctx.chunks.push(Buffer.from(slice));
+      }
+    },
+    onRegularFileEnd(ctx) {
+      rawFileSizes.set(ctx.safe, ctx.size);
+      rawFiles.set(ctx.safe, ctx.wantBuffer && ctx.chunks ? Buffer.concat(ctx.chunks) : Buffer.alloc(0));
+    },
+  });
+
+  const strippedTopDir = unwrapSingleTopDirectory([...rawFiles.keys()], parsed.rawSymlinks, {
+    stripSingleTopDir,
+    hasRootManifest: rawFiles.has('plugin.json'),
+  });
+
+  let files = rawFiles;
+  let fileSizes = rawFileSizes;
+  let symlinks = parsed.rawSymlinks;
+
+  if (strippedTopDir) {
+    const prefixLen = strippedTopDir.length + 1;
+    const unwrappedFiles = new Map();
+    const unwrappedSizes = new Map();
+    for (const [p, buf] of rawFiles.entries()) {
+      unwrappedFiles.set(p.slice(prefixLen), buf);
+    }
+    for (const [p, sz] of rawFileSizes.entries()) {
+      unwrappedSizes.set(p.slice(prefixLen), sz);
+    }
+    files = unwrappedFiles;
+    fileSizes = unwrappedSizes;
+    symlinks = parsed.rawSymlinks.map((s) => ({
+      ...s,
+      path: s.path.slice(prefixLen),
+    }));
+  }
+
+  if (!allowDeferredSymlinkCheck) {
+    assertNoScopedSymlinks(symlinks, pluginRoot, strippedTopDir);
+  }
+
+  return { files, fileSizes, symlinks, globalPax: parsed.globalPax, strippedTopDir };
+}
+
+/**
+ * Streaming `.tar.gz` extractor (`createReadStream -> createGunzip -> createWriteStream`)
+ * enforcing Zip-Slip and scoped symlink guards with O(MB) memory usage on 200MB–2GB+ archives.
+ */
+export async function extractTarGzStreamToDir(
+  archivePath,
+  destDir,
+  { pluginRoot = '.', stripSingleTopDir = true, maxUncompressedBytes = MAX_TARBALL_BYTES } = {},
+) {
+  const absDest = resolve(destDir);
+  const absDestPrefix = absDest.endsWith(sep) ? absDest : `${absDest}${sep}`;
+  const rawTempDir = resolve(`${absDest}.__extract_${randomUUID()}`);
+  const rawTempPrefix = rawTempDir.endsWith(sep) ? rawTempDir : `${rawTempDir}${sep}`;
+  mkdirSync(rawTempDir, { recursive: true });
+
+  const extractedPaths = new Set();
+
+  try {
+    const parsed = await streamParseTarGz(archivePath, {
+      maxUncompressedBytes,
+      onRegularFileStart(safe, size) {
+        const outPath = resolve(rawTempDir, safe);
+        if (outPath !== rawTempDir && !outPath.startsWith(rawTempPrefix)) {
+          throw new Error(`ERR_TAR_ESCAPE: Resolved temp output path escaped staging ("${safe}")`);
+        }
+        extractedPaths.add(safe);
+        if (size === 0) {
+          writeZeroByteFileSync(outPath);
+          return { safe, stream: null };
+        }
+        mkdirSync(dirname(outPath), { recursive: true });
+        return { safe, stream: createWriteStream(outPath) };
+      },
+      async onRegularFileChunk(ctx, slice) {
+        if (ctx.stream) {
+          await writeStreamChunk(ctx.stream, slice);
+        }
+      },
+      async onRegularFileEnd(ctx) {
+        if (ctx.stream) {
+          await finishWriteStream(ctx.stream);
+        }
+      },
+    });
+
+    const uniqueRawPaths = [...extractedPaths];
+    const strippedTopDir = unwrapSingleTopDirectory(uniqueRawPaths, parsed.rawSymlinks, {
+      stripSingleTopDir,
+      hasRootManifest: extractedPaths.has('plugin.json'),
+    });
+
+    const symlinks = strippedTopDir
+      ? parsed.rawSymlinks.map((s) => ({
+          ...s,
+          path: s.path.slice(strippedTopDir.length + 1),
+        }))
+      : parsed.rawSymlinks;
+
+    assertNoScopedSymlinks(symlinks, pluginRoot, strippedTopDir);
+
+    const normRoot = normalizeTarPluginRoot(pluginRoot);
+    const useSubroot = normRoot && normRoot !== '.';
+    const subPrefix = useSubroot ? `${normRoot}/` : '';
+
+    mkdirSync(absDest, { recursive: true });
+
+    let writtenCount = 0;
+    for (const rawRel of uniqueRawPaths) {
+      const strippedRel = strippedTopDir ? rawRel.slice(strippedTopDir.length + 1) : rawRel;
+      let subRel = strippedRel;
+      if (useSubroot) {
+        if (!strippedRel.startsWith(subPrefix)) continue;
+        subRel = strippedRel.slice(subPrefix.length);
+      }
+      const safeSub = validateSafeRelPath(subRel);
+      const srcPath = resolve(rawTempDir, rawRel);
+      const fullOut = resolve(absDest, safeSub);
+      if (fullOut === absDest || !fullOut.startsWith(absDestPrefix)) {
+        throw new Error(`ERR_TAR_ESCAPE: Resolved output path escaped destination ("${safeSub}")`);
+      }
+      mkdirSync(dirname(fullOut), { recursive: true });
+      try {
+        renameSync(srcPath, fullOut);
+      } catch (err) {
+        if (err?.code === 'EXDEV') {
+          copyFileSync(srcPath, fullOut);
+        } else {
+          throw err;
+        }
+      }
+      writtenCount += 1;
+    }
+
+    if (writtenCount === 0) {
+      throw new Error(`ERR_TAR_NO_PLUGIN_FILES: Archive yielded 0 files for pluginRoot="${pluginRoot}"`);
+    }
+
+    return { writtenCount };
+  } finally {
+    rmSync(rawTempDir, { recursive: true, force: true });
+  }
 }
 
 function writeOctal(buf, strVal, offset, length) {
