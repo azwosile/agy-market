@@ -7,8 +7,8 @@
 //       using ETag (`If-None-Match`) + 30-minute TTL caching under `${dataDir}/cache/github`, graceful 403/429
 //       rate-limit degradation, and optional `prefs.githubToken` (strictly never logged or cached).
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { normalizeRepoUrl } from '../preflight/index.mjs';
 import {
   GITHUB_API_BASE_URL,
@@ -28,6 +28,7 @@ const DEFAULT_GITHUB_TIMEOUT_MS = 8000;
 const MIN_RATELIMIT_BACKOFF_MS = 60 * 1000;
 const DEFAULT_RATELIMIT_BACKOFF_MS = 5 * 60 * 1000;
 const MAX_RATELIMIT_BACKOFF_MS = 60 * 60 * 1000;
+const UPDATE_PROBE_CONCURRENCY = 4;
 
 function resolveEffectiveFetch(fetchImpl) {
   return !fetchImpl || fetchImpl === fetch ? defaultProxyFetch : fetchImpl;
@@ -131,7 +132,19 @@ function readJsonSafe(filePath) {
 }
 
 function writeJsonSafe(filePath, data) {
-  writeFileSync(filePath, `${JSON.stringify(data, null, 2)}\n`, 'utf8');
+  mkdirSync(dirname(filePath), { recursive: true });
+  const tmp = `${filePath}.${process.pid}.${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}.tmp`;
+  try {
+    writeFileSync(tmp, `${JSON.stringify(data, null, 2)}\n`, 'utf8');
+    renameSync(tmp, filePath);
+  } catch (err) {
+    try {
+      unlinkSync(tmp);
+    } catch {
+      /* ignore */
+    }
+    throw err;
+  }
 }
 
 function truncateChangelog(raw, maxLen = MAX_CHANGELOG_CHARS) {
@@ -1191,32 +1204,59 @@ export async function checkPluginUpdates({
   const rawManifestMemo = new Map();
   const warnings = [];
   let rateLimited = false;
+  let firstLiveChecked = false;
+  let firstLiveGate = null;
 
-  async function probeOnce(ghSlug) {
-    if (!ghSlug) return null;
+  function probeOnce(ghSlug) {
+    if (!ghSlug) return Promise.resolve(null);
     if (probeMemo.has(ghSlug.fullName)) return probeMemo.get(ghSlug.fullName);
-    const res = await probeGithubRepoUpdates({
-      owner: ghSlug.owner,
-      repo: ghSlug.repo,
-      dataDir,
-      prefs,
-      force,
-      fetchImpl: activeFetch,
-      nowMs,
-      ttlMs,
-      githubApiBaseUrl,
-      timeoutMs,
-      skipNetworkBecauseRateLimited: rateLimited,
-      shouldPersistCache,
-    });
-    if (res.rateLimited) rateLimited = true;
-    if (res.warning) warnings.push(res.warning);
-    probeMemo.set(ghSlug.fullName, res.latest);
-    return res.latest;
+    const pending = (async () => {
+      while (!firstLiveChecked && firstLiveGate) {
+        await firstLiveGate.catch(() => {});
+      }
+      const isGateLeader = !firstLiveChecked && !firstLiveGate;
+      const runProbe = async () => {
+        const res = await probeGithubRepoUpdates({
+          owner: ghSlug.owner,
+          repo: ghSlug.repo,
+          dataDir,
+          prefs,
+          force,
+          fetchImpl: activeFetch,
+          nowMs,
+          ttlMs,
+          githubApiBaseUrl,
+          timeoutMs,
+          skipNetworkBecauseRateLimited: rateLimited,
+          shouldPersistCache,
+        });
+        if (res.rateLimited) rateLimited = true;
+        if (res.warning) warnings.push(res.warning);
+        if (!res.fromCache || res.rateLimited) {
+          firstLiveChecked = true;
+        }
+        return res.latest;
+      };
+      if (!isGateLeader) {
+        return runProbe();
+      }
+      const gatePromise = runProbe();
+      firstLiveGate = gatePromise;
+      try {
+        return await gatePromise;
+      } catch (err) {
+        firstLiveChecked = true;
+        throw err;
+      } finally {
+        if (firstLiveGate === gatePromise) firstLiveGate = null;
+      }
+    })();
+    probeMemo.set(ghSlug.fullName, pending);
+    return pending;
   }
 
-  async function probeBranchOnce(ghSlug, loc) {
-    if (!ghSlug || !loc?.receipt) return null;
+  function probeBranchOnce(ghSlug, loc) {
+    if (!ghSlug || !loc?.receipt) return Promise.resolve(null);
     const branch =
       loc.receipt?.githubSource?.trackBranch ||
       (loc.receipt?.githubSource?.refType === 'branch' && loc.receipt?.githubSource?.ref
@@ -1227,35 +1267,38 @@ export async function checkPluginUpdates({
     const memoKey = `${ghSlug.fullName}|${branch}|${pluginRoot}`;
     if (branchProbeMemo.has(memoKey)) return branchProbeMemo.get(memoKey);
 
-    const res = await probeGithubBranchHead({
-      owner: ghSlug.owner,
-      repo: ghSlug.repo,
-      branch,
-      pluginRoot,
-      installedCommitSha: loc.receipt?.commitSha || '',
-      dataDir,
-      prefs,
-      force,
-      fetchImpl: activeFetch,
-      nowMs,
-      ttlMs,
-      githubApiBaseUrl,
-      timeoutMs,
-      skipNetworkBecauseRateLimited: rateLimited,
-      shouldPersistCache,
-    });
-    if (res.rateLimited) rateLimited = true;
-    if (res.warning) warnings.push(res.warning);
-    branchProbeMemo.set(memoKey, res.head);
-    return res.head;
+    const pending = (async () => {
+      const res = await probeGithubBranchHead({
+        owner: ghSlug.owner,
+        repo: ghSlug.repo,
+        branch,
+        pluginRoot,
+        installedCommitSha: loc.receipt?.commitSha || '',
+        dataDir,
+        prefs,
+        force,
+        fetchImpl: activeFetch,
+        nowMs,
+        ttlMs,
+        githubApiBaseUrl,
+        timeoutMs,
+        skipNetworkBecauseRateLimited: rateLimited,
+        shouldPersistCache,
+      });
+      if (res.rateLimited) rateLimited = true;
+      if (res.warning) warnings.push(res.warning);
+      return res.head;
+    })();
+    branchProbeMemo.set(memoKey, pending);
+    return pending;
   }
 
-  async function probeRawManifestOnce(ghSlug, tagName, pluginRoot = '.') {
-    if (!ghSlug || !tagName) return null;
+  function probeRawManifestOnce(ghSlug, tagName, pluginRoot = '.') {
+    if (!ghSlug || !tagName) return Promise.resolve(null);
     const normRoot = normalizePluginRootForUpdate(pluginRoot);
     const memoKey = `${ghSlug.fullName}|${tagName}|${normRoot}`;
     if (rawManifestMemo.has(memoKey)) return rawManifestMemo.get(memoKey);
-    const res = await probeRawManifestForTagCached({
+    const pending = probeRawManifestForTagCached({
       owner: ghSlug.owner,
       repo: ghSlug.repo,
       tagName,
@@ -1268,98 +1311,115 @@ export async function checkPluginUpdates({
       timeoutMs,
       shouldPersistCache,
     });
-    rawManifestMemo.set(memoKey, res);
-    return res;
+    rawManifestMemo.set(memoKey, pending);
+    return pending;
   }
 
   const items = [];
   let sawInstalledSelf = false;
   let selfUpdate = null;
 
-  for (const loc of globalInstalled) {
-    const isSelf = loc.dir === PLUGIN_ID || loc.name === PLUGIN_ID || loc.receipt?.id === SELF_CATALOG_ID;
-    if (isSelf) sawInstalledSelf = true;
+  const probeSlots = new Array(globalInstalled.length);
+  let nextSlot = 0;
+  const workerCount = Math.min(UPDATE_PROBE_CONCURRENCY, globalInstalled.length);
 
-    // Issue #3A: Exclude native `.git` clones and unversioned unmanaged plugins from update checks
-    if (!isSelf && isUnmanagedNonUpdatableLocal(loc)) {
-      continue;
-    }
+  async function probeWorker() {
+    while (nextSlot < globalInstalled.length) {
+      const idx = nextSlot++;
+      const loc = globalInstalled[idx];
+      const isSelf = loc.dir === PLUGIN_ID || loc.name === PLUGIN_ID || loc.receipt?.id === SELF_CATALOG_ID;
+      if (isSelf) sawInstalledSelf = true;
 
-    const catPlugin = findMatchingCatalogPlugin(loc, catalogPlugins);
-    const ghSlug =
-      parseGithubRepoSlug(catPlugin?.repository?.url) ||
-      parseGithubRepoSlug(loc.repositoryUrl) ||
-      inferRepoSlugFromReceiptId(loc.receipt?.id) ||
-      (isSelf ? parseGithubRepoSlug(SELF_REPO_URL) : null);
-
-    const rawGhLatest = await probeOnce(ghSlug);
-    let ghLatest = rawGhLatest;
-
-    // Issue #2B: For unreceipted & non-catalog plugins (e.g. monorepo plugins like upstash/context7),
-    // verify raw `<tag>/<resolvedPluginRoot>/plugin.json` exists, matches plugin name, and declares a newer version.
-    if (
-      ghLatest &&
-      !loc.receipt &&
-      !catPlugin &&
-      !isSelf &&
-      ghSlug &&
-      isNewerVersion(ghLatest.version, loc.version)
-    ) {
-      const resolvedRoot = normalizePluginRootForUpdate(loc.receipt?.pluginRoot || '.');
-      const rawMeta = await probeRawManifestOnce(ghSlug, ghLatest.tagName, resolvedRoot);
-      const localNames = new Set(
-        [loc.name, loc.dir].filter(Boolean).map((s) => String(s).trim().toLowerCase()),
-      );
-      const remoteName = String(rawMeta?.name || '').trim().toLowerCase();
-      const remoteVersion = String(rawMeta?.version || '').trim();
-      const nameMatches = Boolean(remoteName && localNames.has(remoteName));
-      const versionIsNewer = Boolean(remoteVersion && isNewerVersion(remoteVersion, loc.version));
-      if (!rawMeta?.found || !nameMatches || !versionIsNewer) {
-        ghLatest = null;
+      // Issue #3A: Exclude native `.git` clones and unversioned unmanaged plugins from update checks
+      if (!isSelf && isUnmanagedNonUpdatableLocal(loc)) {
+        probeSlots[idx] = null;
+        continue;
       }
-    }
 
-    const shouldProbeBranch = Boolean(
-      loc.receipt?.track === 'github-url' &&
+      const catPlugin = findMatchingCatalogPlugin(loc, catalogPlugins);
+      const ghSlug =
+        parseGithubRepoSlug(catPlugin?.repository?.url) ||
+        parseGithubRepoSlug(loc.repositoryUrl) ||
+        inferRepoSlugFromReceiptId(loc.receipt?.id) ||
+        (isSelf ? parseGithubRepoSlug(SELF_REPO_URL) : null);
+
+      const rawGhLatest = await probeOnce(ghSlug);
+      let ghLatest = rawGhLatest;
+
+      // Issue #2B: For unreceipted & non-catalog plugins (e.g. monorepo plugins like upstash/context7),
+      // verify raw `<tag>/<resolvedPluginRoot>/plugin.json` exists, matches plugin name, and declares a newer version.
+      if (
+        ghLatest &&
+        !loc.receipt &&
+        !catPlugin &&
         !isSelf &&
         ghSlug &&
-        (loc.receipt?.githubSource?.refType === 'branch' || (!ghLatest && Boolean(loc.receipt?.commitSha))),
-    );
-    const branchHead = shouldProbeBranch ? await probeBranchOnce(ghSlug, loc) : null;
-    const fallbackId = catPlugin?.id || loc.receipt?.id || (ghSlug ? `${ghSlug.owner}__${ghSlug.repo}` : loc.dir);
-
-    const item = buildUpdateItem({
-      id: fallbackId,
-      dir: loc.dir,
-      displayName: loc.displayName || loc.name || loc.dir,
-      installedVersion: loc.version,
-      catPlugin,
-      receipt: loc.receipt || null,
-      repositoryUrl: loc.repositoryUrl || '',
-      ghSlug,
-      ghLatest,
-      branchHead,
-      isSelf,
-    });
-
-    if (item) {
-      items.push(item);
-      if (isSelf) {
-        selfUpdate = {
-          id: item.id,
-          installedVersion: item.installedVersion,
-          latestVersion: item.latestVersion,
-          source: item.source,
-          updateChannel: item.updateChannel || 'catalog',
-          ...(item.updateKind ? { updateKind: item.updateKind } : {}),
-          ...(item.targetRef ? { targetRef: item.targetRef } : {}),
-          ...(item.repositoryUrl ? { repositoryUrl: item.repositoryUrl } : {}),
-          ...(item.pluginRoot ? { pluginRoot: item.pluginRoot } : {}),
-          installable: item.installable,
-          releaseUrl: item.releaseUrl,
-          changelog: item.changelog,
-        };
+        isNewerVersion(ghLatest.version, loc.version)
+      ) {
+        const resolvedRoot = normalizePluginRootForUpdate(loc.receipt?.pluginRoot || '.');
+        const rawMeta = await probeRawManifestOnce(ghSlug, ghLatest.tagName, resolvedRoot);
+        const localNames = new Set(
+          [loc.name, loc.dir].filter(Boolean).map((s) => String(s).trim().toLowerCase()),
+        );
+        const remoteName = String(rawMeta?.name || '').trim().toLowerCase();
+        const remoteVersion = String(rawMeta?.version || '').trim();
+        const nameMatches = Boolean(remoteName && localNames.has(remoteName));
+        const versionIsNewer = Boolean(remoteVersion && isNewerVersion(remoteVersion, loc.version));
+        if (!rawMeta?.found || !nameMatches || !versionIsNewer) {
+          ghLatest = null;
+        }
       }
+
+      const shouldProbeBranch = Boolean(
+        loc.receipt?.track === 'github-url' &&
+          !isSelf &&
+          ghSlug &&
+          (loc.receipt?.githubSource?.refType === 'branch' || (!ghLatest && Boolean(loc.receipt?.commitSha))),
+      );
+      const branchHead = shouldProbeBranch ? await probeBranchOnce(ghSlug, loc) : null;
+      const fallbackId = catPlugin?.id || loc.receipt?.id || (ghSlug ? `${ghSlug.owner}__${ghSlug.repo}` : loc.dir);
+
+      const item = buildUpdateItem({
+        id: fallbackId,
+        dir: loc.dir,
+        displayName: loc.displayName || loc.name || loc.dir,
+        installedVersion: loc.version,
+        catPlugin,
+        receipt: loc.receipt || null,
+        repositoryUrl: loc.repositoryUrl || '',
+        ghSlug,
+        ghLatest,
+        branchHead,
+        isSelf,
+      });
+
+      probeSlots[idx] = { isSelf, item };
+    }
+  }
+
+  if (workerCount > 0) {
+    await Promise.all(Array.from({ length: workerCount }, () => probeWorker()));
+  }
+
+  for (const slot of probeSlots) {
+    if (!slot?.item) continue;
+    const { isSelf, item } = slot;
+    items.push(item);
+    if (isSelf) {
+      selfUpdate = {
+        id: item.id,
+        installedVersion: item.installedVersion,
+        latestVersion: item.latestVersion,
+        source: item.source,
+        updateChannel: item.updateChannel || 'catalog',
+        ...(item.updateKind ? { updateKind: item.updateKind } : {}),
+        ...(item.targetRef ? { targetRef: item.targetRef } : {}),
+        ...(item.repositoryUrl ? { repositoryUrl: item.repositoryUrl } : {}),
+        ...(item.pluginRoot ? { pluginRoot: item.pluginRoot } : {}),
+        installable: item.installable,
+        releaseUrl: item.releaseUrl,
+        changelog: item.changelog,
+      };
     }
   }
 

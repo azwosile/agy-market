@@ -6,6 +6,7 @@ import { createServer } from 'node:http';
 import { dirname, join, resolve } from 'node:path';
 import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
+import { gzip } from 'node:zlib';
 import { fetchPluginDiscussions } from '../discussions/index.mjs';
 import {
   inspectGithubPluginUrl,
@@ -22,11 +23,17 @@ import {
 import { recoverInterruptedJournal } from '../installer/journal.mjs';
 import { sweepRetiredBinaries } from '../installer/sync-dir.mjs';
 import { scanLocalConflicts } from '../preflight/conflicts.mjs';
-import { normalizeRepoUrl, resolveInstallPreflight, scanLocalPluginInventory } from '../preflight/index.mjs';
+import {
+  invalidateLocalInventoryCache,
+  normalizeRepoUrl,
+  resolveInstallPreflight,
+  scanLocalPluginInventory,
+} from '../preflight/index.mjs';
 import { fetchPluginReadme, resolveMarketCatalog } from '../registry/index.mjs';
 import { classifyActivationRequirement } from '../shared/activation.mjs';
 import {
   CUSTOMIZATION_URI,
+  GZIP_MIN_BYTES,
   MAX_FAVORITES,
   PLUGIN_DISPLAY_NAME,
   PLUGIN_ID,
@@ -46,6 +53,7 @@ import {
   computeCapabilityEscalation,
   loadPrefsFromDisk,
   sanitizeFavorites,
+  sanitizePrefs,
   savePrefsToDisk,
   toPublicPrefs,
 } from '../shared/schemas.mjs';
@@ -219,17 +227,56 @@ function parseWorkspaceUrisInput(raw) {
   return [];
 }
 
+function acceptsGzipEncoding(acceptEncodingHeader) {
+  if (!acceptEncodingHeader || typeof acceptEncodingHeader !== 'string') return false;
+  for (const part of acceptEncodingHeader.split(',')) {
+    const [rawCoding, ...params] = part.trim().toLowerCase().split(';');
+    if (rawCoding.trim() !== 'gzip') continue;
+    let q = 1;
+    for (const p of params) {
+      const m = /^q\s*=\s*([0-9.]+)$/.exec(p.trim());
+      if (m) q = Number(m[1]);
+    }
+    if (Number.isFinite(q) && q > 0) return true;
+  }
+  return false;
+}
+
 function sendJson(res, status, payload, onFlushed = null) {
-  const body = JSON.stringify(payload);
-  res.writeHead(status, {
+  const bodyBuf = Buffer.from(JSON.stringify(payload), 'utf8');
+  const acceptEncoding = res.req?.headers?.['accept-encoding'] || '';
+  const baseHeaders = {
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store',
     'X-Content-Type-Options': 'nosniff',
-  });
+  };
+
+  if (bodyBuf.length > GZIP_MIN_BYTES && acceptsGzipEncoding(acceptEncoding)) {
+    gzip(bodyBuf, (err, gzBuf) => {
+      if (res.writableEnded || res.destroyed) return;
+      if (!err && gzBuf) {
+        res.writeHead(status, {
+          ...baseHeaders,
+          'Content-Encoding': 'gzip',
+          Vary: 'Accept-Encoding',
+          'Content-Length': String(gzBuf.length),
+        });
+        if (typeof onFlushed === 'function') res.end(gzBuf, onFlushed);
+        else res.end(gzBuf);
+        return;
+      }
+      res.writeHead(status, { ...baseHeaders, 'Content-Length': String(bodyBuf.length) });
+      if (typeof onFlushed === 'function') res.end(bodyBuf, onFlushed);
+      else res.end(bodyBuf);
+    });
+    return;
+  }
+
+  res.writeHead(status, { ...baseHeaders, 'Content-Length': String(bodyBuf.length) });
   if (typeof onFlushed === 'function') {
-    res.end(body, onFlushed);
+    res.end(bodyBuf, onFlushed);
   } else {
-    res.end(body);
+    res.end(bodyBuf);
   }
 }
 
@@ -390,13 +437,48 @@ export async function createMarketSidecarServer(options = {}) {
 
   let prefs = loadPrefsFromDisk(dataDir);
   let lastCatalog = null;
+  let lastCatalogPrefsKey = '';
+  let catalogGeneration = 0;
+  const inFlightCatalog = new Map(); // flightKey -> { generation, promise }
+  let catalogConfigQueue = Promise.resolve();
   let updateCheckGeneration = 0;
   const inFlightUpdates = new Map(); // flightKey -> { key, force, generation, promise }
   let activeMutation = null; // { route, startedAt }
 
+  function enqueueCatalogConfigOp(taskFn) {
+    const next = catalogConfigQueue.then(taskFn, taskFn);
+    catalogConfigQueue = next.catch(() => {});
+    return next;
+  }
+
+  function getCatalogPrefsKey(p = prefs) {
+    const clean = sanitizePrefs(p);
+    return JSON.stringify({
+      enableExperimentalTrack2: clean.enableExperimentalTrack2,
+      networkMode: clean.networkMode,
+      primaryCatalogUrl: clean.primaryCatalogUrl,
+      customFeeds: clean.customFeeds,
+    });
+  }
+
+  function hasUsableTrack2Data() {
+    if (Array.isArray(lastCatalog?.plugins) && lastCatalog.plugins.some((p) => p?._track === 'unverified')) {
+      return true;
+    }
+    const cacheFile = join(dataDir, 'cache', 'unverified-index.json');
+    if (!existsSync(cacheFile)) return false;
+    try {
+      const parsed = JSON.parse(readFileSync(cacheFile, 'utf8'));
+      return Array.isArray(parsed?.plugins) && parsed.plugins.length > 0;
+    } catch {
+      return false;
+    }
+  }
+
   function invalidateUpdateCheckState() {
     updateCheckGeneration += 1;
     inFlightUpdates.clear();
+    invalidateLocalInventoryCache();
   }
 
   function hasLoadedReadmes(cat) {
@@ -409,17 +491,47 @@ export async function createMarketSidecarServer(options = {}) {
   }
 
   async function ensureCatalogLoaded({ forceCatalogRefresh = false, includeReadmes = false } = {}) {
-    if (!lastCatalog || forceCatalogRefresh || (includeReadmes && !hasLoadedReadmes(lastCatalog))) {
-      lastCatalog = await resolveMarketCatalog({
+    const prefsKey = getCatalogPrefsKey(prefs);
+    const needsReload =
+      !lastCatalog ||
+      forceCatalogRefresh ||
+      lastCatalogPrefsKey !== prefsKey ||
+      (includeReadmes && !hasLoadedReadmes(lastCatalog));
+
+    if (!needsReload) {
+      return lastCatalog;
+    }
+
+    const flightKey = `${catalogGeneration}|${prefsKey}|${forceCatalogRefresh ? '1' : '0'}|${includeReadmes ? '1' : '0'}`;
+    const existing = inFlightCatalog.get(flightKey);
+    if (existing) {
+      return existing.promise;
+    }
+
+    const startGen = catalogGeneration;
+    const startPrefsSnapshot = sanitizePrefs(prefs);
+    const promise = (async () => {
+      const loaded = await resolveMarketCatalog({
         dataDir,
-        prefs,
+        prefs: startPrefsSnapshot,
         forceRefresh: forceCatalogRefresh,
         includeReadmes,
         fetchImpl,
         mirrors,
       });
-    }
-    return lastCatalog;
+      if (startGen === catalogGeneration) {
+        lastCatalog = loaded;
+        lastCatalogPrefsKey = prefsKey;
+      }
+      return loaded;
+    })().finally(() => {
+      if (inFlightCatalog.get(flightKey)?.promise === promise) {
+        inFlightCatalog.delete(flightKey);
+      }
+    });
+
+    inFlightCatalog.set(flightKey, { generation: startGen, promise });
+    return promise;
   }
 
   function findCatalogEntryForDir(dirName) {
@@ -497,7 +609,9 @@ export async function createMarketSidecarServer(options = {}) {
   }
 
   async function buildEnrichedState({ forceCatalogRefresh = false, workspaceUris = [] } = {}) {
-    await ensureCatalogLoaded({ forceCatalogRefresh, includeReadmes: false });
+    const loadedCatalog = await ensureCatalogLoaded({ forceCatalogRefresh, includeReadmes: false });
+    const activeCatalog =
+      lastCatalog && lastCatalogPrefsKey === getCatalogPrefsKey(prefs) ? lastCatalog : loadedCatalog;
 
     const inventory = scanLocalPluginInventory({
       configDir,
@@ -507,7 +621,7 @@ export async function createMarketSidecarServer(options = {}) {
       linkInfoOverride,
     });
     const updatesAvailable = [];
-    const catalogPlugins = lastCatalog.plugins || [];
+    const catalogPlugins = activeCatalog.plugins || [];
 
     // Enrich installed items with merged catalog capabilities & activation classification
     const catalogById = new Map();
@@ -570,26 +684,31 @@ export async function createMarketSidecarServer(options = {}) {
 
       return {
         ...p,
-        activation: catalogActivation,
-        installStatus: {
-          installed: Boolean(localMatch),
-          installedDir: localMatch?.dir || null,
-          installedVersion: localMatch?.version || null,
-          enabled: localMatch ? localMatch.enabled : false,
-          parkedByMarket: localMatch ? Boolean(localMatch.parkedByMarket) : false,
-          hostDisabled: localMatch ? Boolean(localMatch.hostDisabled) : false,
-          canToggle: localMatch ? Boolean(localMatch.canToggle) : false,
-          toggleDisabledReason: localMatch ? localMatch.toggleDisabledReason || '' : '',
-          canUninstall: localMatch ? Boolean(localMatch.canUninstall) : false,
-          uninstallDisabledReason: localMatch ? localMatch.uninstallDisabledReason || '' : '',
-          scope: localMatch?.scope || null,
-          hasUpdate,
-          customizationUri: localMatch?.customizationUri || null,
-          sidecarPane: localMatch?.sidecarPane || null,
-          conflictDetected: preflight.action === 'conflict-prompt',
-          escalation,
-          activation: localMatch?.activation || catalogActivation,
-        },
+        activation: localMatch?.activation || catalogActivation,
+        installStatus: localMatch
+          ? {
+              installed: true,
+              installedDir: localMatch.dir,
+              installedVersion: localMatch.version,
+              enabled: localMatch.enabled,
+              parkedByMarket: Boolean(localMatch.parkedByMarket),
+              hostDisabled: Boolean(localMatch.hostDisabled),
+              canToggle: Boolean(localMatch.canToggle),
+              toggleDisabledReason: localMatch.toggleDisabledReason || '',
+              canUninstall: Boolean(localMatch.canUninstall),
+              uninstallDisabledReason: localMatch.uninstallDisabledReason || '',
+              scope: localMatch.scope || null,
+              hasUpdate,
+              customizationUri: localMatch.customizationUri || null,
+              sidecarPane: localMatch.sidecarPane || null,
+              conflictDetected: preflight.action === 'conflict-prompt',
+              escalation,
+            }
+          : {
+              installed: false,
+              hasUpdate: false,
+              ...(preflight.action === 'conflict-prompt' ? { conflictDetected: true } : {}),
+            },
       };
     });
 
@@ -604,10 +723,10 @@ export async function createMarketSidecarServer(options = {}) {
       },
       prefs: toPublicPrefs(prefs),
       catalog: {
-        channelUsed: lastCatalog.channelUsed,
-        catalogVersion: lastCatalog.catalogVersion,
-        generatedAt: lastCatalog.generatedAt,
-        warnings: lastCatalog.warnings,
+        channelUsed: activeCatalog.channelUsed,
+        catalogVersion: activeCatalog.catalogVersion,
+        generatedAt: activeCatalog.generatedAt,
+        warnings: activeCatalog.warnings,
         plugins: enrichedCatalogPlugins,
       },
       installed: enrichedInstalled,
@@ -634,6 +753,7 @@ export async function createMarketSidecarServer(options = {}) {
   }
 
   async function handleRequest(req, res) {
+    if (!res.req) res.req = req;
     let acquiredMutationLock = false;
     const acquireMutationLock = (route) => {
       if (activeMutation) {
@@ -705,6 +825,11 @@ export async function createMarketSidecarServer(options = {}) {
       const refresh = urlObj.searchParams.get('refresh') === '1';
       const wsParam = urlObj.searchParams.get('workspaceUris') || '';
       const workspaceUris = wsParam ? wsParam.split(',').filter(Boolean) : [];
+      if (refresh) {
+        catalogGeneration += 1;
+        inFlightCatalog.clear();
+        invalidateLocalInventoryCache();
+      }
       const state = await buildEnrichedState({ forceCatalogRefresh: refresh, workspaceUris });
       sendJson(res, 200, state);
       return;
@@ -748,10 +873,10 @@ export async function createMarketSidecarServer(options = {}) {
 
       const generation = updateCheckGeneration;
       const runCheck = async () => {
-        await ensureCatalogLoaded({ forceCatalogRefresh: force, includeReadmes: false });
+        const loadedCat = await ensureCatalogLoaded({ forceCatalogRefresh: force, includeReadmes: false });
         const inventory = scanLocalPluginInventory({ configDir, dataDir, workspaceUris, builtinPluginsDir, linkInfoOverride });
         return checkPluginUpdates({
-          catalog: lastCatalog,
+          catalog: lastCatalog && lastCatalogPrefsKey === getCatalogPrefsKey(prefs) ? lastCatalog : loadedCat,
           inventory,
           dataDir,
           prefs,
@@ -1022,29 +1147,45 @@ export async function createMarketSidecarServer(options = {}) {
       const body = await readJsonBody(req);
 
       if (pathname === '/api/catalog/refresh') {
-        const state = await buildEnrichedState({
-          forceCatalogRefresh: true,
-          workspaceUris: Array.isArray(body.workspaceUris) ? body.workspaceUris : [],
+        const state = await enqueueCatalogConfigOp(async () => {
+          catalogGeneration += 1;
+          inFlightCatalog.clear();
+          invalidateUpdateCheckState();
+          return buildEnrichedState({
+            forceCatalogRefresh: true,
+            workspaceUris: Array.isArray(body.workspaceUris) ? body.workspaceUris : [],
+          });
         });
         sendJson(res, 200, state);
         return;
       }
 
       if (pathname === '/api/prefs' || pathname === '/api/sources') {
-        const merged = { ...prefs, ...body };
-        if (body.clearGithubToken === true) {
-          merged.githubToken = '';
-        } else if (!Object.prototype.hasOwnProperty.call(body, 'githubToken')) {
-          merged.githubToken = prefs.githubToken || '';
-        }
-        if (!Object.prototype.hasOwnProperty.call(body, 'favorites')) {
-          merged.favorites = Array.isArray(prefs.favorites) ? [...prefs.favorites] : [];
-        }
-        prefs = savePrefsToDisk(dataDir, merged);
-        invalidateUpdateCheckState();
-        const state = await buildEnrichedState({
-          forceCatalogRefresh: true,
-          workspaceUris: Array.isArray(body.workspaceUris) ? body.workspaceUris : [],
+        const state = await enqueueCatalogConfigOp(async () => {
+          const prevPrefs = prefs;
+          const prevCatalogKey = getCatalogPrefsKey(prevPrefs);
+          const merged = { ...prefs, ...body };
+          if (body.clearGithubToken === true) {
+            merged.githubToken = '';
+          } else if (!Object.prototype.hasOwnProperty.call(body, 'githubToken')) {
+            merged.githubToken = prefs.githubToken || '';
+          }
+          if (!Object.prototype.hasOwnProperty.call(body, 'favorites')) {
+            merged.favorites = Array.isArray(prefs.favorites) ? [...prefs.favorites] : [];
+          }
+          prefs = savePrefsToDisk(dataDir, merged);
+          const nextCatalogKey = getCatalogPrefsKey(prefs);
+          const track2SwitchedOn = !prevPrefs.enableExperimentalTrack2 && Boolean(prefs.enableExperimentalTrack2);
+          const needsForceCatalog = track2SwitchedOn && !hasUsableTrack2Data();
+          if (prevCatalogKey !== nextCatalogKey) {
+            catalogGeneration += 1;
+            inFlightCatalog.clear();
+          }
+          invalidateUpdateCheckState();
+          return buildEnrichedState({
+            forceCatalogRefresh: needsForceCatalog,
+            workspaceUris: Array.isArray(body.workspaceUris) ? body.workspaceUris : [],
+          });
         });
         sendJson(res, 200, state);
         return;
@@ -2173,6 +2314,7 @@ export async function createMarketSidecarServer(options = {}) {
     });
 
     const res = {
+      req,
       headersSent: false,
       writeHead(code, hdrs = {}) {
         statusCode = code;

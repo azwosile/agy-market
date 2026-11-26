@@ -6,8 +6,8 @@
 //   3. Automatic Mainland China Mirror Fallback (`@agy-market/catalog` on `registry.npmmirror.com` / Tencent Cloud mirror):
 //      streams the pure-JSON npm data tarball in memory and extracts `{index.json, unverified-index.json, readmes.json}`.
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { parseTarGzToMap } from '../installer/tar-extract.mjs';
 import {
   CATALOG_NPM_PACKAGE,
@@ -15,6 +15,7 @@ import {
   PRIMARY_CATALOG_BASE_URL,
   PRIMARY_FETCH_TIMEOUT_MS,
   RAW_GH_PAGES_CATALOG_BASE_URL,
+  UNVERIFIED_FETCH_TIMEOUT_MS,
 } from '../shared/constants.mjs';
 import { fileUriToLocalPath } from '../shared/paths.mjs';
 import { defaultProxyFetch } from '../shared/proxy-fetch.mjs';
@@ -94,13 +95,25 @@ function readCachedJson(cacheDir, key) {
   }
 }
 
+function writeJsonAtomic(filePath, value) {
+  mkdirSync(dirname(filePath), { recursive: true });
+  const tmp = `${filePath}.${process.pid}.${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}.tmp`;
+  try {
+    writeFileSync(tmp, JSON.stringify(value), 'utf8');
+    renameSync(tmp, filePath);
+  } catch (err) {
+    try {
+      unlinkSync(tmp);
+    } catch {
+      /* ignore */
+    }
+    throw err;
+  }
+}
+
 function writeCachedJson(cacheDir, key, data, meta = {}) {
-  writeFileSync(join(cacheDir, `${key}.json`), `${JSON.stringify(data, null, 2)}\n`, 'utf8');
-  writeFileSync(
-    join(cacheDir, `${key}.meta.json`),
-    `${JSON.stringify({ ...meta, cachedAt: new Date().toISOString() }, null, 2)}\n`,
-    'utf8',
-  );
+  writeJsonAtomic(join(cacheDir, `${key}.json`), data);
+  writeJsonAtomic(join(cacheDir, `${key}.meta.json`), { ...meta, cachedAt: new Date().toISOString() });
 }
 
 async function fetchJsonWithConditionalCache(
@@ -203,11 +216,11 @@ export async function loadCatalogFromNpmMirror(
         errors.push(`${tarballUrl} -> missing valid index.json`);
         continue;
       }
-      const unverifiedIndexJson = pickJson('unverified-index.json') || {
-        schemaVersion: 1,
-        track: 'unverified',
-        plugins: [],
-      };
+      const realUnverified = pickJson('unverified-index.json');
+      const unverifiedMissing = !realUnverified || !Array.isArray(realUnverified.plugins);
+      const unverifiedIndexJson = unverifiedMissing
+        ? { schemaVersion: 1, track: 'unverified', plugins: [] }
+        : realUnverified;
       const readmesJson = pickJson('readmes.json') || { schemaVersion: 1, entries: {}, entriesZh: {}, entriesEn: {} };
 
       // Also extract any per-plugin `dist/readmes/<id>.json` files shipped in v1.6+ catalog tarballs
@@ -241,16 +254,19 @@ export async function loadCatalogFromNpmMirror(
       }
 
       writeCachedJson(cacheDir, 'index', indexJson, { channel: 'npm-mirror', mirrorBase, version: packument.version });
-      writeCachedJson(cacheDir, 'unverified-index', unverifiedIndexJson, {
-        channel: 'npm-mirror',
-        mirrorBase,
-        version: packument.version,
-      });
+      if (!unverifiedMissing) {
+        writeCachedJson(cacheDir, 'unverified-index', unverifiedIndexJson, {
+          channel: 'npm-mirror',
+          mirrorBase,
+          version: packument.version,
+        });
+      }
       writeCachedJson(cacheDir, 'readmes', readmesJson, { channel: 'npm-mirror', mirrorBase, version: packument.version });
 
       return {
         indexJson,
         unverifiedIndexJson,
+        unverifiedMissing,
         readmesJson,
         perPluginReadmes,
         channel: `npm-mirror (${mirrorBase})`,
@@ -297,6 +313,11 @@ export async function resolveMarketCatalog({
   let channelUsed = 'offline-empty';
   let activePrimaryBase = '';
   const warnings = [];
+  const warnBi = (zh, en) => warnings.push(`${zh} / ${en}`);
+  const errMsg = (e) => e?.message || String(e);
+  const wantTrack2 = Boolean(cleanPrefs.enableExperimentalTrack2);
+  let track2Loaded = false;
+  let mirrorLackedTrack2 = false;
 
   const tryPrimary = cleanPrefs.networkMode !== 'china-mirror';
   const tryChinaMirror = cleanPrefs.networkMode !== 'direct';
@@ -322,16 +343,6 @@ export async function resolveMarketCatalog({
         channelUsed = vRes.channel;
         activePrimaryBase = candidate.url;
 
-        if (cleanPrefs.enableExperimentalTrack2) {
-          const uRes = await fetchJsonWithConditionalCache(
-            `${candidate.url}/unverified-index.json`,
-            cacheDir,
-            'unverified-index',
-            { forceRefresh, fetchImpl: activeFetch, channelLabel: candidate.channelLabel },
-          ).catch(() => null);
-          if (uRes?.data) unverifiedFeed = uRes.data;
-        }
-
         if (includeReadmes) {
           const rRes = await fetchJsonWithConditionalCache(`${candidate.url}/readmes.json`, cacheDir, 'readmes', {
             forceRefresh,
@@ -347,7 +358,49 @@ export async function resolveMarketCatalog({
     }
 
     if (!verifiedFeed && primaryErrors.length > 0) {
-      warnings.push(`Primary catalog unreachable (${primaryErrors.join(' | ')})`);
+      warnBi(
+        `主目录不可达 (${primaryErrors.join(' | ')})`,
+        `Primary catalog unreachable (${primaryErrors.join(' | ')})`,
+      );
+    }
+
+    // Track 2 (`unverified-index.json`, ~2 MB): own long timeout, alternate primary, never silent.
+    if (wantTrack2 && verifiedFeed) {
+      const ordered = [
+        ...primaryCandidates.filter((c) => c.url === activePrimaryBase),
+        ...primaryCandidates.filter((c) => c.url !== activePrimaryBase),
+      ];
+      const t2Errors = [];
+      for (const candidate of ordered) {
+        try {
+          const uRes = await fetchJsonWithConditionalCache(`${candidate.url}/unverified-index.json`, cacheDir, 'unverified-index', {
+            timeoutMs: UNVERIFIED_FETCH_TIMEOUT_MS,
+            forceRefresh,
+            fetchImpl: activeFetch,
+            channelLabel: candidate.channelLabel,
+          });
+          if (uRes?.data && Array.isArray(uRes.data.plugins)) {
+            unverifiedFeed = uRes.data;
+            track2Loaded = true;
+            if (t2Errors.length > 0) {
+              warnBi(
+                `Track 2 主源失败，已改用备用源 ${candidate.channelLabel}: ${t2Errors.join(' | ')}`,
+                `Track 2 primary failed, loaded from alternate ${candidate.channelLabel}: ${t2Errors.join(' | ')}`,
+              );
+            }
+            break;
+          }
+          t2Errors.push(`${candidate.url}: invalid unverified-index payload`);
+        } catch (e) {
+          t2Errors.push(`${candidate.url}: ${errMsg(e)}`);
+        }
+      }
+      if (!track2Loaded) {
+        warnBi(
+          `Track 2 在线加载失败，将尝试镜像/本地缓存 (${t2Errors.join(' | ')})`,
+          `Track 2 online fetch failed, trying mirror/local cache (${t2Errors.join(' | ')})`,
+        );
+      }
     }
   }
 
@@ -355,15 +408,85 @@ export async function resolveMarketCatalog({
     try {
       const mirrorOut = await loadCatalogFromNpmMirror(cacheDir, { mirrors, fetchImpl: activeFetch });
       verifiedFeed = mirrorOut.indexJson;
-      if (cleanPrefs.enableExperimentalTrack2) {
+      if (wantTrack2 && !mirrorOut.unverifiedMissing) {
         unverifiedFeed = mirrorOut.unverifiedIndexJson;
+        track2Loaded = true;
+      } else if (wantTrack2 && mirrorOut.unverifiedMissing) {
+        mirrorLackedTrack2 = true;
       }
       if (includeReadmes) {
         readmesFeed = mirrorOut.readmesJson;
       }
       channelUsed = mirrorOut.channel;
     } catch (mirrorErr) {
-      warnings.push(`China mirror fallback unreachable (${mirrorErr?.message || String(mirrorErr)})`);
+      warnBi(
+        `国内镜像回退不可达 (${errMsg(mirrorErr)})，将使用 GitHub/本地缓存`,
+        `China mirror fallback unreachable (${errMsg(mirrorErr)}); using GitHub/local cache`,
+      );
+    }
+  }
+
+  // china-mirror mode with an unpublished/unreachable npm package: degrade to GitHub Pages / raw gh-pages (B2).
+  if (!verifiedFeed && !tryPrimary) {
+    const bases = [{ url: baseUrl, label: 'github-pages' }];
+    if (baseUrl === PRIMARY_CATALOG_BASE_URL) bases.push({ url: RAW_GH_PAGES_CATALOG_BASE_URL, label: 'github-raw-gh-pages' });
+    for (const b of bases) {
+      try {
+        const vRes = await fetchJsonWithConditionalCache(`${b.url}/index.json`, cacheDir, 'index', {
+          forceRefresh,
+          fetchImpl: activeFetch,
+          channelLabel: b.label,
+        });
+        verifiedFeed = vRes.data;
+        channelUsed = vRes.channel;
+        activePrimaryBase = b.url;
+        warnBi('镜像不可用，已回退到 GitHub 源', 'Mirror unavailable; fell back to GitHub source ' + b.url);
+        break;
+      } catch (e) {
+        warnBi(`GitHub 回退失败 (${b.url}: ${errMsg(e)})`, `GitHub fallback failed (${b.url}: ${errMsg(e)})`);
+      }
+    }
+  }
+
+  // Track 2 raw-GitHub/gh-pages retry when in china-mirror mode (if mirror failed or lacked Track 2).
+  if (wantTrack2 && !track2Loaded && !tryPrimary && cleanPrefs.networkMode === 'china-mirror') {
+    const fallbackBases = [baseUrl];
+    if (baseUrl === PRIMARY_CATALOG_BASE_URL && !fallbackBases.includes(RAW_GH_PAGES_CATALOG_BASE_URL)) {
+      fallbackBases.push(RAW_GH_PAGES_CATALOG_BASE_URL);
+    }
+    const orderedBases = activePrimaryBase
+      ? [activePrimaryBase, ...fallbackBases.filter((b) => b !== activePrimaryBase)]
+      : fallbackBases;
+    const errs = [];
+    for (const b of orderedBases) {
+      try {
+        const uRes = await fetchJsonWithConditionalCache(`${b}/unverified-index.json`, cacheDir, 'unverified-index', {
+          timeoutMs: UNVERIFIED_FETCH_TIMEOUT_MS,
+          forceRefresh,
+          fetchImpl: activeFetch,
+          channelLabel: b === RAW_GH_PAGES_CATALOG_BASE_URL ? 'github-raw-gh-pages' : 'github-pages',
+        });
+        if (uRes?.data && Array.isArray(uRes.data.plugins)) {
+          unverifiedFeed = uRes.data;
+          track2Loaded = true;
+          if (mirrorLackedTrack2 || errs.length > 0) {
+            warnBi(
+              `镜像未提供 Track 2，已从 ${b} 加载`,
+              `Mirror lacked Track 2; loaded from ${b}`,
+            );
+          }
+          break;
+        }
+        errs.push(`${b}: invalid unverified-index payload`);
+      } catch (e) {
+        errs.push(`${b}: ${errMsg(e)}`);
+      }
+    }
+    if (!track2Loaded && errs.length > 0) {
+      warnBi(
+        `Track 2 GitHub 回退源不可达 (${errs.join(' | ')})`,
+        `Track 2 GitHub fallback unreachable (${errs.join(' | ')})`,
+      );
     }
   }
 
@@ -376,9 +499,6 @@ export async function resolveMarketCatalog({
     } else {
       verifiedFeed = { schemaVersion: 1, track: 'verified', catalogVersion: 'offline', plugins: [] };
     }
-    if (cleanPrefs.enableExperimentalTrack2) {
-      unverifiedFeed = readCachedJson(cacheDir, 'unverified-index').data || unverifiedFeed;
-    }
     if (includeReadmes) {
       readmesFeed = readCachedJson(cacheDir, 'readmes').data || {
         schemaVersion: 1,
@@ -386,6 +506,24 @@ export async function resolveMarketCatalog({
         entriesZh: {},
         entriesEn: {},
       };
+    }
+  }
+
+  // Track 2 local-cache fallback, INDEPENDENT of whether the verified feed succeeded.
+  if (wantTrack2 && !track2Loaded) {
+    const diskT2 = readCachedJson(cacheDir, 'unverified-index');
+    if (diskT2.data && Array.isArray(diskT2.data.plugins) && diskT2.data.plugins.length > 0) {
+      unverifiedFeed = diskT2.data;
+      track2Loaded = true;
+      warnBi(
+        `Track 2 使用本地缓存 (${diskT2.data.plugins.length} 个插件, 缓存于 ${diskT2.meta?.cachedAt || '未知'})，可能不是最新`,
+        `Track 2 served from local cache (${diskT2.data.plugins.length} plugins, cached ${diskT2.meta?.cachedAt || 'unknown'}); may be stale`,
+      );
+    } else {
+      warnBi(
+        'Track 2 暂不可用：在线源与本地缓存均无数据，请检查网络后点击刷新',
+        'Track 2 unavailable: no online source or local cache; check network and refresh',
+      );
     }
   }
 

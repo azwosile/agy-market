@@ -20,14 +20,22 @@ Sidebar Panel UI · Lock-Safe One-Click Uninstall · Direct In-Sidebar Upstream 
 
 ---
 
-## ✨ Highlights (v1.7.0)
+## ✨ Highlights (v1.7.1)
 
-### 0. What's New in v1.7.0
+### 0. What's New in v1.7.1
+- **Faster, Smoother Track 2 Rendering at Scale**: Discover now renders incrementally in pages of 48 cards (`IntersectionObserver` sentinel auto-append plus a visible Load More button), pairs `.plugin-card` with CSS `content-visibility: auto`, removes per-card `backdrop-filter` / `filter: blur` layers in favor of clean semi-opaque surfaces, uses root event delegation, 150ms debounced search across Discover/Favorites/Installed, and `requestAnimationFrame`-throttled card spotlight tracking.
+- **Responsive Track 2 Toggle & Concurrency Guards**: Decouples `#track2-checkbox` from background update-check locks (disabling only during its own in-flight save with a visible `Switching…` spinner), applies optimistic preference updates with error rollback, moves toasts to a dedicated `#toast-host` node so toast updates/dismissal never rebuild the grid, and adds `stateRequestSeq` / `prefsRequestSeq` guards alongside reliable `unverified-index.json` fetch & cache fallback.
+
+<details>
+<summary>Previous v1.7.0 Highlights (System Proxy Auto-Detect / Unlimited Streaming Installs / Monorepo Update Accuracy / Release Automation)</summary>
+
 - **Zero-Dependency HTTP/HTTPS & Windows System Proxy Support**: Adds `src/shared/proxy-fetch.mjs` respecting `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` (with `NO_PROXY` and automatic bypass for `127.0.0.1` / `localhost`) plus Windows registry system proxy settings (`HKCU\...\Internet Settings`), preventing GitHub archive timeouts when using local proxies without TUN mode.
 - **Unlimited >100 MB Streaming Plugin Installs & Extraction**: Removes the artificial `100 MB` `MAX_TARBALL_BYTES` archive cap (`0 = unlimited`), switching to streaming gunzip + POSIX/PAX tar disk extraction (`extractTarGzStreamToDir`, O(MB) RAM), 60s per-chunk stall timeouts instead of fixed 60s total download ceilings, `server.requestTimeout = 0`, and `GB` size formatting in the UI.
 - **Monorepo, Native `.git` & Unversioned Plugin Update Accuracy**: Verifies raw `<tag>/<pluginRoot>/plugin.json` existence, plugin name, and version for unreceipted/unlisted Monorepo plugins (e.g., `upstash/context7`) to prevent false-positive `github-upstream` upgrades; detects native `.git` clones (`conductor`, `sepia`, etc.) and unversioned external plugins, excluding them from auto/batch updates with read-only **Git Native / Unversioned** status pills.
 - **`app.asar` Patch Script Guidance & `preservePaths` Merge**: Guides users in toast notices, the restart banner, and the installed Detail Drawer to run bundled patch scripts (e.g., `node setup.cjs` per plugin docs) before restarting Antigravity and to re-run them after AGY Market updates, with one-click **Copy Plugin Folder** and **Patch Docs** actions; merges `existingReceipt.preservePaths` with `distribution.preservePaths` on catalog updates to keep user configs intact.
 - **`npx` GitHub Bootstrap Fix & Automated GitHub Releases**: Replaces the unpublished npm `npx` bootstrap command with `npx --yes github:azwosile/agy-market`, fixes `scripts/install-local.mjs` relative-path `node_modules` filtering inside `_npx` caches, and adds `.github/workflows/release.yml` to automatically pack and publish `agy-market.tar.gz` + `.sha256` assets on `v*` tag pushes.
+
+</details>
 
 <details>
 <summary>Previous v1.6.0 Highlights (Recommended Sort / Lazy README Cache / Scoped Symlinks / Zero-PII Nomination)</summary>

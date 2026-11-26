@@ -20,14 +20,22 @@ Sidebar 侧边栏界面 · 锁安全一键卸载 · Sidebar 上游直装与一�
 
 ---
 
-## ✨ 核心特性（v1.7.0）
+## ✨ 核心特性（v1.7.1）
 
-### 0. v1.7.0 升级亮点
+### 0. v1.7.1 升级亮点
+- **Track 2 极速流畅渲染与增量加载**：发现页采用 48 张卡片分页增量渲染（`IntersectionObserver` 触底自动追加 + 可见「加载更多」兜底按钮），配合卡片 `content-visibility: auto` 视口隔离、移除每张卡片高开销 `backdrop-filter` / `filter: blur` 合成层、根容器事件委托、150ms 搜索防抖与 `requestAnimationFrame` 光斑节流，开启近千个 Track 2 插件后依然丝滑流畅。
+- **修复 Track 2 开关偶发无响应与并发回跳**：将 `#track2-checkbox` 从后台更新检查全局锁彻底解耦（仅在自身保存期间显示「切换中…」加载态并防重入），配置保存改用乐观更新与失败自动回滚，Toast 通知使用独立挂载节点更新不再触发全量卡片重建，并为 `loadState` / `updatePrefs` 及后端目录加载增加请求序号与缓存回退保护。
+
+<details>
+<summary>查看 v1.7.0 既有特性（系统代理自动适配 / 无上限流式大插件 / Monorepo 更新防误判 / Release 自动化）</summary>
+
 - **零依赖 HTTP/HTTPS 与 Windows 系统代理自动适配**：新增 `src/shared/proxy-fetch.mjs` 代理感知网络层，自动读取 `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`（支持 `NO_PROXY` 并旁路 `127.0.0.1` / `localhost`）以及 Windows 注册表系统代理（`HKCU\...\Internet Settings`），彻底解决仅开启本地代理未开 TUN 时 GitHub 归档拉取超时问题。
 - **取消 100 MB 插件大小门禁与全流式解压校验**：移除 `MAX_TARBALL_BYTES` 人为 `100 MB` 归档上限（设为无限制 `0`），改为全流式 Gunzip + POSIX/PAX Tar 落盘解包（O(MB) 内存占用）、`60s` 分块静默失活超时与 `server.requestTimeout = 0`，并新增 `GB` 体积显示，轻松支持 >100MB 乃至 GB 级含本地二进制/模型资源的插件。
 - **Monorepo / 原生 Git / 无版本插件更新防误判**：更新检测对未收录、无收据的外部 Monorepo 插件（如 `upstash/context7`）核验远端 Tag 对应子目录 `plugin.json` 是否存在及版本是否真正领先；同时自动识别含 `.git` 目录的原生克隆插件（`conductor`、`sepia` 等）及无 `version` 声明插件，将其移出自动与批量更新队列并在卡片/抽屉展示只读「`Git 原生` / `无版本号`」胶囊，杜绝误报降级与软链拦截报错。
 - **`app.asar` 补丁脚本引导与 `preservePaths` 合并保留**：安装或更新含 `app-asar` 宿主增强的插件后，弹窗、顶部横幅与详情抽屉明确提示先按插件文档运行其自带补丁脚本（如 `node setup.cjs`）再重启 Antigravity，并在每次市场更新后重新运行补丁脚本同步注入客户端代码，同时提供一键「复制插件目录」与「查看补丁文档」按钮；目录安装通道同步合并已有 `.agy-market-receipt.json` 与目录声明的 `preservePaths`，升级时保护用户配置不被覆盖。
 - **`npx` GitHub 引导入口修复与 Release 自动化**：将尚未发布至 npm 的旧 `npx` 包名入口统一替换为直接可运行的 `npx --yes github:azwosile/agy-market`，修复 `scripts/install-local.mjs` 在 `_npx/.../node_modules/agy-market` 缓存路径下因全路径匹配 `node_modules` 误过滤全部文件的缺陷；新增 `.github/workflows/release.yml` 在推送 `v*` 标签时自动打包并发布 `agy-market.tar.gz` 与 `.sha256` 至 GitHub Releases。
+
+</details>
 
 <details>
 <summary>查看 v1.6.0 既有特性（综合推荐排序 / 按需 README 缓存 / 作用域符号链接 / 零 PII 提名）</summary>

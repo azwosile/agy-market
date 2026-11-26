@@ -84,9 +84,9 @@ agy-market/
 ### 4.1 Live Catalog Revalidation (Zero Bundled Stale Snapshot)
 On every market session open (and manual Refresh), `src/registry/` resolves catalogs without relying on any bundled snapshot:
 1. **Custom User/Enterprise Feeds**: Static `https://.../index.json` URLs configured in `${PLUGIN_DATA}/prefs.json` (merged with highest display priority on matching `repositoryId`).
-2. **Primary Channel (GitHub Pages CDN)**: Conditional `GET` with `If-None-Match` / `If-Modified-Since` against `index.json` (and `unverified-index.json` when the Track-2 experimental switch is enabled). `304 Not Modified` reuses `${PLUGIN_DATA}/cache/index.json` in <50ms.
+2. **Primary Channel (GitHub Pages CDN)**: Conditional `GET` with `If-None-Match` / `If-Modified-Since` against `index.json` (3.5s timeout) and `unverified-index.json` (20s timeout when Track-2 is enabled, falling back independently to `raw.githubusercontent.com/.../gh-pages` and local `cache/unverified-index.json` with warnings). `304 Not Modified` reuses `${PLUGIN_DATA}/cache/*.json` in <50ms.
 3. **Automatic Mainland China Mirror Fallback (`@agy-market/catalog`)**:
-   - If GitHub Pages times out (>3.5s) or fails, automatically query the `@agy-market/catalog` npm data package packument from `https://registry.npmmirror.com/@agy-market/catalog/latest` (fallback: `https://mirrors.cloud.tencent.com/npm/@agy-market/catalog/latest`), stream its `.tgz` tarball in memory, and extract `{index.json, unverified-index.json, readmes.json}`.
+   - If GitHub Pages times out or fails (or `networkMode: "china-mirror"`), query `@agy-market/catalog` on `registry.npmmirror.com` / Tencent Cloud mirror; if the npm package returns 404/unavailable, gracefully fall back to GitHub Pages / `raw.githubusercontent.com` and local disk cache with clear warnings.
    - **Crucial Distinction**: `@agy-market/catalog` uses npm **strictly as a high-availability JSON transport CDN**. Individual Antigravity plugins listed inside `index.json` are **NOT** required to be npm packages or JavaScript projects!
 
 ### 4.2 SHA-256 Tamper-Proof Tarball Download & Release Mirror Support

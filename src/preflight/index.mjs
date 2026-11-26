@@ -8,7 +8,7 @@
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, posix, resolve } from 'node:path';
 import { classifyActivationRequirement } from '../shared/activation.mjs';
-import { PLUGIN_ID, SELF_CATALOG_ID, toScopedPluginName } from '../shared/constants.mjs';
+import { LOCAL_INVENTORY_CACHE_TTL_MS, PLUGIN_ID, SELF_CATALOG_ID, toScopedPluginName } from '../shared/constants.mjs';
 import {
   fileUriToLocalPath,
   resolveAntigravityConfigDir,
@@ -757,6 +757,70 @@ function scanSinglePluginFolder(
  * active workspaces `.agents/plugins/*`, optional builtin plugins dir, and user `mcp_config.json`
  * without touching LS RPCs or mutating `config.json`.
  */
+const localInventoryCache = new Map(); // cacheKey -> { cachedAtMs, signature, value }
+
+export function invalidateLocalInventoryCache() {
+  localInventoryCache.clear();
+}
+
+function statSignature(targetPath, useLstat = false) {
+  try {
+    const st = useLstat ? lstatSync(targetPath) : statSync(targetPath);
+    return `${st.mtimeMs}:${st.size}:${st.isSymbolicLink?.() ? 1 : 0}`;
+  } catch {
+    return '-';
+  }
+}
+
+function appendRootInventorySignature(parts, rootDir, label) {
+  if (!rootDir || !existsSync(rootDir)) {
+    parts.push(`${label}:0`);
+    return;
+  }
+  parts.push(`${label}:${statSignature(rootDir)}`);
+  let entries;
+  try {
+    entries = readdirSync(rootDir).sort();
+  } catch {
+    return;
+  }
+  for (const d of entries) {
+    const full = join(rootDir, d);
+    parts.push(
+      d,
+      statSignature(full, true),
+      statSignature(join(full, 'plugin.json')),
+      statSignature(join(full, '.agy-market-receipt.json')),
+      statSignature(join(full, 'hooks.json')),
+      statSignature(join(full, 'hooks', 'hooks.json')),
+      statSignature(join(full, 'mcp_config.json')),
+      statSignature(join(full, '.git')),
+    );
+  }
+}
+
+function computeInventorySignature({
+  configDir,
+  globalPluginsDir,
+  disabledPluginsDir,
+  workspaceRoots,
+  builtinPluginsDir,
+}) {
+  const parts = [
+    statSignature(join(configDir, 'config.json')),
+    statSignature(join(configDir, 'plugins.json')),
+    statSignature(join(configDir, 'mcp_config.json')),
+  ];
+  appendRootInventorySignature(parts, globalPluginsDir, 'g');
+  appendRootInventorySignature(parts, disabledPluginsDir, 'd');
+  for (const wsRoot of workspaceRoots) {
+    appendRootInventorySignature(parts, join(wsRoot, '.agents', 'plugins'), `wa:${wsRoot}`);
+    appendRootInventorySignature(parts, join(wsRoot, '.agent', 'plugins'), `wb:${wsRoot}`);
+  }
+  appendRootInventorySignature(parts, builtinPluginsDir, 'b');
+  return parts.join('|');
+}
+
 export function scanLocalPluginInventory({
   configDir = resolveAntigravityConfigDir(),
   pluginsDir = '',
@@ -764,10 +828,43 @@ export function scanLocalPluginInventory({
   workspaceUris = [],
   builtinPluginsDir = '',
   linkInfoOverride = null,
+  bypassCache = false,
 } = {}) {
-  const enabledByDir = readHostEnabledMapReadOnly(configDir);
-  const globalPluginsDir = pluginsDir ? resolve(pluginsDir) : resolvePluginsDir(configDir);
+  const resolvedConfigDir = resolve(configDir);
+  const globalPluginsDir = pluginsDir ? resolve(pluginsDir) : resolvePluginsDir(resolvedConfigDir);
   const disabledPluginsDir = dataDir ? resolveDisabledPluginsDir(dataDir) : '';
+  const resolvedBuiltinDir = builtinPluginsDir ? resolve(builtinPluginsDir) : '';
+  const workspaceRoots = [];
+  for (const uri of workspaceUris || []) {
+    const wsRoot = typeof uri === 'string' && uri.startsWith('file://') ? fileUriToLocalPath(uri) : uri;
+    if (wsRoot) workspaceRoots.push(wsRoot);
+  }
+
+  const canCache = !bypassCache && typeof linkInfoOverride !== 'function';
+  const cacheKey = canCache
+    ? JSON.stringify([resolvedConfigDir, globalPluginsDir, disabledPluginsDir, workspaceRoots, resolvedBuiltinDir])
+    : '';
+  const nowMs = Date.now();
+  let currentSig = '';
+  if (canCache) {
+    currentSig = computeInventorySignature({
+      configDir: resolvedConfigDir,
+      globalPluginsDir,
+      disabledPluginsDir,
+      workspaceRoots,
+      builtinPluginsDir: resolvedBuiltinDir,
+    });
+    const hit = localInventoryCache.get(cacheKey);
+    if (hit && nowMs - hit.cachedAtMs < LOCAL_INVENTORY_CACHE_TTL_MS && hit.signature === currentSig) {
+      return {
+        ...hit.value,
+        installed: [...hit.value.installed],
+        userMcpServerNames: new Set(hit.value.userMcpServerNames),
+      };
+    }
+  }
+
+  const enabledByDir = readHostEnabledMapReadOnly(resolvedConfigDir);
   const installed = [];
   const seenGlobalDirs = new Set();
 
@@ -795,9 +892,7 @@ export function scanLocalPluginInventory({
     }
   }
 
-  for (const uri of workspaceUris || []) {
-    const wsRoot = typeof uri === 'string' && uri.startsWith('file://') ? fileUriToLocalPath(uri) : uri;
-    if (!wsRoot) continue;
+  for (const wsRoot of workspaceRoots) {
     for (const rel of ['.agents/plugins', '.agent/plugins']) {
       const wsPlugDir = join(wsRoot, rel);
       if (!existsSync(wsPlugDir)) continue;
@@ -808,15 +903,15 @@ export function scanLocalPluginInventory({
     }
   }
 
-  if (builtinPluginsDir && existsSync(builtinPluginsDir)) {
-    for (const d of readdirSync(builtinPluginsDir).sort()) {
-      const item = scanSinglePluginFolder(builtinPluginsDir, d, 'builtin', enabledByDir, { parkedByMarket: false });
+  if (resolvedBuiltinDir && existsSync(resolvedBuiltinDir)) {
+    for (const d of readdirSync(resolvedBuiltinDir).sort()) {
+      const item = scanSinglePluginFolder(resolvedBuiltinDir, d, 'builtin', enabledByDir, { parkedByMarket: false });
       if (item) installed.push(item);
     }
   }
 
   const userMcpServerNames = new Set();
-  const userMcpPath = join(configDir, 'mcp_config.json');
+  const userMcpPath = join(resolvedConfigDir, 'mcp_config.json');
   if (existsSync(userMcpPath)) {
     try {
       const mcp = parseJsonc(readFileSync(userMcpPath, 'utf8'));
@@ -826,13 +921,31 @@ export function scanLocalPluginInventory({
     }
   }
 
-  return {
-    configDir,
+  const result = {
+    configDir: resolvedConfigDir,
     globalPluginsDir,
     disabledPluginsDir,
     installed,
     userMcpServerNames,
   };
+
+  if (canCache) {
+    if (localInventoryCache.size >= 16) {
+      const oldestKey = localInventoryCache.keys().next().value;
+      if (oldestKey !== undefined) localInventoryCache.delete(oldestKey);
+    }
+    localInventoryCache.set(cacheKey, {
+      cachedAtMs: nowMs,
+      signature: currentSig,
+      value: {
+        ...result,
+        installed: [...installed],
+        userMcpServerNames: new Set(userMcpServerNames),
+      },
+    });
+  }
+
+  return result;
 }
 
 /**

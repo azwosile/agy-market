@@ -1629,7 +1629,7 @@ body,
   white-space: nowrap;
 }
 
-.track2-pill:hover:not(.is-disabled) {
+.track2-pill:hover:not(.is-disabled):not(.is-saving) {
   border-color: var(--m-hairline-strong);
   color: var(--m-text);
 }
@@ -1637,6 +1637,43 @@ body,
 .track2-pill.is-disabled {
   opacity: 0.55;
   cursor: not-allowed;
+}
+
+.track2-pill.is-saving {
+  opacity: 0.88;
+  cursor: progress;
+  border-color: var(--m-accent-border);
+}
+
+.track2-ico {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.track2-saving-text {
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--m-accent-bright);
+}
+
+.load-more-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 18px 0 10px;
+}
+
+.load-more-sentinel {
+  width: 100%;
+  height: 1px;
+}
+
+.load-more-meta {
+  font-size: 11.5px;
+  color: var(--m-muted);
 }
 
 .track2-pill.enabled {
@@ -2299,10 +2336,10 @@ html[data-theme="light"] .fav-btn.is-favorited {
   position: relative;
   min-width: 0;
   background:
-    radial-gradient(280px 150px at 0% 0%, color-mix(in srgb, var(--card-accent) 16%, transparent), transparent 72%),
-    radial-gradient(220px 120px at 100% 100%, color-mix(in srgb, var(--card-accent-2) 9%, transparent), transparent 72%),
+    radial-gradient(280px 150px at 0% 0%, color-mix(in srgb, var(--card-accent) 14%, transparent), transparent 72%),
+    radial-gradient(220px 120px at 100% 100%, color-mix(in srgb, var(--card-accent-2) 8%, transparent), transparent 72%),
     var(--m-sheen),
-    var(--m-card-bg);
+    color-mix(in srgb, var(--m-surface-raw) 94%, transparent);
   border: 1px solid var(--m-hairline);
   border-radius: var(--m-r-lg);
   padding: 15px 15px 12px;
@@ -2311,15 +2348,14 @@ html[data-theme="light"] .fav-btn.is-favorited {
   gap: 11px;
   overflow: hidden;
   isolation: isolate;
-  backdrop-filter: blur(16px) saturate(145%);
-  -webkit-backdrop-filter: blur(16px) saturate(145%);
+  content-visibility: auto;
+  contain-intrinsic-size: auto 220px;
   box-shadow:
     inset 0 1px 0 var(--m-specular),
     var(--m-shadow-card);
   transition:
     transform var(--m-dur-base) var(--m-ease-out),
     border-color var(--m-dur-base) var(--m-ease-out),
-    background var(--m-dur-base) var(--m-ease-out),
     box-shadow var(--m-dur-base) var(--m-ease-out),
     opacity var(--m-dur-base) var(--m-ease-out);
 }
@@ -2399,7 +2435,7 @@ html[data-theme="light"] .fav-btn.is-favorited {
   border-color: var(--m-hairline-strong);
   background:
     radial-gradient(240px 120px at 0% 0%, color-mix(in srgb, var(--card-accent) 7%, transparent), transparent 72%),
-    var(--m-card-bg);
+    color-mix(in srgb, var(--m-surface-raw) 90%, transparent);
 }
 
 .plugin-card.is-parked .plugin-logo-wrap,
@@ -2429,16 +2465,15 @@ html[data-theme="light"] .fav-btn.is-favorited {
 .plugin-logo-wrap::before {
   content: '';
   position: absolute;
-  inset: -4px;
-  border-radius: 16px;
+  inset: -5px;
+  border-radius: 17px;
   background: radial-gradient(
     circle at 35% 30%,
-    color-mix(in srgb, var(--card-accent) 52%, transparent),
-    color-mix(in srgb, var(--card-accent-2) 22%, transparent) 58%,
+    color-mix(in srgb, var(--card-accent) 44%, transparent),
+    color-mix(in srgb, var(--card-accent-2) 18%, transparent) 58%,
     transparent 76%
   );
-  filter: blur(8px);
-  opacity: 0.65;
+  opacity: 0.52;
   transition: opacity var(--m-dur-base) var(--m-ease-out), transform var(--m-dur-base) var(--m-ease-out);
   pointer-events: none;
   z-index: 0;
@@ -2446,7 +2481,7 @@ html[data-theme="light"] .fav-btn.is-favorited {
 
 @media (hover: hover) {
   .plugin-card:hover .plugin-logo-wrap::before {
-    opacity: 0.95;
+    opacity: 0.85;
     transform: scale(1.08);
   }
 }
@@ -4917,6 +4952,13 @@ html[data-theme="light"] .fav-btn.is-favorited {
    Toast Bar (Clean Concise Feedback Notifications)
    ========================================================================== */
 
+.toast-host {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 65;
+}
+
 .toast-bar {
   position: fixed;
   bottom: 14px;
@@ -4924,6 +4966,7 @@ html[data-theme="light"] .fav-btn.is-favorited {
   left: 14px;
   max-width: 600px;
   margin-left: auto;
+  pointer-events: auto;
   background: var(--m-sheet-bg);
   backdrop-filter: blur(20px) saturate(150%);
   -webkit-backdrop-filter: blur(20px) saturate(150%);
@@ -5315,6 +5358,7 @@ html[data-theme="light"] .fav-btn.is-favorited {
 </head>
 <body>
   <div id="app" role="application" aria-label="AGY Market"></div>
+  <div id="toast-host" class="toast-host" aria-live="polite"></div>
   <script id="agy-market-bundle">
 (function(){
 'use strict';
@@ -5328,7 +5372,7 @@ const SUBMIT_PLUGIN_GUIDE_URL =
 const NOMINATE_PLUGIN_ISSUE_BASE_URL =
   'https://github.com/azwosile/agy-market-catalog/issues/new';
 const PLUGIN_DISPLAY_NAME = 'AGY Market · 反重力插件市场';
-const PLUGIN_VERSION = '1.7.0';
+const PLUGIN_VERSION = '1.7.1';
 const SIDECAR_ID = 'market_pane';
 const SIDECAR_URI = 'sidecar://agy-market/market_pane/';
 const CUSTOMIZATION_URI = 'customization://agy-market';
@@ -5337,6 +5381,10 @@ const MAX_FAVORITES = 500;
 const PRIMARY_CATALOG_BASE_URL = 'https://azwosile.github.io/agy-market-catalog';
 const RAW_GH_PAGES_CATALOG_BASE_URL = 'https://raw.githubusercontent.com/azwosile/agy-market-catalog/gh-pages';
 const PRIMARY_FETCH_TIMEOUT_MS = 3500;
+// `unverified-index.json` is ~2 MB: it needs a much longer budget than the tiny `index.json`.
+const UNVERIFIED_FETCH_TIMEOUT_MS = 20000;
+const LOCAL_INVENTORY_CACHE_TTL_MS = 30 * 1000;
+const GZIP_MIN_BYTES = 64 * 1024;
 const GITHUB_API_BASE_URL = 'https://api.github.com';
 const UPDATE_CHECK_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
 const DISCUSSIONS_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
@@ -5489,7 +5537,7 @@ function scrubChildProcessEnv(baseEnv = process.env) {
   return clean;
 }
 
-return { formatBadgeLabel: formatBadgeLabel, toScopedPluginName: toScopedPluginName, scrubChildProcessEnv: scrubChildProcessEnv, PLUGIN_ID: PLUGIN_ID, SELF_CATALOG_ID: SELF_CATALOG_ID, SELF_REPO_URL: SELF_REPO_URL, SUBMIT_PLUGIN_GUIDE_URL: SUBMIT_PLUGIN_GUIDE_URL, NOMINATE_PLUGIN_ISSUE_BASE_URL: NOMINATE_PLUGIN_ISSUE_BASE_URL, PLUGIN_DISPLAY_NAME: PLUGIN_DISPLAY_NAME, PLUGIN_VERSION: PLUGIN_VERSION, SIDECAR_ID: SIDECAR_ID, SIDECAR_URI: SIDECAR_URI, CUSTOMIZATION_URI: CUSTOMIZATION_URI, MAX_TARBALL_BYTES: MAX_TARBALL_BYTES, MAX_FAVORITES: MAX_FAVORITES, PRIMARY_CATALOG_BASE_URL: PRIMARY_CATALOG_BASE_URL, RAW_GH_PAGES_CATALOG_BASE_URL: RAW_GH_PAGES_CATALOG_BASE_URL, PRIMARY_FETCH_TIMEOUT_MS: PRIMARY_FETCH_TIMEOUT_MS, GITHUB_API_BASE_URL: GITHUB_API_BASE_URL, UPDATE_CHECK_CACHE_TTL_MS: UPDATE_CHECK_CACHE_TTL_MS, DISCUSSIONS_CACHE_TTL_MS: DISCUSSIONS_CACHE_TTL_MS, CHINA_NPM_MIRRORS: CHINA_NPM_MIRRORS, CATALOG_NPM_PACKAGE: CATALOG_NPM_PACKAGE, PLUGIN_JSON_ALLOWED_KEYS: PLUGIN_JSON_ALLOWED_KEYS, PRIVILEGE_ESCALATION_BADGES: PRIVILEGE_ESCALATION_BADGES, CAPABILITY_BADGE_SPECS: CAPABILITY_BADGE_SPECS, CATEGORY_LABELS: CATEGORY_LABELS, DEFAULT_PREFS: DEFAULT_PREFS };
+return { formatBadgeLabel: formatBadgeLabel, toScopedPluginName: toScopedPluginName, scrubChildProcessEnv: scrubChildProcessEnv, PLUGIN_ID: PLUGIN_ID, SELF_CATALOG_ID: SELF_CATALOG_ID, SELF_REPO_URL: SELF_REPO_URL, SUBMIT_PLUGIN_GUIDE_URL: SUBMIT_PLUGIN_GUIDE_URL, NOMINATE_PLUGIN_ISSUE_BASE_URL: NOMINATE_PLUGIN_ISSUE_BASE_URL, PLUGIN_DISPLAY_NAME: PLUGIN_DISPLAY_NAME, PLUGIN_VERSION: PLUGIN_VERSION, SIDECAR_ID: SIDECAR_ID, SIDECAR_URI: SIDECAR_URI, CUSTOMIZATION_URI: CUSTOMIZATION_URI, MAX_TARBALL_BYTES: MAX_TARBALL_BYTES, MAX_FAVORITES: MAX_FAVORITES, PRIMARY_CATALOG_BASE_URL: PRIMARY_CATALOG_BASE_URL, RAW_GH_PAGES_CATALOG_BASE_URL: RAW_GH_PAGES_CATALOG_BASE_URL, PRIMARY_FETCH_TIMEOUT_MS: PRIMARY_FETCH_TIMEOUT_MS, UNVERIFIED_FETCH_TIMEOUT_MS: UNVERIFIED_FETCH_TIMEOUT_MS, LOCAL_INVENTORY_CACHE_TTL_MS: LOCAL_INVENTORY_CACHE_TTL_MS, GZIP_MIN_BYTES: GZIP_MIN_BYTES, GITHUB_API_BASE_URL: GITHUB_API_BASE_URL, UPDATE_CHECK_CACHE_TTL_MS: UPDATE_CHECK_CACHE_TTL_MS, DISCUSSIONS_CACHE_TTL_MS: DISCUSSIONS_CACHE_TTL_MS, CHINA_NPM_MIRRORS: CHINA_NPM_MIRRORS, CATALOG_NPM_PACKAGE: CATALOG_NPM_PACKAGE, PLUGIN_JSON_ALLOWED_KEYS: PLUGIN_JSON_ALLOWED_KEYS, PRIVILEGE_ESCALATION_BADGES: PRIVILEGE_ESCALATION_BADGES, CAPABILITY_BADGE_SPECS: CAPABILITY_BADGE_SPECS, CATEGORY_LABELS: CATEGORY_LABELS, DEFAULT_PREFS: DEFAULT_PREFS };
 })();
 
 const __market_mod_3 = (function() {
@@ -6115,6 +6163,9 @@ const CONFLICT_LAYER_META = Object.freeze({
 });
 
 const state = {
+  prefsSaving: false, // true only while a /api/prefs request is in flight (Track 2 toggle lock)
+  visibleLimit: 48, // incremental Discover page window
+  discoverFilterKey: '',
   loading: false, // loadState(false) sets loading=true synchronously on boot; default false keeps idle VM harnesses unlocked
   busyId: '',
   togglingDir: '',
@@ -6202,12 +6253,23 @@ const state = {
   focusGithubUrlInput: false,
 };
 
+const DISCOVER_PAGE_SIZE = 48;
+
 let toastTimer = null;
 let reconnectTimer = null;
 let updatesRequestSeq = 0;
 let readmeRequestSeq = 0;
 let githubInspectSeq = 0;
+let stateRequestSeq = 0;
+let prefsRequestSeq = 0;
+let prefsInFlight = 0;
+const prefsLastSeq = Object.create(null);
 let lastForcedUpdatesAt = 0;
+let loadMoreObserver = null;
+let lastFiltered = { key: '', pluginsRef: null, totalLen: 0, plugins: null };
+let searchDebounceTimer = null;
+let isComposingSearch = false;
+let lastRenderedTab = 'discover';
 
 function isSelfBannerVisible() {
   const su = state.updates.selfUpdate;
@@ -6286,14 +6348,65 @@ function isSafeHttpUrl(url) {
   return /^https?:\/\/[^\s]+$/i.test(s);
 }
 
+function renderToastHtml() {
+  if (!state.toast) return '';
+  const toastTone = state.toast.tone || 'info';
+  const isToastErr = toastTone === 'danger' || toastTone === 'error' || toastTone === 'err';
+  const toastIco = isToastErr
+    ? icon('alertTriangle', 14, 'toast-lead-ico')
+    : toastTone === 'ok'
+      ? icon('checkCircle', 14, 'toast-lead-ico')
+      : toastTone === 'warn'
+        ? icon('alertCircle', 14, 'toast-lead-ico')
+        : icon('info', 14, 'toast-lead-ico');
+  return `<div class="toast-bar tone-${escapeHtml(toastTone)}" role="${isToastErr ? 'alert' : 'status'}">
+      <div class="toast-copy">
+        <span class="toast-lead-row">${toastIco}<span>${escapeHtml(state.toast.message)}</span></span>
+        ${state.toast.subtext ? `<span class="toast-sub">${escapeHtml(state.toast.subtext)}</span>` : ''}
+      </div>
+      <div class="toast-actions">
+        <button type="button" class="icon-btn is-square" data-action="dismiss-toast" title="${escapeHtml(t('关闭', 'Dismiss'))}">${icon('close', 12)}</button>
+      </div>
+    </div>`;
+}
+
+function ensureToastHost() {
+  let host = document.getElementById?.('toast-host') || null;
+  if (!host && document.body && typeof document.createElement === 'function' && typeof document.body.appendChild === 'function') {
+    host = document.createElement('div');
+    host.id = 'toast-host';
+    host.className = 'toast-host';
+    host.setAttribute?.('aria-live', 'polite');
+    document.body.appendChild(host);
+  }
+  if (host && !host.__agyToastDelegated && typeof host.addEventListener === 'function') {
+    host.__agyToastDelegated = true;
+    host.addEventListener('click', (e) => {
+      const btn = e.target?.closest?.('[data-action="dismiss-toast"]');
+      if (!btn) return;
+      state.toast = null;
+      renderToast();
+    });
+  }
+  return host;
+}
+
+/** Update or clear the dedicated `#toast-host` node without triggering a full `render()`. */
+function renderToast() {
+  const host = ensureToastHost();
+  if (!host) return false;
+  host.innerHTML = renderToastHtml();
+  return true;
+}
+
 function showToast(message, { subtext = '', tone = 'info', durationMs = 5000 } = {}) {
   state.toast = { message, subtext, tone };
-  render();
+  renderToast();
   if (toastTimer) clearTimeout(toastTimer);
   toastTimer = setTimeout(() => {
     if (state.toast?.message === message) {
       state.toast = null;
-      render();
+      renderToast();
     }
   }, durationMs);
 }
@@ -7135,30 +7248,41 @@ function syncDetailPluginReference() {
 // ==========================================================================
 
 async function loadState(forceRefresh = false) {
+  const seq = ++stateRequestSeq;
+  const startPrefsSeq = prefsRequestSeq;
   state.loading = true;
   render();
   try {
     if (window.sidecar?.getWorkspaceUris) {
-      state.workspaceUris = await window.sidecar.getWorkspaceUris().catch(() => []);
+      const uris = await window.sidecar.getWorkspaceUris().catch(() => []);
+      if (seq !== stateRequestSeq) return;
+      state.workspaceUris = uris;
     }
+    let nextState;
     if (forceRefresh) {
-      applyServerState(
-        await apiFetch('/api/catalog/refresh', {
-          method: 'POST',
-          body: { workspaceUris: state.workspaceUris },
-        }),
-      );
+      nextState = await apiFetch('/api/catalog/refresh', {
+        method: 'POST',
+        body: { workspaceUris: state.workspaceUris },
+      });
     } else {
       const qs = state.workspaceUris.length
         ? `?workspaceUris=${encodeURIComponent(state.workspaceUris.join(','))}`
         : '';
-      applyServerState(await apiFetch(`/api/state${qs}`));
+      nextState = await apiFetch(`/api/state${qs}`);
     }
+    if (seq !== stateRequestSeq) return;
+    // Do not overwrite newer optimistic or committed prefs with a stale /api/state snapshot.
+    if (prefsInFlight > 0 || prefsRequestSeq !== startPrefsSeq) return;
+    applyServerState(nextState);
   } catch (err) {
-    showToast(`${t('加载失败', 'Load failed')}: ${err?.message || String(err)}`, { tone: 'danger' });
+    if (seq === stateRequestSeq) {
+      showToast(`${t('加载失败', 'Load failed')}: ${err?.message || String(err)}`, { tone: 'danger' });
+    }
   } finally {
-    state.loading = false;
-    render();
+    if (seq === stateRequestSeq) {
+      state.loading = false;
+      render();
+    }
   }
 }
 
@@ -8864,16 +8988,76 @@ async function loadPluginDiscussions(pluginId, force = false) {
   }
 }
 
+/** Update `.track2-pill` DOM state in place so `updatePrefs` avoids an extra full `render()`. */
+function syncTrack2PillDom({
+  saving = state.prefsSaving,
+  enabled = Boolean(state.serverState?.prefs?.enableExperimentalTrack2),
+} = {}) {
+  const label = document.querySelector?.('.track2-pill');
+  if (!label || !label.classList) return;
+  label.classList.toggle('enabled', Boolean(enabled));
+  label.classList.toggle('is-saving', Boolean(saving));
+  label.setAttribute('aria-busy', saving ? 'true' : 'false');
+  const input = label.querySelector?.('#track2-checkbox');
+  if (input) {
+    input.checked = Boolean(enabled);
+    input.disabled = Boolean(saving);
+    if (saving) input.setAttribute('aria-disabled', 'true');
+    else input.removeAttribute('aria-disabled');
+  }
+  const icoWrap = label.querySelector?.('.track2-ico');
+  if (icoWrap) {
+    icoWrap.innerHTML = saving ? icon('refresh', 12, 'spin') : icon('flask', 12);
+  }
+  const existingText = label.querySelector?.('.track2-saving-text');
+  if (saving) {
+    const msg = t('切换中…', 'Switching…');
+    if (existingText) {
+      existingText.textContent = msg;
+    } else if (typeof label.insertAdjacentHTML === 'function') {
+      label.insertAdjacentHTML(
+        'beforeend',
+        `<span class="track2-saving-text" role="status">${escapeHtml(msg)}</span>`,
+      );
+    }
+  } else if (existingText) {
+    existingText.remove();
+  }
+}
+
 async function updatePrefs(patch, successMsg = '') {
+  const seq = ++prefsRequestSeq;
+  if (state.serverState && !state.serverState.prefs) {
+    state.serverState.prefs = {};
+  }
+  const prefsObj = state.serverState?.prefs || null;
+  const skipOptimistic = new Set(['githubToken', 'clearGithubToken', 'workspaceUris']);
+  const rollback = {};
+  const optimisticKeys = prefsObj ? Object.keys(patch).filter((k) => !skipOptimistic.has(k)) : [];
+  for (const k of optimisticKeys) {
+    rollback[k] = {
+      hadOwn: Object.prototype.hasOwnProperty.call(prefsObj, k),
+      value: prefsObj[k],
+    };
+    prefsObj[k] = patch[k];
+    prefsLastSeq[k] = seq;
+  }
+
+  prefsInFlight += 1;
+  state.prefsSaving = true;
+  syncTrack2PillDom({
+    saving: true,
+    enabled: Boolean(state.serverState?.prefs?.enableExperimentalTrack2),
+  });
+
+  let rolledBackAny = false;
   try {
-    state.loading = true;
-    render();
-    applyServerState(
-      await apiFetch('/api/prefs', {
-        method: 'POST',
-        body: { ...patch, workspaceUris: state.workspaceUris },
-      }),
-    );
+    const nextState = await apiFetch('/api/prefs', {
+      method: 'POST',
+      body: { ...patch, workspaceUris: state.workspaceUris },
+    });
+    if (seq !== prefsRequestSeq) return;
+    applyServerState(nextState);
     if ('githubToken' in patch || 'clearGithubToken' in patch) {
       state.discussionsCache = {};
     }
@@ -8885,10 +9069,25 @@ async function updatePrefs(patch, successMsg = '') {
       void checkUpdates(true, { silent: true });
     }
   } catch (err) {
+    if (state.serverState?.prefs) {
+      for (const k of optimisticKeys) {
+        if (prefsLastSeq[k] !== seq) continue;
+        rolledBackAny = true;
+        if (rollback[k].hadOwn) state.serverState.prefs[k] = rollback[k].value;
+        else delete state.serverState.prefs[k];
+      }
+    }
     showToast(`${t('保存失败', 'Save error')}: ${err?.message || String(err)}`, { tone: 'danger' });
   } finally {
-    state.loading = false;
-    render();
+    prefsInFlight = Math.max(0, prefsInFlight - 1);
+    state.prefsSaving = prefsInFlight > 0;
+    syncTrack2PillDom({
+      saving: state.prefsSaving,
+      enabled: Boolean(state.serverState?.prefs?.enableExperimentalTrack2),
+    });
+    if (seq === prefsRequestSeq || rolledBackAny) {
+      render();
+    }
   }
 }
 
@@ -9878,6 +10077,80 @@ function renderSelfUpdateBanner() {
   `;
 }
 
+function getDiscoverFilterKey(prefs = state.serverState?.prefs || {}) {
+  return [state.search, state.category, state.sortBy, Boolean(prefs.enableExperimentalTrack2)].join('\u0001');
+}
+
+function renderLoadMoreHtml(shown, total) {
+  if (shown >= total) return '';
+  const remaining = Math.max(0, total - shown);
+  const nextBatch = Math.min(DISCOVER_PAGE_SIZE, remaining);
+  return `<div class="load-more-wrap" id="load-more-wrap">
+    <div id="load-more-sentinel" class="load-more-sentinel" aria-hidden="true"></div>
+    <div class="load-more-meta">${escapeHtml(t(`已显示 ${shown} / ${total} 个插件`, `Showing ${shown} of ${total} plugins`))}</div>
+    <button type="button" class="btn btn-sm load-more-btn" data-action="load-more">${escapeHtml(t(`加载更多（+${nextBatch}）`, `Load more (+${nextBatch})`))}</button>
+  </div>`;
+}
+
+/** Append the next Discover page of up to 48 cards without rebuilding existing cards. */
+function loadMorePlugins() {
+  if (state.activeTab !== 'discover') return;
+  const prefs = state.serverState?.prefs || {};
+  const loc = getLocale();
+  const pluginsRef = state.serverState?.catalog?.plugins || null;
+  const cacheKey = `${getDiscoverFilterKey(prefs)}\u0001${loc}`;
+  const plugins =
+    lastFiltered.key === cacheKey &&
+    lastFiltered.pluginsRef === pluginsRef &&
+    lastFiltered.totalLen === (pluginsRef?.length || 0) &&
+    Array.isArray(lastFiltered.plugins)
+      ? lastFiltered.plugins
+      : getFilteredPlugins();
+
+  const next = plugins.slice(state.visibleLimit, state.visibleLimit + DISCOVER_PAGE_SIZE);
+  if (!next.length) {
+    const wrap = document.getElementById?.('load-more-wrap');
+    if (wrap && typeof wrap.remove === 'function') wrap.remove();
+    return;
+  }
+
+  const grid = document.getElementById?.('discover-grid');
+  if (grid && typeof grid.insertAdjacentHTML === 'function') {
+    const { byId: updById, byDir: updByDir } = getUpdateMaps();
+    const installedByDir = getInstalledByDirMap();
+    grid.insertAdjacentHTML('beforeend', next.map((p) => renderPluginCard(p, updById, installedByDir, updByDir)).join(''));
+    state.visibleLimit = Math.min(plugins.length, state.visibleLimit + next.length);
+    const wrap = document.getElementById?.('load-more-wrap');
+    if (wrap) {
+      wrap.outerHTML = renderLoadMoreHtml(state.visibleLimit, plugins.length);
+    }
+    setupLoadMoreObserver();
+  } else {
+    state.visibleLimit = Math.min(plugins.length, state.visibleLimit + next.length);
+    render();
+  }
+}
+
+function setupLoadMoreObserver() {
+  if (loadMoreObserver) {
+    loadMoreObserver.disconnect();
+    loadMoreObserver = null;
+  }
+  if (state.activeTab !== 'discover') return;
+  const sentinel = document.getElementById?.('load-more-sentinel');
+  if (!sentinel || typeof IntersectionObserver !== 'function') return;
+  const scrollRoot = document.querySelector?.('.main-scroll') || null;
+  loadMoreObserver = new IntersectionObserver(
+    (entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) {
+        loadMorePlugins();
+      }
+    },
+    { root: scrollRoot, rootMargin: '400px 0px' },
+  );
+  loadMoreObserver.observe(sentinel);
+}
+
 function renderDiscoverView() {
   const prefs = state.serverState?.prefs || {};
   const loc = getLocale();
@@ -9887,6 +10160,20 @@ function renderDiscoverView() {
   const installedByDir = getInstalledByDirMap();
   const installableUpds = getInstallableUpdates();
   const updateActionLocked = isUpdateActionLocked();
+
+  const filterKey = getDiscoverFilterKey(prefs);
+  if (filterKey !== state.discoverFilterKey) {
+    state.discoverFilterKey = filterKey;
+    state.visibleLimit = DISCOVER_PAGE_SIZE;
+  }
+  const pluginsRef = state.serverState?.catalog?.plugins || null;
+  lastFiltered = {
+    key: `${filterKey}\u0001${loc}`,
+    pluginsRef,
+    totalLen: pluginsRef?.length || 0,
+    plugins,
+  };
+  const shownPlugins = plugins.slice(0, state.visibleLimit);
 
   const coreOrder = [
     'all',
@@ -9931,11 +10218,12 @@ function renderDiscoverView() {
           <option value="name" ${state.sortBy === 'name' ? 'selected' : ''}>${escapeHtml(t('按名称排序', 'Name A–Z'))}</option>
         </select>
 
-        <label class="track2-pill ${prefs.enableExperimentalTrack2 ? 'enabled' : ''}${updateActionLocked ? ' is-disabled' : ''}" title="${escapeHtml(t('开启 GitHub Topic 自动发现 (Track 2)，自动采用 <owner>--<slug> 隔离命名', 'Enable experimental GitHub topic discovery (Track 2) with automatic scoped isolation'))}">
-          <input id="track2-checkbox" type="checkbox" ${prefs.enableExperimentalTrack2 ? 'checked' : ''}${updateActionLocked ? ' disabled aria-disabled="true"' : ''} />
+        <label class="track2-pill ${prefs.enableExperimentalTrack2 ? 'enabled' : ''}${state.prefsSaving ? ' is-saving' : ''}" aria-busy="${state.prefsSaving ? 'true' : 'false'}" title="${escapeHtml(t('开启 GitHub Topic 自动发现 (Track 2)，自动采用 <owner>--<slug> 隔离命名', 'Enable experimental GitHub topic discovery (Track 2) with automatic scoped isolation'))}">
+          <input id="track2-checkbox" type="checkbox" ${prefs.enableExperimentalTrack2 ? 'checked' : ''}${state.prefsSaving ? ' disabled aria-disabled="true"' : ''} />
           <span class="switch-track" aria-hidden="true"></span>
-          ${icon('flask', 12)}
+          <span class="track2-ico" aria-hidden="true">${state.prefsSaving ? icon('refresh', 12, 'spin') : icon('flask', 12)}</span>
           <span>Track 2</span>
+          ${state.prefsSaving ? `<span class="track2-saving-text" role="status">${escapeHtml(t('切换中…', 'Switching…'))}</span>` : ''}
         </label>
       </div>
 
@@ -9981,7 +10269,7 @@ function renderDiscoverView() {
         state.loading && !plugins.length
           ? renderSkeletonGrid(4)
           : plugins.length
-            ? `<div class="cards-grid">${plugins.map((p) => renderPluginCard(p, updById, installedByDir, updByDir)).join('')}</div>`
+            ? `<div class="cards-grid" id="discover-grid">${shownPlugins.map((p) => renderPluginCard(p, updById, installedByDir, updByDir)).join('')}</div>${renderLoadMoreHtml(shownPlugins.length, plugins.length)}`
             : (() => {
                 const prefillUrl = extractGithubPrefillUrl(state.search);
                 const prefillAttr = prefillUrl ? ` data-prefill-url="${escapeHtml(prefillUrl)}"` : '';
@@ -10743,6 +11031,7 @@ function renderSourcesView() {
   const hasToken = Boolean(prefs.hasGithubToken);
   const updateActionLocked = isUpdateActionLocked();
   const lockAttr = updateActionLocked ? ' disabled aria-disabled="true"' : '';
+  const saveLockAttr = updateActionLocked || state.prefsSaving ? ' disabled aria-disabled="true"' : '';
 
   return `
     <div class="main-scroll">
@@ -10793,7 +11082,7 @@ function renderSourcesView() {
             />
             ${
               hasToken
-                ? `<button type="button" class="btn btn-danger-ghost btn-sm" data-action="clear-github-token"${lockAttr}>${escapeHtml(t('清除 Token', 'Clear'))}</button>`
+                ? `<button type="button" class="btn btn-danger-ghost btn-sm" data-action="clear-github-token"${saveLockAttr}>${escapeHtml(t('清除 Token', 'Clear'))}</button>`
                 : ''
             }
           </div>
@@ -10826,7 +11115,7 @@ function renderSourcesView() {
         </div>
 
         <div style="display:flex;align-items:center;gap:8px">
-          <button type="submit" class="btn btn-primary"${lockAttr}>${icon('check', 13)} ${escapeHtml(t('保存并重新同步目录', 'Save & Revalidate Catalog'))}</button>
+          <button type="submit" class="btn btn-primary"${saveLockAttr}>${icon('check', 13)} ${escapeHtml(t('保存并重新同步目录', 'Save & Revalidate Catalog'))}</button>
         </div>
       </form>
     </div>
@@ -11301,7 +11590,7 @@ function renderDetailDrawer() {
 
   return `
     <div class="drawer-backdrop" data-action="close-modal">
-      <aside class="drawer-panel" style="--card-accent:${accent.a1};--card-accent-2:${accent.a2}" role="dialog" aria-modal="true" aria-label="${escapeHtml(p.displayName || p.canonicalName)}" onclick="event.stopPropagation()">
+      <aside class="drawer-panel" style="--card-accent:${accent.a1};--card-accent-2:${accent.a2}" role="dialog" aria-modal="true" aria-label="${escapeHtml(p.displayName || p.canonicalName)}" data-stop-modal="1">
         <div class="drawer-hero">
           <div class="drawer-hero-top">
             ${renderLogoHtml(p.media?.iconUrl, p.displayName || p.canonicalName, { sizeClass: 'is-lg', isSelf })}
@@ -11890,7 +12179,7 @@ function renderGithubUrlModal() {
 
   return `
     <div class="modal-backdrop" ${isBusyPhase ? '' : 'data-action="close-modal"'}>
-      <div class="modal-box gh-url-modal" role="dialog" aria-modal="true" aria-label="${escapeHtml(t('通过 GitHub 链接添加插件', 'Add Plugin via GitHub URL'))}" onclick="event.stopPropagation()">
+      <div class="modal-box gh-url-modal" role="dialog" aria-modal="true" aria-label="${escapeHtml(t('通过 GitHub 链接添加插件', 'Add Plugin via GitHub URL'))}" data-stop-modal="1">
         <div class="modal-header">
           <div class="modal-title-wrap">
             ${icon('link', 15)}
@@ -11933,7 +12222,7 @@ function renderModals() {
       );
     html += `
       <div class="modal-backdrop" ${isRemoving ? '' : 'data-action="close-modal"'}>
-        <div class="modal-box" role="dialog" aria-modal="true" aria-label="${escapeHtml(t('确认卸载插件', 'Confirm Uninstall Plugin'))}" onclick="event.stopPropagation()">
+        <div class="modal-box" role="dialog" aria-modal="true" aria-label="${escapeHtml(t('确认卸载插件', 'Confirm Uninstall Plugin'))}" data-stop-modal="1">
           <div class="modal-header">
             <div class="modal-title-wrap">
               <span style="color:var(--m-danger)">${icon('trash', 15)}</span>
@@ -11985,7 +12274,7 @@ function renderModals() {
     ) {
       html += `
       <div class="modal-backdrop" data-action="close-modal">
-        <div class="modal-box" onclick="event.stopPropagation()">
+        <div class="modal-box" data-stop-modal="1">
           <div class="modal-header">
             <div class="modal-title-wrap">
               ${icon('sparkle', 15)}
@@ -12016,7 +12305,7 @@ function renderModals() {
     const cm = state.conflictModal;
     html += `
       <div class="modal-backdrop" data-action="close-modal">
-        <div class="modal-box" onclick="event.stopPropagation()">
+        <div class="modal-box" data-stop-modal="1">
           <div class="modal-header">
             <div class="modal-title-wrap">
               <span style="color:var(--m-warn)">${icon('alertCircle', 16)}</span>
@@ -12048,7 +12337,7 @@ function renderModals() {
     const isBatch = em.mode === 'batch' && em.items.length > 1;
     html += `
       <div class="modal-backdrop" data-action="close-modal">
-        <div class="modal-box" onclick="event.stopPropagation()">
+        <div class="modal-box" data-stop-modal="1">
           <div class="modal-header">
             <div class="modal-title-wrap">
               <span style="color:var(--m-warn)">${icon('shieldAlert', 16)}</span>
@@ -12144,7 +12433,10 @@ function render() {
   const focusId = document.activeElement?.id || '';
   const selStart = document.activeElement?.selectionStart ?? null;
   const selEnd = document.activeElement?.selectionEnd ?? null;
-  const prevMainScroll = root.querySelector('.main-scroll')?.scrollTop ?? 0;
+  const selDir = document.activeElement?.selectionDirection ?? null;
+  const prevMainScrollEl = root.querySelector('.main-scroll');
+  const prevMainScroll = state.activeTab === lastRenderedTab ? prevMainScrollEl?.scrollTop ?? 0 : 0;
+  const prevMainScrollLeft = state.activeTab === lastRenderedTab ? prevMainScrollEl?.scrollLeft ?? 0 : 0;
   const prevDrawerScroll = root.querySelector('#market-drawer-body')?.scrollTop ?? 0;
 
   const catalogCount = state.serverState?.catalog?.plugins?.length || 0;
@@ -12179,16 +12471,6 @@ function render() {
   else if (state.activeTab === 'installed') viewHtml = renderInstalledView();
   else if (state.activeTab === 'conflicts') viewHtml = renderConflictsView();
   else viewHtml = renderSourcesView();
-
-  const toastTone = state.toast?.tone || 'info';
-  const isToastErr = toastTone === 'danger' || toastTone === 'error' || toastTone === 'err';
-  const toastIco = isToastErr
-    ? icon('alertTriangle', 14, 'toast-lead-ico')
-    : toastTone === 'ok'
-      ? icon('checkCircle', 14, 'toast-lead-ico')
-      : toastTone === 'warn'
-        ? icon('alertCircle', 14, 'toast-lead-ico')
-        : icon('info', 14, 'toast-lead-ico');
 
   root.innerHTML = `
     <div class="market-shell" data-stuck="${state.scrolledStuck ? 'true' : 'false'}">
@@ -12273,40 +12555,32 @@ function render() {
       ${viewHtml}
 
       ${renderModals()}
-
-      ${
-        state.toast
-          ? `<div class="toast-bar tone-${escapeHtml(toastTone)}" role="${isToastErr ? 'alert' : 'status'}">
-              <div class="toast-copy">
-                <span class="toast-lead-row">${toastIco}<span>${escapeHtml(state.toast.message)}</span></span>
-                ${state.toast.subtext ? `<span class="toast-sub">${escapeHtml(state.toast.subtext)}</span>` : ''}
-              </div>
-              <div class="toast-actions">
-                <button type="button" class="icon-btn is-square" data-action="dismiss-toast" title="${escapeHtml(t('关闭', 'Dismiss'))}">${icon('close', 12)}</button>
-              </div>
-            </div>`
-          : ''
-      }
     </div>
   `;
 
+  lastRenderedTab = state.activeTab;
   bindDomEvents(root);
+  setupLoadMoreObserver();
+  renderToast();
 
   const mainScrollEl = root.querySelector('.main-scroll');
   if (mainScrollEl) {
     if (prevMainScroll > 0) mainScrollEl.scrollTop = prevMainScroll;
-    mainScrollEl.addEventListener(
-      'scroll',
-      () => {
-        const stuck = mainScrollEl.scrollTop > 4;
-        if (stuck !== state.scrolledStuck) {
-          state.scrolledStuck = stuck;
-          const shell = root.querySelector('.market-shell');
-          if (shell) shell.setAttribute('data-stuck', stuck ? 'true' : 'false');
-        }
-      },
-      { passive: true },
-    );
+    if (prevMainScrollLeft > 0) mainScrollEl.scrollLeft = prevMainScrollLeft;
+    if (typeof mainScrollEl.addEventListener === 'function') {
+      mainScrollEl.addEventListener(
+        'scroll',
+        () => {
+          const stuck = mainScrollEl.scrollTop > 4;
+          if (stuck !== state.scrolledStuck) {
+            state.scrolledStuck = stuck;
+            const shell = root.querySelector('.market-shell');
+            if (shell) shell.setAttribute('data-stuck', stuck ? 'true' : 'false');
+          }
+        },
+        { passive: true },
+      );
+    }
   }
   const drawerScrollEl = root.querySelector('#market-drawer-body');
   if (drawerScrollEl && prevDrawerScroll > 0) drawerScrollEl.scrollTop = prevDrawerScroll;
@@ -12315,7 +12589,11 @@ function render() {
     state.focusGithubUrlInput = false;
     const urlEl = document.getElementById('github-url-input');
     if (urlEl) {
-      urlEl.focus();
+      try {
+        urlEl.focus({ preventScroll: true });
+      } catch {
+        urlEl.focus();
+      }
       if (urlEl.value && typeof urlEl.select === 'function') {
         try {
           urlEl.select();
@@ -12327,14 +12605,24 @@ function render() {
   } else if (state.focusTokenField) {
     state.focusTokenField = false;
     const tokEl = document.getElementById('github-token-input');
-    if (tokEl) tokEl.focus();
+    if (tokEl) {
+      try {
+        tokEl.focus({ preventScroll: true });
+      } catch {
+        tokEl.focus();
+      }
+    }
   } else if (focusId) {
     const el = document.getElementById(focusId);
     if (el) {
-      el.focus();
+      try {
+        el.focus({ preventScroll: true });
+      } catch {
+        el.focus();
+      }
       if (selStart !== null && typeof el.setSelectionRange === 'function') {
         try {
-          el.setSelectionRange(selStart, selEnd);
+          el.setSelectionRange(selStart, selEnd, selDir || 'none');
         } catch {
           /* ignore */
         }
@@ -12347,45 +12635,574 @@ function render() {
 // Event Binding & Pointer-Tracking Spotlight
 // ==========================================================================
 
-function bindDomEvents(root) {
-  // Pointer-tracking optical spotlight on plugin cards (zero DOM re-renders!)
+function cancelSearchDebounce() {
+  if (searchDebounceTimer) {
+    clearTimeout(searchDebounceTimer);
+    searchDebounceTimer = null;
+  }
+}
+
+function debouncedRender(ms = 150) {
+  cancelSearchDebounce();
+  searchDebounceTimer = setTimeout(() => {
+    searchDebounceTimer = null;
+    render();
+  }, ms);
+}
+
+function handleActionClick(el, e, root) {
+  const action = el.getAttribute('data-action');
+
+  if (action === 'tab') {
+    cancelSearchDebounce();
+    const nextTab = el.getAttribute('data-tab') || 'discover';
+    const changed = nextTab !== state.activeTab;
+    state.activeTab = nextTab;
+    if (changed) state.scrolledStuck = false;
+    render();
+    if (nextTab === 'installed' && Date.now() - lastForcedUpdatesAt > 10_000 && !isUpdateActionLocked()) {
+      void checkUpdates(true, { silent: true });
+    } else if (nextTab === 'conflicts' && !state.conflicts.loading) {
+      void loadConflicts({ silent: true });
+    }
+  } else if (action === 'toggle-hero') {
+    state.heroCollapsed = !state.heroCollapsed;
+    writeStorage(HERO_COLLAPSED_KEY, state.heroCollapsed ? '1' : '0');
+    render();
+  } else if (action === 'toggle-favs-shelf') {
+    state.favoritesShelfCollapsed = !state.favoritesShelfCollapsed;
+    writeStorage(FAVS_SHELF_COLLAPSED_KEY, state.favoritesShelfCollapsed ? '1' : '0');
+    render();
+  } else if (action === 'toggle-favorite') {
+    e.stopPropagation();
+    const key = el.getAttribute('data-fav-key') || '';
+    const name = el.getAttribute('data-fav-name') || '';
+    if (key) void toggleFavorite(key, name);
+  } else if (action === 'clear-favorites-search') {
+    cancelSearchDebounce();
+    state.favoritesSearch = '';
+    render();
+  } else if (action === 'installed-filter') {
+    cancelSearchDebounce();
+    state.installedFilter = el.getAttribute('data-filter') || 'all';
+    render();
+  } else if (action === 'clear-installed-search') {
+    cancelSearchDebounce();
+    state.installedSearch = '';
+    render();
+  } else if (action === 'reset-installed-filters') {
+    cancelSearchDebounce();
+    state.installedSearch = '';
+    state.installedFilter = 'all';
+    render();
+  } else if (action === 'category') {
+    e.stopPropagation();
+    cancelSearchDebounce();
+    const nextCategory = el.getAttribute('data-category') || 'all';
+    if (nextCategory !== state.category) {
+      state.visibleLimit = DISCOVER_PAGE_SIZE;
+    }
+    state.category = nextCategory;
+    if (state.activeTab !== 'discover') {
+      state.activeTab = 'discover';
+    }
+    render();
+  } else if (action === 'clear-search') {
+    cancelSearchDebounce();
+    state.search = '';
+    state.visibleLimit = DISCOVER_PAGE_SIZE;
+    render();
+  } else if (action === 'reset-filters') {
+    cancelSearchDebounce();
+    state.search = '';
+    state.category = 'all';
+    state.visibleLimit = DISCOVER_PAGE_SIZE;
+    render();
+  } else if (action === 'load-more') {
+    loadMorePlugins();
+  } else if (action === 'refresh') {
+    if (isUpdateActionLocked()) return;
+    void Promise.all([
+      loadState(true),
+      checkUpdates(true, { silent: false }),
+      state.activeTab === 'conflicts' || state.conflicts.loaded ? loadConflicts({ silent: true }) : Promise.resolve(),
+    ]);
+  } else if (action === 'refresh-conflicts') {
+    void loadConflicts({ silent: false });
+  } else if (action === 'fix-conflict') {
+    e.stopPropagation();
+    const type = el.getAttribute('data-fix-type') || '';
+    const targetDir = el.getAttribute('data-target-dir') || '';
+    const suggestedDir = el.getAttribute('data-suggested-dir') || '';
+    if (type && targetDir) {
+      void triggerFixConflict({ type, targetDir, suggestedDir });
+    }
+  } else if (action === 'toggle-plugin') {
+    e.stopPropagation();
+    const dir = el.getAttribute('data-dir') || '';
+    const nextEnabled = el.getAttribute('data-next-enabled') === '1';
+    if (dir && !el.disabled) {
+      void triggerTogglePlugin(dir, nextEnabled);
+    }
+  } else if (action === 'open-pane') {
+    e.stopPropagation();
+    const dir = el.getAttribute('data-dir') || '';
+    const folder = el.getAttribute('data-folder') || '';
+    const viewPath = el.getAttribute('data-path') || '/';
+    const title = el.getAttribute('data-title') || dir;
+    const uri = el.getAttribute('data-uri') || '';
+    if (dir) {
+      void openSiblingSidecarPane({ dir, folder, viewPath, title, uri });
+    }
+  } else if (action === 'open-uri-pane') {
+    e.stopPropagation();
+    const uri = el.getAttribute('data-uri') || '';
+    const label = el.getAttribute('data-label') || uri;
+    const m = /^sidecar:\/\/([^/?#]+)\/([^/?#]+)((?:[/?#].*)?)$/i.exec(uri);
+    if (m) {
+      const normPath = normalizeSidecarViewPath(m[3] || '/');
+      void openSiblingSidecarPane({
+        dir: m[1],
+        folder: m[2],
+        viewPath: normPath,
+        title: label,
+        uri: buildSidecarPaneUri(m[1], m[2], normPath),
+      });
+    }
+  } else if (action === 'prompt-uninstall' || action === 'prompt-remove-files') {
+    e.stopPropagation();
+    if (isUpdateActionLocked()) return;
+    const dir = el.getAttribute('data-dir') || '';
+    const displayName = el.getAttribute('data-name') || dir;
+    const version = el.getAttribute('data-version') || '';
+    const favKey = el.getAttribute('data-fav-key') || '';
+    if (dir && dir !== 'agy-market') {
+      state.removeConfirmModal = {
+        dir,
+        displayName,
+        version,
+        isFavorited: isPluginDirFavorited(dir, favKey),
+        removeFavorite: false,
+      };
+      render();
+    }
+  } else if (action === 'confirm-uninstall' || action === 'confirm-remove-files') {
+    if (isUpdateActionLocked()) return;
+    const dir = el.getAttribute('data-dir') || state.removeConfirmModal?.dir || '';
+    const removeFavorite = Boolean(state.removeConfirmModal?.removeFavorite);
+    const displayName = state.removeConfirmModal?.displayName || dir;
+    if (dir) void triggerUninstallPlugin(dir, { removeFavorite, displayName });
+  } else if (action === 'dismiss-restart-banner') {
+    state.restartBanner = null;
+    render();
+  } else if (action === 'dismiss-nomination-banner') {
+    state.nominationBanner = null;
+    render();
+  } else if (action === 'dismiss-error-banner') {
+    state.errorBanner = null;
+    render();
+  } else if (action === 'retry-error-banner') {
+    if (isUpdateActionLocked()) return;
+    const retry = state.errorBanner?.retryAction;
+    state.errorBanner = null;
+    render();
+    if (retry?.type === 'install' && retry.plugin) {
+      void triggerInstall(retry.plugin, retry.opts || {});
+    } else if (retry?.type === 'update-plugin-direct' || retry?.type === 'update-local-github') {
+      void triggerDirectPluginUpdate({
+        id: retry.id || '',
+        dir: retry.dir || '',
+        displayName: retry.displayName || '',
+        source: retry.source || '',
+        updateChannel: retry.updateChannel || '',
+        targetRef: retry.targetRef || '',
+        updateKind: retry.updateKind || '',
+        trackBranch: retry.trackBranch || '',
+        repositoryUrl: retry.repositoryUrl || '',
+        preferUpstream: Boolean(retry.preferUpstream),
+        forceResync: Boolean(retry.forceResync),
+        confirmEscalation: false,
+      });
+    } else if (retry?.type === 'update-all') {
+      void triggerUpdateAll(retry.ids || null, { confirmEscalation: false });
+    } else if (retry?.type === 'self-update') {
+      void triggerSelfUpdate({
+        confirmEscalation: false,
+        updateChannel: retry.updateChannel || '',
+        targetVersion: retry.targetVersion || '',
+        targetRef: retry.targetRef || '',
+      });
+    }
+  } else if (action === 'check-updates') {
+    if (isUpdateActionLocked()) return;
+    void checkUpdates(true, { silent: false });
+  } else if (action === 'toggle-locale') {
+    const nextLocale = getLocale() === 'en' ? 'zh' : 'en';
+    void updatePrefs({ locale: nextLocale }, nextLocale === 'en' ? 'Switched to English' : '已切换为简体中文');
+  } else if (action === 'close-modal') {
+    if (state.removeConfirmModal) {
+      if (state.removingDir) return;
+      state.removeConfirmModal = null;
+    } else if (state.escalationModal) {
+      state.escalationModal = null;
+    } else if (state.conflictModal) {
+      state.conflictModal = null;
+    } else if (state.githubUrlModal) {
+      if (state.githubUrlModal.phase === 'inspecting' || state.githubUrlModal.phase === 'installing') {
+        return;
+      }
+      state.githubUrlModal = null;
+    } else if (state.selfChangelogModal) {
+      state.selfChangelogModal = false;
+    } else {
+      state.detailPlugin = null;
+    }
+    render();
+  } else if (action === 'open-github-url-modal') {
+    e.stopPropagation();
+    const prefill = el.getAttribute('data-prefill-url') || '';
+    openGithubUrlModal(prefill);
+  } else if (action === 'inspect-github-url') {
+    if (state.githubUrlModal) {
+      const inputVal = root?.querySelector?.('#github-url-input')?.value ?? state.githubUrlModal.url;
+      void triggerGithubUrlInspect({ url: inputVal });
+    }
+  } else if (action === 'select-github-subpath') {
+    if (state.githubUrlModal) {
+      const pluginRoot = el.getAttribute('data-plugin-root') || '.';
+      void triggerGithubUrlInspect({
+        url: state.githubUrlModal.url,
+        inspectToken: state.githubUrlModal.inspectToken,
+        pluginRoot,
+      });
+    }
+  } else if (action === 'back-github-subpaths') {
+    if (state.githubUrlModal && Array.isArray(state.githubUrlModal.subpathCandidates)) {
+      state.githubUrlModal.phase = 'subpaths';
+      state.githubUrlModal.error = '';
+      render();
+    }
+  } else if (action === 'select-github-install-mode') {
+    if (state.githubUrlModal && state.githubUrlModal.phase === 'preview') {
+      const mode = el.getAttribute('data-mode') || 'native';
+      state.githubUrlModal.installMode = mode;
+      state.githubUrlModal.error = '';
+      render();
+    }
+  } else if (action === 'install-github-url') {
+    if (isUpdateActionLocked()) return;
+    void triggerGithubUrlInstall();
+  } else if (action === 'reset-github-url-modal') {
+    if (state.githubUrlModal) {
+      githubInspectSeq += 1;
+      state.githubUrlModal = {
+        phase: 'input',
+        url: state.githubUrlModal.url || '',
+        inspectToken: '',
+        selectedPluginRoot: '.',
+        installMode: 'native',
+        confirmEscalation: false,
+        inspectResult: null,
+        subpathCandidates: null,
+        error: '',
+      };
+      state.focusGithubUrlInput = true;
+      render();
+    }
+  } else if (action === 'update-plugin-direct' || action === 'update-local-github') {
+    e.stopPropagation();
+    if (isUpdateActionLocked()) return;
+    const id = el.getAttribute('data-id') || '';
+    const dir = el.getAttribute('data-dir') || '';
+    const displayName = el.getAttribute('data-name') || dir || id;
+    const source = el.getAttribute('data-source') || '';
+    const updateChannel = el.getAttribute('data-update-channel') || '';
+    const targetRef = el.getAttribute('data-target-ref') || '';
+    const updateKind = el.getAttribute('data-update-kind') || '';
+    const trackBranch = el.getAttribute('data-track-branch') || '';
+    const repositoryUrl = el.getAttribute('data-repo-url') || '';
+    const forceResync = el.getAttribute('data-force-resync') === '1';
+    if (id || dir) {
+      void triggerDirectPluginUpdate({
+        id,
+        dir,
+        displayName,
+        source,
+        updateChannel,
+        targetRef,
+        updateKind,
+        trackBranch,
+        repositoryUrl,
+        forceResync,
+        confirmEscalation: false,
+      });
+    }
+  } else if (action === 'sync-installed-plugin') {
+    e.stopPropagation();
+    if (isUpdateActionLocked()) return;
+    const dir = el.getAttribute('data-dir') || '';
+    const id = el.getAttribute('data-id') || '';
+    const displayName = el.getAttribute('data-name') || dir || id;
+    if (dir || id) {
+      void triggerSyncInstalledPlugin({ dir, id, displayName });
+    }
+  } else if (action === 'detail') {
+    e.stopPropagation();
+    const id = el.getAttribute('data-id');
+    const initialTab = el.getAttribute('data-detail-tab') || 'overview';
+    const p = (state.serverState?.catalog?.plugins || []).find((x) => x.id === id);
+    if (p) void openPluginDetail(p, initialTab);
+  } else if (action === 'detail-local') {
+    e.stopPropagation();
+    const dir = el.getAttribute('data-dir');
+    const initialTab = el.getAttribute('data-detail-tab') || 'overview';
+    const loc = (state.serverState?.installed || []).find((x) => x.dir === dir);
+    if (loc) {
+      const { byId: catById, byDir: catByDir } = getCatalogMaps();
+      const catEntry = (loc.receipt?.id && catById.get(loc.receipt.id)) || catByDir.get(loc.dir) || null;
+      void openPluginDetail(buildLocalDetailModel(loc, catEntry), initialTab);
+    }
+  } else if (action === 'detail-tab') {
+    const tab = el.getAttribute('data-tab') || 'overview';
+    state.detailTab = tab;
+    render();
+    if (tab === 'discuss' && state.detailPlugin) {
+      void loadPluginDiscussions(state.detailPlugin.id, false);
+    }
+  } else if (action === 'refresh-discussions') {
+    const id = el.getAttribute('data-id');
+    if (id) void loadPluginDiscussions(id, true);
+  } else if (action === 'install') {
+    e.stopPropagation();
+    if (isUpdateActionLocked()) return;
+    const id = el.getAttribute('data-id');
+    const dir = el.getAttribute('data-dir') || '';
+    const forceResync = el.getAttribute('data-force-resync') === '1';
+    const p = (state.serverState?.catalog?.plugins || []).find((x) => x.id === id) || state.detailPlugin;
+    if (p) void triggerInstall(p, { ...(dir ? { dir } : {}), ...(forceResync ? { forceResync: true } : {}) });
+  } else if (action === 'update-all') {
+    e.stopPropagation();
+    if (isUpdateActionLocked()) return;
+    void triggerUpdateAll(null, { confirmEscalation: false });
+  } else if (action === 'retry-batch-one') {
+    if (isUpdateActionLocked()) return;
+    const id = el.getAttribute('data-id');
+    if (id) void triggerUpdateAll([id], { confirmEscalation: false });
+  } else if (action === 'clear-batch-results') {
+    state.batchResults = null;
+    render();
+  } else if (action === 'self-update') {
+    e.stopPropagation();
+    if (isUpdateActionLocked()) return;
+    const updateChannel = el.getAttribute('data-update-channel') || '';
+    const targetVersion = el.getAttribute('data-target-version') || '';
+    const targetRef = el.getAttribute('data-target-ref') || '';
+    void triggerSelfUpdate({
+      confirmEscalation: false,
+      updateChannel,
+      targetVersion,
+      targetRef,
+    });
+  } else if (action === 'open-self-changelog') {
+    state.selfChangelogModal = true;
+    render();
+  } else if (action === 'dismiss-self-banner') {
+    const ver = state.updates.selfUpdate?.latestVersion || '__dismissed__';
+    state.dismissedSelfVersion = ver;
+    writeStorage(SELF_OFFER_DISMISSED_KEY, ver);
+    render();
+  } else if (action === 'restore-self-banner') {
+    state.dismissedSelfVersion = '';
+    writeStorage(SELF_OFFER_DISMISSED_KEY, '');
+    render();
+  } else if (action === 'resolve-conflict' && state.conflictModal) {
+    if (isUpdateActionLocked()) return;
+    const strategy = el.getAttribute('data-strategy') || 'isolate';
+    void triggerInstall(state.conflictModal.plugin, { conflictStrategy: strategy });
+  } else if (action === 'confirm-escalation' && state.escalationModal) {
+    if (isUpdateActionLocked()) return;
+    const em = state.escalationModal;
+    state.escalationModal = null;
+    if (em.mode === 'single' && em.items[0]?.plugin) {
+      const item = em.items[0];
+      void triggerInstall(item.plugin, {
+        confirmEscalation: true,
+        ...(item.dir ? { dir: item.dir } : {}),
+        ...(item.forceResync ? { forceResync: true } : {}),
+      });
+    } else if ((em.mode === 'direct-update' || em.mode === 'local-github') && em.items[0]) {
+      const item = em.items[0];
+      void triggerDirectPluginUpdate({
+        id: item.id || '',
+        dir: item.dir || '',
+        displayName: item.displayName || '',
+        source: item.source || '',
+        updateChannel: item.updateChannel || '',
+        targetRef: item.targetRef || '',
+        updateKind: item.updateKind || '',
+        trackBranch: item.trackBranch || '',
+        repositoryUrl: item.repositoryUrl || '',
+        preferUpstream: Boolean(item.preferUpstream),
+        forceResync: Boolean(item.forceResync),
+        confirmEscalation: true,
+      });
+    } else if (em.mode === 'self') {
+      const item = em.items[0] || {};
+      void triggerSelfUpdate({
+        confirmEscalation: true,
+        updateChannel: item.updateChannel || '',
+        targetVersion: item.targetVersion && item.targetVersion !== '?' ? item.targetVersion : '',
+        targetRef: item.targetRef || '',
+      });
+    } else {
+      const escalatedIds = em.items.map((x) => x.id).filter(Boolean);
+      void triggerUpdateAll(escalatedIds, { confirmEscalation: true });
+    }
+  } else if (action === 'goto-token') {
+    state.detailPlugin = null;
+    state.activeTab = 'sources';
+    state.focusTokenField = true;
+    render();
+  } else if (action === 'clear-github-token') {
+    if (isUpdateActionLocked() || state.prefsSaving) return;
+    void updatePrefs({ githubToken: '', clearGithubToken: true }, t('已清除本地 GitHub Token', 'Cleared local GitHub Token'));
+  } else if (action === 'copy-text') {
+    e.stopPropagation();
+    const val = el.getAttribute('data-copy-val') || '';
+    const key = el.getAttribute('data-copy-key') || 'copy';
+    const toastMsg = el.getAttribute('data-copy-toast') || '';
+    if (val) void copyText(val, key, toastMsg);
+  } else if (action === 'open-patch-docs') {
+    e.stopPropagation();
+    const dir = el.getAttribute('data-dir') || '';
+    const id = el.getAttribute('data-id') || '';
+    const { byId: catById, byDir: catByDir } = getCatalogMaps();
+    const loc = dir ? getInstalledByDirMap().get(dir) || null : null;
+    const catEntry =
+      (id && catById.get(id)) || (loc?.receipt?.id && catById.get(loc.receipt.id)) || (dir && catByDir.get(dir)) || null;
+    if (catEntry) {
+      void openPluginDetail(catEntry, 'overview');
+    } else if (loc) {
+      void openPluginDetail(buildLocalDetailModel(loc, null), 'overview');
+    }
+  } else if (action === 'dismiss-toast') {
+    state.toast = null;
+    renderToast();
+  } else if (action === 'retry-reconnect') {
+    startReconnectPolling(state.reconnecting?.targetVersion || '');
+  } else if (action === 'reload-page') {
+    window.location.reload();
+  }
+}
+
+/**
+ * Bind delegated listeners once on `#app` (never per-render) to avoid attaching
+ * thousands of per-card listeners on Track 2 catalog renders.
+ */
+function bindDelegatedEvents(root) {
+  if (!root || root.__agyDelegated || typeof root.addEventListener !== 'function') return;
+  root.__agyDelegated = true;
+
   const reducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches;
   if (!reducedMotion) {
-    root.querySelectorAll('.cards-grid').forEach((grid) => {
-      grid.addEventListener(
-        'pointermove',
-        (e) => {
-          const card = e.target?.closest?.('.plugin-card');
-          if (!card) return;
-          const rect = card.getBoundingClientRect();
-          card.style.setProperty('--mx', `${Math.round(e.clientX - rect.left)}px`);
-          card.style.setProperty('--my', `${Math.round(e.clientY - rect.top)}px`);
-        },
-        { passive: true },
-      );
-    });
+    const scheduleFrame =
+      typeof requestAnimationFrame === 'function' ? requestAnimationFrame : (cb) => setTimeout(cb, 16);
+    let pmRaf = 0;
+    let pmLast = null;
+    root.addEventListener(
+      'pointermove',
+      (e) => {
+        const card = e.target?.closest?.('.cards-grid .plugin-card');
+        if (!card) return;
+        pmLast = { card, x: e.clientX, y: e.clientY };
+        if (pmRaf) return;
+        pmRaf = scheduleFrame(() => {
+          pmRaf = 0;
+          const snap = pmLast;
+          pmLast = null;
+          if (!snap || snap.card.isConnected === false) return;
+          const rect = snap.card.getBoundingClientRect();
+          snap.card.style.setProperty('--mx', `${Math.round(snap.x - rect.left)}px`);
+          snap.card.style.setProperty('--my', `${Math.round(snap.y - rect.top)}px`);
+        });
+      },
+      { passive: true },
+    );
   }
 
-  // Stop propagation on direct external title links & dock controls inside clickable card headers
-  root.querySelectorAll('[data-stop-card]').forEach((el) => {
-    el.addEventListener('click', (e) => {
-      e.stopPropagation();
-    });
+  root.addEventListener('click', (e) => {
+    const path = [];
+    for (let n = e.target; n && n !== root.parentNode; n = n.parentNode) {
+      if (n.nodeType === 1) path.push(n);
+    }
+    let stopped = false;
+    const proxy = {
+      target: e.target,
+      stopPropagation() {
+        stopped = true;
+        e.stopPropagation?.();
+      },
+      preventDefault() {
+        e.preventDefault?.();
+      },
+    };
+    for (const node of path) {
+      if (node.hasAttribute?.('data-action')) {
+        const isDisabled = Boolean(node.disabled || node.getAttribute?.('aria-disabled') === 'true');
+        if (!isDisabled) {
+          handleActionClick(node, proxy, root);
+        }
+        if (stopped) return;
+      }
+      if (node.hasAttribute?.('data-stop-card') || node.hasAttribute?.('data-stop-modal')) {
+        if (node.hasAttribute?.('data-stop-card')) {
+          e.stopPropagation?.();
+        }
+        return;
+      }
+    }
   });
 
-  const searchEl = root.querySelector('#market-search-input');
-  if (searchEl) {
-    searchEl.addEventListener('input', (e) => {
-      state.search = e.target.value;
-      render();
-    });
-  }
+  root.addEventListener('compositionstart', (e) => {
+    const id = e.target?.id;
+    if (id === 'market-search-input' || id === 'favorites-search-input' || id === 'installed-search-input') {
+      isComposingSearch = true;
+    }
+  });
 
-  const ghUrlEl = root.querySelector('#github-url-input');
-  if (ghUrlEl) {
-    ghUrlEl.addEventListener('input', (e) => {
+  root.addEventListener('compositionend', (e) => {
+    const target = e.target;
+    const id = target?.id;
+    if (id === 'market-search-input' || id === 'favorites-search-input' || id === 'installed-search-input') {
+      isComposingSearch = false;
+      if (id === 'market-search-input') {
+        state.search = target.value;
+        state.visibleLimit = DISCOVER_PAGE_SIZE;
+      } else if (id === 'favorites-search-input') {
+        state.favoritesSearch = target.value;
+      } else {
+        state.installedSearch = target.value;
+      }
+      debouncedRender(150);
+    }
+  });
+
+  root.addEventListener('input', (e) => {
+    const target = e.target;
+    const id = target?.id;
+    if (id === 'market-search-input') {
+      state.search = target.value;
+      state.visibleLimit = DISCOVER_PAGE_SIZE;
+      if (!e.isComposing && !isComposingSearch) debouncedRender(150);
+    } else if (id === 'favorites-search-input') {
+      state.favoritesSearch = target.value;
+      if (!e.isComposing && !isComposingSearch) debouncedRender(150);
+    } else if (id === 'installed-search-input') {
+      state.installedSearch = target.value;
+      if (!e.isComposing && !isComposingSearch) debouncedRender(150);
+    } else if (id === 'github-url-input') {
       if (!state.githubUrlModal) return;
-      const val = e.target.value;
+      const val = target.value;
       const hadError = Boolean(state.githubUrlModal.error);
       state.githubUrlModal.url = val;
       if (hadError) {
@@ -12397,533 +13214,74 @@ function bindDomEvents(root) {
       if (submitBtn) {
         submitBtn.disabled = !String(val || '').trim();
       }
-    });
-    ghUrlEl.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        if (state.githubUrlModal?.phase === 'input') {
-          void triggerGithubUrlInspect({ url: e.target.value });
-        }
-      }
-    });
-  }
+    }
+  });
 
-  const ghEscCheckEl = root.querySelector('#gh-confirm-escalation');
-  if (ghEscCheckEl) {
-    ghEscCheckEl.addEventListener('change', (e) => {
+  root.addEventListener('keydown', (e) => {
+    const target = e.target;
+    if (target?.id === 'github-url-input' && e.key === 'Enter') {
+      e.preventDefault();
+      if (state.githubUrlModal?.phase === 'input') {
+        void triggerGithubUrlInspect({ url: target.value });
+      }
+    }
+  });
+
+  root.addEventListener('change', (e) => {
+    const target = e.target;
+    const id = target?.id;
+    if (id === 'track2-checkbox') {
+      if (state.prefsSaving) {
+        target.checked = Boolean(state.serverState?.prefs?.enableExperimentalTrack2);
+        return;
+      }
+      void updatePrefs({ enableExperimentalTrack2: Boolean(target.checked) });
+    } else if (id === 'market-sort-select') {
+      cancelSearchDebounce();
+      state.sortBy = target.value;
+      state.visibleLimit = DISCOVER_PAGE_SIZE;
+      render();
+    } else if (id === 'favorites-sort-select') {
+      cancelSearchDebounce();
+      state.favoritesSortBy = target.value;
+      render();
+    } else if (id === 'gh-confirm-escalation') {
       if (!state.githubUrlModal) return;
-      state.githubUrlModal.confirmEscalation = Boolean(e.target.checked);
+      state.githubUrlModal.confirmEscalation = Boolean(target.checked);
       if (state.githubUrlModal.confirmEscalation) {
         state.githubUrlModal.error = '';
       }
       render();
-    });
-  }
-
-  const uninstallFavCheckEl = root.querySelector('#uninstall-remove-favorite');
-  if (uninstallFavCheckEl) {
-    uninstallFavCheckEl.addEventListener('change', (e) => {
+    } else if (id === 'uninstall-remove-favorite') {
       if (!state.removeConfirmModal) return;
-      state.removeConfirmModal.removeFavorite = Boolean(e.target.checked);
-    });
-  }
-
-  const favSearchEl = root.querySelector('#favorites-search-input');
-  if (favSearchEl) {
-    favSearchEl.addEventListener('input', (e) => {
-      state.favoritesSearch = e.target.value;
-      render();
-    });
-  }
-
-  const favSortEl = root.querySelector('#favorites-sort-select');
-  if (favSortEl) {
-    favSortEl.addEventListener('change', (e) => {
-      state.favoritesSortBy = e.target.value;
-      render();
-    });
-  }
-
-  const instSearchEl = root.querySelector('#installed-search-input');
-  if (instSearchEl) {
-    instSearchEl.addEventListener('input', (e) => {
-      state.installedSearch = e.target.value;
-      render();
-    });
-  }
-
-  const sortEl = root.querySelector('#market-sort-select');
-  if (sortEl) {
-    sortEl.addEventListener('change', (e) => {
-      state.sortBy = e.target.value;
-      render();
-    });
-  }
-
-  const track2El = root.querySelector('#track2-checkbox');
-  if (track2El) {
-    track2El.addEventListener('change', (e) => {
-      if (isUpdateActionLocked()) {
-        e.target.checked = Boolean(state.serverState?.prefs?.enableExperimentalTrack2);
-        return;
-      }
-      void updatePrefs({ enableExperimentalTrack2: Boolean(e.target.checked) });
-    });
-  }
-
-  const sourcesForm = root.querySelector('#sources-form');
-  if (sourcesForm) {
-    sourcesForm.addEventListener('submit', (e) => {
-      e.preventDefault();
-      if (isUpdateActionLocked()) return;
-      const networkMode = root.querySelector('#net-mode-select')?.value || 'auto';
-      const githubReleaseMirrorPrefix = root.querySelector('#mirror-prefix-input')?.value?.trim() || '';
-      const primaryCatalogUrl = root.querySelector('#primary-url-input')?.value?.trim() || '';
-      const rawCustom = root.querySelector('#custom-feeds-textarea')?.value || '';
-      const customFeeds = rawCustom
-        .split(/\r?\n/)
-        .map((s) => s.trim())
-        .filter(Boolean);
-      const patch = { networkMode, githubReleaseMirrorPrefix, primaryCatalogUrl, customFeeds };
-      const tokenVal = root.querySelector('#github-token-input')?.value?.trim() || '';
-      if (tokenVal) {
-        patch.githubToken = tokenVal;
-      }
-      void updatePrefs(patch);
-    });
-  }
-
-  root.querySelectorAll('[data-action]').forEach((el) => {
-    el.addEventListener('click', (e) => {
-      if (el.disabled || el.getAttribute('aria-disabled') === 'true') return;
-      const action = el.getAttribute('data-action');
-
-      if (action === 'tab') {
-        const nextTab = el.getAttribute('data-tab') || 'discover';
-        const changed = nextTab !== state.activeTab;
-        state.activeTab = nextTab;
-        if (changed) state.scrolledStuck = false;
-        render();
-        if (nextTab === 'installed' && Date.now() - lastForcedUpdatesAt > 10_000 && !isUpdateActionLocked()) {
-          void checkUpdates(true, { silent: true });
-        } else if (nextTab === 'conflicts' && !state.conflicts.loading) {
-          void loadConflicts({ silent: true });
-        }
-      } else if (action === 'toggle-hero') {
-        state.heroCollapsed = !state.heroCollapsed;
-        writeStorage(HERO_COLLAPSED_KEY, state.heroCollapsed ? '1' : '0');
-        render();
-      } else if (action === 'toggle-favs-shelf') {
-        state.favoritesShelfCollapsed = !state.favoritesShelfCollapsed;
-        writeStorage(FAVS_SHELF_COLLAPSED_KEY, state.favoritesShelfCollapsed ? '1' : '0');
-        render();
-      } else if (action === 'toggle-favorite') {
-        e.stopPropagation();
-        const key = el.getAttribute('data-fav-key') || '';
-        const name = el.getAttribute('data-fav-name') || '';
-        if (key) void toggleFavorite(key, name);
-      } else if (action === 'clear-favorites-search') {
-        state.favoritesSearch = '';
-        render();
-      } else if (action === 'installed-filter') {
-        state.installedFilter = el.getAttribute('data-filter') || 'all';
-        render();
-      } else if (action === 'clear-installed-search') {
-        state.installedSearch = '';
-        render();
-      } else if (action === 'reset-installed-filters') {
-        state.installedSearch = '';
-        state.installedFilter = 'all';
-        render();
-      } else if (action === 'category') {
-        e.stopPropagation();
-        state.category = el.getAttribute('data-category') || 'all';
-        if (state.activeTab !== 'discover') {
-          state.activeTab = 'discover';
-        }
-        render();
-      } else if (action === 'clear-search') {
-        state.search = '';
-        render();
-      } else if (action === 'reset-filters') {
-        state.search = '';
-        state.category = 'all';
-        render();
-      } else if (action === 'refresh') {
-        if (isUpdateActionLocked()) return;
-        void Promise.all([
-          loadState(true),
-          checkUpdates(true, { silent: false }),
-          state.activeTab === 'conflicts' || state.conflicts.loaded ? loadConflicts({ silent: true }) : Promise.resolve(),
-        ]);
-      } else if (action === 'refresh-conflicts') {
-        void loadConflicts({ silent: false });
-      } else if (action === 'fix-conflict') {
-        e.stopPropagation();
-        const type = el.getAttribute('data-fix-type') || '';
-        const targetDir = el.getAttribute('data-target-dir') || '';
-        const suggestedDir = el.getAttribute('data-suggested-dir') || '';
-        if (type && targetDir) {
-          void triggerFixConflict({ type, targetDir, suggestedDir });
-        }
-      } else if (action === 'toggle-plugin') {
-        e.stopPropagation();
-        const dir = el.getAttribute('data-dir') || '';
-        const nextEnabled = el.getAttribute('data-next-enabled') === '1';
-        if (dir && !el.disabled) {
-          void triggerTogglePlugin(dir, nextEnabled);
-        }
-      } else if (action === 'open-pane') {
-        e.stopPropagation();
-        const dir = el.getAttribute('data-dir') || '';
-        const folder = el.getAttribute('data-folder') || '';
-        const viewPath = el.getAttribute('data-path') || '/';
-        const title = el.getAttribute('data-title') || dir;
-        const uri = el.getAttribute('data-uri') || '';
-        if (dir) {
-          void openSiblingSidecarPane({ dir, folder, viewPath, title, uri });
-        }
-      } else if (action === 'open-uri-pane') {
-        e.stopPropagation();
-        const uri = el.getAttribute('data-uri') || '';
-        const label = el.getAttribute('data-label') || uri;
-        const m = /^sidecar:\/\/([^/?#]+)\/([^/?#]+)((?:[/?#].*)?)$/i.exec(uri);
-        if (m) {
-          const normPath = normalizeSidecarViewPath(m[3] || '/');
-          void openSiblingSidecarPane({
-            dir: m[1],
-            folder: m[2],
-            viewPath: normPath,
-            title: label,
-            uri: buildSidecarPaneUri(m[1], m[2], normPath),
-          });
-        }
-      } else if (action === 'prompt-uninstall' || action === 'prompt-remove-files') {
-        e.stopPropagation();
-        if (isUpdateActionLocked()) return;
-        const dir = el.getAttribute('data-dir') || '';
-        const displayName = el.getAttribute('data-name') || dir;
-        const version = el.getAttribute('data-version') || '';
-        const favKey = el.getAttribute('data-fav-key') || '';
-        if (dir && dir !== 'agy-market') {
-          state.removeConfirmModal = {
-            dir,
-            displayName,
-            version,
-            isFavorited: isPluginDirFavorited(dir, favKey),
-            removeFavorite: false,
-          };
-          render();
-        }
-      } else if (action === 'confirm-uninstall' || action === 'confirm-remove-files') {
-        if (isUpdateActionLocked()) return;
-        const dir = el.getAttribute('data-dir') || state.removeConfirmModal?.dir || '';
-        const removeFavorite = Boolean(state.removeConfirmModal?.removeFavorite);
-        const displayName = state.removeConfirmModal?.displayName || dir;
-        if (dir) void triggerUninstallPlugin(dir, { removeFavorite, displayName });
-      } else if (action === 'dismiss-restart-banner') {
-        state.restartBanner = null;
-        render();
-      } else if (action === 'dismiss-nomination-banner') {
-        state.nominationBanner = null;
-        render();
-      } else if (action === 'dismiss-error-banner') {
-        state.errorBanner = null;
-        render();
-      } else if (action === 'retry-error-banner') {
-        if (isUpdateActionLocked()) return;
-        const retry = state.errorBanner?.retryAction;
-        state.errorBanner = null;
-        render();
-        if (retry?.type === 'install' && retry.plugin) {
-          void triggerInstall(retry.plugin, retry.opts || {});
-        } else if (retry?.type === 'update-plugin-direct' || retry?.type === 'update-local-github') {
-          void triggerDirectPluginUpdate({
-            id: retry.id || '',
-            dir: retry.dir || '',
-            displayName: retry.displayName || '',
-            source: retry.source || '',
-            updateChannel: retry.updateChannel || '',
-            targetRef: retry.targetRef || '',
-            updateKind: retry.updateKind || '',
-            trackBranch: retry.trackBranch || '',
-            repositoryUrl: retry.repositoryUrl || '',
-            preferUpstream: Boolean(retry.preferUpstream),
-            forceResync: Boolean(retry.forceResync),
-            confirmEscalation: false,
-          });
-        } else if (retry?.type === 'update-all') {
-          void triggerUpdateAll(retry.ids || null, { confirmEscalation: false });
-        } else if (retry?.type === 'self-update') {
-          void triggerSelfUpdate({
-            confirmEscalation: false,
-            updateChannel: retry.updateChannel || '',
-            targetVersion: retry.targetVersion || '',
-            targetRef: retry.targetRef || '',
-          });
-        }
-      } else if (action === 'check-updates') {
-        if (isUpdateActionLocked()) return;
-        void checkUpdates(true, { silent: false });
-      } else if (action === 'toggle-locale') {
-        const nextLocale = getLocale() === 'en' ? 'zh' : 'en';
-        void updatePrefs({ locale: nextLocale }, nextLocale === 'en' ? 'Switched to English' : '已切换为简体中文');
-      } else if (action === 'close-modal') {
-        if (state.removeConfirmModal) {
-          if (state.removingDir) return;
-          state.removeConfirmModal = null;
-        } else if (state.escalationModal) {
-          state.escalationModal = null;
-        } else if (state.conflictModal) {
-          state.conflictModal = null;
-        } else if (state.githubUrlModal) {
-          if (state.githubUrlModal.phase === 'inspecting' || state.githubUrlModal.phase === 'installing') {
-            return;
-          }
-          state.githubUrlModal = null;
-        } else if (state.selfChangelogModal) {
-          state.selfChangelogModal = false;
-        } else {
-          state.detailPlugin = null;
-        }
-        render();
-      } else if (action === 'open-github-url-modal') {
-        e.stopPropagation();
-        const prefill = el.getAttribute('data-prefill-url') || '';
-        openGithubUrlModal(prefill);
-      } else if (action === 'inspect-github-url') {
-        if (state.githubUrlModal) {
-          const inputVal = root.querySelector('#github-url-input')?.value ?? state.githubUrlModal.url;
-          void triggerGithubUrlInspect({ url: inputVal });
-        }
-      } else if (action === 'select-github-subpath') {
-        if (state.githubUrlModal) {
-          const pluginRoot = el.getAttribute('data-plugin-root') || '.';
-          void triggerGithubUrlInspect({
-            url: state.githubUrlModal.url,
-            inspectToken: state.githubUrlModal.inspectToken,
-            pluginRoot,
-          });
-        }
-      } else if (action === 'back-github-subpaths') {
-        if (state.githubUrlModal && Array.isArray(state.githubUrlModal.subpathCandidates)) {
-          state.githubUrlModal.phase = 'subpaths';
-          state.githubUrlModal.error = '';
-          render();
-        }
-      } else if (action === 'select-github-install-mode') {
-        if (state.githubUrlModal && state.githubUrlModal.phase === 'preview') {
-          const mode = el.getAttribute('data-mode') || 'native';
-          state.githubUrlModal.installMode = mode;
-          state.githubUrlModal.error = '';
-          render();
-        }
-      } else if (action === 'install-github-url') {
-        if (isUpdateActionLocked()) return;
-        void triggerGithubUrlInstall();
-      } else if (action === 'reset-github-url-modal') {
-        if (state.githubUrlModal) {
-          githubInspectSeq += 1;
-          state.githubUrlModal = {
-            phase: 'input',
-            url: state.githubUrlModal.url || '',
-            inspectToken: '',
-            selectedPluginRoot: '.',
-            installMode: 'native',
-            confirmEscalation: false,
-            inspectResult: null,
-            subpathCandidates: null,
-            error: '',
-          };
-          state.focusGithubUrlInput = true;
-          render();
-        }
-      } else if (action === 'update-plugin-direct' || action === 'update-local-github') {
-        e.stopPropagation();
-        if (isUpdateActionLocked()) return;
-        const id = el.getAttribute('data-id') || '';
-        const dir = el.getAttribute('data-dir') || '';
-        const displayName = el.getAttribute('data-name') || dir || id;
-        const source = el.getAttribute('data-source') || '';
-        const updateChannel = el.getAttribute('data-update-channel') || '';
-        const targetRef = el.getAttribute('data-target-ref') || '';
-        const updateKind = el.getAttribute('data-update-kind') || '';
-        const trackBranch = el.getAttribute('data-track-branch') || '';
-        const repositoryUrl = el.getAttribute('data-repo-url') || '';
-        const forceResync = el.getAttribute('data-force-resync') === '1';
-        if (id || dir) {
-          void triggerDirectPluginUpdate({
-            id,
-            dir,
-            displayName,
-            source,
-            updateChannel,
-            targetRef,
-            updateKind,
-            trackBranch,
-            repositoryUrl,
-            forceResync,
-            confirmEscalation: false,
-          });
-        }
-      } else if (action === 'sync-installed-plugin') {
-        e.stopPropagation();
-        if (isUpdateActionLocked()) return;
-        const dir = el.getAttribute('data-dir') || '';
-        const id = el.getAttribute('data-id') || '';
-        const displayName = el.getAttribute('data-name') || dir || id;
-        if (dir || id) {
-          void triggerSyncInstalledPlugin({ dir, id, displayName });
-        }
-      } else if (action === 'detail') {
-        e.stopPropagation();
-        const id = el.getAttribute('data-id');
-        const initialTab = el.getAttribute('data-detail-tab') || 'overview';
-        const p = (state.serverState?.catalog?.plugins || []).find((x) => x.id === id);
-        if (p) void openPluginDetail(p, initialTab);
-      } else if (action === 'detail-local') {
-        e.stopPropagation();
-        const dir = el.getAttribute('data-dir');
-        const initialTab = el.getAttribute('data-detail-tab') || 'overview';
-        const loc = (state.serverState?.installed || []).find((x) => x.dir === dir);
-        if (loc) {
-          const { byId: catById, byDir: catByDir } = getCatalogMaps();
-          const catEntry = (loc.receipt?.id && catById.get(loc.receipt.id)) || catByDir.get(loc.dir) || null;
-          void openPluginDetail(buildLocalDetailModel(loc, catEntry), initialTab);
-        }
-      } else if (action === 'detail-tab') {
-        const tab = el.getAttribute('data-tab') || 'overview';
-        state.detailTab = tab;
-        render();
-        if (tab === 'discuss' && state.detailPlugin) {
-          void loadPluginDiscussions(state.detailPlugin.id, false);
-        }
-      } else if (action === 'refresh-discussions') {
-        const id = el.getAttribute('data-id');
-        if (id) void loadPluginDiscussions(id, true);
-      } else if (action === 'install') {
-        e.stopPropagation();
-        if (isUpdateActionLocked()) return;
-        const id = el.getAttribute('data-id');
-        const dir = el.getAttribute('data-dir') || '';
-        const forceResync = el.getAttribute('data-force-resync') === '1';
-        const p = (state.serverState?.catalog?.plugins || []).find((x) => x.id === id) || state.detailPlugin;
-        if (p) void triggerInstall(p, { ...(dir ? { dir } : {}), ...(forceResync ? { forceResync: true } : {}) });
-      } else if (action === 'update-all') {
-        e.stopPropagation();
-        if (isUpdateActionLocked()) return;
-        void triggerUpdateAll(null, { confirmEscalation: false });
-      } else if (action === 'retry-batch-one') {
-        if (isUpdateActionLocked()) return;
-        const id = el.getAttribute('data-id');
-        if (id) void triggerUpdateAll([id], { confirmEscalation: false });
-      } else if (action === 'clear-batch-results') {
-        state.batchResults = null;
-        render();
-      } else if (action === 'self-update') {
-        e.stopPropagation();
-        if (isUpdateActionLocked()) return;
-        const updateChannel = el.getAttribute('data-update-channel') || '';
-        const targetVersion = el.getAttribute('data-target-version') || '';
-        const targetRef = el.getAttribute('data-target-ref') || '';
-        void triggerSelfUpdate({
-          confirmEscalation: false,
-          updateChannel,
-          targetVersion,
-          targetRef,
-        });
-      } else if (action === 'open-self-changelog') {
-        state.selfChangelogModal = true;
-        render();
-      } else if (action === 'dismiss-self-banner') {
-        const ver = state.updates.selfUpdate?.latestVersion || '__dismissed__';
-        state.dismissedSelfVersion = ver;
-        writeStorage(SELF_OFFER_DISMISSED_KEY, ver);
-        render();
-      } else if (action === 'restore-self-banner') {
-        state.dismissedSelfVersion = '';
-        writeStorage(SELF_OFFER_DISMISSED_KEY, '');
-        render();
-      } else if (action === 'resolve-conflict' && state.conflictModal) {
-        if (isUpdateActionLocked()) return;
-        const strategy = el.getAttribute('data-strategy') || 'isolate';
-        void triggerInstall(state.conflictModal.plugin, { conflictStrategy: strategy });
-      } else if (action === 'confirm-escalation' && state.escalationModal) {
-        if (isUpdateActionLocked()) return;
-        const em = state.escalationModal;
-        state.escalationModal = null;
-        if (em.mode === 'single' && em.items[0]?.plugin) {
-          const item = em.items[0];
-          void triggerInstall(item.plugin, {
-            confirmEscalation: true,
-            ...(item.dir ? { dir: item.dir } : {}),
-            ...(item.forceResync ? { forceResync: true } : {}),
-          });
-        } else if ((em.mode === 'direct-update' || em.mode === 'local-github') && em.items[0]) {
-          const item = em.items[0];
-          void triggerDirectPluginUpdate({
-            id: item.id || '',
-            dir: item.dir || '',
-            displayName: item.displayName || '',
-            source: item.source || '',
-            updateChannel: item.updateChannel || '',
-            targetRef: item.targetRef || '',
-            updateKind: item.updateKind || '',
-            trackBranch: item.trackBranch || '',
-            repositoryUrl: item.repositoryUrl || '',
-            preferUpstream: Boolean(item.preferUpstream),
-            forceResync: Boolean(item.forceResync),
-            confirmEscalation: true,
-          });
-        } else if (em.mode === 'self') {
-          const item = em.items[0] || {};
-          void triggerSelfUpdate({
-            confirmEscalation: true,
-            updateChannel: item.updateChannel || '',
-            targetVersion: item.targetVersion && item.targetVersion !== '?' ? item.targetVersion : '',
-            targetRef: item.targetRef || '',
-          });
-        } else {
-          const escalatedIds = em.items.map((x) => x.id).filter(Boolean);
-          void triggerUpdateAll(escalatedIds, { confirmEscalation: true });
-        }
-      } else if (action === 'goto-token') {
-        state.detailPlugin = null;
-        state.activeTab = 'sources';
-        state.focusTokenField = true;
-        render();
-      } else if (action === 'clear-github-token') {
-        if (isUpdateActionLocked()) return;
-        void updatePrefs({ githubToken: '', clearGithubToken: true }, t('已清除本地 GitHub Token', 'Cleared local GitHub Token'));
-      } else if (action === 'copy-text') {
-        e.stopPropagation();
-        const val = el.getAttribute('data-copy-val') || '';
-        const key = el.getAttribute('data-copy-key') || 'copy';
-        const toastMsg = el.getAttribute('data-copy-toast') || '';
-        if (val) void copyText(val, key, toastMsg);
-      } else if (action === 'open-patch-docs') {
-        e.stopPropagation();
-        const dir = el.getAttribute('data-dir') || '';
-        const id = el.getAttribute('data-id') || '';
-        const { byId: catById, byDir: catByDir } = getCatalogMaps();
-        const loc = dir ? getInstalledByDirMap().get(dir) || null : null;
-        const catEntry =
-          (id && catById.get(id)) || (loc?.receipt?.id && catById.get(loc.receipt.id)) || (dir && catByDir.get(dir)) || null;
-        if (catEntry) {
-          void openPluginDetail(catEntry, 'overview');
-        } else if (loc) {
-          void openPluginDetail(buildLocalDetailModel(loc, null), 'overview');
-        }
-      } else if (action === 'dismiss-toast') {
-        state.toast = null;
-        render();
-      } else if (action === 'retry-reconnect') {
-        startReconnectPolling(state.reconnecting?.targetVersion || '');
-      } else if (action === 'reload-page') {
-        window.location.reload();
-      }
-    });
+      state.removeConfirmModal.removeFavorite = Boolean(target.checked);
+    }
   });
+
+  root.addEventListener('submit', (e) => {
+    const target = e.target;
+    if (target?.id !== 'sources-form') return;
+    e.preventDefault();
+    if (isUpdateActionLocked() || state.prefsSaving) return;
+    const networkMode = root.querySelector('#net-mode-select')?.value || 'auto';
+    const githubReleaseMirrorPrefix = root.querySelector('#mirror-prefix-input')?.value?.trim() || '';
+    const primaryCatalogUrl = root.querySelector('#primary-url-input')?.value?.trim() || '';
+    const rawCustom = root.querySelector('#custom-feeds-textarea')?.value || '';
+    const customFeeds = rawCustom
+      .split(/\r?\n/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const patch = { networkMode, githubReleaseMirrorPrefix, primaryCatalogUrl, customFeeds };
+    const tokenVal = root.querySelector('#github-token-input')?.value?.trim() || '';
+    if (tokenVal) {
+      patch.githubToken = tokenVal;
+    }
+    void updatePrefs(patch);
+  });
+}
+
+function bindDomEvents(root) {
+  bindDelegatedEvents(root);
 }
 
 // Global keyboard shortcuts (Esc to close modals/drawer, `/` to focus search)
