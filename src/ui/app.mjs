@@ -3975,7 +3975,7 @@ function renderPluginCard(p, updateById, installedByDir, updateByDir = null) {
             <span class="meta-star" title="GitHub Stars">${icon('star', 11)} ${Number(p.repository?.stars || 0)}</span>
             ${relUpdated ? `<span class="meta-sep">·</span><span style="white-space:nowrap">${escapeHtml(relUpdated)}</span>` : ''}
             ${upd?.changelog ? `<span class="meta-sep">·</span><button type="button" class="notes-link" data-action="detail" data-id="${escapeHtml(p.id)}" data-detail-tab="changelog">${escapeHtml(t('更新内容 ›', 'Notes ›'))}</button>` : ''}
-            ${p.forceScopedInstall ? `<span class="track-tag" title="Track 2 Experimental Topic">Track 2</span>` : ''}
+            ${p.forceScopedInstall ? `<span class="track-tag" title="${escapeHtml(t("GitHub Topic 自动发现（未审核社区仓库，自动隔离命名）", "GitHub Topic auto-discovery (scoped isolation)"))}">${escapeHtml(t("社区发现", "Community"))}</span>` : ''}
             ${renderRankingMetaPillsHtml(p)}
           </div>
         </div>
@@ -4177,11 +4177,11 @@ function renderDiscoverView() {
           <option value="name" ${state.sortBy === 'name' ? 'selected' : ''}>${escapeHtml(t('按名称排序', 'Name A–Z'))}</option>
         </select>
 
-        <label class="track2-pill ${prefs.enableExperimentalTrack2 ? 'enabled' : ''}${state.prefsSaving ? ' is-saving' : ''}" aria-busy="${state.prefsSaving ? 'true' : 'false'}" title="${escapeHtml(t('开启 GitHub Topic 自动发现 (Track 2)，自动采用 <owner>--<slug> 隔离命名', 'Enable experimental GitHub topic discovery (Track 2) with automatic scoped isolation'))}">
+        <label class="track2-pill ${prefs.enableExperimentalTrack2 ? 'enabled' : ''}${state.prefsSaving ? ' is-saving' : ''}" aria-busy="${state.prefsSaving ? 'true' : 'false'}" title="${escapeHtml(t('开启 GitHub Topic 自动发现，自动采用 <owner>--<slug> 隔离命名', 'Enable GitHub Topic discovery with automatic scoped isolation'))}">
           <input id="track2-checkbox" type="checkbox" ${prefs.enableExperimentalTrack2 ? 'checked' : ''}${state.prefsSaving ? ' disabled aria-disabled="true"' : ''} />
           <span class="switch-track" aria-hidden="true"></span>
           <span class="track2-ico" aria-hidden="true">${state.prefsSaving ? icon('refresh', 12, 'spin') : icon('flask', 12)}</span>
-          <span>Track 2</span>
+          <span>${escapeHtml(t("社区发现", "Community"))}</span>
           ${state.prefsSaving ? `<span class="track2-saving-text" role="status">${escapeHtml(t('切换中…', 'Switching…'))}</span>` : ''}
         </label>
       </div>

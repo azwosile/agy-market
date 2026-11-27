@@ -48,6 +48,8 @@
   const grid = byId('site-grid');
   const search = byId('site-search');
   const category = byId('site-category');
+  const discovery = byId('site-discovery-toggle');
+  const discoveryStatus = byId('discovery-status');
   const sort = byId('site-sort');
   const peek = byId('site-peek');
   const palette = byId('site-palette');
@@ -59,6 +61,9 @@
     button,
   }));
   const copyTimers = new WeakMap();
+  const discoveryCache = new Map();
+  let verifiedPlugins = [];
+  let activeFeedUrl;
   let plugins = [];
   let visiblePlugins = [];
   let paletteItems = [];
@@ -243,6 +248,8 @@
     byId('catalog-title').textContent = hasCategory ? labelForCategory(category.value) : '全部插件';
     document.querySelector('.catalog-actions').hidden = !isCatalog;
     byId('catalog-heading').hidden = !isCatalog;
+    byId('site-stats').hidden = !isCatalog;
+    document.querySelector('.features-toggle').hidden = !isCatalog;
     byId('catalog-page').hidden = !isCatalog;
     byId('quick-install').hidden = page === 'settings';
     byId('settings-page').hidden = page !== 'settings';
@@ -264,7 +271,13 @@
 
   function renderBadges(plugin, limit) {
     const badges = badgesOf(plugin).slice(0, limit ?? Infinity);
-    return badges.length ? `<span class="badges">${badges.map((id) => `<span class="badge">${icon(badgeIcon(id))}${escapeHtml(labelForBadge(id))}</span>`).join('')}</span>` : '';
+    const tags = badges.map((id) => `<span class="badge">${icon(badgeIcon(id))}${escapeHtml(labelForBadge(id))}</span>`);
+    if (plugin.isDiscovery) tags.unshift(renderDiscoveryTag());
+    return tags.length ? `<span class="badges">${tags.join('')}</span>` : '';
+  }
+
+  function renderDiscoveryTag() {
+    return `<span class="badge discovery-tag" title="GitHub Topic 自动发现（未审核社区仓库）">${icon('discovery')}社区发现</span>`;
   }
 
   function renderStars(plugin) {
@@ -282,7 +295,7 @@
     visiblePlugins = sortPluginsList(plugins.filter((plugin) =>
       (selected === 'all' || categoriesOf(plugin).includes(selected)) && matchesPlugin(plugin, query),
     ), sort.value);
-    byId('stat-total').textContent = visiblePlugins.length === plugins.length
+    byId('catalog-count').textContent = visiblePlugins.length === plugins.length
       ? `${plugins.length} 款`
       : `${visiblePlugins.length} / ${plugins.length} 款`;
     grid.className = view === 'grid' ? 'grid' : 'table-wrap';
@@ -297,7 +310,7 @@
     if (view === 'table') {
       const rows = visiblePlugins.map((plugin, index) => `
         <tr data-plugin="${index}">
-          <td><button type="button" class="table-title" aria-haspopup="dialog">${renderMark(plugin)}${escapeHtml(titleOf(plugin))}${icon('chevron-right', 'card-arrow')}</button></td>
+          <td><button type="button" class="table-title" aria-haspopup="dialog">${renderMark(plugin)}${escapeHtml(titleOf(plugin))}${plugin.isDiscovery ? renderDiscoveryTag() : ''}${icon('chevron-right', 'card-arrow')}</button></td>
           <td>${categoryLabelFor(plugin)}</td>
           <td class="table-version">${plugin.version ? `v${escapeHtml(plugin.version)}` : '—'}</td>
           <td>${renderStars(plugin)}</td>
@@ -319,6 +332,75 @@
   const DEFAULT_PAGES_FEED_URL = 'https://azwosile.github.io/agy-market-catalog/index.json';
   const RAW_GH_PAGES_FEED_URL = 'https://raw.githubusercontent.com/azwosile/agy-market-catalog/gh-pages/index.json';
 
+  async function fetchFeed(url, signals = []) {
+    if (!isSafeUrl(url)) return;
+    const signal = AbortSignal.any([...signals, AbortSignal.timeout(6500)]);
+    const response = await fetch(url, { headers: { Accept: 'application/json' }, signal });
+    if (!response.ok) return;
+    const json = await response.json();
+    if (Array.isArray(json?.plugins)) {
+      return json.plugins.filter((plugin) => plugin && typeof plugin === 'object' && !Array.isArray(plugin));
+    }
+  }
+
+  function mergeDiscovery(items) {
+    const seenIds = new Set();
+    const seenRoots = new Set();
+    return [...verifiedPlugins, ...items.map((plugin) => ({ ...plugin, isDiscovery: true }))].filter((plugin) => {
+      const repoId = Number(plugin.repository?.repositoryId);
+      const root = String(plugin.repository?.pluginRoot || '.')
+        .trim().replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+|\/+$/g, '') || '.';
+      const key = repoId > 0 ? `${repoId}:${root}` : '';
+      if ((plugin.id && seenIds.has(plugin.id)) || (key && seenRoots.has(key))) return false;
+      if (plugin.id) seenIds.add(plugin.id);
+      if (key) seenRoots.add(key);
+      return true;
+    });
+  }
+
+  function renderCatalog(items, animate = false) {
+    plugins = items;
+    byId('stat-total').textContent = activeFeedUrl ? `${items.length} 款` : '—';
+    renderCategories();
+    renderNavigation();
+    renderGrid(animate);
+    if (palette.open) renderPalette();
+  }
+
+  async function fetchDiscovery(url) {
+    const feeds = (url === DEFAULT_PAGES_FEED_URL ? [url, RAW_GH_PAGES_FEED_URL] : [url])
+      .map((feed) => new URL('unverified-index.json', feed).href);
+    for (const feed of feeds) {
+      try {
+        const items = await fetchFeed(feed);
+        if (items) return items;
+      } catch {
+        // Try the next discovery source.
+      }
+    }
+  }
+
+  async function syncDiscovery(animate = false) {
+    discoveryStatus.textContent = '';
+    const url = activeFeedUrl;
+    if (!discovery.checked || !url) {
+      renderCatalog(verifiedPlugins, animate);
+      return;
+    }
+
+    let pending = discoveryCache.get(url);
+    if (!pending) {
+      pending = fetchDiscovery(url);
+      discoveryCache.set(url, pending);
+    }
+    discoveryStatus.textContent = '正在同步社区发现…';
+    const items = await pending;
+    if (!items && discoveryCache.get(url) === pending) discoveryCache.delete(url);
+    if (!discovery.checked || url !== activeFeedUrl) return;
+    discoveryStatus.textContent = items ? '' : '社区发现同步失败。关闭后重新开启可重试。';
+    renderCatalog(items ? mergeDiscovery(items) : verifiedPlugins, animate);
+  }
+
   async function fetchCatalog() {
     feedRequest?.abort();
     const request = new AbortController();
@@ -327,24 +409,21 @@
     const candidates = url === DEFAULT_PAGES_FEED_URL
       ? [[url, 'GitHub Pages'], [RAW_GH_PAGES_FEED_URL, 'GitHub Raw 镜像']]
       : [[url, '自定义目录']];
-    const channel = byId('stat-channel');
+    const channels = [byId('stat-channel'), byId('settings-channel')];
     const loadButton = byId('site-load-btn');
     feedStatus = 'loading';
     loadButton.setAttribute('aria-busy', 'true');
-    channel.textContent = '同步中…';
-    channel.classList.remove('has-error');
+    for (const channel of channels) {
+      channel.textContent = '同步中…';
+      channel.classList.remove('has-error');
+    }
     grid.setAttribute('aria-busy', 'true');
     let loaded;
     let channelName;
     for (const [candidate, name] of candidates) {
       try {
-        if (!isSafeUrl(candidate)) break;
-        const signal = AbortSignal.any([request.signal, AbortSignal.timeout(6500)]);
-        const response = await fetch(candidate, { headers: { Accept: 'application/json' }, signal });
-        if (!response.ok) continue;
-        const json = await response.json();
-        if (Array.isArray(json?.plugins)) {
-          loaded = json.plugins.filter((plugin) => plugin && typeof plugin === 'object' && !Array.isArray(plugin));
+        loaded = await fetchFeed(candidate, [request.signal]);
+        if (loaded) {
           channelName = name;
           break;
         }
@@ -356,15 +435,16 @@
     feedStatus = loaded ? 'ready' : 'error';
     loadButton.removeAttribute('aria-busy');
     if (loaded) {
-      plugins = loaded;
-      renderCategories();
+      activeFeedUrl = url;
+      verifiedPlugins = loaded;
     }
-    channel.textContent = loaded ? channelName : plugins.length ? '同步失败，仍显示上次目录' : '连接失败，请检查目录地址';
-    channel.classList.toggle('has-error', !loaded);
+    for (const channel of channels) {
+      channel.textContent = loaded ? channelName : activeFeedUrl ? '同步失败，仍显示上次目录' : '连接失败，请检查目录地址';
+      channel.classList.toggle('has-error', !loaded);
+    }
     grid.setAttribute('aria-busy', 'false');
-    renderNavigation();
-    renderGrid(Boolean(loaded));
-    if (palette.open) renderPalette();
+    renderCatalog(loaded || plugins, Boolean(loaded) && !discovery.checked);
+    if (loaded && discovery.checked) void syncDiscovery(true);
   }
 
   function openPeek(plugin) {
@@ -539,6 +619,7 @@
     if (item) showPage('catalog', item.dataset.category);
   });
   search.addEventListener('input', () => renderGrid());
+  discovery.addEventListener('change', () => void syncDiscovery());
   category.addEventListener('change', () => {
     renderNavigation();
     renderGrid();
