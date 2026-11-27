@@ -5,7 +5,8 @@
 import { createHash } from 'node:crypto';
 import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
+import { isMainModule } from '../src/shared/paths.mjs';
 import { CUSTOMIZATION_URI, PLUGIN_ID, PLUGIN_VERSION, SIDECAR_URI } from '../src/shared/constants.mjs';
 import { resolvePluginsDir } from '../src/shared/paths.mjs';
 import { buildMarketSidecarHtml } from './build.mjs';
@@ -119,7 +120,7 @@ export async function installLocalAgyMarket({ destPluginsDir = '' } = {}) {
   return { dstDir, sidecarUri: SIDECAR_URI, customizationUri: CUSTOMIZATION_URI };
 }
 
-if (import.meta.url === pathToFileURL(resolve(process.argv[1] || '')).href) {
+if (isMainModule(import.meta.url)) {
   const destIdx = process.argv.indexOf('--dest');
   const destPluginsDir = destIdx !== -1 && process.argv[destIdx + 1] ? process.argv[destIdx + 1] : '';
   const res = await installLocalAgyMarket({ destPluginsDir });

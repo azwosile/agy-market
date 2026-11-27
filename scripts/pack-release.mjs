@@ -5,7 +5,8 @@
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
+import { isMainModule } from '../src/shared/paths.mjs';
 import { collectDirectoryFilesMap, createDeterministicTarGz } from '../src/installer/tar-extract.mjs';
 import { PLUGIN_JSON_ALLOWED_KEYS } from '../src/shared/constants.mjs';
 import { parseJsonc } from '../src/shared/schemas.mjs';
@@ -68,7 +69,7 @@ export async function packReleaseBundle({ outDir = join(repoRoot, 'dist') } = {}
   };
 }
 
-if (import.meta.url === pathToFileURL(resolve(process.argv[1] || '')).href) {
+if (isMainModule(import.meta.url)) {
   const res = await packReleaseBundle();
   console.log(
     `[pack:release] Created ${res.tarPath} (${res.sizeBytes} bytes, ${res.fileCount} files, sha256=${res.sha256})`,

@@ -549,13 +549,13 @@ test('Category 3a: root plugin two-step inspect -> install achieves ZERO re-down
     assert.equal(installBody.installedDir, 'clean-root-plugin');
     assert.equal(tarballDownloads, 1, 'Install MUST reuse staged archive with ZERO network re-download');
 
-    // Verify 10-field manifest purity on disk (license & keywords stripped!)
+    // Verify official v1 15-field manifest purity on disk (license & keywords preserved; unknown keys stripped)
     const diskManifest = JSON.parse(readFileSync(join(ws.pluginsDir, 'clean-root-plugin', 'plugin.json'), 'utf8'));
     for (const k of Object.keys(diskManifest)) {
       assert.ok(PLUGIN_JSON_ALLOWED_KEYS.has(k), `Extra key "${k}" leaked into installed plugin.json`);
     }
-    assert.equal(diskManifest.license, undefined);
-    assert.equal(diskManifest.keywords, undefined);
+    assert.equal(diskManifest.license, 'MIT');
+    assert.deepEqual(diskManifest.keywords, ['antigravity', 'test']);
 
     // Verify receipt metadata & staging cleanup
     const receipt = JSON.parse(readFileSync(join(ws.pluginsDir, 'clean-root-plugin', '.agy-market-receipt.json'), 'utf8'));

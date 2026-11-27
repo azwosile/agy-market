@@ -5,7 +5,8 @@
 
 import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, extname, join, resolve } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
+import { isMainModule } from '../src/shared/paths.mjs';
 import vm from 'node:vm';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -260,7 +261,7 @@ export async function buildMarketSidecarHtml({ buildSiteDocs = false } = {}) {
   };
 }
 
-if (import.meta.url === pathToFileURL(resolve(process.argv[1] || '')).href) {
+if (isMainModule(import.meta.url)) {
   const buildSiteDocs = process.argv.includes('--site');
   const out = await buildMarketSidecarHtml({ buildSiteDocs });
   console.log(

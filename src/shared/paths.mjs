@@ -1,9 +1,9 @@
 // Node-only filesystem path helpers for Antigravity host directories (`src/shared/paths.mjs`).
 
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { PLUGIN_ID, SIDECAR_ID } from './constants.mjs';
 
 export function resolveAntigravityConfigDir(explicitConfigDir = '') {
@@ -40,5 +40,48 @@ export function fileUriToLocalPath(uri) {
     return fileURLToPath(uri);
   } catch {
     return null;
+  }
+}
+
+/**
+ * Symlink / Windows NTFS Junction-safe ESM main-module check.
+ * Node.js resolves `import.meta.url` to the canonical realpath (e.g. `file:///D:/Antigravity/.gemini/...`),
+ * whereas `path.resolve(process.argv[1])` preserves the junction/symlink path (`C:\Users\...\.gemini\...`).
+ * Comparing canonicalized realpaths (with case-insensitive fallback on Windows) prevents false negatives
+ * that would cause the sidecar or CLI entrypoint to exit prematurely before starting.
+ */
+export function isMainModule(
+  metaUrl,
+  argv1 = process.argv[1],
+  { realpathFn = realpathSync, platform = process.platform } = {},
+) {
+  if (!metaUrl || !argv1) return false;
+  try {
+    const resolvedArgv = resolve(argv1);
+    if (metaUrl === pathToFileURL(resolvedArgv).href) return true;
+
+    const metaPath = fileURLToPath(metaUrl);
+    const norm = (inputPath) => {
+      const r = resolve(inputPath);
+      return platform === 'win32' ? r.toLowerCase() : r;
+    };
+
+    if (norm(metaPath) === norm(resolvedArgv)) return true;
+
+    const toReal = (inputPath) => {
+      try {
+        return typeof realpathFn.native === 'function' ? realpathFn.native(inputPath) : realpathFn(inputPath);
+      } catch {
+        return inputPath;
+      }
+    };
+
+    const realArgv = toReal(resolvedArgv);
+    if (metaUrl === pathToFileURL(realArgv).href) return true;
+
+    const realMeta = toReal(metaPath);
+    return norm(realMeta) === norm(realArgv);
+  } catch {
+    return false;
   }
 }

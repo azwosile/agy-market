@@ -5394,6 +5394,7 @@ const CHINA_NPM_MIRRORS = Object.freeze([
 ]);
 const CATALOG_NPM_PACKAGE = '@agy-market/catalog';
 const PLUGIN_JSON_ALLOWED_KEYS = new Set([
+  '$schema',
   'name',
   'displayName',
   'description',
@@ -5404,6 +5405,10 @@ const PLUGIN_JSON_ALLOWED_KEYS = new Set([
   'repository',
   'suggestedPrompts',
   'disabled',
+  'skills',
+  'license',
+  'keywords',
+  'extensions',
 ]);
 const PRIVILEGE_ESCALATION_BADGES = new Set([
   'lifecycle-hooks',

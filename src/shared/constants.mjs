@@ -34,6 +34,7 @@ export const CHINA_NPM_MIRRORS = Object.freeze([
 export const CATALOG_NPM_PACKAGE = '@agy-market/catalog';
 
 export const PLUGIN_JSON_ALLOWED_KEYS = new Set([
+  '$schema',
   'name',
   'displayName',
   'description',
@@ -44,6 +45,10 @@ export const PLUGIN_JSON_ALLOWED_KEYS = new Set([
   'repository',
   'suggestedPrompts',
   'disabled',
+  'skills',
+  'license',
+  'keywords',
+  'extensions',
 ]);
 
 export const PRIVILEGE_ESCALATION_BADGES = new Set([

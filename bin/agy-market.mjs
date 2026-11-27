@@ -17,7 +17,7 @@ import {
   PLUGIN_VERSION,
   SIDECAR_URI,
 } from '../src/shared/constants.mjs';
-import { resolveAntigravityConfigDir, resolveMarketDataDir, resolvePluginsDir } from '../src/shared/paths.mjs';
+import { isMainModule, resolveAntigravityConfigDir, resolveMarketDataDir, resolvePluginsDir } from '../src/shared/paths.mjs';
 import { defaultProxyFetch } from '../src/shared/proxy-fetch.mjs';
 import { loadPrefsFromDisk, parseJsonc } from '../src/shared/schemas.mjs';
 import { redactSecret } from '../src/updates/index.mjs';
@@ -463,7 +463,7 @@ export async function runCli(argv = process.argv.slice(2), runtimeOpts = {}) {
   throw new Error(`Unknown subcommand "${sub}". Run "npx agy-market --help".`);
 }
 
-if (import.meta.url === pathToFileURL(resolve(process.argv[1] || '')).href) {
+if (isMainModule(import.meta.url)) {
   const { code } = await runCli();
   process.exitCode = code;
 }

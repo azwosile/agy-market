@@ -3,7 +3,8 @@
 
 import { readFileSync, statSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
+import { isMainModule } from '../../src/shared/paths.mjs';
 import { createMarketSidecarServer } from '../../src/sidecar/server.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -28,12 +29,8 @@ function readDiskMtimeMs(filePath) {
   }
 }
 
-function isMainEntry() {
-  try {
-    return Boolean(process.argv[1]) && import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
-  } catch {
-    return false;
-  }
+export function isMainEntry(argv1 = process.argv[1]) {
+  return isMainModule(import.meta.url, argv1);
 }
 
 if (isMainEntry()) {
