@@ -2,13 +2,23 @@
   'use strict';
 
   const BADGE_LABELS = {
-    'declarative-only': '🌿 纯声明式技能',
-    'global-rules': '🔵 常驻规则',
-    'sidecar-ui': '🟣 Sidebar 侧边栏',
-    'mcp-stdio': '🟠 本地 MCP 进程',
-    'mcp-remote': '🌐 远程 MCP 服务',
-    'lifecycle-hooks': '🔶 生命周期钩子',
-    'host-enhancement': '💡 宿主界面增强',
+    'declarative-only': '纯声明式技能',
+    'global-rules': '常驻规则',
+    'sidecar-ui': 'Sidebar 侧边栏',
+    'mcp-stdio': '本地 MCP 进程',
+    'mcp-remote': '远程 MCP 服务',
+    'lifecycle-hooks': '生命周期钩子',
+    'host-enhancement': '宿主界面增强',
+  };
+
+  const BADGE_ICONS = {
+    'declarative-only': 'leaf',
+    'global-rules': 'rules',
+    'sidecar-ui': 'panel',
+    'mcp-stdio': 'chip',
+    'mcp-remote': 'globe',
+    'lifecycle-hooks': 'hook',
+    'host-enhancement': 'spark',
   };
 
   const CATEGORY_LABELS = {
@@ -29,45 +39,37 @@
     other: '其他扩展',
   };
 
-  const CATEGORY_ACCENTS = {
-    'monitoring-quota': ['#06b6d4', '#3b82f6'],
-    'context-cache': ['#14b8a6', '#6366f1'],
-    'ui-themes': ['#a855f7', '#ec4899'],
-    'agents-reasoning': ['#8b5cf6', '#f43f5e'],
-    'developer-tools': ['#6366f1', '#06b6d4'],
-    'mcp-integrations': ['#f59e0b', '#f97316'],
-    'skills-workflows': ['#10b981', '#34d399'],
-    productivity: ['#38bdf8', '#14b8a6'],
-    'data-science': ['#3b82f6', '#8b5cf6'],
-    'cloud-devops': ['#06b6d4', '#3b82f6'],
-    'creative-media': ['#ec4899', '#f97316'],
-    'writing-knowledge': ['#8b5cf6', '#38bdf8'],
-    automation: ['#eab308', '#10b981'],
-    security: ['#f43f5e', '#f59e0b'],
-    other: ['#6366f1', '#38bdf8'],
-  };
-
-  function syncCategorySelectOptions(list) {
-    const select = document.getElementById('site-category');
-    if (!select) return;
-    const existing = new Set(Array.from(select.options).map((opt) => opt.value));
-    for (const p of list) {
-      for (const rawCat of p.taxonomy?.categories || []) {
-        const catId = String(rawCat || '').trim();
-        if (!catId || existing.has(catId)) continue;
-        existing.add(catId);
-        const opt = document.createElement('option');
-        opt.value = catId;
-        opt.textContent = CATEGORY_LABELS[catId] || catId;
-        select.appendChild(opt);
-      }
-    }
-  }
-
+  const byId = (id) => document.getElementById(id);
+  const workspace = document.querySelector('.workspace');
+  const mobile = matchMedia('(max-width: 760px)');
+  const sidebar = byId('site-sidebar');
+  const sidebarToggle = byId('sidebar-toggle');
+  const canvas = document.querySelector('.canvas');
+  const grid = byId('site-grid');
+  const search = byId('site-search');
+  const category = byId('site-category');
+  const sort = byId('site-sort');
+  const peek = byId('site-peek');
+  const palette = byId('site-palette');
+  const paletteInput = byId('palette-input');
+  const paletteResults = byId('palette-results');
+  const pages = [...document.querySelectorAll('[data-page]')].map((button) => ({
+    id: button.dataset.page,
+    label: button.lastChild.textContent.trim(),
+    button,
+  }));
+  const copyTimers = new WeakMap();
   let plugins = [];
+  let visiblePlugins = [];
+  let paletteItems = [];
+  let activeResult = -1;
+  let view = 'grid';
+  let page = 'catalog';
+  let feedRequest;
+  let feedStatus = 'loading';
 
   function escapeHtml(s) {
-    return String(s || '')
+    return String(s ?? '')
       .replace(/&/g, '&amp;')
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;')
@@ -75,7 +77,11 @@
   }
 
   function isSafeUrl(u) {
-    return /^https?:\/\/[^\s]+$/i.test(String(u || '').trim());
+    try {
+      return ['http:', 'https:'].includes(new URL(u).protocol);
+    } catch {
+      return false;
+    }
   }
 
   function getFiniteRankingScore(p) {
@@ -152,159 +158,467 @@
     return dampened.map((entry) => entry.plugin);
   }
 
-  function renderGrid() {
-    const grid = document.getElementById('site-grid');
-    const q = (document.getElementById('site-search').value || '').trim().toLowerCase();
-    const cat = document.getElementById('site-category').value || 'all';
-    const sortEl = document.getElementById('site-sort');
-    const sortBy = (sortEl && sortEl.value) || 'recommended';
+  function titleOf(plugin) {
+    return plugin.displayName || plugin.canonicalName || plugin.id || '未命名插件';
+  }
 
-    const filtered = plugins.filter((p) => {
-      if (cat !== 'all' && !(p.taxonomy?.categories || []).includes(cat)) return false;
-      if (!q) return true;
-      const desc = typeof p.description === 'object' ? `${p.description.zh || ''} ${p.description.en || ''}` : String(p.description || '');
-      const catTerms = (p.taxonomy?.categories || [])
-        .map((c) => `${c} ${CATEGORY_LABELS[c] || ''}`)
-        .join(' ');
-      return `${p.displayName || ''} ${p.canonicalName || ''} ${desc} ${catTerms} ${(p.taxonomy?.tags || []).join(' ')} ${(p.capabilities?.badges || []).join(' ')}`.toLowerCase().includes(q);
-    });
-    const list = sortPluginsList(filtered, sortBy);
+  function descriptionOf(plugin, includeBoth = false) {
+    const description = plugin.description;
+    if (description && typeof description === 'object') {
+      return includeBoth ? [description.zh, description.en].filter(Boolean).join(' ') : description.zh || description.en || '';
+    }
+    return String(description ?? '');
+  }
 
-    const totalEl = document.getElementById('stat-total');
-    if (totalEl) totalEl.textContent = `${plugins.length} 款`;
+  function categoriesOf(plugin) {
+    return Array.isArray(plugin.taxonomy?.categories) ? plugin.taxonomy.categories : [];
+  }
 
-    if (!list.length) {
-      grid.innerHTML = `<div class="empty">目录就绪（当前包含 ${plugins.length} 款已收录插件）。安装 AGY Market 客户端或向 <code>agy-market-catalog</code> 提交 YAML PR 即可在此实时展示。</div>`;
+  function badgesOf(plugin) {
+    return Array.isArray(plugin.capabilities?.badges) ? plugin.capabilities.badges : [];
+  }
+
+  function labelForCategory(id) {
+    return Object.hasOwn(CATEGORY_LABELS, id) ? CATEGORY_LABELS[id] : id;
+  }
+
+  function labelForBadge(id) {
+    return Object.hasOwn(BADGE_LABELS, id) ? BADGE_LABELS[id] : id;
+  }
+
+  function icon(name, className = '') {
+    const size = name === 'empty' ? 64 : 20;
+    return `<svg class="icon${className ? ` ${className}` : ''}" viewBox="0 0 ${size} ${size}" aria-hidden="true"><use href="#icon-${name}"/></svg>`;
+  }
+
+  function categoryIcon(id) {
+    return Object.hasOwn(CATEGORY_LABELS, id) ? id : 'other';
+  }
+
+  function badgeIcon(id) {
+    return Object.hasOwn(BADGE_ICONS, id) ? BADGE_ICONS[id] : 'layers';
+  }
+
+  function matchesPlugin(plugin, query) {
+    if (!query) return true;
+    const fields = [
+      titleOf(plugin), plugin.canonicalName, plugin.id, plugin.scopedName, descriptionOf(plugin, true),
+      ...categoriesOf(plugin).flatMap((id) => [id, labelForCategory(id)]),
+      ...badgesOf(plugin).flatMap((id) => [id, labelForBadge(id)]),
+      ...(Array.isArray(plugin.taxonomy?.tags) ? plugin.taxonomy.tags : []),
+    ];
+    return fields.join(' ').toLowerCase().includes(query);
+  }
+
+  function renderCategories() {
+    const counts = new Map();
+    for (const plugin of plugins) {
+      for (const id of new Set(categoriesOf(plugin))) {
+        if (typeof id === 'string' && id && id !== 'all') counts.set(id, (counts.get(id) || 0) + 1);
+      }
+    }
+    const previous = category.value;
+    const list = byId('site-category-list');
+    const entries = [...counts].sort(([a], [b]) => labelForCategory(a).localeCompare(labelForCategory(b), 'zh'));
+    category.replaceChildren(new Option('全部分类', 'all'));
+    list.replaceChildren();
+    for (const [id, count] of entries) {
+      const label = labelForCategory(id);
+      category.add(new Option(label, id));
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'sidebar-item sidebar-category';
+      button.dataset.category = id;
+      button.innerHTML = `${icon(categoryIcon(id))}<span class="category-label">${escapeHtml(label)}</span><span class="category-count">${count}</span>`;
+      list.append(button);
+    }
+    list.closest('nav').hidden = !entries.length;
+    category.value = counts.has(previous) ? previous : 'all';
+  }
+
+  function renderNavigation() {
+    const isCatalog = page === 'catalog';
+    const hasCategory = isCatalog && category.value !== 'all';
+    byId('site-breadcrumb').textContent = hasCategory ? labelForCategory(category.value) : pages.find((item) => item.id === page).label;
+    byId('catalog-title').textContent = hasCategory ? labelForCategory(category.value) : '全部插件';
+    document.querySelector('.catalog-actions').hidden = !isCatalog;
+    byId('catalog-heading').hidden = !isCatalog;
+    byId('catalog-page').hidden = !isCatalog;
+    byId('quick-install').hidden = page === 'settings';
+    byId('settings-page').hidden = page !== 'settings';
+    for (const item of pages) {
+      if (item.id === page && !hasCategory) item.button.setAttribute('aria-current', 'page');
+      else item.button.removeAttribute('aria-current');
+    }
+    for (const button of byId('site-category-list').children) {
+      button.setAttribute('aria-pressed', String(hasCategory && button.dataset.category === category.value));
+    }
+  }
+
+  function renderMark(plugin) {
+    const primary = categoriesOf(plugin).find((id) => Object.hasOwn(CATEGORY_LABELS, id));
+    const capability = badgesOf(plugin).find((id) => Object.hasOwn(BADGE_ICONS, id));
+    const mark = primary ? categoryIcon(primary) : capability ? badgeIcon(capability) : 'other';
+    return `<span class="plugin-mark" aria-hidden="true">${icon(mark)}</span>`;
+  }
+
+  function renderBadges(plugin, limit) {
+    const badges = badgesOf(plugin).slice(0, limit ?? Infinity);
+    return badges.length ? `<span class="badges">${badges.map((id) => `<span class="badge">${icon(badgeIcon(id))}${escapeHtml(labelForBadge(id))}</span>`).join('')}</span>` : '';
+  }
+
+  function renderStars(plugin) {
+    const stars = Number(plugin.repository?.stars) || 0;
+    return `<span class="star-count" aria-label="${stars} 个星标">${icon('star')}<span>${stars}</span></span>`;
+  }
+
+  function categoryLabelFor(plugin) {
+    return escapeHtml(categoriesOf(plugin).map(labelForCategory).join(' / ') || '—');
+  }
+
+  function renderGrid(animate = false) {
+    const query = search.value.trim().toLowerCase();
+    const selected = category.value;
+    visiblePlugins = sortPluginsList(plugins.filter((plugin) =>
+      (selected === 'all' || categoriesOf(plugin).includes(selected)) && matchesPlugin(plugin, query),
+    ), sort.value);
+    byId('stat-total').textContent = visiblePlugins.length === plugins.length
+      ? `${plugins.length} 款`
+      : `${visiblePlugins.length} / ${plugins.length} 款`;
+    grid.className = view === 'grid' ? 'grid' : 'table-wrap';
+
+    if (!visiblePlugins.length) {
+      if (feedStatus === 'loading') grid.innerHTML = '<p class="empty">正在同步目录…</p>';
+      else if (feedStatus === 'error' && !plugins.length) grid.innerHTML = '<p class="empty">无法连接目录。<button type="button" class="settings-link" data-settings>打开目录设置</button></p>';
+      else grid.innerHTML = `<p class="empty empty-results" role="status">${icon('empty')}${plugins.length ? '没有匹配的插件。' : '该目录暂无插件。'}</p>`;
       return;
     }
 
-    grid.innerHTML = list
-      .map((p) => {
-        const desc = typeof p.description === 'object' ? p.description.zh || p.description.en || '' : String(p.description || '');
-        const badges = (p.capabilities?.badges || [])
-          .map((b) => `<span class="badge">${escapeHtml(BADGE_LABELS[b] || b)}</span>`)
-          .join('');
-        const primaryCat = (p.taxonomy?.categories || [])[0] || '';
-        const [a1, a2] = CATEGORY_ACCENTS[primaryCat] || ['#6366f1', '#06b6d4'];
-        const title = p.displayName || p.canonicalName || p.id;
-        const repoUrl = p.repository?.url || '';
-        const titleHtml = isSafeUrl(repoUrl)
-          ? `<a class="card-name-link" href="${escapeHtml(repoUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(title)} ↗</a>`
-          : `<span class="card-name">${escapeHtml(title)}</span>`;
-        const discussUrl = isSafeUrl(repoUrl) ? `${repoUrl.replace(/\/+$/, '')}/discussions` : '';
+    if (view === 'table') {
+      const rows = visiblePlugins.map((plugin, index) => `
+        <tr data-plugin="${index}">
+          <td><button type="button" class="table-title" aria-haspopup="dialog">${renderMark(plugin)}${escapeHtml(titleOf(plugin))}${icon('chevron-right', 'card-arrow')}</button></td>
+          <td>${categoryLabelFor(plugin)}</td>
+          <td class="table-version">${plugin.version ? `v${escapeHtml(plugin.version)}` : '—'}</td>
+          <td>${renderStars(plugin)}</td>
+        </tr>`).join('');
+      grid.innerHTML = `<table class="table" aria-label="插件目录"><thead><tr><th scope="col">插件</th><th scope="col">分类</th><th scope="col">版本</th><th scope="col">星标</th></tr></thead><tbody>${rows}</tbody></table>`;
+      return;
+    }
 
-        return `
-          <article class="card" style="--card-accent:${a1};--card-accent-2:${a2}">
-            <div class="card-top">
-              ${titleHtml}
-              <span class="card-ver">v${escapeHtml(p.version)} · ★ ${Number(p.repository?.stars || 0)}</span>
-            </div>
-            <p class="card-desc">${escapeHtml(desc)}</p>
-            <div class="badges">${badges}</div>
-            <div class="card-dock">
-              <span class="dock-slug">${escapeHtml(p.forceScopedInstall ? p.scopedName : p.canonicalName)}</span>
-              <div class="dock-links">
-                ${discussUrl ? `<a class="dock-link" href="${escapeHtml(discussUrl)}" target="_blank" rel="noopener noreferrer">讨论区</a>` : ''}
-                ${isSafeUrl(repoUrl) ? `<a class="dock-link" href="${escapeHtml(repoUrl)}" target="_blank" rel="noopener noreferrer">GitHub ↗</a>` : ''}
-              </div>
-            </div>
-          </article>
-        `;
-      })
-      .join('');
+    grid.innerHTML = visiblePlugins.map((plugin, index) => `
+      <button type="button" class="card${animate && index < 12 ? ' entering' : ''}" data-plugin="${index}" aria-haspopup="dialog"${animate && index < 12 ? ` style="--enter-delay:${Math.min(index, 6) * 25}ms"` : ''}>
+        <span class="card-top">${renderMark(plugin)}${icon('chevron-right', 'card-arrow')}</span>
+        <span class="card-title">${escapeHtml(titleOf(plugin))}</span>
+        <span class="card-description">${escapeHtml(descriptionOf(plugin))}</span>
+        ${renderBadges(plugin, 3)}
+        <span class="card-bottom"><span>${categoryLabelFor(plugin)}</span>${renderStars(plugin)}</span>
+      </button>`).join('');
   }
 
   const DEFAULT_PAGES_FEED_URL = 'https://azwosile.github.io/agy-market-catalog/index.json';
   const RAW_GH_PAGES_FEED_URL = 'https://raw.githubusercontent.com/azwosile/agy-market-catalog/gh-pages/index.json';
 
   async function fetchCatalog() {
-    const url = document.getElementById('site-feed-url').value.trim();
-    const candidates = url === DEFAULT_PAGES_FEED_URL ? [url, RAW_GH_PAGES_FEED_URL] : [url];
-    const channelEl = document.getElementById('stat-channel');
-    let loaded = null;
-    let usedChannel = '离线缓存';
-    for (const candidate of candidates) {
+    feedRequest?.abort();
+    const request = new AbortController();
+    feedRequest = request;
+    const url = byId('site-feed-url').value.trim();
+    const candidates = url === DEFAULT_PAGES_FEED_URL
+      ? [[url, 'GitHub Pages'], [RAW_GH_PAGES_FEED_URL, 'GitHub Raw 镜像']]
+      : [[url, '自定义目录']];
+    const channel = byId('stat-channel');
+    const loadButton = byId('site-load-btn');
+    feedStatus = 'loading';
+    loadButton.setAttribute('aria-busy', 'true');
+    channel.textContent = '同步中…';
+    channel.classList.remove('has-error');
+    grid.setAttribute('aria-busy', 'true');
+    let loaded;
+    let channelName;
+    for (const [candidate, name] of candidates) {
       try {
-        const res = await fetch(candidate, { headers: { Accept: 'application/json' } });
-        if (!res.ok) continue;
-        const json = await res.json();
-        if (Array.isArray(json.plugins)) {
-          loaded = json.plugins;
-          usedChannel = candidate.includes('raw.githubusercontent.com') ? 'GitHub Raw 镜像' : 'GitHub Pages';
+        if (!isSafeUrl(candidate)) break;
+        const signal = AbortSignal.any([request.signal, AbortSignal.timeout(6500)]);
+        const response = await fetch(candidate, { headers: { Accept: 'application/json' }, signal });
+        if (!response.ok) continue;
+        const json = await response.json();
+        if (Array.isArray(json?.plugins)) {
+          loaded = json.plugins.filter((plugin) => plugin && typeof plugin === 'object' && !Array.isArray(plugin));
+          channelName = name;
           break;
         }
       } catch {
-        /* try next candidate */
+        if (request.signal.aborted) return;
       }
     }
-    plugins = loaded || [];
-    syncCategorySelectOptions(plugins);
-    if (channelEl) channelEl.textContent = loaded ? usedChannel : '等待连接';
-    renderGrid();
+    if (request.signal.aborted) return;
+    feedStatus = loaded ? 'ready' : 'error';
+    loadButton.removeAttribute('aria-busy');
+    if (loaded) {
+      plugins = loaded;
+      renderCategories();
+    }
+    channel.textContent = loaded ? channelName : plugins.length ? '同步失败，仍显示上次目录' : '连接失败，请检查目录地址';
+    channel.classList.toggle('has-error', !loaded);
+    grid.setAttribute('aria-busy', 'false');
+    renderNavigation();
+    renderGrid(Boolean(loaded));
+    if (palette.open) renderPalette();
   }
 
-  document.querySelectorAll('.boot-tab').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      document.querySelectorAll('.boot-tab').forEach((b) => b.classList.remove('active'));
-      btn.classList.add('active');
-      document.getElementById('boot-cmd-text').textContent = btn.getAttribute('data-cmd') || '';
+  function openPeek(plugin) {
+    const repoUrl = String(plugin.repository?.url || '').trim();
+    const repo = isSafeUrl(repoUrl) ? new URL(repoUrl) : null;
+    const github = repo?.hostname.toLowerCase() === 'github.com' && !repo.username && !repo.password && !repo.port;
+    const baseRepo = github && repo.pathname.match(/^\/[a-z0-9_.-]+\/[a-z0-9_.-]+(?=\/|$)/i)?.[0];
+    const discussions = baseRepo ? `${repo.origin}${baseRepo.replace(/\.git$/i, '')}/discussions` : '';
+    // The command is pasted into a shell. Only include GitHub paths without shell metacharacters.
+    const command = baseRepo && /^https?:\/\/github\.com\/[a-z0-9_.\/-]+$/i.test(repoUrl)
+      ? `npx --yes github:azwosile/agy-market add ${repoUrl}`
+      : '';
+    byId('peek-content').innerHTML = `
+      ${renderMark(plugin)}
+      <h2 id="peek-title">${escapeHtml(titleOf(plugin))}</h2>
+      <p class="peek-meta">${plugin.version ? `v${escapeHtml(plugin.version)} · ` : ''}${renderStars(plugin)}</p>
+      <p class="peek-desc">${escapeHtml(descriptionOf(plugin) || '暂无简介。')}</p>
+      ${renderBadges(plugin)}
+      ${repo ? `<div class="peek-links">
+        <a href="${escapeHtml(repo.href)}" target="_blank" rel="noopener noreferrer">${icon(github ? 'github' : 'link')}${github ? 'GitHub 仓库' : '源码仓库'}${icon('external', 'peek-link-external')}</a>
+        ${discussions ? `<a href="${escapeHtml(discussions)}" target="_blank" rel="noopener noreferrer">${icon('discussion')}讨论区${icon('external', 'peek-link-external')}</a>` : ''}
+      </div>` : ''}
+      ${command ? `<h3 class="peek-install-heading">添加插件</h3><div class="code-row">
+        <code>${escapeHtml(command)}</code>
+        <button type="button" class="copy-button"><span class="copy-icon" aria-hidden="true">${icon('copy')}${icon('check')}</span><span class="copy-label">复制命令</span></button>
+      </div>` : ''}`;
+    peek.showModal();
+  }
+
+  function syncSidebar() {
+    if (!mobile.matches) workspace.classList.remove('mobile-open');
+    const open = mobile.matches ? workspace.classList.contains('mobile-open') : !workspace.classList.contains('collapsed');
+    sidebar.inert = !open;
+    canvas.inert = mobile.matches && open;
+    sidebarToggle.setAttribute('aria-expanded', String(open));
+  }
+
+  function closeMobileSidebar(restoreFocus = true) {
+    if (!workspace.classList.contains('mobile-open')) return;
+    workspace.classList.remove('mobile-open');
+    syncSidebar();
+    if (restoreFocus) sidebarToggle.focus();
+  }
+
+  function showPage(nextPage, nextCategory = 'all') {
+    closeMobileSidebar(false);
+    page = nextPage;
+    if (page === 'catalog') {
+      category.value = nextCategory;
+      search.value = '';
+    }
+    renderNavigation();
+    if (page === 'catalog') renderGrid();
+    if (page === 'catalog' && nextCategory !== 'all') {
+      byId('catalog-title').focus({ preventScroll: true });
+      byId('catalog-page').scrollIntoView({ block: 'start' });
+    } else {
+      const heading = { catalog: 'workspace-title', install: 'install-heading', settings: 'settings-heading' }[page];
+      byId(heading).focus({ preventScroll: true });
+      window.scrollTo(0, 0);
+    }
+  }
+
+  function setPressed(button, index) {
+    for (const sibling of button.parentElement.children) {
+      sibling.setAttribute('aria-pressed', String(sibling === button));
+    }
+    button.parentElement.style.setProperty('--selected', index);
+  }
+
+  function setPaletteSelection(index) {
+    paletteResults.children[activeResult]?.setAttribute('aria-selected', 'false');
+    activeResult = index;
+    const option = paletteResults.children[index];
+    if (option) {
+      option.setAttribute('aria-selected', 'true');
+      paletteInput.setAttribute('aria-activedescendant', option.id);
+      option.scrollIntoView({ block: 'nearest' });
+    } else {
+      paletteInput.removeAttribute('aria-activedescendant');
+    }
+  }
+
+  function renderPalette() {
+    const query = paletteInput.value.trim().toLowerCase();
+    paletteItems = [
+      ...pages.filter((item) => `${item.label} ${item.id}`.includes(query)),
+      ...sortPluginsList(plugins.filter((plugin) => matchesPlugin(plugin, query)), sort.value)
+        .slice(0, 30).map((plugin) => ({ plugin, label: titleOf(plugin) })),
+    ];
+    paletteResults.innerHTML = paletteItems.map((item, index) => `
+      <div id="palette-option-${index}" class="palette-option" role="option" aria-selected="false" data-option="${index}">
+        <span>${escapeHtml(item.label)}</span><small>${item.plugin ? '插件' : '页面'}</small>
+      </div>`).join('');
+    byId('palette-empty').hidden = Boolean(paletteItems.length);
+    paletteInput.setAttribute('aria-expanded', String(Boolean(paletteItems.length)));
+    setPaletteSelection(paletteItems.length ? 0 : -1);
+  }
+
+  function openPalette() {
+    closeMobileSidebar();
+    if (palette.open) {
+      paletteInput.focus();
+      return;
+    }
+    if (peek.open) peek.close();
+    paletteInput.value = '';
+    palette.showModal();
+    renderPalette();
+  }
+
+  function runPaletteItem(index) {
+    const item = paletteItems[index];
+    if (!item) return;
+    palette.close();
+    if (item.plugin) openPeek(item.plugin);
+    else showPage(item.id);
+  }
+
+  function fallbackCopy(text, button) {
+    const field = document.createElement('textarea');
+    field.value = text;
+    field.readOnly = true;
+    field.style.cssText = 'position:fixed;inset:0 auto auto 0;opacity:0;pointer-events:none';
+    (button.closest('dialog') || document.body).append(field);
+    field.select();
+    try {
+      return document.execCommand('copy');
+    } catch {
+      return false;
+    } finally {
+      field.remove();
+      button.focus({ preventScroll: true });
+    }
+  }
+
+  function updateCopyLabel(button, label, copied) {
+    button.querySelector('.copy-label').textContent = label;
+    button.classList.toggle('is-copied', copied);
+  }
+
+  async function copyCommand(button) {
+    const code = button.parentElement.querySelector('code');
+    const text = code.textContent;
+    let copied = false;
+    try {
+      await navigator.clipboard.writeText(text);
+      copied = true;
+    } catch {
+      copied = fallbackCopy(text, button);
+    }
+    if (code.textContent !== text) return;
+    clearTimeout(copyTimers.get(button));
+    updateCopyLabel(button, copied ? '已复制' : '复制失败', copied);
+    byId('copy-status').textContent = copied ? '已复制命令' : '复制失败，可手动选中命令';
+    copyTimers.set(button, setTimeout(() => updateCopyLabel(button, '复制命令', false), 1600));
+  }
+
+  sidebarToggle.addEventListener('click', () => {
+    workspace.classList.toggle(mobile.matches ? 'mobile-open' : 'collapsed');
+    syncSidebar();
+    if (mobile.matches) sidebar.querySelector('.sidebar-close').focus();
+  });
+  document.querySelector('.sidebar-close').addEventListener('click', () => closeMobileSidebar());
+  document.querySelector('.sidebar-scrim').addEventListener('click', () => closeMobileSidebar());
+  mobile.addEventListener('change', syncSidebar);
+  syncSidebar();
+
+  for (const item of pages) item.button.addEventListener('click', () => showPage(item.id));
+  byId('site-category-list').addEventListener('click', (event) => {
+    const item = event.target.closest('[data-category]');
+    if (item) showPage('catalog', item.dataset.category);
+  });
+  search.addEventListener('input', () => renderGrid());
+  category.addEventListener('change', () => {
+    renderNavigation();
+    renderGrid();
+  });
+  sort.addEventListener('change', () => renderGrid());
+  byId('site-feed-form').addEventListener('submit', (event) => {
+    event.preventDefault();
+    void fetchCatalog();
+  });
+  grid.addEventListener('click', (event) => {
+    const item = event.target.closest('[data-plugin]');
+    if (item) {
+      const rowButton = item.querySelector('button');
+      if (rowButton) rowButton.focus({ preventScroll: true });
+      openPeek(visiblePlugins[Number(item.dataset.plugin)]);
+    } else if (event.target.closest('[data-settings]')) {
+      showPage('settings');
+    }
+  });
+  byId('site-view-switch').querySelectorAll('[data-view]').forEach((button, index) => {
+    button.addEventListener('click', () => {
+      if (view === button.dataset.view) return;
+      view = button.dataset.view;
+      setPressed(button, index);
+      renderGrid(true);
     });
   });
 
-  function execCommandCopyFallback(text) {
-    const ta = document.createElement('textarea');
-    ta.value = String(text || '');
-    ta.setAttribute('readonly', '');
-    ta.style.position = 'fixed';
-    ta.style.top = '-9999px';
-    ta.style.left = '-9999px';
-    ta.style.opacity = '0';
-    document.body.appendChild(ta);
-    ta.focus();
-    ta.select();
-    try {
-      ta.setSelectionRange(0, ta.value.length);
-    } catch {
-      /* ignore */
-    }
-    let ok = false;
-    try {
-      ok = document.execCommand('copy');
-    } catch {
-      ok = false;
-    } finally {
-      ta.remove();
-    }
-    return ok;
+  const copyBoot = byId('copy-boot-btn');
+  document.querySelectorAll('.boot-tab').forEach((button, index) => {
+    button.addEventListener('click', () => {
+      setPressed(button, index);
+      byId('boot-cmd-text').textContent = button.dataset.cmd;
+      clearTimeout(copyTimers.get(copyBoot));
+      updateCopyLabel(copyBoot, '复制命令', false);
+    });
+  });
+  document.addEventListener('click', (event) => {
+    const copyButton = event.target.closest('.copy-button');
+    if (copyButton) void copyCommand(copyButton);
+    if (event.target.closest('[data-open-palette]')) openPalette();
+    event.target.closest('[data-close-dialog]')?.closest('dialog').close();
+  });
+  for (const dialog of [palette, peek]) {
+    dialog.addEventListener('click', (event) => {
+      if (event.target !== dialog) return;
+      const rect = dialog.getBoundingClientRect();
+      if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) {
+        dialog.close();
+      }
+    });
   }
 
-  document.getElementById('copy-boot-btn').addEventListener('click', async () => {
-    const text = document.getElementById('boot-cmd-text').textContent || '';
-    let copied = false;
-    if (navigator.clipboard?.writeText) {
-      try {
-        await navigator.clipboard.writeText(text);
-        copied = true;
-      } catch {
-        copied = execCommandCopyFallback(text);
-      }
-    } else {
-      copied = execCommandCopyFallback(text);
-    }
-    if (copied) {
-      const btn = document.getElementById('copy-boot-btn');
-      btn.textContent = '已复制 ✓';
-      setTimeout(() => {
-        btn.textContent = '复制命令';
-      }, 1800);
+  paletteInput.addEventListener('input', renderPalette);
+  paletteResults.addEventListener('click', (event) => {
+    const option = event.target.closest('[data-option]');
+    if (option) runPaletteItem(Number(option.dataset.option));
+  });
+  paletteInput.addEventListener('keydown', (event) => {
+    if (event.isComposing || !paletteItems.length) return;
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      const step = event.key === 'ArrowDown' ? 1 : -1;
+      setPaletteSelection((activeResult + step + paletteItems.length) % paletteItems.length);
+    } else if (event.key === 'Enter') {
+      event.preventDefault();
+      runPaletteItem(activeResult);
     }
   });
 
-  document.getElementById('site-search').addEventListener('input', renderGrid);
-  document.getElementById('site-category').addEventListener('change', renderGrid);
-  const siteSortEl = document.getElementById('site-sort');
-  if (siteSortEl) siteSortEl.addEventListener('change', renderGrid);
-  document.getElementById('site-load-btn').addEventListener('click', fetchCatalog);
+  document.addEventListener('keydown', (event) => {
+    if (event.isComposing || event.defaultPrevented) return;
+    if (event.key === 'Escape' && !palette.open && !peek.open) closeMobileSidebar();
+    const shortcut = (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k';
+    const slash = event.key === '/' && !event.metaKey && !event.ctrlKey && !event.altKey
+      && !event.target.closest('input, textarea, select, [contenteditable]');
+    if (!shortcut && !slash) return;
+    event.preventDefault();
+    if (!palette.open) openPalette();
+  });
 
   void fetchCatalog();
 })();
