@@ -360,8 +360,31 @@
       <path class="scene-action" style="--scene-y:-5px;--scene-rotation:9deg" d="M86 35h8m-4-4v8"/>`,
   };
 
-  function renderScene({ id }, className) {
-    return `<span class="${className}"><svg viewBox="0 0 180 70" aria-hidden="true">${PURPOSE_SCENES[id]}</svg></span>`;
+  let coverManifest;
+
+  function renderCover(id) {
+    const entry = coverManifest && Object.hasOwn(coverManifest, id) ? coverManifest[id] : null;
+    if (!['cover', 'logo'].includes(entry?.kind) || typeof entry.src !== 'string'
+      || !/^\.\/assets\/(?:logo\.png|covers\/[a-z0-9_-]+\.(?:svg|png|jpg|webp|gif|avif))$/i.test(entry.src)) return '';
+    return `<img class="scene-cover is-${entry.kind}" src="${escapeHtml(entry.src)}" alt="" loading="lazy">`;
+  }
+
+  function renderScene(plugin, purpose, className) {
+    const id = String(plugin.id ?? '');
+    return `<span class="${className}" data-cover-id="${escapeHtml(id)}"><svg viewBox="0 0 180 70" aria-hidden="true">${PURPOSE_SCENES[purpose.id]}</svg>${renderCover(id)}</span>`;
+  }
+
+  async function loadCovers() {
+    try {
+      const response = await fetch('./assets/covers/manifest.json');
+      if (!response.ok) return;
+      coverManifest = await response.json();
+    } catch {
+      return;
+    }
+    for (const scene of document.querySelectorAll('[data-cover-id]')) {
+      scene.insertAdjacentHTML('beforeend', renderCover(scene.dataset.coverId));
+    }
   }
 
   function labelForCategory(id) {
@@ -526,7 +549,7 @@
       const purpose = getPlainPurpose(plugin);
       return `
       <button type="button" class="card${animate ? ' entering' : ''}" data-plugin="${index}" aria-haspopup="dialog"${animate ? ` style="--enter-delay:${Math.min(index, 7) * 18}ms"` : ''}>
-        ${renderScene(purpose, 'card-scene')}
+        ${renderScene(plugin, purpose, 'card-scene')}
         <span class="card-top"><span class="card-title">${escapeHtml(titleOf(plugin))}</span>${icon('chevron-right', 'card-arrow')}</span>
         ${renderPurpose(purpose)}
         ${renderBadges(plugin, 3)}
@@ -680,7 +703,7 @@
       ? `npx --yes github:azwosile/agy-market add ${repoUrl}`
       : '';
     byId('peek-content').innerHTML = `
-      ${renderScene(purpose, 'peek-scene')}
+      ${renderScene(plugin, purpose, 'peek-scene')}
       <h2 id="peek-title">${escapeHtml(titleOf(plugin))}</h2>
       ${renderPurpose(purpose)}
       <p class="peek-meta">${plugin.version ? `v${escapeHtml(plugin.version)} · ` : ''}${renderStars(plugin)}</p>
@@ -937,5 +960,17 @@
     if (!palette.open) openPalette();
   });
 
+  document.addEventListener('load', (event) => {
+    if (event.target.matches?.('.scene-cover') && event.target.naturalWidth > 0) {
+      event.target.parentElement.classList.add('has-cover');
+    }
+  }, true);
+  document.addEventListener('error', (event) => {
+    if (!event.target.matches?.('.scene-cover')) return;
+    event.target.parentElement.classList.remove('has-cover');
+    event.target.remove();
+  }, true);
+
+  void loadCovers();
   void fetchCatalog();
 })();

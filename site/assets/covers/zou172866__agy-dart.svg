@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 250" width="880" height="250" role="img" aria-label="agy-dart 架构示意图">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b1120"/>
+      <stop offset="100%" stop-color="#111827"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="100%" stop-color="#818cf8"/>
+    </linearGradient>
+  </defs>
+  <rect width="880" height="250" rx="14" fill="url(#bg)" stroke="#1e293b" stroke-width="1.5"/>
+  <!-- Host Box -->
+  <rect x="24" y="42" width="188" height="166" rx="10" fill="#0f172a" stroke="#334155" stroke-width="1.5"/>
+  <text x="118" y="72" text-anchor="middle" fill="#f8fafc" font-family="system-ui,-apple-system,'PingFang SC','Microsoft YaHei','Segoe UI',sans-serif" font-size="14" font-weight="700">Antigravity 客户端</text>
+  <text x="118" y="95" text-anchor="middle" fill="#94a3b8" font-family="system-ui,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif" font-size="11">桌面端 2.0 · IDE · CLI</text>
+  <rect x="36" y="112" width="164" height="26" rx="6" fill="#1e293b"/>
+  <text x="118" y="129" text-anchor="middle" fill="#cbd5e1" font-family="system-ui,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif" font-size="11">开局前缀 &lt;=3k 稳缓存</text>
+  <rect x="36" y="146" width="164" height="26" rx="6" fill="#1e293b"/>
+  <text x="118" y="163" text-anchor="middle" fill="#38bdf8" font-family="system-ui,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif" font-size="11">防误改插件目录守卫</text>
+  <text x="118" y="194" text-anchor="middle" fill="#64748b" font-family="system-ui,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif" font-size="10.5">跨目录无漂移钩子启动</text>
+
+  <!-- Arrows 1 -->
+  <path d="M212 95 L252 95" stroke="#38bdf8" stroke-width="2" fill="none"/>
+  <polygon points="252,95 245,91 245,99" fill="#38bdf8"/>
+  <path d="M212 158 L252 158" stroke="#818cf8" stroke-width="2" fill="none"/>
+  <polygon points="252,158 245,154 245,162" fill="#818cf8"/>
+
+  <!-- Dual Engine Center -->
+  <rect x="256" y="24" width="356" height="202" rx="12" fill="#0f172a" stroke="url(#accent)" stroke-width="1.8"/>
+  <text x="434" y="49" text-anchor="middle" fill="#f8fafc" font-family="system-ui,-apple-system,'PingFang SC','Microsoft YaHei','Segoe UI',sans-serif" font-size="13.5" font-weight="700">agy-dart 双引擎（零依赖 · 单次返回 &lt;=8.8 KB）</text>
+
+  <rect x="272" y="62" width="324" height="68" rx="8" fill="#172554" stroke="#1d4ed8" stroke-width="1"/>
+  <text x="286" y="82" fill="#7dd3fc" font-family="ui-monospace,SFMono-Regular,Consolas,'PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="700">agy-dart_fast（默认直连 4 工具 · 170s 保护）</text>
+  <text x="286" y="101" fill="#e2e8f0" font-family="system-ui,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif" font-size="11">批量搜索 · 多文件修改 · 按行看目录切片 · 并发跑检查</text>
+  <text x="286" y="119" fill="#93c5fd" font-family="system-ui,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif" font-size="10">短项省额度让给报错堆栈 · 扁平行号切片 · Git 只读沙盒</text>
+
+  <rect x="272" y="140" width="324" height="72" rx="8" fill="#1e1b4b" stroke="#4338ca" stroke-width="1"/>
+  <text x="286" y="160" fill="#c4b5fd" font-family="ui-monospace,SFMono-Regular,Consolas,'PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="700">agy-dart_context + 5 钩子（SQLite 本地检索库）</text>
+  <text x="286" y="179" fill="#e2e8f0" font-family="system-ui,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif" font-size="11">拦截长日志噪音 · 大 JSON 摘要 · 重复读文件去重</text>
+  <text x="286" y="198" fill="#a5b4fc" font-family="system-ui,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif" font-size="10">密钥自动打码 · 防内网穿透 · /compact 后恢复进度</text>
+
+  <!-- Arrow 2 -->
+  <path d="M612 125 L652 125" stroke="#34d399" stroke-width="2" fill="none"/>
+  <polygon points="652,125 645,121 645,129" fill="#34d399"/>
+
+  <!-- Sidecar Right -->
+  <rect x="656" y="42" width="200" height="166" rx="10" fill="#0f172a" stroke="#10b981" stroke-width="1.5"/>
+  <text x="756" y="70" text-anchor="middle" fill="#6ee7b7" font-family="system-ui,-apple-system,'PingFang SC','Microsoft YaHei','Segoe UI',sans-serif" font-size="14" font-weight="700">右侧实时监控面板</text>
+  <rect x="668" y="84" width="176" height="26" rx="6" fill="#064e3b"/>
+  <text x="756" y="101" text-anchor="middle" fill="#ecfdf5" font-family="system-ui,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif" font-size="11">缓存到期前自动续温 (3次)</text>
+  <rect x="668" y="118" width="176" height="26" rx="6" fill="#1e293b"/>
+  <text x="756" y="135" text-anchor="middle" fill="#cbd5e1" font-family="system-ui,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif" font-size="11">多窗口告警点击直达对话</text>
+  <rect x="668" y="152" width="176" height="26" rx="6" fill="#1e293b"/>
+  <text x="756" y="169" text-anchor="middle" fill="#cbd5e1" font-family="system-ui,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif" font-size="11">卡死监测与崩溃一键抢救</text>
+  <text x="756" y="196" text-anchor="middle" fill="#64748b" font-family="ui-monospace,SFMono-Regular,Consolas,'PingFang SC','Microsoft YaHei',sans-serif" font-size="10">127.0.0.1 本地防伪造保护</text>
+</svg>

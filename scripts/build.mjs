@@ -3,7 +3,7 @@
 // Compiles `src/ui/{template.html,styles.css,app.mjs}` (+ imported `src/shared/*.mjs` modules)
 // into a single self-contained `sidecars/market_pane/index.html`, and optionally copies `site/` -> `docs/`.
 
-import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, extname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isMainModule } from '../src/shared/paths.mjs';
@@ -245,6 +245,7 @@ export async function buildMarketSidecarHtml({ buildSiteDocs = false } = {}) {
   const siteDir = join(repoRoot, 'site');
   if (buildSiteDocs && existsSync(siteDir)) {
     const docsDir = join(repoRoot, 'docs');
+    rmSync(join(docsDir, 'assets', 'covers'), { recursive: true, force: true });
     copyTreeNormalizedLf(siteDir, docsDir);
     const logoSrc = join(repoRoot, 'assets', 'logo.svg');
     if (existsSync(logoSrc)) {

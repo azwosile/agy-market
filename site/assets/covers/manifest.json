@@ -1,0 +1,82 @@
+{
+  "a16nights__antigravity-azure-compass": {
+    "src": "./assets/covers/a16nights__antigravity-azure-compass.svg",
+    "kind": "cover"
+  },
+  "a16nights__antigravity-azure-corridor": {
+    "src": "./assets/covers/a16nights__antigravity-azure-corridor.svg",
+    "kind": "cover"
+  },
+  "a16nights__antigravity-azure-orbit": {
+    "src": "./assets/covers/a16nights__antigravity-azure-orbit.svg",
+    "kind": "cover"
+  },
+  "a16nights__antigravity-azure-prism": {
+    "src": "./assets/covers/a16nights__antigravity-azure-prism.svg",
+    "kind": "cover"
+  },
+  "a16nights__antigravity-azure-wand": {
+    "src": "./assets/covers/a16nights__antigravity-azure-wand.svg",
+    "kind": "cover"
+  },
+  "a16nights__antigravity-external-orchestrator": {
+    "src": "./assets/covers/a16nights__antigravity-external-orchestrator.svg",
+    "kind": "cover"
+  },
+  "a16nights__antigravity-lanxi-memory": {
+    "src": "./assets/covers/a16nights__antigravity-lanxi-memory.svg",
+    "kind": "cover"
+  },
+  "a16nights__antigravity-soul-md": {
+    "src": "./assets/covers/a16nights__antigravity-soul-md.svg",
+    "kind": "cover"
+  },
+  "a16nights__antigravity-think-zh": {
+    "src": "./assets/covers/a16nights__antigravity-think-zh.svg",
+    "kind": "cover"
+  },
+  "apollyonin__billion-context-antigravity": {
+    "src": "./assets/covers/apollyonin__billion-context-antigravity.svg",
+    "kind": "logo"
+  },
+  "apollyonin__trajectory-lens-antigravity": {
+    "src": "./assets/covers/apollyonin__trajectory-lens-antigravity.svg",
+    "kind": "logo"
+  },
+  "asthestarsfalll__answer-card": {
+    "src": "./assets/covers/asthestarsfalll__answer-card.png",
+    "kind": "cover"
+  },
+  "azwosile__agy-market": {
+    "src": "./assets/logo.png",
+    "kind": "logo"
+  },
+  "azwosile__agy-wallpaper-prism": {
+    "src": "./assets/covers/azwosile__agy-wallpaper-prism.svg",
+    "kind": "logo"
+  },
+  "curelove__agy-anchor-wheel": {
+    "src": "./assets/covers/curelove__agy-anchor-wheel.gif",
+    "kind": "cover"
+  },
+  "yuezhu114__agy-novel-forge": {
+    "src": "./assets/covers/yuezhu114__agy-novel-forge.png",
+    "kind": "cover"
+  },
+  "yuhuan-dev__antigravity-usage-monitor": {
+    "src": "./assets/covers/yuhuan-dev__antigravity-usage-monitor.png",
+    "kind": "cover"
+  },
+  "yukikaguraa__agy-archive-manager": {
+    "src": "./assets/covers/yukikaguraa__agy-archive-manager.png",
+    "kind": "cover"
+  },
+  "yunjuanyunshu114-byte__antigravity-observer": {
+    "src": "./assets/covers/yunjuanyunshu114-byte__antigravity-observer.png",
+    "kind": "cover"
+  },
+  "zou172866__agy-dart": {
+    "src": "./assets/covers/zou172866__agy-dart.svg",
+    "kind": "cover"
+  }
+}
