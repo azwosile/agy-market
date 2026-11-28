@@ -6,6 +6,7 @@
 //   3. Automatic Mainland China Mirror Fallback (`@agy-market/catalog` on `registry.npmmirror.com` / Tencent Cloud mirror):
 //      streams the pure-JSON npm data tarball in memory and extracts `{index.json, unverified-index.json, readmes.json}`.
 
+import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { parseTarGzToMap } from '../installer/tar-extract.mjs';
@@ -15,26 +16,48 @@ import {
   PRIMARY_CATALOG_BASE_URL,
   PRIMARY_FETCH_TIMEOUT_MS,
   RAW_GH_PAGES_CATALOG_BASE_URL,
+  SELF_CATALOG_ID,
   UNVERIFIED_FETCH_TIMEOUT_MS,
 } from '../shared/constants.mjs';
-import { fileUriToLocalPath } from '../shared/paths.mjs';
+import { assertSafePluginDir, fileUriToLocalPath } from '../shared/paths.mjs';
 import { defaultProxyFetch } from '../shared/proxy-fetch.mjs';
-import { sanitizePrefs } from '../shared/schemas.mjs';
+import { normalizePluginRoot, sanitizePrefs } from '../shared/schemas.mjs';
 
 function resolveFetch(fetchImpl) {
   return !fetchImpl || fetchImpl === fetch ? defaultProxyFetch : fetchImpl;
 }
 
-function getCacheDir(dataDir) {
-  const d = join(dataDir, 'cache');
-  mkdirSync(d, { recursive: true });
-  return d;
+function isOfficialCatalog(baseUrl) {
+  return baseUrl === PRIMARY_CATALOG_BASE_URL || baseUrl === RAW_GH_PAGES_CATALOG_BASE_URL;
 }
 
-function getPerPluginReadmesCacheDir(dataDir) {
-  const d = join(getCacheDir(dataDir), 'readmes');
-  mkdirSync(d, { recursive: true });
-  return d;
+function getCacheDir(dataDir, baseUrl) {
+  const root = join(dataDir, 'cache');
+  const dir = isOfficialCatalog(baseUrl) ? root : join(root, 'sources', createHash('sha256').update(baseUrl).digest('hex'));
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+function readSourceCache(dataDir, baseUrl, key, subdir = '', urlKey = key) {
+  const dir = getCacheDir(dataDir, baseUrl);
+  const current = readCachedJson(join(dir, subdir), key);
+  const legacyDir = join(dataDir, 'cache', subdir);
+  const cached = current.data || isOfficialCatalog(baseUrl) ? current : readCachedJson(legacyDir, key);
+  // Older releases shared one cache across all feeds. Reuse only proven origins.
+  const bases = isOfficialCatalog(baseUrl) ? [PRIMARY_CATALOG_BASE_URL, RAW_GH_PAGES_CATALOG_BASE_URL] : [baseUrl];
+  if (bases.some(base => cached.meta.url === `${base}/${subdir ? subdir + '/' : ''}${encodeURIComponent(urlKey)}.json`) ||
+      (isOfficialCatalog(baseUrl) && cached.meta.channel === 'npm-mirror')) {
+    if (!subdir && (key === 'index' || key === 'unverified-index')) {
+      return { ...cached, data: cleanPluginIndex(cached.data) };
+    }
+    return cached;
+  }
+  return { data: null, meta: {} };
+}
+
+export function hasCachedTrack2(dataDir, baseUrl) {
+  const cached = readSourceCache(dataDir, baseUrl || PRIMARY_CATALOG_BASE_URL, 'unverified-index');
+  return Boolean(cached.data?.plugins.length);
 }
 
 function toSafeReadmeCacheKey(rawId) {
@@ -116,6 +139,25 @@ function writeCachedJson(cacheDir, key, data, meta = {}) {
   writeJsonAtomic(join(cacheDir, `${key}.meta.json`), { ...meta, cachedAt: new Date().toISOString() });
 }
 
+function cleanPluginIndex(data) {
+  if (!Array.isArray(data?.plugins)) return null;
+  const plugins = data.plugins.filter(p => {
+    if (typeof p?.id !== 'string' || !p.id.trim() || typeof p.canonicalName !== 'string' ||
+        typeof p.version !== 'string' || !p.version.trim()) return false;
+    try {
+      assertSafePluginDir(p.canonicalName);
+      if (p.scopedName != null) assertSafePluginDir(p.scopedName);
+    } catch { return false; }
+    const lists = [p.taxonomy?.categories, p.taxonomy?.tags, p.taxonomy?.platforms, p.capabilities?.badges,
+      p.capabilities?.mcpServers, p.capabilities?.mcpRemoteDomains, p.capabilities?.hookEvents,
+      p.capabilities?.hostEnhancementKind, p.distribution?.preservePaths];
+    return lists.every(list => list == null || (Array.isArray(list) && list.every(item => typeof item === 'string')));
+  });
+  if (plugins.length === data.plugins.length) return data;
+  if (!plugins.length) return null;
+  return { ...data, plugins, skippedEntries: data.plugins.length - plugins.length };
+}
+
 async function fetchJsonWithConditionalCache(
   url,
   cacheDir,
@@ -125,14 +167,21 @@ async function fetchJsonWithConditionalCache(
     forceRefresh = false,
     fetchImpl = defaultProxyFetch,
     channelLabel = 'github-pages',
+    writeCache = writeCachedJson,
   } = {},
 ) {
   const activeFetch = resolveFetch(fetchImpl);
+  const validate = data => {
+    if (cacheKey === 'readmes') return data;
+    const clean = cleanPluginIndex(data);
+    if (!clean) throw new Error(`Invalid plugin index at ${url}`);
+    return clean;
+  };
   if (url.startsWith('file://')) {
     const local = fileUriToLocalPath(url);
     if (!local || !existsSync(local)) throw new Error(`Local feed not found: ${url}`);
-    const parsed = JSON.parse(readFileSync(local, 'utf8'));
-    writeCachedJson(cacheDir, cacheKey, parsed, { source: 'file', url });
+    const parsed = validate(JSON.parse(readFileSync(local, 'utf8')));
+    writeCache(cacheDir, cacheKey, parsed, { source: 'file', url });
     return { data: parsed, fromCache: false, channel: 'local-file' };
   }
 
@@ -148,18 +197,18 @@ async function fetchJsonWithConditionalCache(
     signal: AbortSignal.timeout(timeoutMs),
   });
 
-  if (res.status === 304 && cached.data) {
-    return { data: cached.data, fromCache: true, status: 304, channel: `${channelLabel}-304` };
+  if (res.status === 304 && cached.data && cached.meta.url === url) {
+    return { data: validate(cached.data), fromCache: true, status: 304, channel: `${channelLabel}-304` };
   }
 
   if (!res.ok) {
-    throw new Error(`HTTP ${res.status} fetching ${url}`);
+    throw Object.assign(new Error(`HTTP ${res.status} fetching ${url}`), { status: res.status });
   }
 
-  const data = await res.json();
+  const data = validate(await res.json());
   const etag = res.headers?.get?.('etag') || '';
   const lastModified = res.headers?.get?.('last-modified') || '';
-  writeCachedJson(cacheDir, cacheKey, data, { etag, lastModified, url });
+  writeCache(cacheDir, cacheKey, data, { etag, lastModified, url });
   return { data, fromCache: false, status: 200, channel: channelLabel };
 }
 
@@ -169,7 +218,8 @@ async function fetchJsonWithConditionalCache(
  */
 export async function loadCatalogFromNpmMirror(
   cacheDir,
-  { mirrors = CHINA_NPM_MIRRORS, fetchImpl = defaultProxyFetch, timeoutMs = 8000 } = {},
+  { mirrors = CHINA_NPM_MIRRORS, fetchImpl = defaultProxyFetch, timeoutMs = 8000, track2Only = false,
+    content = track2Only ? 'track2' : 'catalog', includeTrack2 = true, writeCache = writeCachedJson } = {},
 ) {
   const activeFetch = resolveFetch(fetchImpl);
   const encodedPkg = `@${encodeURIComponent(CATALOG_NPM_PACKAGE.slice(1))}`;
@@ -211,16 +261,33 @@ export async function loadCatalogFromNpmMirror(
         return buf ? JSON.parse(buf.toString('utf8')) : null;
       };
 
-      const indexJson = pickJson('index.json');
-      if (!indexJson || !Array.isArray(indexJson.plugins)) {
-        errors.push(`${tarballUrl} -> missing valid index.json`);
+      const readIndex = name => {
+        try { return cleanPluginIndex(pickJson(name)); } catch { return null; }
+      };
+      const realUnverified = includeTrack2 ? readIndex('unverified-index.json') : null;
+      const unverifiedMissing = !realUnverified;
+      if (content === 'track2' && unverifiedMissing) {
+        errors.push(`${tarballUrl} -> missing valid unverified-index.json`);
         continue;
       }
-      const realUnverified = pickJson('unverified-index.json');
-      const unverifiedMissing = !realUnverified || !Array.isArray(realUnverified.plugins);
       const unverifiedIndexJson = unverifiedMissing
         ? { schemaVersion: 1, track: 'unverified', plugins: [] }
         : realUnverified;
+      if (content !== 'readmes' && !unverifiedMissing) {
+        writeCache(cacheDir, 'unverified-index', unverifiedIndexJson, {
+          channel: 'npm-mirror',
+          mirrorBase,
+          version: packument.version,
+        });
+      }
+      if (content === 'track2') {
+        return { unverifiedMissing, unverifiedIndexJson, channel: `npm-mirror (${mirrorBase})` };
+      }
+      const indexJson = readIndex('index.json');
+      if (!indexJson) {
+        errors.push(`${tarballUrl} -> missing valid index.json`);
+        continue;
+      }
       const readmesJson = pickJson('readmes.json') || { schemaVersion: 1, entries: {}, entriesZh: {}, entriesEn: {} };
 
       // Also extract any per-plugin `dist/readmes/<id>.json` files shipped in v1.6+ catalog tarballs
@@ -241,7 +308,7 @@ export async function loadCatalogFromNpmMirror(
                 mkdirSync(perPluginCacheDir, { recursive: true });
                 ensuredPerPluginDir = true;
               }
-              writeCachedJson(perPluginCacheDir, safeKey, norm, {
+              writeCache(perPluginCacheDir, safeKey, norm, {
                 channel: 'npm-mirror',
                 mirrorBase,
                 version: packument.version,
@@ -253,15 +320,10 @@ export async function loadCatalogFromNpmMirror(
         }
       }
 
-      writeCachedJson(cacheDir, 'index', indexJson, { channel: 'npm-mirror', mirrorBase, version: packument.version });
-      if (!unverifiedMissing) {
-        writeCachedJson(cacheDir, 'unverified-index', unverifiedIndexJson, {
-          channel: 'npm-mirror',
-          mirrorBase,
-          version: packument.version,
-        });
+      if (content === 'catalog') {
+        writeCache(cacheDir, 'index', indexJson, { channel: 'npm-mirror', mirrorBase, version: packument.version });
       }
-      writeCachedJson(cacheDir, 'readmes', readmesJson, { channel: 'npm-mirror', mirrorBase, version: packument.version });
+      writeCache(cacheDir, 'readmes', readmesJson, { channel: 'npm-mirror', mirrorBase, version: packument.version });
 
       return {
         indexJson,
@@ -280,17 +342,6 @@ export async function loadCatalogFromNpmMirror(
   throw new Error(`ERR_MIRROR_FALLBACK_FAILED: ${errors.join(' | ')}`);
 }
 
-async function fetchSingleCustomFeed(feedUrl, index, cacheDir, fetchImpl = defaultProxyFetch) {
-  const res = await fetchJsonWithConditionalCache(feedUrl, cacheDir, `custom-feed-${index}`, {
-    timeoutMs: 6000,
-    fetchImpl: resolveFetch(fetchImpl),
-  });
-  return {
-    feedUrl,
-    plugins: Array.isArray(res.data?.plugins) ? res.data.plugins : [],
-  };
-}
-
 /**
  * Resolves and merges custom feeds + Track 1 (`index.json`) + optional Track 2 (`unverified-index.json`).
  */
@@ -299,13 +350,17 @@ export async function resolveMarketCatalog({
   prefs = {},
   forceRefresh = false,
   includeReadmes = false,
+  shouldPersistCache = () => true,
   fetchImpl = defaultProxyFetch,
   mirrors = CHINA_NPM_MIRRORS,
 }) {
   const activeFetch = resolveFetch(fetchImpl);
+  const writeCache = (...args) => {
+    if (shouldPersistCache()) writeCachedJson(...args);
+  };
   const cleanPrefs = sanitizePrefs(prefs);
-  const cacheDir = getCacheDir(dataDir);
   const baseUrl = (cleanPrefs.primaryCatalogUrl || PRIMARY_CATALOG_BASE_URL).replace(/\/+$/, '');
+  const cacheDir = getCacheDir(dataDir, baseUrl);
 
   let verifiedFeed = null;
   let unverifiedFeed = { schemaVersion: 1, track: 'unverified', plugins: [] };
@@ -313,14 +368,15 @@ export async function resolveMarketCatalog({
   let channelUsed = 'offline-empty';
   let activePrimaryBase = '';
   const warnings = [];
+  const failedCustomFeeds = [];
   const warnBi = (zh, en) => warnings.push(`${zh} / ${en}`);
   const errMsg = (e) => e?.message || String(e);
   const wantTrack2 = Boolean(cleanPrefs.enableExperimentalTrack2);
   let track2Loaded = false;
   let mirrorLackedTrack2 = false;
 
-  const tryPrimary = cleanPrefs.networkMode !== 'china-mirror';
-  const tryChinaMirror = cleanPrefs.networkMode !== 'direct';
+  const tryPrimary = !isOfficialCatalog(baseUrl) || cleanPrefs.networkMode !== 'china-mirror';
+  const tryChinaMirror = isOfficialCatalog(baseUrl) && cleanPrefs.networkMode !== 'direct';
 
   if (tryPrimary) {
     const primaryCandidates = [{ url: baseUrl, channelLabel: 'github-pages' }];
@@ -335,7 +391,7 @@ export async function resolveMarketCatalog({
     for (const candidate of primaryCandidates) {
       try {
         const vRes = await fetchJsonWithConditionalCache(`${candidate.url}/index.json`, cacheDir, 'index', {
-          forceRefresh,
+          forceRefresh, writeCache,
           fetchImpl: activeFetch,
           channelLabel: candidate.channelLabel,
         });
@@ -345,7 +401,7 @@ export async function resolveMarketCatalog({
 
         if (includeReadmes) {
           const rRes = await fetchJsonWithConditionalCache(`${candidate.url}/readmes.json`, cacheDir, 'readmes', {
-            forceRefresh,
+            forceRefresh, writeCache,
             fetchImpl: activeFetch,
             channelLabel: candidate.channelLabel,
           }).catch(() => null);
@@ -365,7 +421,7 @@ export async function resolveMarketCatalog({
     }
 
     // Track 2 (`unverified-index.json`, ~2 MB): own long timeout, alternate primary, never silent.
-    if (wantTrack2 && verifiedFeed) {
+    if (wantTrack2) {
       const ordered = [
         ...primaryCandidates.filter((c) => c.url === activePrimaryBase),
         ...primaryCandidates.filter((c) => c.url !== activePrimaryBase),
@@ -375,7 +431,7 @@ export async function resolveMarketCatalog({
         try {
           const uRes = await fetchJsonWithConditionalCache(`${candidate.url}/unverified-index.json`, cacheDir, 'unverified-index', {
             timeoutMs: UNVERIFIED_FETCH_TIMEOUT_MS,
-            forceRefresh,
+            forceRefresh, writeCache,
             fetchImpl: activeFetch,
             channelLabel: candidate.channelLabel,
           });
@@ -404,20 +460,23 @@ export async function resolveMarketCatalog({
     }
   }
 
-  if (!verifiedFeed && tryChinaMirror) {
+  if (tryChinaMirror && (!verifiedFeed || (wantTrack2 && !track2Loaded))) {
     try {
-      const mirrorOut = await loadCatalogFromNpmMirror(cacheDir, { mirrors, fetchImpl: activeFetch });
-      verifiedFeed = mirrorOut.indexJson;
-      if (wantTrack2 && !mirrorOut.unverifiedMissing) {
+      const mirrorOut = await loadCatalogFromNpmMirror(cacheDir, {
+        mirrors, fetchImpl: activeFetch, writeCache, content: verifiedFeed ? 'track2' : 'catalog', includeTrack2: !track2Loaded,
+      });
+      if (!verifiedFeed) {
+        verifiedFeed = mirrorOut.indexJson;
+        channelUsed = mirrorOut.channel;
+        if (includeReadmes) readmesFeed = mirrorOut.readmesJson;
+      }
+      if (wantTrack2 && !track2Loaded && !mirrorOut.unverifiedMissing) {
         unverifiedFeed = mirrorOut.unverifiedIndexJson;
         track2Loaded = true;
-      } else if (wantTrack2 && mirrorOut.unverifiedMissing) {
+      } else if (wantTrack2 && !track2Loaded && mirrorOut.unverifiedMissing) {
         mirrorLackedTrack2 = true;
       }
-      if (includeReadmes) {
-        readmesFeed = mirrorOut.readmesJson;
-      }
-      channelUsed = mirrorOut.channel;
+
     } catch (mirrorErr) {
       warnBi(
         `国内镜像回退不可达 (${errMsg(mirrorErr)})，将使用 GitHub/本地缓存`,
@@ -433,7 +492,7 @@ export async function resolveMarketCatalog({
     for (const b of bases) {
       try {
         const vRes = await fetchJsonWithConditionalCache(`${b.url}/index.json`, cacheDir, 'index', {
-          forceRefresh,
+          forceRefresh, writeCache,
           fetchImpl: activeFetch,
           channelLabel: b.label,
         });
@@ -462,7 +521,7 @@ export async function resolveMarketCatalog({
       try {
         const uRes = await fetchJsonWithConditionalCache(`${b}/unverified-index.json`, cacheDir, 'unverified-index', {
           timeoutMs: UNVERIFIED_FETCH_TIMEOUT_MS,
-          forceRefresh,
+          forceRefresh, writeCache,
           fetchImpl: activeFetch,
           channelLabel: b === RAW_GH_PAGES_CATALOG_BASE_URL ? 'github-raw-gh-pages' : 'github-pages',
         });
@@ -492,7 +551,7 @@ export async function resolveMarketCatalog({
 
   // Last-resort disk cache fallback when user is completely offline
   if (!verifiedFeed) {
-    const diskIndex = readCachedJson(cacheDir, 'index').data;
+    const diskIndex = readSourceCache(dataDir, baseUrl, 'index').data;
     if (diskIndex) {
       verifiedFeed = diskIndex;
       channelUsed = 'disk-cache-offline';
@@ -500,7 +559,7 @@ export async function resolveMarketCatalog({
       verifiedFeed = { schemaVersion: 1, track: 'verified', catalogVersion: 'offline', plugins: [] };
     }
     if (includeReadmes) {
-      readmesFeed = readCachedJson(cacheDir, 'readmes').data || {
+      readmesFeed = readSourceCache(dataDir, baseUrl, 'readmes').data || {
         schemaVersion: 1,
         entries: {},
         entriesZh: {},
@@ -511,8 +570,8 @@ export async function resolveMarketCatalog({
 
   // Track 2 local-cache fallback, INDEPENDENT of whether the verified feed succeeded.
   if (wantTrack2 && !track2Loaded) {
-    const diskT2 = readCachedJson(cacheDir, 'unverified-index');
-    if (diskT2.data && Array.isArray(diskT2.data.plugins) && diskT2.data.plugins.length > 0) {
+    const diskT2 = readSourceCache(dataDir, baseUrl, 'unverified-index');
+    if (diskT2.data) {
       unverifiedFeed = diskT2.data;
       track2Loaded = true;
       warnBi(
@@ -527,15 +586,6 @@ export async function resolveMarketCatalog({
     }
   }
 
-  const normalizePluginRoot = (rawRoot) => {
-    const s = String(rawRoot || '.')
-      .trim()
-      .replace(/\\/g, '/')
-      .replace(/^\.\/+/, '')
-      .replace(/\/+$/, '');
-    return s || '.';
-  };
-
   const makeRepoRootKey = (plugin) => {
     const repoId = Number(plugin?.repository?.repositoryId || 0);
     if (repoId <= 0) return '';
@@ -546,20 +596,53 @@ export async function resolveMarketCatalog({
   const mergedPlugins = [];
   const seenRepoRoots = new Set();
   const seenIds = new Set();
+  const reportSkipped = (feed, label) => {
+    if (Number.isInteger(feed?.skippedEntries) && feed.skippedEntries > 0) {
+      warnBi(`${label} 已跳过 ${feed.skippedEntries} 条无效插件记录`,
+        `${label} skipped ${feed.skippedEntries} invalid plugin entries`);
+    }
+  };
+  reportSkipped(verifiedFeed, 'Track 1');
+  if (wantTrack2) reportSkipped(unverifiedFeed, 'Track 2');
 
   for (let i = 0; i < cleanPrefs.customFeeds.length; i++) {
     const feedUrl = cleanPrefs.customFeeds[i];
+    const feedDir = getCacheDir(dataDir, feedUrl);
+    let custom;
     try {
-      const custom = await fetchSingleCustomFeed(feedUrl, i, cacheDir, activeFetch);
-      for (const p of custom.plugins) {
-        const repoRootKey = makeRepoRootKey(p);
-        if ((repoRootKey && seenRepoRoots.has(repoRootKey)) || seenIds.has(p.id)) continue;
-        if (repoRootKey) seenRepoRoots.add(repoRootKey);
-        seenIds.add(p.id);
-        mergedPlugins.push({ ...p, _track: 'custom', _feedUrl: feedUrl });
-      }
+      custom = (await fetchJsonWithConditionalCache(feedUrl, feedDir, 'custom-index', {
+        timeoutMs: 6000, forceRefresh, writeCache, fetchImpl: activeFetch,
+      })).data;
     } catch (err) {
+      failedCustomFeeds.push({ url: feedUrl, status: String(err.status || '') });
       warnings.push(`Custom feed failed (${feedUrl}): ${err?.message || String(err)}`);
+      if (err.status === 410) {
+        // An empty URL-specific snapshot also supersedes caches from older clients.
+        // Drop the previous validators so a restored feed is fetched in full.
+        try {
+          writeCache(feedDir, 'custom-index', { plugins: [] }, { url: feedUrl, status: 410 });
+        } catch (cacheError) {
+          warnings.push(`Could not cache feed withdrawal (${feedUrl}): ${cacheError.message}`);
+        }
+        continue;
+      }
+      if (feedUrl.startsWith('file:') || (err.status >= 400 && err.status < 500 && ![408, 429].includes(err.status))) continue;
+      let cached = readCachedJson(feedDir, 'custom-index');
+      if (cached.meta.status === 410) continue;
+      // Older clients stored feeds by position. Only reuse an exact recorded URL.
+      if (!cached.data) cached = readCachedJson(cacheDir, `custom-feed-${i}`);
+      custom = cached.meta.url === feedUrl && cleanPluginIndex(cached.data);
+      if (!custom) continue;
+      warnBi(`自定义源使用离线缓存 (${feedUrl})`, `Using cached custom feed (${feedUrl})`);
+    }
+    reportSkipped(custom, feedUrl);
+    for (const p of custom.plugins) {
+      if (p.id === SELF_CATALOG_ID) continue;
+      const repoRootKey = makeRepoRootKey(p);
+      if ((repoRootKey && seenRepoRoots.has(repoRootKey)) || seenIds.has(p.id)) continue;
+      if (repoRootKey) seenRepoRoots.add(repoRootKey);
+      seenIds.add(p.id);
+      mergedPlugins.push({ ...p, _track: 'custom', _feedUrl: feedUrl });
     }
   }
 
@@ -582,6 +665,7 @@ export async function resolveMarketCatalog({
 
   for (const rawP of verifiedFeed?.plugins || []) {
     const p = normalizePluginMedia(rawP);
+    if (p.id === SELF_CATALOG_ID && !isOfficialCatalog(baseUrl)) continue;
     const repoRootKey = makeRepoRootKey(p);
     if ((repoRootKey && seenRepoRoots.has(repoRootKey)) || seenIds.has(p.id)) continue;
     if (repoRootKey) seenRepoRoots.add(repoRootKey);
@@ -592,6 +676,7 @@ export async function resolveMarketCatalog({
   if (cleanPrefs.enableExperimentalTrack2) {
     for (const rawP of unverifiedFeed?.plugins || []) {
       const p = normalizePluginMedia(rawP);
+      if (p.id === SELF_CATALOG_ID) continue;
       const repoRootKey = makeRepoRootKey(p);
       if ((repoRootKey && seenRepoRoots.has(repoRootKey)) || seenIds.has(p.id)) continue;
       if (repoRootKey) seenRepoRoots.add(repoRootKey);
@@ -604,7 +689,7 @@ export async function resolveMarketCatalog({
     }
   }
 
-  const resolvedReadmes = readmesFeed || readCachedJson(cacheDir, 'readmes').data || {};
+  const resolvedReadmes = readmesFeed || readSourceCache(dataDir, baseUrl, 'readmes').data || {};
 
   return {
     channelUsed,
@@ -618,6 +703,7 @@ export async function resolveMarketCatalog({
     readmesEn:
       resolvedReadmes.entriesEn && typeof resolvedReadmes.entriesEn === 'object' ? resolvedReadmes.entriesEn : {},
     warnings,
+    failedCustomFeeds,
   };
 }
 
@@ -645,12 +731,12 @@ export async function fetchPluginReadme({
   }
 
   const cleanPrefs = sanitizePrefs(prefs);
-  const cacheDir = getCacheDir(dataDir);
-  const perPluginCacheDir = getPerPluginReadmesCacheDir(dataDir);
   const baseUrl = (primaryBaseUrl || cleanPrefs.primaryCatalogUrl || PRIMARY_CATALOG_BASE_URL).replace(/\/+$/, '');
+  const cacheDir = getCacheDir(dataDir, baseUrl);
+  const perPluginCacheDir = join(cacheDir, 'readmes');
 
-  const tryPrimary = cleanPrefs.networkMode !== 'china-mirror';
-  const tryChinaMirror = cleanPrefs.networkMode !== 'direct';
+  const tryPrimary = !isOfficialCatalog(baseUrl) || cleanPrefs.networkMode !== 'china-mirror';
+  const tryChinaMirror = isOfficialCatalog(baseUrl) && cleanPrefs.networkMode !== 'direct';
 
   const primaryCandidates = [];
   const pushCandidate = (url, channelLabel) => {
@@ -662,17 +748,18 @@ export async function fetchPluginReadme({
     baseUrl,
     baseUrl === RAW_GH_PAGES_CATALOG_BASE_URL ? 'github-raw-gh-pages' : 'github-pages',
   );
-  if (baseUrl === PRIMARY_CATALOG_BASE_URL || cleanPrefs.primaryCatalogUrl === PRIMARY_CATALOG_BASE_URL) {
+  if (isOfficialCatalog(baseUrl)) {
     pushCandidate(PRIMARY_CATALOG_BASE_URL, 'github-pages');
     pushCandidate(RAW_GH_PAGES_CATALOG_BASE_URL, 'github-raw-gh-pages');
   }
 
   let anyPrimaryReachable = false;
   let monolithicData = null;
+  let readmeRequestFailed = false;
 
   // 1. Primary lazy per-plugin endpoint: `${base}/readmes/${encodeURIComponent(id)}.json` with ETag cache
   if (tryPrimary) {
-    const cachedPerPlugin = readCachedJson(perPluginCacheDir, safeKey);
+    const cachedPerPlugin = readSourceCache(dataDir, baseUrl, safeKey, 'readmes', pluginId);
     for (const candidate of primaryCandidates) {
       const perUrl = `${candidate.url}/readmes/${encodeURIComponent(pluginId)}.json`;
       try {
@@ -703,7 +790,7 @@ export async function fetchPluginReadme({
           signal: AbortSignal.timeout(timeoutMs),
         });
 
-        if (res.status === 304 && cachedPerPlugin.data) {
+        if (res.status === 304 && cachedPerPlugin.data && cachedPerPlugin.meta.url === perUrl) {
           const norm = normalizePerPluginReadmePayload(cachedPerPlugin.data, pluginId);
           if (norm) {
             return { ok: true, ...norm, fromCache: true, channel: `${candidate.channelLabel}-per-plugin-304` };
@@ -720,12 +807,15 @@ export async function fetchPluginReadme({
             writeCachedJson(perPluginCacheDir, safeKey, norm, { etag, lastModified, url: perUrl });
             return { ok: true, ...norm, fromCache: false, channel: `${candidate.channelLabel}-per-plugin` };
           }
-        } else if (res.status >= 400 && res.status < 500) {
+          readmeRequestFailed = true;
+        } else if (res.status === 404 || res.status === 410) {
           // 404 on per-plugin endpoint may simply mean legacy catalog only serves monolithic readmes.json
           anyPrimaryReachable = true;
+        } else {
+          readmeRequestFailed = true;
         }
       } catch {
-        /* try next primary candidate */
+        readmeRequestFailed = true;
       }
     }
   }
@@ -765,13 +855,13 @@ export async function fetchPluginReadme({
           }
           break;
         }
-      } catch {
-        /* try next primary candidate */
+      } catch (err) {
+        if (err.status !== 404 && err.status !== 410) readmeRequestFailed = true;
       }
     }
     if (monolithicSucceeded) {
       // Primary monolithic readmes loaded cleanly and does not contain this id — check local per-plugin cache before returning
-      const cachedPer = normalizePerPluginReadmePayload(readCachedJson(perPluginCacheDir, safeKey).data, pluginId);
+      const cachedPer = normalizePerPluginReadmePayload(readSourceCache(dataDir, baseUrl, safeKey, 'readmes', pluginId).data, pluginId);
       if (cachedPer) {
         return {
           ok: true,
@@ -797,11 +887,11 @@ export async function fetchPluginReadme({
   // 4. Fallback to China `@agy-market/catalog` npm mirror (in china-mirror mode or when primary is unreachable)
   if (tryChinaMirror && (!tryPrimary || !anyPrimaryReachable)) {
     if (!forceRefresh) {
-      const diskPer = normalizePerPluginReadmePayload(readCachedJson(perPluginCacheDir, safeKey).data, pluginId);
+      const diskPer = normalizePerPluginReadmePayload(readSourceCache(dataDir, baseUrl, safeKey, 'readmes', pluginId).data, pluginId);
       if (diskPer) {
         return { ok: true, ...diskPer, fromCache: true, channel: 'disk-cache-per-plugin' };
       }
-      const diskMono = readCachedJson(cacheDir, 'readmes');
+      const diskMono = readSourceCache(dataDir, baseUrl, 'readmes');
       if (diskMono.data && diskMono.meta?.channel === 'npm-mirror') {
         const fromDiskMono = extractPluginFromMonolithicReadmes(diskMono.data, pluginId);
         if (fromDiskMono) {
@@ -817,7 +907,7 @@ export async function fetchPluginReadme({
     }
 
     try {
-      const mirrorOut = await loadCatalogFromNpmMirror(cacheDir, { mirrors, fetchImpl: activeFetch });
+      const mirrorOut = await loadCatalogFromNpmMirror(cacheDir, { mirrors, fetchImpl: activeFetch, content: 'readmes' });
       monolithicData = mirrorOut.readmesJson;
       if (mirrorOut.perPluginReadmes?.[pluginId]) {
         return {
@@ -839,16 +929,20 @@ export async function fetchPluginReadme({
         };
       }
     } catch {
-      /* fall through to offline disk cache */
+      if (!tryPrimary) {
+        return fetchPluginReadme({ id, dataDir, prefs: { ...cleanPrefs, networkMode: 'direct' },
+          primaryBaseUrl: baseUrl, cachedCatalog, forceRefresh, fetchImpl: activeFetch, timeoutMs });
+      }
+      readmeRequestFailed = true;
     }
   }
 
   // 5. Offline disk cache fallback (per-plugin cache first, then monolithic cache)
-  const offlinePer = normalizePerPluginReadmePayload(readCachedJson(perPluginCacheDir, safeKey).data, pluginId);
+  const offlinePer = normalizePerPluginReadmePayload(readSourceCache(dataDir, baseUrl, safeKey, 'readmes', pluginId).data, pluginId);
   if (offlinePer) {
     return { ok: true, ...offlinePer, fromCache: true, channel: 'disk-cache-per-plugin' };
   }
-  const offlineMono = readCachedJson(cacheDir, 'readmes').data;
+  const offlineMono = readSourceCache(dataDir, baseUrl, 'readmes').data;
   const fromOfflineMono = extractPluginFromMonolithicReadmes(offlineMono, pluginId);
   if (fromOfflineMono) {
     return {
@@ -867,7 +961,7 @@ export async function fetchPluginReadme({
     zh: '',
     en: '',
     fromCache: false,
-    channel: 'not-found',
+    channel: readmeRequestFailed && !monolithicData ? 'unavailable' : 'not-found',
     ...(monolithicData ? { monolithicReadmes: monolithicData } : {}),
   };
 }

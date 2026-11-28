@@ -536,7 +536,7 @@ export function buildHubOpenPaneExpression({ sidecarId, sidecarFolder, dir, titl
 
   return `(async () => {
     const req = ${payloadJson};
-    const norm = (s) => String(s || '').trim().toLowerCase();
+    const norm = (s) => String(s || '').trim();
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     const waitFor = async (fn, maxMs = 320, stepMs = 25) => {
       const deadline = Date.now() + maxMs;
@@ -574,14 +574,7 @@ export function buildHubOpenPaneExpression({ sidecarId, sidecarFolder, dir, titl
       el.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true, cancelable: true }));
     };
 
-    const matchesSidecarId = (candidate) => {
-      const c = norm(candidate);
-      if (!c) return false;
-      if (req.sidecarId && c === norm(req.sidecarId)) return true;
-      if (req.sidecarFolder && c.endsWith('/' + norm(req.sidecarFolder))) return true;
-      if (req.dir && (c === norm(req.dir) || c.startsWith(norm(req.dir) + '/'))) return true;
-      return false;
-    };
+    const matchesSidecarId = candidate => Boolean(req.sidecarId && norm(candidate) === norm(req.sidecarId));
 
     // 1. Already visible in Aux Pane slot
     const slots = Array.from(document.querySelectorAll('[data-testid="sidecar-iframe-slot"]'));
@@ -599,13 +592,10 @@ export function buildHubOpenPaneExpression({ sidecarId, sidecarFolder, dir, titl
       const items = Array.from(document.querySelectorAll('[data-testid="plugins-submenu-item"]'));
       const byId = items.find((el) => matchesSidecarId(el.getAttribute('data-sidecar-id')));
       if (byId) return byId;
-      const wantTitle = norm(req.title);
+      const wantTitle = norm(req.title).toLowerCase();
       if (!wantTitle) return null;
-      return (
-        items.find((el) => norm(el.textContent) === wantTitle) ||
-        (wantTitle.length >= 3 ? items.find((el) => norm(el.textContent).includes(wantTitle)) : null) ||
-        null
-      );
+      const matchingTitle = items.filter(el => norm(el.textContent).toLowerCase() === wantTitle);
+      return matchingTitle.length === 1 && !matchingTitle[0].getAttribute('data-sidecar-id') ? matchingTitle[0] : null;
     };
 
     const existingItem = findPluginMenuItem();
@@ -641,10 +631,9 @@ export function buildHubOpenPaneExpression({ sidecarId, sidecarFolder, dir, titl
     if (req.uri) {
       const wantUri = norm(req.uri).replace(/\\/+$/, '');
       const links = Array.from(document.querySelectorAll('a[href^="sidecar://"]'));
-      const matchedLink = links.find((a) => {
-        const href = norm(a.getAttribute('href')).replace(/\\/+$/, '');
-        return href === wantUri || (req.sidecarId && href.startsWith('sidecar://' + norm(req.sidecarId)));
-      });
+      const hrefOf = a => norm(a.getAttribute('href')).replace(/\\/+$/, '');
+      const matchedLink = links.find(a => hrefOf(a) === wantUri) ||
+        (req.sidecarId && links.find(a => hrefOf(a) === 'sidecar://' + norm(req.sidecarId)));
       if (matchedLink) {
         firePointerClick(matchedLink);
         return { opened: true, detail: 'existing-sidecar-link', sidecarId: req.sidecarId };

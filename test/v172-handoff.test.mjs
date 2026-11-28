@@ -262,7 +262,7 @@ test('Req 1: junction-safe sync/removal and EPERM-tolerant backup/readdir/cleanu
     assert.equal(updRes.ok, true, 'Update must succeed even with locked subdirectory & nested junction');
     assert.equal(updRes.version, '2.0.0');
     assert.equal(readFileSync(join(targetDir, 'bin', 'tool.js'), 'utf8'), 'console.log("v2");\n');
-    assert.equal(existsSync(nestedJunction), false, 'Stray nested junction must be unlinked');
+    assert.equal(lstatSync(nestedJunction).isSymbolicLink(), true, 'Unmanaged nested junction is preserved without traversal');
     assert.equal(readFileSync(join(externalDir, 'keep-me.txt'), 'utf8'), 'EXTERNAL_DATA_INTACT');
 
     // Unrecoverable EPERM during sync must surface stage context `[sync]` and relPath
@@ -413,7 +413,7 @@ test('Issue #6 client: managedFiles preserves user files on legacy->managed and 
     const receipt141 = JSON.parse(readFileSync(join(nekoDir, '.agy-market-receipt.json'), 'utf8'));
     assert.deepEqual(receipt141.managedFiles, ['assets/logo.svg', 'index.js', 'plugin.json']);
 
-    // 4. Legacy plugin WITH preservePaths (no managedFiles) retains legacy preservePaths-based stale cleanup
+    // 4. Legacy plugin WITH preservePaths (no managedFiles) keeps files of unknown ownership
     const legacyPreserveDir = join(ws.pluginsDir, 'legacy-preserved');
     writeTree(legacyPreserveDir, {
       'plugin.json': { name: 'legacy-preserved', displayName: 'Legacy', version: '1.0.0', logo: 'assets/logo.svg' },
@@ -443,7 +443,7 @@ test('Issue #6 client: managedFiles preserves user files on legacy->managed and 
       configDir: ws.configDir,
       dataDir: ws.dataDir,
     });
-    assert.equal(existsSync(join(legacyPreserveDir, 'stale-legacy.txt')), false);
+    assert.equal(readFileSync(join(legacyPreserveDir, 'stale-legacy.txt'), 'utf8'), 'STALE');
     assert.equal(existsSync(join(legacyPreserveDir, 'user-data', 'keep.json')), true);
 
     // 5. journal.mjs crash recovery passes previousManagedFiles on completed-forward & cleans dirs safely
@@ -713,7 +713,7 @@ test('Req 4 backend: POST /api/conflicts/ignore enforces CSRF, persists ignoredC
 
 function createV172UiHarness({ withResizeObserver = false, captureTimers = false } = {}) {
   const bundled = bundleZeroDepEsm(join(REPO_ROOT, 'src', 'ui', 'app.mjs'));
-  const bootMarker = 'void loadState(false);\nvoid checkUpdates(false, { silent: true });';
+  const bootMarker = 'void openMarketPanel();';
   assert.ok(bundled.includes(bootMarker));
 
   const instrumented = bundled.replace(
@@ -728,7 +728,7 @@ function createV172UiHarness({ withResizeObserver = false, captureTimers = false
       '  renderInstalledView,',
       '  renderSourcesView,',
       '  syncChipStripOverflow,',
-      '  triggerUpdateAll,',
+      '  triggerUpdateAll, maybeTriggerRestartBanner,',
       '  getEffectiveUpdateItems,',
       '};',
     ].join('\n'),
@@ -977,7 +977,7 @@ test('Req 3, 4 UI, 5, 6: CSS styles, built HTML, Conflicts Ignore UI, Discover C
   assert.match(verDeltaCss[1], /padding:\s*3px 9px/);
   assert.match(verDeltaCss[1], /line-height:\s*1\.25/);
 
-  assert.match(stylesCss, /@container market \(max-width:\s*520px\)[\s\S]*\.card-title-right[\s\S]*overflow:\s*hidden;[\s\S]*text-overflow:\s*ellipsis;/);
+  assert.match(stylesCss, /\.card-title-right \.version-tag,\s*\.card-title-right \.version-delta\s*\{[^}]*overflow:\s*hidden;[^}]*text-overflow:\s*ellipsis;/);
 
   // Req 6 CSS assertions
   const settingsCss = /\.settings-panel\s*\{([^}]*)\}/.exec(stylesCss);
@@ -1045,6 +1045,17 @@ test('Req 3, 4 UI, 5, 6: CSS styles, built HTML, Conflicts Ignore UI, Discover C
   );
   assert.equal(prevented, true);
   assert.ok(h.ui.state.chipStripScrollLeft > 0);
+
+  h.chipStripEl.scrollLeft = h.chipStripEl.scrollWidth - h.chipStripEl.clientWidth;
+  h.ui.syncChipStripOverflow();
+  assert.equal(h.chipWrapEl.classList.contains('can-scroll-right'), false);
+  assert.equal(h.chipWrapEl.classList.contains('can-scroll-left'), true);
+  // After widening, the categories can fit in the row even though the old
+  // scrollport still excludes the two buttons and their gaps.
+  h.chipWrapEl.clientWidth = h.chipStripEl.scrollWidth;
+  h.ui.syncChipStripOverflow();
+  assert.equal(h.chipWrapEl.classList.contains('has-overflow'), false);
+  assert.equal(h.chipWrapEl.classList.contains('can-scroll-left'), false);
 
   // Installed view keeps plain .chip-strip without #discover-chip-wrap
   const installedHtml = h.ui.renderInstalledView();
@@ -1570,4 +1581,27 @@ test('Wave 4 UI Polish: batch update results manual + 8s auto-close, narrow card
   h.flushTimers(8000);
   assert.equal(Array.isArray(h.ui.state.batchResults) && h.ui.state.batchResults.length === 1, true);
   assert.match(h.getHtml(), /HTTP 502/);
+
+  // A retry of one directory must retain unrelated failures until they are resolved.
+  h.ui.state.batchResults.push({ id: 'other', dir: 'other', ok: false, error: 'Unavailable' });
+  h.setFetchHandler(async (url, options) => {
+    if (url !== '/api/update-all') return Response.json({ ok: true, items: [] });
+    const [dir] = JSON.parse(options.body).ids;
+    return Response.json({ ok: true, results: [{ dir, id: dir, ok: true, version: '2.0.1' }] });
+  });
+  await h.ui.triggerUpdateAll(['context-mode']);
+  assert.equal(h.ui.state.batchResults.length, 2);
+  assert.equal(h.ui.state.errorBanner.items.length, 1);
+  assert.equal(h.ui.state.errorBanner.items[0].message, 'Unavailable');
+  assert.equal(h.ui.state.batchResultsAutoClose, null);
+  await h.ui.triggerUpdateAll(['other']);
+  assert.equal(h.ui.state.errorBanner, null);
+  assert.equal(h.ui.state.batchResultsAutoClose?.active, true);
+
+  h.ui.state.restartBanner = null;
+  h.ui.maybeTriggerRestartBanner({ pluginDir: 'prism', requiresPatchScript: true });
+  h.ui.maybeTriggerRestartBanner({ pluginDir: 'reader', operation: 'enable', reloadRequired: true });
+  assert.equal(h.ui.state.restartBanner.level, 'host-restart');
+  assert.equal(h.ui.state.restartBanner.patchTargets[0].dir, 'prism');
+  assert.equal(h.ui.state.restartBanner.pending.length, 2);
 });

@@ -26,6 +26,7 @@ jobs:
         with:
           ref: ${{ inputs.tag || github.ref }}
           path: agy-market
+          fetch-depth: 0
 
       - name: Checkout sibling agy-market-catalog
         uses: actions/checkout@v4
@@ -37,6 +38,25 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '22'
+
+      - name: Verify release tag and checked-out commit
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          MANIFEST_TAG="v$(node -p "require('./plugin.json').version")"
+          TAG_NAME="${INPUT_TAG:-$MANIFEST_TAG}"
+          if [[ -z "$INPUT_TAG" && "$GITHUB_REF_TYPE" == tag ]]; then TAG_NAME="$GITHUB_REF_NAME"; fi
+          if [[ "$TAG_NAME" != "$MANIFEST_TAG" ]]; then
+            echo "Release tag $TAG_NAME differs from manifest $MANIFEST_TAG" >&2
+            exit 1
+          fi
+          TAG_COMMIT="$(git rev-parse --verify "refs/tags/${TAG_NAME}^{commit}")"
+          if [[ "$(git rev-parse HEAD)" != "$TAG_COMMIT" ]]; then
+            echo "Checkout differs from release tag $TAG_NAME" >&2
+            exit 1
+          fi
+          echo "TAG_NAME=$TAG_NAME" >> "$GITHUB_ENV"
 
       - name: Build sidecar UI and static site
         run: node scripts/build.mjs --site
@@ -50,19 +70,13 @@ jobs:
       - name: Publish or update GitHub Release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          INPUT_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          TAG_NAME="${INPUT_TAG:-${GITHUB_REF_NAME:-}}"
-          if [[ ! "$TAG_NAME" =~ ^v[0-9] ]]; then
-            MANIFEST_VER="$(node -e "process.stdout.write(JSON.parse(require('node:fs').readFileSync('plugin.json','utf8')).version)")"
-            TAG_NAME="v${MANIFEST_VER}"
-          fi
           echo "Publishing release for tag: ${TAG_NAME}"
           if gh release view "$TAG_NAME" --repo "${{ github.repository }}" >/dev/null 2>&1; then
             gh release upload "$TAG_NAME" dist/agy-market.tar.gz dist/agy-market.tar.gz.sha256 --clobber --repo "${{ github.repository }}"
           else
-            gh release create "$TAG_NAME" dist/agy-market.tar.gz dist/agy-market.tar.gz.sha256 \
+            gh release create "$TAG_NAME" --verify-tag dist/agy-market.tar.gz dist/agy-market.tar.gz.sha256 \
               --repo "${{ github.repository }}" \
               --title "AGY Market ${TAG_NAME}" \
               --generate-notes

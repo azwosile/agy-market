@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { createHash } from 'node:crypto';
-import { copyFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+import { copyFileSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import test from 'node:test';
@@ -16,21 +19,24 @@ import { validatePluginTarball } from '../../agy-market-catalog/scripts/validate
 
 import { runCli } from '../bin/agy-market.mjs';
 import { packReleaseBundle } from '../scripts/pack-release.mjs';
-import { fetchVerifiedPluginTarball, resolveMutableTagCommitFallbackUrl } from '../src/installer/fetch-tarball.mjs';
-import { installOrUpdateCatalogPlugin } from '../src/installer/index.mjs';
-import { recoverInterruptedJournal, writePendingJournal } from '../src/installer/journal.mjs';
-import { sweepRetiredBinaries } from '../src/installer/sync-dir.mjs';
+import { fetchVerifiedPluginTarball, isOfficialGithubTokenHost, resolveMutableTagCommitFallbackUrl } from '../src/installer/fetch-tarball.mjs';
+import { inspectGithubPluginUrl, installGithubPlugin } from '../src/installer/github-url.mjs';
+import { fixLocalConflict, installOrUpdateCatalogPlugin, removeMarketPluginFiles, toggleInstalledPlugin } from '../src/installer/index.mjs';
+import { acquirePluginMutation, recoverInterruptedJournal, writePendingJournal } from '../src/installer/journal.mjs';
+import { sweepRetiredBinaries, syncDirectoryLockSafe } from '../src/installer/sync-dir.mjs';
 import {
   createDeterministicTarGz,
   encodePaxRecord,
+  extractTarGzStreamToDir,
   extractTarGzToDir,
   parsePaxRecords,
   parseTarGzToMap,
 } from '../src/installer/tar-extract.mjs';
 import { resolveInstallPreflight, scanLocalPluginInventory } from '../src/preflight/index.mjs';
-import { resolveMarketCatalog } from '../src/registry/index.mjs';
+import { fetchPluginReadme, resolveMarketCatalog } from '../src/registry/index.mjs';
 import { scrubChildProcessEnv } from '../src/shared/constants.mjs';
-import { buildInstallReceipt, sanitizeNativePluginManifest } from '../src/shared/schemas.mjs';
+import { buildInstallReceipt, parseJsonc, sanitizeNativePluginManifest } from '../src/shared/schemas.mjs';
+import { renderSafeMarkdown } from '../src/ui/markdown.mjs';
 import { createMarketSidecarServer } from '../src/sidecar/server.mjs';
 
 const CLEAN_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><rect x="16" y="16" width="96" height="96" rx="20" fill="#6366f1"/></svg>`;
@@ -65,6 +71,405 @@ function makeCommits() {
     { sha: 'c'.repeat(40), commit: { tree: { sha: 'tree_alpha_3' } } },
   ];
 }
+
+function stagedRelease(ws, name, version, files = {}) {
+  const owner = name === 'agy-market' ? 'azwosile' : 'example';
+  const url = `https://github.com/${owner}/${name}`;
+  const manifest = { name, version, repository: url };
+  const archive = createDeterministicTarGz({ 'plugin.json': JSON.stringify(manifest), ...files });
+  const path = join(ws.artifactsDir, name + '-' + version + '.tgz');
+  writeFileSync(path, archive);
+  return {
+    id: owner + '__' + name, canonicalName: name, version, repository: { url, pluginRoot: '.' },
+    distribution: { tarballUrl: pathToFileURL(path).href, sha256: createHash('sha256').update(archive).digest('hex') },
+  };
+}
+
+test('a live sidecar resumes an interrupted update before installing another plugin', async t => {
+  const ws = makeTempWorkspace();
+  t.after(ws.cleanup);
+  const one = stagedRelease(ws, 'reader', '1.0.0');
+  const two = stagedRelease(ws, 'reader', '2.0.0');
+  const other = stagedRelease(ws, 'writer', '1.0.0');
+  const server = await createMarketSidecarServer({ ...ws, listen: false, recoveryDelayMs: -1,
+    fetchImpl: async () => Response.json({ plugins: [two, other] }) });
+  t.after(() => server.close());
+  await installOrUpdateCatalogPlugin({ ...ws, plugin: one });
+  await assert.rejects(installOrUpdateCatalogPlugin({ ...ws, plugin: two,
+    writeOverride() { throw new Error('temporary I/O failure'); } }), /temporary I\/O failure/);
+  assert.ok(existsSync(join(ws.dataDir, 'pending-journal.json')));
+  const response = await server.inject({ method: 'POST', url: '/api/install',
+    headers: { 'x-sidecar-token': server.sideToken }, body: { id: other.id } });
+  assert.equal(response.json().ok, true, response.body);
+  assert.equal(JSON.parse(readFileSync(join(ws.pluginsDir, 'reader/.agy-market-receipt.json'))).installedVersion, '2.0.0');
+  assert.ok(existsSync(join(ws.pluginsDir, 'writer/plugin.json')));
+  assert.equal(existsSync(join(ws.dataDir, 'pending-journal.json')), false);
+});
+
+test('startup collection keeps an empty installation root reserved for recovery', async t => {
+  const ws = makeTempWorkspace();
+  t.after(ws.cleanup);
+  const plugin = stagedRelease(ws, 'reader', '1.0.0');
+  await assert.rejects(installOrUpdateCatalogPlugin({ ...ws, plugin,
+    writeOverride() { throw new Error('before first copy'); } }), /before first copy/);
+  const target = join(ws.pluginsDir, 'reader');
+  assert.deepEqual(fs.readdirSync(target), []);
+  const server = await createMarketSidecarServer({ ...ws, listen: false, recoveryDelayMs: -1 });
+  try {
+    assert.ok(existsSync(target));
+    assert.equal(recoverInterruptedJournal(ws).action, 'completed-forward');
+    assert.equal(JSON.parse(readFileSync(join(target, 'plugin.json'))).name, 'reader');
+  } finally { await server.close(); }
+});
+
+test('first-install recovery distinguishes published, partial and user-created files', async t => {
+  const ws = makeTempWorkspace();
+  t.after(ws.cleanup);
+  const dir = join(ws.pluginsDir, 'reader');
+  const partial = join(dir, 'b-partial.txt');
+  const later = join(dir, 'z-settings.txt');
+  const release = stagedRelease(ws, 'reader', '1.0.0', {
+    'a-published.txt': 'complete', 'b-partial.txt': 'long content', 'z-settings.txt': 'release defaults',
+  });
+  const copy = fs.copyFileSync;
+  t.mock.method(fs, 'copyFileSync', (src, dst, ...args) => {
+    if (dst === partial) { writeFileSync(dst, 'long'); throw new Error('interrupted copy'); }
+    return copy(src, dst, ...args);
+  });
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(installOrUpdateCatalogPlugin({ ...ws, plugin: release }), /interrupted copy/);
+  } finally {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+  }
+  assert.equal(readFileSync(join(dir, 'a-published.txt'), 'utf8'), 'complete');
+  assert.equal(readFileSync(partial, 'utf8'), 'long');
+  assert.equal(existsSync(later), false);
+  for (const userContent of ['private notes', 'release', 'release defaults', '']) {
+    writeFileSync(later, userContent);
+    const result = recoverInterruptedJournal(ws);
+    assert.match(result.error, /ERR_PLUGIN_LAYOUT_CONFLICT.*z-settings/);
+    assert.equal(readFileSync(later, 'utf8'), userContent);
+    assert.equal(existsSync(join(dir, '.agy-market-receipt.json')), false);
+  }
+  rmSync(later);
+  assert.equal(recoverInterruptedJournal(ws).action, 'completed-forward');
+  assert.equal(readFileSync(partial, 'utf8'), 'long content');
+  assert.equal(readFileSync(later, 'utf8'), 'release defaults');
+});
+
+test('legacy first-install recovery leaves shorter local files intact and reuses identical files without writing', async t => {
+  for (const op of ['install-native', 'install-scoped']) {
+    await t.test(op, t => {
+      const ws = makeTempWorkspace();
+      t.after(ws.cleanup);
+      const dir = op === 'install-native' ? 'reader' : 'example--reader';
+      const target = join(ws.pluginsDir, dir);
+      const stage = join(ws.dataDir, 'staging', 'legacy', 'bundle');
+      mkdirSync(stage, { recursive: true });
+      mkdirSync(target);
+      const manifest = JSON.stringify({ name: dir, version: '1.0.0' });
+      const files = { 'plugin.json': manifest, 'a-new.txt': 'new entry', 'settings.txt': 'release defaults' };
+      for (const [path, content] of Object.entries(files)) writeFileSync(join(stage, path), content);
+      writeFileSync(join(target, 'plugin.json'), manifest);
+      const receipt = { id: 'example__reader', managedFiles: Object.keys(files) };
+      writePendingJournal(ws.dataDir, { op, dir, stagingRootDir: join(stage, '..'), stagingBundleDir: stage,
+        previousManagedFiles: null, fromVersion: null, backupDir: null, receipt });
+      const local = join(target, 'settings.txt');
+      for (const content of ['release', '', 'release defaultX']) {
+        writeFileSync(local, content);
+        assert.match(recoverInterruptedJournal(ws).error || '', /ERR_PLUGIN_LAYOUT_CONFLICT.*settings/);
+        assert.equal(readFileSync(local, 'utf8'), content);
+        assert.equal(existsSync(join(target, 'a-new.txt')), false);
+        assert.ok(existsSync(join(ws.dataDir, 'pending-journal.json')));
+      }
+      writeFileSync(local, files['settings.txt']);
+      const receiptPath = join(target, '.agy-market-receipt.json');
+      if (op === 'install-scoped') {
+        const editedReceipt = JSON.stringify({ ...receipt, userNotes: 'keep' });
+        writeFileSync(receiptPath, editedReceipt);
+        assert.match(recoverInterruptedJournal(ws).error || '', /ERR_PLUGIN_LAYOUT_CONFLICT.*receipt/);
+        assert.equal(readFileSync(receiptPath, 'utf8'), editedReceipt);
+        assert.equal(existsSync(join(target, 'a-new.txt')), false);
+        writeFileSync(receiptPath, JSON.stringify(receipt, null, 2) + '\n');
+        fs.utimesSync(receiptPath, 100, 100);
+      }
+      fs.utimesSync(local, 100, 100);
+      const prior = statSync(local, { bigint: true });
+      assert.equal(recoverInterruptedJournal(ws).action, 'completed-forward');
+      assert.equal(statSync(local, { bigint: true }).mtimeNs, prior.mtimeNs);
+      assert.equal(readFileSync(join(target, 'a-new.txt'), 'utf8'), 'new entry');
+      assert.deepEqual(JSON.parse(readFileSync(receiptPath)), receipt);
+      if (op === 'install-scoped') assert.equal(statSync(receiptPath, { bigint: true }).mtimeNs, prior.mtimeNs);
+    });
+  }
+});
+
+test('catalog updates confirm capabilities observed in the verified archive before changing the installation', async t => {
+  const ws = makeTempWorkspace();
+  t.after(ws.cleanup);
+  const first = stagedRelease(ws, 'reader', '1.0.0');
+  await installOrUpdateCatalogPlugin({ ...ws, plugin: first });
+  const plugin = stagedRelease(ws, 'reader', '2.0.0', { 'rules/format.md': 'Prefer short paragraphs.' });
+  const primary = readFileSync(fileURLToPath(plugin.distribution.tarballUrl));
+  const fallback = createDeterministicTarGz({
+    'plugin.json': JSON.stringify({ name: 'reader', version: '2.0.0', repository: plugin.repository.url }),
+    'rules/format.md': 'Prefer short paragraphs and clear headings.',
+  });
+  plugin.commitSha = COMMIT_1;
+  plugin.distribution.tarballUrl = plugin.repository.url + '/archive/refs/tags/v2.0.0.tar.gz';
+  plugin.distribution.commitFallbackSha256 = createHash('sha256').update(fallback).digest('hex');
+  let tagAvailable = true;
+  const fetchImpl = async url => String(url) === plugin.distribution.tarballUrl
+    ? (tagAvailable ? new Response(primary) : new Response('', { status: 404 }))
+    : new Response(fallback);
+  const updated = opts => installOrUpdateCatalogPlugin({ ...ws, plugin, fetchImpl, ...opts });
+  const pending = await updated({});
+  assert.equal(pending.status, 'CAPABILITY_ESCALATION_CONFIRM_REQUIRED');
+  assert.deepEqual(pending.escalation.addedBadges, ['global-rules']);
+  assert.equal(existsSync(join(ws.pluginsDir, 'reader/rules/format.md')), false);
+  assert.equal(existsSync(join(ws.dataDir, 'pending-journal.json')), false);
+  tagAvailable = false;
+  const changed = await updated({ confirmEscalation: true, approvalKey: pending.escalation.approvalKey });
+  assert.equal(changed.status, 'CAPABILITY_ESCALATION_CONFIRM_REQUIRED');
+  assert.notEqual(changed.escalation.approvalKey, pending.escalation.approvalKey);
+  assert.equal(existsSync(join(ws.pluginsDir, 'reader/rules/format.md')), false);
+  const installed = await updated({ confirmEscalation: true, approvalKey: changed.escalation.approvalKey });
+  assert.equal(installed.status, 'INSTALLED');
+  assert.equal(installed.receipt.sha256, plugin.distribution.commitFallbackSha256);
+  assert.ok(installed.receipt.grantedCapabilities.badges.includes('global-rules'));
+});
+
+test('an update cannot claim a regular file created by the user after the previous install', async () => {
+  const ws = makeTempWorkspace();
+  try {
+    const dir = join(ws.pluginsDir, 'reader');
+    const install = (version, files) => installOrUpdateCatalogPlugin({ ...ws, plugin: stagedRelease(ws, 'reader', version, files) });
+    await install('1.0.0', { 'entry.js': 'original' });
+    writeFileSync(join(dir, 'notes.md'), 'private draft');
+    const receipt = readFileSync(join(dir, '.agy-market-receipt.json'));
+    await assert.rejects(install('2.0.0', { 'entry.js': 'updated', 'notes.md': 'example notes' }), /ERR_PLUGIN_LAYOUT_CONFLICT.*notes\.md/);
+    assert.equal(readFileSync(join(dir, 'notes.md'), 'utf8'), 'private draft');
+    assert.equal(readFileSync(join(dir, 'entry.js'), 'utf8'), 'original');
+    assert.deepEqual(readFileSync(join(dir, '.agy-market-receipt.json')), receipt);
+    assert.equal(existsSync(join(ws.dataDir, 'pending-journal.json')), false);
+  } finally { ws.cleanup(); }
+});
+
+test('recovery verifies staged and backup file contents before replacing live files', async () => {
+  for (const corruptBackup of [false, true]) {
+    const ws = makeTempWorkspace();
+    try {
+      const install = (version, writeOverride) => installOrUpdateCatalogPlugin({ ...ws,
+        plugin: stagedRelease(ws, 'reader', version, { 'entry.js': version }), writeOverride });
+      await install('1.0.0');
+      await assert.rejects(install('2.0.0', () => { throw new Error('interrupted'); }), /interrupted/);
+      const pendingPath = join(ws.dataDir, 'pending-journal.json');
+      const journal = JSON.parse(readFileSync(pendingPath));
+      writeFileSync(join(journal.stagingBundleDir, 'entry.js'), '');
+      if (corruptBackup) writeFileSync(join(journal.backupDir, 'entry.js'), 'x.y.z');
+      const recovered = recoverInterruptedJournal(ws);
+      assert.equal(recovered.action, corruptBackup ? 'error' : 'rolled-back');
+      assert.equal(existsSync(pendingPath), corruptBackup);
+      assert.equal(readFileSync(join(ws.pluginsDir, 'reader', 'entry.js'), 'utf8'), '1.0.0');
+      assert.equal(JSON.parse(readFileSync(join(ws.pluginsDir, 'reader', '.agy-market-receipt.json'))).installedVersion, '1.0.0');
+    } finally { ws.cleanup(); }
+  }
+});
+
+test('rollback removes completed additions and keeps new, edited and unrelated user files', async t => {
+  const ws = makeTempWorkspace();
+  t.after(ws.cleanup);
+  const active = join(ws.pluginsDir, 'reader');
+  const install = (version, files, options) => installOrUpdateCatalogPlugin({
+    ...ws, plugin: stagedRelease(ws, 'reader', version, files), ...options });
+  await install('1.0.0', {});
+  writeFileSync(join(active, 'local.txt'), 'before');
+  const additions = { 'a-new.txt': 'package', 'b-edited.txt': 'original', 'z-notes.txt': 'template' };
+  await assert.rejects(install('2.0.0', additions, { writeOverride(src, dst, rel) {
+    if (rel === 'z-notes.txt') throw new Error('interrupted');
+    copyFileSync(src, dst);
+  } }), /interrupted/);
+  const journal = JSON.parse(readFileSync(join(ws.dataDir, 'pending-journal.json')));
+  rmSync(join(journal.stagingBundleDir, 'z-notes.txt'));
+  writeFileSync(join(active, 'z-notes.txt'), 'template'); // identical bytes, but the update never wrote this file
+  writeFileSync(join(active, 'b-edited.txt'), 'changed while market was closed');
+  writeFileSync(join(active, 'local.txt'), 'after');
+  assert.equal(recoverInterruptedJournal(ws).action, 'rolled-back');
+  assert.equal(existsSync(join(active, 'a-new.txt')), false);
+  assert.equal(readFileSync(join(active, 'z-notes.txt'), 'utf8'), 'template');
+  assert.equal(readFileSync(join(active, 'b-edited.txt'), 'utf8'), 'changed while market was closed');
+  assert.equal(readFileSync(join(active, 'local.txt'), 'utf8'), 'after');
+});
+
+test('manual replacement protects host entries that would survive from the old plugin', async t => {
+  const ws = makeTempWorkspace();
+  t.after(ws.cleanup);
+  const active = join(ws.pluginsDir, 'reader');
+  mkdirSync(join(active, 'rules'), { recursive: true });
+  writeFileSync(join(active, 'plugin.json'), JSON.stringify({ name: 'reader', version: '1.0.0' }));
+  const oldRule = join(active, 'rules', 'format.md');
+  writeFileSync(oldRule, 'Original formatting preferences');
+  const plugin = stagedRelease(ws, 'reader', '2.0.0', { 'skills/read/SKILL.md': '# Read' });
+  const install = opts => installOrUpdateCatalogPlugin({ ...ws, plugin, ...opts });
+  const prompt = await install({});
+  await assert.rejects(install({ conflictStrategy: 'replace', replacementKey: prompt.replacementKey }),
+    /ERR_PLUGIN_LAYOUT_CONFLICT.*rules\/format.md/);
+  assert.equal(readFileSync(oldRule, 'utf8'), 'Original formatting preferences');
+  assert.equal(JSON.parse(readFileSync(join(active, 'plugin.json'))).version, '1.0.0');
+  const isolated = await install({ conflictStrategy: 'isolate' });
+  assert.equal(isolated.status, 'INSTALLED');
+  assert.equal(existsSync(join(ws.pluginsDir, isolated.installedDir, 'rules', 'format.md')), false);
+});
+
+test('Windows retries original-path deletes after unlocking and preserves subsequently replaced files',
+  { skip: process.platform !== 'win32', timeout: 30000 }, async t => {
+  for (const operation of ['disable', 'uninstall', 'replacement']) {
+    const ws = makeTempWorkspace();
+    t.after(ws.cleanup);
+    const args = { ...ws, dir: 'reader' };
+    const plugin = stagedRelease(ws, 'reader', '1.0.0', { 'runtime.txt': 'running' });
+    await installOrUpdateCatalogPlugin({ ...ws, plugin });
+    const file = join(ws.pluginsDir, 'reader', 'runtime.txt');
+    const hold = spawn('powershell.exe', ['-NoProfile', '-Command',
+      "$f=[IO.File]::OpenRead($env:AGY_TEST_LOCK); try { [Console]::WriteLine('ready'); [Console]::ReadLine() | Out-Null } finally { $f.Dispose() }"],
+    { env: { ...scrubChildProcessEnv(process.env), AGY_TEST_LOCK: file }, stdio: ['pipe', 'pipe', 'inherit'], windowsHide: true });
+    const exited = once(hold, 'exit');
+    try {
+      await Promise.race([once(hold.stdout, 'data'), exited.then(() => { throw Error('File-lock helper exited early'); })]);
+      if (operation === 'disable') assert.equal(toggleInstalledPlugin({ ...args, enabled: false }).parkedByMarket, true);
+      else assert.equal(removeMarketPluginFiles(args).removed, true);
+      assert.equal(existsSync(file), true);
+    } finally {
+      hold.stdin.end('\n');
+      await exited;
+    }
+    if (operation === 'disable') {
+      assert.equal(toggleInstalledPlugin({ ...args, enabled: true }).enabled, true);
+    } else if (operation === 'uninstall') {
+      assert.equal((await installOrUpdateCatalogPlugin({ ...ws, plugin })).status, 'INSTALLED');
+    } else {
+      rmSync(file);
+      writeFileSync(file, 'created after uninstall');
+      sweepRetiredBinaries(ws.dataDir, { pluginsDir: ws.pluginsDir });
+      assert.equal(readFileSync(file, 'utf8'), 'created after uninstall');
+    }
+  }
+});
+
+test('preserved settings survive case-only renames and later releases on case-insensitive volumes', async t => {
+  const ws = makeTempWorkspace();
+  try {
+    const path = join(ws.pluginsDir, 'reader', 'Config', 'PREFS.json');
+    const install = async (version, settingsPath) => {
+      const plugin = stagedRelease(ws, 'reader', version, { [settingsPath]: 'vendor defaults' });
+      plugin.distribution.preservePaths = ['config/**/prefs.*'];
+      assert.equal((await installOrUpdateCatalogPlugin({ ...ws, plugin })).ok, true);
+    };
+    await install('1.0.0', 'config/prefs.json');
+    if (!existsSync(path)) return t.skip('Case-sensitive filesystem');
+    writeFileSync(path, 'user settings');
+    await install('2.0.0', 'Config/PREFS.json');
+    await install('3.0.0', 'Config/PREFS.json');
+    await install('4.0.0', 'other.json');
+    assert.equal(readFileSync(path, 'utf8'), 'user settings');
+  } finally { ws.cleanup(); }
+});
+
+test('a locked retired entry keeps the old receipt and journal until recovery removes it', async t => {
+  const ws = makeTempWorkspace();
+  try {
+    const path = join(ws.pluginsDir, 'reader', 'old.txt');
+    const install = (version, files) => installOrUpdateCatalogPlugin({ ...ws, plugin: stagedRelease(ws, 'reader', version, files) });
+    await install('1.0.0', { 'old.txt': 'old' });
+    for (const method of ['unlinkSync', 'renameSync']) {
+      const original = fs[method];
+      t.mock.method(fs, method, (file, ...args) => {
+        if (file === path) throw Object.assign(new Error('file in use'), { code: 'EBUSY' });
+        return original(file, ...args);
+      });
+    }
+    syncBuiltinESMExports();
+    try {
+      await assert.rejects(install('2.0.0', {}), /file in use/);
+      assert.equal(recoverInterruptedJournal(ws).action, 'error');
+      assert.equal(JSON.parse(readFileSync(join(ws.pluginsDir, 'reader', '.agy-market-receipt.json'))).installedVersion, '1.0.0');
+    } finally {
+      t.mock.restoreAll();
+      syncBuiltinESMExports();
+    }
+    assert.equal(recoverInterruptedJournal(ws).action, 'completed-forward');
+    assert.equal(existsSync(path), false);
+    assert.equal(existsSync(join(ws.dataDir, 'pending-journal.json')), false);
+  } finally { ws.cleanup(); }
+});
+
+test('GitHub URL installation and an official catalog self-update respect unmanaged Git checkouts', async () => {
+  const ws = makeTempWorkspace();
+  try {
+    for (const name of ['reader', 'agy-market']) {
+      const plugin = stagedRelease(ws, name, '2.0.0', { 'work.md': 'published content' });
+      const dir = join(ws.pluginsDir, name);
+      mkdirSync(dir);
+      // A linked Git worktree uses a .git file, an ordinary checkout a directory.
+      if (name === 'reader') mkdirSync(join(dir, '.git'));
+      else writeFileSync(join(dir, '.git'), 'gitdir: ../worktrees/market');
+      writeFileSync(join(dir, 'plugin.json'), JSON.stringify({ name, version: '1.0.0', repository: plugin.repository.url }));
+      writeFileSync(join(dir, 'work.md'), 'uncommitted edits');
+      if (name === 'reader') {
+        const fetchImpl = async url => String(url).includes('api.github.com') ? Response.json({}, { status: 404 }) :
+          new Response(readFileSync(fileURLToPath(plugin.distribution.tarballUrl)));
+        const preview = await inspectGithubPluginUrl({ ...ws, url: plugin.repository.url + '/tree/main', fetchImpl });
+        await assert.rejects(installGithubPlugin({ ...ws, inspectToken: preview.inspectToken, fetchImpl }), /ERR_UNMANAGED_GIT_OR_UNVERSIONED/);
+      } else {
+        await assert.rejects(installOrUpdateCatalogPlugin({ ...ws, plugin }), /ERR_UNMANAGED_GIT_OR_UNVERSIONED/);
+      }
+      assert.equal(readFileSync(join(dir, 'work.md'), 'utf8'), 'uncommitted edits');
+      assert.equal(existsSync(join(dir, '.agy-market-receipt.json')), false);
+    }
+  } finally { ws.cleanup(); }
+});
+
+test('forward recovery and rollback leave replacement plugin directories untouched', async () => {
+  for (const mode of ['forward', 'rollback', 'first-install', 'recreated-directory', 'legacy-journal']) {
+    const ws = makeTempWorkspace();
+    try {
+      const dir = join(ws.pluginsDir, 'reader');
+      if (mode !== 'first-install') await installOrUpdateCatalogPlugin({ ...ws, plugin: stagedRelease(ws, 'reader', '1.0.0') });
+      await assert.rejects(installOrUpdateCatalogPlugin({ ...ws, plugin: stagedRelease(ws, 'reader', '2.0.0', { 'code.js': 'upstream' }),
+        writeOverride() { throw new Error('interrupted'); } }), /interrupted/);
+      const journalPath = join(ws.dataDir, 'pending-journal.json');
+      const record = JSON.parse(readFileSync(journalPath));
+      if (mode === 'rollback') rmSync(join(record.stagingBundleDir, 'code.js'));
+      if (mode === 'legacy-journal') {
+        delete record.targetIdentity;
+        writeFileSync(journalPath, JSON.stringify(record));
+      }
+      if (mode === 'recreated-directory') {
+        const old = join(ws.root, 'other-installation');
+        renameSync(dir, old);
+        mkdirSync(dir);
+        copyFileSync(join(old, 'plugin.json'), join(dir, 'plugin.json'));
+      } else {
+        // External tools can replace metadata while retaining the original directory.
+        writeFileSync(join(dir, 'plugin.json'), JSON.stringify({ name: 'other', repository: 'https://github.com/other/project' }));
+      }
+      writeFileSync(join(dir, 'code.js'), 'local work');
+      const before = readFileSync(join(dir, 'plugin.json'));
+      const recovery = recoverInterruptedJournal(ws);
+      assert.match(recovery.error, /ERR_RECOVERY_TARGET_CHANGED/);
+      assert.deepEqual(readFileSync(join(dir, 'plugin.json')), before);
+      assert.equal(readFileSync(join(dir, 'code.js'), 'utf8'), 'local work');
+      assert.equal(recovery.action, 'target-changed');
+      assert.equal(existsSync(journalPath), false);
+      assert.ok(existsSync(recovery.journalPath));
+      assert.ok(existsSync(record.stagingBundleDir));
+      const unrelated = await installOrUpdateCatalogPlugin({ ...ws, plugin: stagedRelease(ws, 'unrelated', '1.0.0') });
+      assert.ok(unrelated.ok);
+    } finally { ws.cleanup(); }
+  }
+});
 
 test('Cross-repo dogfooding: packed agy-market.tar.gz passes agy-market-catalog 10-field & 4-layer gate', async () => {
   const packed = await packReleaseBundle();
@@ -276,6 +681,16 @@ test('Installer enforces SHA-256 tamper protection, Track-2 <owner>--<slug> rewr
       },
     };
 
+    const occupied = join(ws.pluginsDir, 'other-directory');
+    mkdirSync(occupied);
+    writeFileSync(join(occupied, 'plugin.json'), JSON.stringify({ name: 'code-lens', version: '0.1.0' }));
+    await assert.rejects(installOrUpdateCatalogPlugin({
+      plugin: { ...v1Plugin, canonicalName: 'catalog-label' }, configDir: ws.configDir, dataDir: ws.dataDir,
+    }), /ERR_UPDATE_TARGET_MISMATCH/);
+    assert.equal(existsSync(join(ws.pluginsDir, 'catalog-label')), false);
+    assert.equal(JSON.parse(readFileSync(join(occupied, 'plugin.json'))).version, '0.1.0');
+    rmSync(occupied, { recursive: true });
+
     // 1. Tampered SHA-256 must hard-abort with INTEGRITY_SHA256_MISMATCH
     await assert.rejects(
       () =>
@@ -362,7 +777,7 @@ test('Installer enforces SHA-256 tamper protection, Track-2 <owner>--<slug> rewr
       plugin: v2Plugin,
       configDir: ws.configDir,
       dataDir: ws.dataDir,
-      confirmEscalation: true,
+      confirmEscalation: true, approvalKey: paused.escalation.approvalKey,
       writeOverride(src, dst, rel) {
         if (rel === 'bin/helper.exe' && !simulatedLockHit) {
           simulatedLockHit = true;
@@ -497,6 +912,13 @@ test('Sidecar HTTP server enforces X-Sidecar-Token & Origin CSRF guards and CLI 
       assert.equal(health.statusCode, 200);
       assert.equal(health.json().plugin, 'agy-market');
 
+      const wrongHost = await srv.inject({ url: '/', headers: { Host: 'catalog.example' } });
+      assert.equal(wrongHost.statusCode, 403);
+      assert.equal(wrongHost.text.includes(srv.sideToken), false);
+      const opaque = await srv.inject({ method: 'POST', url: '/api/prefs',
+        headers: { Origin: 'null', 'X-Sidecar-Token': srv.sideToken }, body: { locale: 'en' } });
+      assert.equal(opaque.statusCode, 403);
+
       // Missing X-Sidecar-Token -> 403 Forbidden
       const noToken = await srv.inject({
         method: 'POST',
@@ -541,10 +963,28 @@ test('Sidecar HTTP server enforces X-Sidecar-Token & Origin CSRF guards and CLI 
       await srv.close();
     }
 
+    const doctor = () => runCli(['doctor', '--dest', ws.pluginsDir, '--json'], { dataDir: ws.dataDir });
+    assert.equal((await doctor()).code, 1);
+    const emptyDir = join(ws.pluginsDir, 'agy-market');
+    mkdirSync(emptyDir);
+    assert.equal((await doctor()).code, 1);
+    writeFileSync(join(emptyDir, 'plugin.json'), '{broken');
+    assert.equal((await doctor()).code, 1);
+    const unknown = await runCli(['typo', '--json']);
+    assert.equal(unknown.code, 1);
+    await assert.rejects(runCli(['install', '--dest', ws.pluginsDir], { dataDir: ws.dataDir }), /ERR_BOOTSTRAP_CONFLICT/);
+    assert.equal(readFileSync(join(emptyDir, 'plugin.json'), 'utf8'), '{broken');
+    rmSync(join(emptyDir, 'plugin.json'));
     // CLI install + doctor check into isolated pluginsDir
-    const cliInstall = await runCli(['install', '--dest', ws.pluginsDir, '--json']);
+    const cliInstall = await runCli(['install', '--dest', ws.pluginsDir, '--json'], { dataDir: ws.dataDir });
     assert.equal(cliInstall.code, 0);
-    const cliDoctor = await runCli(['doctor', '--dest', ws.pluginsDir, '--json']);
+    const selfDir = join(ws.pluginsDir, 'agy-market');
+    writeFileSync(join(selfDir, '.agy-market-receipt.json'), '{');
+    writeFileSync(join(selfDir, 'user-notes.txt'), 'keep');
+    assert.equal((await runCli(['install', '--dest', ws.pluginsDir, '--json'], { dataDir: ws.dataDir })).code, 0);
+    assert.equal(readFileSync(join(selfDir, 'user-notes.txt'), 'utf8'), 'keep');
+    assert.ok(Array.isArray(JSON.parse(readFileSync(join(selfDir, '.agy-market-receipt.json'))).managedFiles));
+    const cliDoctor = await doctor();
     assert.equal(cliDoctor.code, 0);
   } finally {
     ws.cleanup();
@@ -552,7 +992,7 @@ test('Sidecar HTTP server enforces X-Sidecar-Token & Origin CSRF guards and CLI 
 });
 
 
-test('Real-world plugin manifest compatibility: author string/object, repo {type,url}/README fallback, PNG logo & custom sidecar path', () => {
+test('Real-world plugin manifest compatibility: author string/object, repo {type,url}/README fallback, PNG logo & custom sidecar path', async () => {
   const ws = makeTempWorkspace('agy-real-compat-');
   try {
     // 1. agy-dart shape: repository { type, url } + author { name, url }
@@ -655,8 +1095,23 @@ test('Real-world plugin manifest compatibility: author string/object, repo {type
       },
       inv,
     );
-    assert.equal(preflightNeko.action, 'update');
-    assert.equal(preflightNeko.targetDir, 'gemini-neko-cockpit');
+    assert.equal(preflightNeko.action, 'conflict-prompt');
+    assert.equal(preflightNeko.conflict.dir, 'gemini-neko-cockpit');
+    const broken = join(ws.pluginsDir, 'unrelated');
+    mkdirSync(broken);
+    writeFileSync(join(broken, 'plugin.json'), 'null');
+    const fresh = scanLocalPluginInventory({ configDir: ws.configDir, bypassCache: true });
+    assert.ok(fresh.installed.some(loc => loc.dir === 'agy-dart'));
+    assert.ok(!fresh.installed.some(loc => loc.dir === 'unrelated'));
+    const reader = join(ws.pluginsDir, 'reader');
+    mkdirSync(reader);
+    writeFileSync(join(reader, 'plugin.json'), JSON.stringify({ name: 'reader', version: '1.0.0' }));
+    writeFileSync(join(reader, 'README.md'), 'Credits: https://github.com/example/reader');
+    writeFileSync(join(reader, 'entry.mjs'), 'local work');
+    const offer = await installOrUpdateCatalogPlugin({ ...ws,
+      plugin: stagedRelease(ws, 'reader', '2.0.0', { 'entry.mjs': 'upstream code' }) });
+    assert.equal(offer.status, 'CONFLICT_CHOICE_REQUIRED');
+    assert.equal(readFileSync(join(reader, 'entry.mjs'), 'utf8'), 'local work');
   } finally {
     ws.cleanup();
   }
@@ -827,7 +1282,7 @@ function buildTarGzWithGlobalPax(entries, { globalPaxComment = '' } = {}) {
   return gzipSync(Buffer.concat(chunks), { level: 6 });
 }
 
-test('fetchVerifiedPluginTarball hardens commit-pinned GitHub archive fallback with PAX commitSha & digest verification', async () => {
+test('fetchVerifiedPluginTarball hardens commit-pinned GitHub archive fallback with catalog-pinned archive digests', async () => {
   const commitSha = 'eb55259f0e17ec75794e7a3fad411a177eb94bb7';
   const otherCommitSha = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 
@@ -901,7 +1356,7 @@ test('fetchVerifiedPluginTarball hardens commit-pinned GitHub archive fallback w
     const expectedSha = createHash('sha256').update(expectedOldPayload).digest('hex');
     const validCommitSha256 = createHash('sha256').update(validCommitPayload).digest('hex');
 
-    // 1. Tag drift (INTEGRITY_SHA256_MISMATCH on direct github.com) -> valid PAX commit fallback succeeds & forwards auth header
+    // 1. Tag drift (INTEGRITY_SHA256_MISMATCH on direct github.com) -> digest-pinned commit fallback succeeds & forwards auth header
     const requestedUrls = [];
     const seenAuthHeaders = {};
     const mockFetchDrift = async (url, init = {}) => {
@@ -925,6 +1380,7 @@ test('fetchVerifiedPluginTarball hardens commit-pinned GitHub archive fallback w
         distribution: {
           tarballUrl: 'https://github.com/zou172866/agy-dart/archive/refs/tags/v1.7.0.tar.gz',
           sha256: expectedSha,
+          commitFallbackSha256: validCommitSha256,
         },
       },
       stagingDir: join(stageRoot, 'stage-1'),
@@ -945,7 +1401,7 @@ test('fetchVerifiedPluginTarball hardens commit-pinned GitHub archive fallback w
       'Bearer mock-fallback-auth-token',
     );
 
-    // 2. Tag deleted (HTTP 404 on direct github.com) -> valid PAX commit fallback succeeds & returns real sha256
+    // 2. Tag deleted (HTTP 404 on direct github.com) -> digest-pinned commit fallback succeeds & returns real sha256
     const notFoundResult = await fetchVerifiedPluginTarball({
       plugin: {
         id: 'zou172866__agy-dart',
@@ -954,6 +1410,7 @@ test('fetchVerifiedPluginTarball hardens commit-pinned GitHub archive fallback w
         distribution: {
           tarballUrl: 'https://github.com/zou172866/agy-dart/archive/refs/tags/v1.7.0.tar.gz',
           sha256: expectedSha,
+          commitFallbackSha256: validCommitSha256,
         },
       },
       stagingDir: join(stageRoot, 'stage-404'),
@@ -970,6 +1427,18 @@ test('fetchVerifiedPluginTarball hardens commit-pinned GitHub archive fallback w
     });
     assert.equal(notFoundResult.channelUsed, 'github-commit-fallback');
     assert.equal(notFoundResult.sha256, validCommitSha256);
+
+    const noFallbackPin = join(stageRoot, 'stage-no-fallback-pin');
+    await assert.rejects(fetchVerifiedPluginTarball({
+      plugin: {
+        id: 'zou172866__agy-dart', version: '1.7.0', commitSha,
+        distribution: { tarballUrl: requestedUrls[0], sha256: expectedSha },
+      },
+      stagingDir: noFallbackPin,
+      stagingArchivePath: join(noFallbackPin, 'archive.tar.gz'),
+      fetchImpl: mockFetchDrift,
+    }), /INTEGRITY_SHA256_MISMATCH/);
+    assert.equal(existsSync(noFallbackPin), false);
 
     // 3. Forged fallback archive WITHOUT PAX comment MUST be rejected & staging archive deleted
     const forgedStageNoPax = join(stageRoot, 'stage-forged-no-pax');
@@ -1145,6 +1614,7 @@ test('fetchVerifiedPluginTarball hardens commit-pinned GitHub archive fallback w
           distribution: {
             tarballUrl: 'https://github.com/zou172866/agy-dart/archive/refs/tags/v1.7.0.tar.gz',
             sha256: expectedSha,
+            commitFallbackSha256: validCommitSha256,
           },
           capabilities: { badges: [], mcpRemoteDomains: [], hookEvents: [] },
         },
@@ -1165,4 +1635,493 @@ test('fetchVerifiedPluginTarball hardens commit-pinned GitHub archive fallback w
   } finally {
     rmSync(stageRoot, { recursive: true, force: true });
   }
+});
+
+test('file extraction retains executable and non-executable modes on POSIX', { skip: process.platform === 'win32' }, async () => {
+  const ws = makeTempWorkspace();
+  try {
+    const archive = join(ws.artifactsDir, 'modes.tar.gz');
+    writeFileSync(archive, createDeterministicTarGz({ 'bin/run': 'example', 'bin/empty': '', 'plugin.json': '{}' }));
+    for (const [name, extract] of [['stream', extractTarGzStreamToDir], ['buffer', extractTarGzToDir]]) {
+      const out = join(ws.root, name);
+      await extract(archive, out);
+      const expectedExec = 0o111 & ~process.umask();
+      for (const file of ['bin/run', 'bin/empty']) assert.equal(statSync(join(out, file)).mode & 0o111, expectedExec);
+      assert.equal(statSync(join(out, 'plugin.json')).mode & 0o111, 0);
+    }
+  } finally { ws.cleanup(); }
+});
+
+test('invalid catalog responses use another source and preserve the last usable offline index', async () => {
+  const ws = makeTempWorkspace();
+  try {
+    const options = { dataDir: ws.dataDir, prefs: { networkMode: 'direct', enableExperimentalTrack2: false } };
+    const valid = { plugins: [{ id: 'demo__reader', canonicalName: 'demo__reader', version: '1.0.0' }] };
+    const resolved = await resolveMarketCatalog({ ...options, fetchImpl: async url =>
+      Response.json(String(url).includes('raw.githubusercontent.com') ? valid : { message: 'outage' }) });
+    assert.equal(resolved.channelUsed, 'github-raw-gh-pages');
+    const offline = await resolveMarketCatalog({ ...options, fetchImpl: async () => Response.json({ plugins: [null] }) });
+    assert.equal(offline.channelUsed, 'disk-cache-offline');
+    assert.deepEqual(offline.plugins.map(p => p.id), ['demo__reader']);
+    const empty = await resolveMarketCatalog({ ...options, fetchImpl: async () => Response.json({ plugins: [] }) });
+    assert.equal(empty.channelUsed, 'github-pages');
+    assert.deepEqual(empty.plugins, []);
+  } finally { ws.cleanup(); }
+});
+
+test('a withdrawn custom feed stays withdrawn offline until it publishes a new index', async t => {
+  const ws = makeTempWorkspace();
+  t.after(ws.cleanup);
+  const feed = 'https://company.example/reader/index.json';
+  const other = 'https://company.example/tools/index.json';
+  const plugin = id => ({ id, canonicalName: id, version: '1.0.0' });
+  let status = 200;
+  let version = 'old-reader';
+  const fetchImpl = async (url, init) => {
+    if (url === feed) {
+      if (status === 0) throw new Error('offline');
+      if (status === 410) return new Response(null, { status });
+      if (version === 'new-reader') assert.equal(init.headers['If-None-Match'], undefined);
+      return Response.json({ plugins: [plugin(version)] }, { headers: { etag: '"reader"' } });
+    }
+    return Response.json({ plugins: url === other ? [plugin('tools')] : [] });
+  };
+  const load = async () => (await resolveMarketCatalog({ dataDir: ws.dataDir,
+    prefs: { customFeeds: [feed, other] }, fetchImpl })).plugins.map(p => p.id);
+  assert.deepEqual(await load(), ['old-reader', 'tools']);
+  // Older versions cached a second copy by position.
+  const cache = join(ws.dataDir, 'cache', 'custom-feed-0');
+  writeFileSync(cache + '.json', JSON.stringify({ plugins: [plugin('legacy-reader')] }));
+  writeFileSync(cache + '.meta.json', JSON.stringify({ url: feed }));
+  status = 410;
+  assert.deepEqual(await load(), ['tools']);
+  status = 0;
+  assert.deepEqual(await load(), ['tools']);
+  status = 200;
+  version = 'new-reader';
+  assert.deepEqual(await load(), ['new-reader', 'tools']);
+  status = 0;
+  assert.deepEqual(await load(), ['new-reader', 'tools']);
+});
+
+test('offline primary catalogs, discovery and README data follow the selected feed', async () => {
+  const ws = makeTempWorkspace();
+  const a = 'https://a.example/catalog';
+  const b = 'https://b.example/catalog';
+  const offline = async () => { throw new Error('offline'); };
+  const options = primaryCatalogUrl => ({ dataDir: ws.dataDir,
+    prefs: { primaryCatalogUrl, networkMode: 'direct', enableExperimentalTrack2: true } });
+  const load = (url, fetchImpl) => resolveMarketCatalog({ ...options(url), fetchImpl, includeReadmes: true });
+  try {
+    const fetchSource = async url => {
+      const host = new URL(url).hostname[0];
+      if (url.includes('/readmes/')) return Response.json({ id: 'common', default: host });
+      if (url.endsWith('/readmes.json')) return Response.json({ entries: { common: host } });
+      const id = host + (url.endsWith('/unverified-index.json') ? '-experimental' : '-verified');
+      return Response.json({ plugins: [{ id, canonicalName: id, version: '1.0.0' }] });
+    };
+    await load(a, fetchSource);
+    await fetchPluginReadme({ ...options(a), id: 'common', fetchImpl: fetchSource });
+    const firstB = await load(b, offline);
+    assert.deepEqual(firstB.plugins, []);
+    assert.equal((await fetchPluginReadme({ ...options(b), id: 'common', fetchImpl: offline })).ok, false);
+    await load(b, fetchSource);
+    const againA = await load(a, offline);
+    assert.deepEqual(againA.plugins.map(p => p.id).sort(), ['a-experimental', 'a-verified']);
+    assert.equal((await fetchPluginReadme({ ...options(a), id: 'common', fetchImpl: offline })).default, 'a');
+  } finally { ws.cleanup(); }
+});
+
+test('PowerShell bootstrap recognizes its interrupted additions and preserves later user edits', { skip: process.platform !== 'win32' }, t => {
+  const ws = makeTempWorkspace();
+  t.after(ws.cleanup);
+  const target = join(ws.pluginsDir, 'agy-market');
+  const script = fileURLToPath(new URL('../scripts/install.ps1', import.meta.url));
+  const archive = join(ws.artifactsDir, 'agy-market.tar.gz');
+  const receiptPath = join(target, '.agy-market-receipt.json');
+  function publish(version, files) {
+    const tar = createDeterministicTarGz({
+      'plugin.json': JSON.stringify({ name: 'agy-market', version, repository: 'https://github.com/azwosile/agy-market' }),
+      'z-runtime.mjs': version,
+      ...files,
+    });
+    writeFileSync(archive, tar);
+    writeFileSync(archive + '.sha256', createHash('sha256').update(tar).digest('hex'));
+  }
+  const env = { ...scrubChildProcessEnv(process.env), ANTIGRAVITY_CONFIG_DIR: ws.configDir,
+    AGY_MARKET_DATA_DIR: ws.dataDir, BOOT_SCRIPT: script, BOOT_URL: pathToFileURL(ws.artifactsDir).href,
+    BOOT_LOCK: join(target, 'z-runtime.mjs') };
+  const invoke = '& $env:BOOT_SCRIPT -ReleaseBaseUrl $env:BOOT_URL';
+  const run = cmd => execFileSync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', cmd], { env, stdio: 'pipe' });
+  publish('1.0.0', {});
+  run(invoke);
+  const previous = readFileSync(receiptPath, 'utf8');
+  publish('2.0.0', { 'a-helper.mjs': 'helper', 'b-notes.txt': 'draft' });
+  assert.throws(() => run("$ErrorActionPreference = 'Stop'; $lock = [IO.File]::OpenRead($env:BOOT_LOCK); try { " + invoke + ' } finally { $lock.Dispose() }'));
+  assert.equal(readFileSync(receiptPath, 'utf8'), previous);
+  assert.equal(JSON.parse(readFileSync(join(target, 'plugin.json'))).version, '1.0.0');
+  assert.equal(readFileSync(join(target, 'a-helper.mjs'), 'utf8'), 'helper');
+  writeFileSync(join(target, 'b-notes.txt'), 'my notes');
+  assert.throws(() => run(invoke), /ERR_PLUGIN_LAYOUT_CONFLICT/);
+  assert.equal(readFileSync(receiptPath, 'utf8'), previous);
+  publish('3.0.0', { 'a-helper.mjs': 'revised helper' });
+  run(invoke);
+  assert.equal(JSON.parse(readFileSync(receiptPath)).installedVersion, '3.0.0');
+  assert.equal(readFileSync(join(target, 'a-helper.mjs'), 'utf8'), 'revised helper');
+  assert.equal(readFileSync(join(target, 'b-notes.txt'), 'utf8'), 'my notes');
+  assert.equal(existsSync(join(target, '.agy-market-bootstrap-pending')), false);
+});
+
+test('OS bootstrap removes only retired managed files and preserves the next inventory', () => {
+  const ws = makeTempWorkspace();
+  const target = join(ws.pluginsDir, 'agy-market');
+  const script = fileURLToPath(new URL(process.platform === 'win32' ? '../scripts/install.ps1' : '../scripts/install.sh', import.meta.url));
+  try {
+    const tar = createDeterministicTarGz({
+      'plugin.json': JSON.stringify({ name: 'agy-market', version: '1.7.3' }),
+      'skills/current/SKILL.md': 'current', 'settings.txt': 'default',
+    });
+    const tarPath = join(ws.artifactsDir, 'agy-market.tar.gz');
+    writeFileSync(tarPath, tar);
+    writeFileSync(tarPath + '.sha256', createHash('sha256').update(tar).digest('hex') + '  agy-market.tar.gz\n');
+    mkdirSync(join(target, 'skills/old'), { recursive: true });
+    writeFileSync(join(target, 'skills/old/SKILL.md'), 'retired');
+    writeFileSync(join(target, 'settings.txt'), 'my settings');
+    writeFileSync(join(target, 'notes.txt'), 'my notes');
+    writeFileSync(join(target, '.agy-market-receipt.json'), JSON.stringify({
+      id: 'azwosile__agy-market', managedFiles: ['skills/old/SKILL.md', 'settings.txt'], preservePaths: ['settings.txt'],
+    }));
+    const stage = join(ws.dataDir, 'staging', 'self-update');
+    mkdirSync(stage, { recursive: true });
+    writeFileSync(join(stage, 'plugin.json'), JSON.stringify({ name: 'agy-market', version: '1.7.2' }));
+    writePendingJournal(ws.dataDir, { dir: 'agy-market', pluginsDir: ws.pluginsDir, stagingRootDir: stage, stagingBundleDir: stage });
+    const env = { ...scrubChildProcessEnv(process.env), ANTIGRAVITY_CONFIG_DIR: ws.configDir, AGY_MARKET_DATA_DIR: ws.dataDir };
+    let runBootstrap;
+    if (process.platform === 'win32') {
+      runBootstrap = () => execFileSync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script,
+        '-ReleaseBaseUrl', pathToFileURL(ws.artifactsDir).href], { env, stdio: 'pipe' });
+    } else {
+      // Provide local release bytes in the same CLI shape as curl; keep the test offline.
+      const bin = join(ws.root, 'bin');
+      mkdirSync(bin);
+      writeFileSync(join(bin, 'curl'), '#!/bin/sh\ncp "$2" "$4"\n', { mode: 0o755 });
+      runBootstrap = () => execFileSync('sh', [script], { env: { ...env, PATH: bin + ':' + env.PATH, AGY_MARKET_RELEASE_URL: ws.artifactsDir }, stdio: 'pipe' });
+    }
+
+    const unlock = acquirePluginMutation(ws.dataDir);
+    try { assert.throws(runBootstrap, /ERR_PLUGIN_OPERATION_BUSY/); }
+    finally { unlock(); }
+    assert.ok(existsSync(join(stage, 'plugin.json')));
+    assert.equal(existsSync(join(target, 'plugin.json')), false);
+    runBootstrap();
+    assert.equal(recoverInterruptedJournal(ws).action, 'none');
+    assert.equal(existsSync(stage), false);
+    assert.equal(JSON.parse(readFileSync(join(target, 'plugin.json'))).version, '1.7.3');
+    assert.equal(existsSync(join(target, 'skills/old/SKILL.md')), false);
+    assert.equal(readFileSync(join(target, 'settings.txt'), 'utf8'), 'my settings');
+    assert.equal(readFileSync(join(target, 'notes.txt'), 'utf8'), 'my notes');
+    const receipt = JSON.parse(readFileSync(join(target, '.agy-market-receipt.json'), 'utf8'));
+    assert.deepEqual(receipt.managedFiles.sort(), ['plugin.json', 'settings.txt', 'skills/current/SKILL.md']);
+    assert.deepEqual(receipt.preservePaths, ['settings.txt']);
+    const receiptPath = join(target, '.agy-market-receipt.json');
+    const manifestPath = join(target, 'plugin.json');
+    const officialManifest = readFileSync(manifestPath, 'utf8');
+    const conflictingReceipt = { ...receipt, id: 'internal__market', managedFiles: ['notes.txt'] };
+    writeFileSync(receiptPath, JSON.stringify(conflictingReceipt));
+    assert.throws(runBootstrap, /ERR_BOOTSTRAP_CONFLICT/);
+    assert.equal(readFileSync(join(target, 'notes.txt'), 'utf8'), 'my notes');
+    assert.deepEqual(JSON.parse(readFileSync(receiptPath)), conflictingReceipt);
+    writeFileSync(receiptPath, JSON.stringify({ ...receipt, managedFiles: ['settings.txt', 'plugin.json'] }));
+    assert.throws(runBootstrap, /ERR_PLUGIN_LAYOUT_CONFLICT/);
+    assert.equal(readFileSync(manifestPath, 'utf8'), officialManifest);
+    writeFileSync(receiptPath, JSON.stringify(receipt));
+    // A bootstrap only supersedes an active self-update at this exact plugins root.
+    writePendingJournal(ws.dataDir, { dir: 'agy-market', pluginsDir: join(ws.root, 'other-plugins'), stagingRootDir: stage });
+    runBootstrap();
+    assert.equal(JSON.parse(readFileSync(join(ws.dataDir, 'pending-journal.json'))).pluginsDir, join(ws.root, 'other-plugins'));
+  } finally { ws.cleanup(); }
+});
+
+test('saving sources distinguishes invalid addresses, saved unavailable feeds and a recovered feed', async () => {
+  const ws = makeTempWorkspace();
+  const feed = 'https://team.example/index.json';
+  let fail = true;
+  const srv = await createMarketSidecarServer({ ...ws, listen: false, recoveryDelayMs: -1, fetchImpl: async url =>
+    String(url) === feed && fail ? new Response('', { status: 503 }) : Response.json({ plugins: [] }) });
+  const save = customFeeds => srv.inject({ method: 'POST', url: '/api/sources',
+    headers: { 'x-sidecar-token': srv.sideToken }, body: { customFeeds } });
+  try {
+    const saved = (await save([feed])).json();
+    assert.deepEqual(saved.prefs.customFeeds, [feed]);
+    assert.deepEqual(saved.catalog.failedCustomFeeds, [{ url: feed, status: '503' }]);
+    const invalid = await save([feed, 'team.example/catalog']);
+    assert.equal(invalid.statusCode, 400);
+    assert.match(invalid.json().error, /Feed 2/);
+    assert.deepEqual(JSON.parse(readFileSync(join(ws.dataDir, 'prefs.json'))).customFeeds, [feed]);
+    fail = false;
+    assert.deepEqual((await save([feed])).json().catalog.failedCustomFeeds, []);
+  } finally { await srv.close(); ws.cleanup(); }
+});
+
+test('native conflicts and reserved market names follow platform casing', () => {
+  const existing = { scope: 'global', dir: 'MyPlugin', name: 'OtherManifest', repositoryUrl: 'https://github.com/another/tool' };
+  const plugin = { id: 'demo__myplugin', canonicalName: 'myplugin', repository: { url: 'https://github.com/demo/tool' } };
+  const plan = resolveInstallPreflight(plugin, { installed: [existing] });
+  assert.equal(plan.action, process.platform === 'win32' ? 'conflict-prompt' : 'install-native');
+  if (process.platform === 'win32') {
+    assert.equal(resolveInstallPreflight({ ...plugin, canonicalName: 'othermanifest' }, { installed: [existing] }).action, 'conflict-prompt');
+    const replaced = resolveInstallPreflight(plugin, { installed: [existing] }, { conflictStrategy: 'replace' });
+    assert.equal(replaced.targetDir, 'MyPlugin');
+    assert.throws(() => resolveInstallPreflight({ ...plugin, canonicalName: 'AGY-MARKET' },
+      { installed: [{ ...existing, dir: 'agy-market' }] }, { conflictStrategy: 'replace' }), /CANNOT_REPLACE_SELF/);
+  }
+});
+
+test('interrupted sync leaves previously retired binaries available for collection', () => {
+  const ws = makeTempWorkspace();
+  const dst = join(ws.pluginsDir, 'worker');
+  const stage = join(ws.dataDir, 'bundle');
+  try {
+    for (const dir of [dst, stage]) mkdirSync(dir);
+    writeFileSync(join(stage, 'a.exe'), 'new');
+    writeFileSync(join(stage, 'z.txt'), 'after binary');
+    writeFileSync(join(dst, 'a.exe'), 'old');
+    assert.throws(() => syncDirectoryLockSafe({ stagingBundleDir: stage, targetPluginDir: dst, dataDir: ws.dataDir,
+      writeOverride(src, dest, rel) {
+        if (rel === 'a.exe') throw Object.assign(new Error('busy'), { code: 'EBUSY' });
+        throw new Error('disk interrupted');
+      } }), /disk interrupted/);
+    const [retired] = JSON.parse(readFileSync(join(ws.dataDir, 'retired-binaries.json')));
+    assert.equal(readFileSync(retired, 'utf8'), 'old');
+    assert.equal(readFileSync(join(dst, 'a.exe'), 'utf8'), 'new');
+    sweepRetiredBinaries(ws.dataDir);
+    assert.equal(existsSync(retired), false);
+  } finally { ws.cleanup(); }
+});
+
+test('recovery rejects empty and malformed plugin directory names before writing', () => {
+  const ws = makeTempWorkspace();
+  const stage = join(ws.dataDir, 'staging', 'bundle');
+  try {
+    mkdirSync(stage, { recursive: true });
+    writeFileSync(join(stage, 'plugin.json'), '{}');
+    for (const dir of ['', ' ', '..', 'bad:name']) {
+      writeFileSync(join(ws.dataDir, 'pending-journal.json'), JSON.stringify({ dir, stagingBundleDir: stage }));
+      assert.equal(recoverInterruptedJournal(ws).action, 'error');
+      assert.equal(existsSync(join(ws.pluginsDir, 'plugin.json')), false);
+      assert.equal(existsSync(join(stage, 'plugin.json')), true);
+    }
+  } finally { ws.cleanup(); }
+});
+
+test('README inline markup keeps images as alt text and linked badges clickable', () => {
+  const image = '![Build](https://img.example/badge.svg)';
+  const html = renderSafeMarkdown(image + ' [' + image + '](https://example.com/build) ' + '`' + image + '`');
+  assert.match(html, /<span class="md-img-alt">\[Build\]<\/span>/);
+  assert.match(html, /<a href="https:\/\/example\.com\/build"[^>]*>Build<\/a>/);
+  assert.match(html, /<code class="md-code">!\[Build\]/);
+  assert.doesNotMatch(html, /<img|href="https:\/\/img\.example/);
+});
+
+test('README lookup distinguishes a failed server from genuinely absent documentation', async () => {
+  const ws = makeTempWorkspace();
+  try {
+    const lookup = status => fetchPluginReadme({ id: 'demo__tool', dataDir: ws.dataDir,
+      primaryBaseUrl: 'https://team.example', fetchImpl: async () => new Response(null, { status }) });
+    assert.equal((await lookup(503)).channel, 'unavailable');
+    assert.equal((await lookup(404)).channel, 'not-found');
+  } finally { ws.cleanup(); }
+});
+
+test('JSONC preserves punctuation in string values while removing trailing commas after comments', () => {
+  const pattern = '[0-9]{1,},]';
+  assert.deepEqual(parseJsonc('{"match":' + JSON.stringify(pattern) + ',"list":["a, }", /* note */ ],}'),
+    { match: pattern, list: ['a, }'] });
+});
+
+test('isolate-rename preserves vendor docs and restores originals if rewriting the receipt fails', () => {
+  const ws = makeTempWorkspace();
+  const src = join(ws.pluginsDir, 'reader');
+  const dst = join(ws.pluginsDir, 'local--reader');
+  try {
+    mkdirSync(join(src, 'node_modules', 'other'), { recursive: true });
+    mkdirSync(join(src, '.git'));
+    const manifest = JSON.stringify({ name: 'reader', description: '[0-9]{1,}' });
+    const md = 'Open sidecar://reader/pane/';
+    writeFileSync(join(src, 'plugin.json'), manifest);
+    for (const path of ['README.md', '.git/doc.md', 'node_modules/other/doc.md']) writeFileSync(join(src, path), md);
+    const dangling = join(src, 'broken-link');
+    symlinkSync(join(ws.root, 'absent'), dangling, process.platform === 'win32' ? 'junction' : 'dir');
+    const fix = () => fixLocalConflict({ ...ws, type: 'isolate-rename', targetDir: 'reader', suggestedDir: 'local--reader' });
+    writeFileSync(join(src, '.agy-market-receipt.json'), '{bad');
+    assert.throws(fix);
+    assert.equal(existsSync(dst), false);
+    assert.equal(readFileSync(join(src, 'plugin.json'), 'utf8'), manifest);
+    assert.equal(readFileSync(join(src, 'README.md'), 'utf8'), md);
+    writeFileSync(join(src, '.agy-market-receipt.json'), '{}');
+    assert.equal(fix().ok, true);
+    assert.equal(JSON.parse(readFileSync(join(dst, 'plugin.json'))).description, '[0-9]{1,}');
+    assert.match(readFileSync(join(dst, 'README.md'), 'utf8'), /local--reader/);
+    assert.equal(JSON.parse(readFileSync(join(dst, '.agy-market-receipt.json'))).installedDir, 'local--reader');
+    for (const file of ['.git/doc.md', 'node_modules/other/doc.md']) assert.equal(readFileSync(join(dst, file), 'utf8'), md);
+  } finally { ws.cleanup(); }
+});
+
+test('reading a monolithic README before the first state request leaves catalog preflight usable', async () => {
+  const ws = makeTempWorkspace();
+  const id = 'demo__reader';
+  const plugin = { id, canonicalName: 'reader', version: '1.0.0', repository: { url: 'https://github.com/demo/reader' } };
+  const srv = await createMarketSidecarServer({ ...ws, listen: false, recoveryDelayMs: -1, fetchImpl: async url => {
+    if (url.endsWith('/readmes.json')) return Response.json({ entries: { [id]: 'The reader' } });
+    if (url.endsWith('/index.json')) return Response.json({ plugins: [plugin] });
+    return new Response(null, { status: 404 });
+  } });
+  try {
+    assert.equal((await srv.inject({ url: '/api/readme?id=' + id })).json().markdown, 'The reader');
+    const plan = await srv.inject({ method: 'POST', url: '/api/preflight', headers: { 'X-Sidecar-Token': srv.sideToken }, body: { id } });
+    assert.equal(plan.json().preflight?.action, 'install-native', plan.text);
+  } finally { await srv.close(); ws.cleanup(); }
+});
+
+test('scoped detail reads the selected workspace README and discussion repository', async () => {
+  const ws = makeTempWorkspace();
+  const root = join(ws.root, 'project');
+  const workspace = join(root, '.agents', 'plugins', 'reader');
+  const global = join(ws.pluginsDir, 'reader');
+  const srv = await createMarketSidecarServer({ ...ws, listen: false, recoveryDelayMs: -1,
+    fetchImpl: async () => Response.json({ has_discussions: true }) });
+  try {
+    for (const [folder, owner] of [[global, 'global'], [workspace, 'project']]) {
+      mkdirSync(folder, { recursive: true });
+      writeFileSync(join(folder, 'plugin.json'), JSON.stringify({ name: 'reader', repository: 'https://github.com/' + owner + '/reader' }));
+      writeFileSync(join(folder, 'README.md'), owner + ' documentation');
+    }
+    const qs = new URLSearchParams({ dir: 'reader', id: 'reader', scope: 'workspace', localPath: workspace,
+      workspace: pathToFileURL(root).href });
+    assert.equal((await srv.inject({ url: '/api/readme?' + qs })).json().markdown, 'project documentation');
+    assert.equal((await srv.inject({ url: '/api/discussions?' + qs })).json().repo, 'project/reader');
+    qs.set('localPath', global);
+    assert.equal((await srv.inject({ url: '/api/readme?' + qs })).statusCode, 404);
+  } finally { await srv.close(); ws.cleanup(); }
+});
+
+
+test('sync preserves local links, checks incoming overlaps before writing, and retires only owned links', () => {
+  const ws = makeTempWorkspace();
+  try {
+    const src = join(ws.artifactsDir, 'bundle');
+    const dst = join(ws.pluginsDir, 'reader');
+    const external = join(ws.root, 'documents');
+    for (const path of [src, dst, external]) mkdirSync(path);
+    writeFileSync(join(external, 'notes.txt'), 'my notes');
+    for (const name of ['notes', 'workspace', 'old-tool']) symlinkSync(external, join(dst, name), 'junction');
+    for (const name of ['notes', 'workspace']) {
+      mkdirSync(join(src, name));
+      writeFileSync(join(src, name, 'notes.txt'), 'default');
+    }
+    const options = { stagingBundleDir: src, targetPluginDir: dst, dataDir: ws.dataDir,
+      previousManagedFiles: ['old-tool'], preservePaths: ['notes'] };
+    assert.throws(() => syncDirectoryLockSafe(options), /ERR_PLUGIN_LAYOUT_CONFLICT/);
+    assert.ok(lstatSync(join(dst, 'old-tool')).isSymbolicLink());
+    rmSync(join(src, 'workspace'), { recursive: true });
+    syncDirectoryLockSafe(options);
+    assert.ok(lstatSync(join(dst, 'notes')).isSymbolicLink());
+    assert.ok(lstatSync(join(dst, 'workspace')).isSymbolicLink());
+    assert.equal(existsSync(join(dst, 'old-tool')), false);
+    assert.equal(readFileSync(join(external, 'notes.txt'), 'utf8'), 'my notes');
+  } finally { ws.cleanup(); }
+});
+
+test('one failed discovery channel can use a second mirror without replacing the verified catalog cache', async () => {
+  const ws = makeTempWorkspace();
+  try {
+    const mirrors = ['https://one.example', 'https://two.example'];
+    const prefs = { enableExperimentalTrack2: true };
+    const primary = { plugins: [{ id: 'verified-current', canonicalName: 'verified-current', version: '1.0.0' }] };
+    const discovery = { plugins: [{ id: 'from-mirror', canonicalName: 'from-mirror', version: '1.0.0' }] };
+    const archives = mirrors.map((_, i) => {
+      const path = join(ws.artifactsDir, i + '.tgz');
+      writeFileSync(path, createDeterministicTarGz({
+        'package/dist/index.json': JSON.stringify({ plugins: [{ id: 'verified-old', canonicalName: 'verified-old', version: '1.0.0' }] }),
+        ...(i ? { 'package/dist/unverified-index.json': JSON.stringify(discovery) } : {}),
+      }));
+      return pathToFileURL(path).href;
+    });
+    const fetchImpl = async url => {
+      const mirror = mirrors.findIndex(base => String(url).startsWith(base + '/'));
+      if (mirror >= 0) return Response.json({ version: '1', dist: { tarball: archives[mirror] } });
+      if (String(url).endsWith('/index.json')) return Response.json(primary);
+      return new Response(null, { status: 404 });
+    };
+    const result = await resolveMarketCatalog({ dataDir: ws.dataDir, prefs, mirrors, fetchImpl });
+    assert.equal(result.channelUsed, 'github-pages');
+    assert.deepEqual(result.plugins.map(p => p.id).sort(), ['from-mirror', 'verified-current']);
+    const offline = await resolveMarketCatalog({ dataDir: ws.dataDir, prefs, mirrors, fetchImpl: async () => { throw Error('offline'); } });
+    assert.deepEqual(offline.plugins.map(p => p.id).sort(), ['from-mirror', 'verified-current']);
+    const readme = await fetchPluginReadme({ id: 'reader', dataDir: ws.dataDir, prefs: { networkMode: 'china-mirror' }, mirrors,
+      fetchImpl: async url => {
+        if (String(url).endsWith('/readmes/reader.json')) return Response.json({ id: 'reader', default: 'Reader documentation' });
+        throw Error('offline');
+      } });
+    assert.equal(readme.default, 'Reader documentation');
+  } finally { ws.cleanup(); }
+});
+
+test('reading mirror documentation preserves both primary catalog caches and their ETags', async () => {
+  const ws = makeTempWorkspace();
+  try {
+    const opts = { dataDir: ws.dataDir, prefs: { enableExperimentalTrack2: true }, mirrors: ['https://mirror.example'] };
+    const expected = ['latest-experimental', 'latest-verified'];
+    const primary = await resolveMarketCatalog({ ...opts, fetchImpl: async url => {
+      const id = url.endsWith('/unverified-index.json') ? expected[0] : expected[1];
+      return Response.json({ plugins: [{ id, canonicalName: id, version: '1.0.0' }] }, { headers: { etag: id } });
+    } });
+    assert.deepEqual(primary.plugins.map(p => p.id).sort(), expected);
+    const tar = join(ws.artifactsDir, 'mirror.tgz');
+    writeFileSync(tar, createDeterministicTarGz({
+      'package/dist/index.json': JSON.stringify({ plugins: [{ id: 'old-verified', canonicalName: 'old-verified', version: '1.0.0' }] }),
+      'package/dist/unverified-index.json': JSON.stringify({ plugins: [{ id: 'old-experimental', canonicalName: 'old-experimental', version: '1.0.0' }] }),
+      'package/dist/readmes.json': JSON.stringify({ entries: { reader: 'Mirror documentation' } }),
+    }));
+    const readme = await fetchPluginReadme({ ...opts, id: 'reader', fetchImpl: async url => {
+      if (url.startsWith(opts.mirrors[0])) return Response.json({ dist: { tarball: pathToFileURL(tar).href } });
+      throw Error('offline');
+    } });
+    assert.equal(readme.default, 'Mirror documentation');
+    const tags = [];
+    const refreshed = await resolveMarketCatalog({ ...opts, fetchImpl: async (_, request) => {
+      tags.push(request.headers['If-None-Match']);
+      return new Response(null, { status: 304 });
+    } });
+    assert.deepEqual(tags.sort(), expected);
+    assert.deepEqual(refreshed.plugins.map(p => p.id).sort(), expected);
+    const offline = await resolveMarketCatalog({ ...opts, fetchImpl: async () => { throw Error('offline'); } });
+    assert.deepEqual(offline.plugins.map(p => p.id).sort(), expected);
+  } finally { ws.cleanup(); }
+});
+
+test('only HTTPS GitHub downloads qualify for authentication and sidecar labels keep inline code in button text', () => {
+  assert.equal(isOfficialGithubTokenHost('http://github.com'), false);
+  assert.equal(isOfficialGithubTokenHost('https://github.com'), true);
+  assert.equal(isOfficialGithubTokenHost('https://example.com'), false);
+  const html = renderSafeMarkdown('[Open `pane`](sidecar://reader/pane/)');
+  assert.match(html, /data-label="Open `pane`"/);
+  assert.match(html, /Open <code class="md-code">pane<\/code><\/button>/);
+});
+
+test('an incomplete interrupted first install keeps its journal until staging is usable', () => {
+  const ws = makeTempWorkspace();
+  try {
+    const stage = join(ws.dataDir, 'staging', 'first', 'bundle');
+    mkdirSync(stage, { recursive: true });
+    writeFileSync(join(stage, 'plugin.json'), JSON.stringify({ name: 'reader', version: '1.0.0' }));
+    writePendingJournal(ws.dataDir, { dir: 'reader', stagingRootDir: join(stage, '..'), stagingBundleDir: stage,
+      receipt: { id: 'demo__reader', managedFiles: ['plugin.json', 'entry.js'] } });
+    assert.match(recoverInterruptedJournal(ws).error, /ERR_INCOMPLETE_STAGING/);
+    assert.equal(existsSync(join(ws.pluginsDir, 'reader')), false);
+    assert.ok(existsSync(join(ws.dataDir, 'pending-journal.json')));
+    writeFileSync(join(stage, 'entry.js'), 'export default 1');
+    assert.equal(recoverInterruptedJournal(ws).action, 'completed-forward');
+    assert.equal(readFileSync(join(ws.pluginsDir, 'reader', 'entry.js'), 'utf8'), 'export default 1');
+  } finally { ws.cleanup(); }
 });

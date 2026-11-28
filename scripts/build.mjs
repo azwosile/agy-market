@@ -5,7 +5,7 @@
 
 import { copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, extname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isMainModule } from '../src/shared/paths.mjs';
 import vm from 'node:vm';
 
@@ -61,7 +61,8 @@ async function tryLoadEsbuild() {
   for (const c of candidates) {
     if (existsSync(c)) {
       try {
-        return await import(pathToFileURL(c).href);
+        const mod = await import(pathToFileURL(c).href);
+        return mod.default || mod;
       } catch {
         /* try next */
       }
@@ -190,7 +191,10 @@ export async function buildMarketSidecarHtml({ buildSiteDocs = false } = {}) {
   }
 
   const rawCss = existsSync(cssEntry) ? normalizeLf(readFileSync(cssEntry, 'utf8')) : '';
-  const safeCss = rawCss.replace(/<\/style>/gi, '<\\/style>');
+  const lightTheme = normalizeLf(readFileSync(join(uiDir, 'light-theme.css'), 'utf8')).trim();
+  const systemLightTheme = lightTheme.replace('html[data-theme="light"]', ':root:not([data-theme="dark"])');
+  const themeCss = `@media (prefers-color-scheme: light) {\n${systemLightTheme}\n}\n\n${lightTheme}`;
+  const safeCss = rawCss.replace('/* MARKET_LIGHT_THEME */', () => themeCss).replace(/<\/style>/gi, '<\\/style>');
 
   let jsBundle = '';
   let bundlerUsed = 'zero-dep-inline';
@@ -246,6 +250,9 @@ export async function buildMarketSidecarHtml({ buildSiteDocs = false } = {}) {
   if (buildSiteDocs && existsSync(siteDir)) {
     const docsDir = join(repoRoot, 'docs');
     copyTreeNormalizedLf(siteDir, docsDir);
+    const version = JSON.parse(readFileSync(join(repoRoot, 'plugin.json'), 'utf8')).version;
+    const siteTemplate = normalizeLf(readFileSync(join(siteDir, 'index.html'), 'utf8'));
+    writeFileSync(join(docsDir, 'index.html'), siteTemplate.replaceAll('{{MARKET_VERSION}}', version), 'utf8');
     const logoPngSrc = join(repoRoot, 'assets', 'logo.png');
     if (existsSync(logoPngSrc)) {
       copyFileSync(logoPngSrc, join(docsDir, 'logo.png'));

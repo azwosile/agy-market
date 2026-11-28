@@ -2,13 +2,13 @@
 // One-Line Bootstrap CLI (`npx agy-market`), GitHub URL Installer (`add`) & Local Diagnostics (`bin/agy-market.mjs`).
 
 import { existsSync, lstatSync, readFileSync } from 'node:fs';
-import { basename, dirname, join, resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { installLocalAgyMarket } from '../scripts/install-local.mjs';
 import { inspectGithubPluginUrl, installGithubPlugin } from '../src/installer/github-url.mjs';
 import { uninstallPlugin } from '../src/installer/index.mjs';
-import { sweepRetiredBinaries } from '../src/installer/sync-dir.mjs';
-import { scanLocalPluginInventory } from '../src/preflight/index.mjs';
+import { trySweepRetiredBinaries } from '../src/installer/journal.mjs';
+import { samePluginName, scanLocalPluginInventory } from '../src/preflight/index.mjs';
 import {
   CUSTOMIZATION_URI,
   PLUGIN_DISPLAY_NAME,
@@ -75,8 +75,14 @@ export async function runCli(argv = process.argv.slice(2), runtimeOpts = {}) {
   const asJson = args.includes('--json');
   const sub = args[0] && !args[0].startsWith('--') ? args[0] : 'install';
 
+  function fail(status, error) {
+    if (asJson) console.log(JSON.stringify({ ok: false, status, error }, null, 2));
+    else console.error(`✗ ${error}`);
+    return status === 'INVALID_USAGE' ? { code: 1 } : { code: 1, error };
+  }
+
   if (sub === 'install' || sub === 'bootstrap') {
-    const out = await installLocalAgyMarket({ destPluginsDir });
+    const out = await installLocalAgyMarket({ destPluginsDir, dataDir: runtimeOpts.dataDir });
     if (asJson) {
       console.log(JSON.stringify({ ok: true, ...out }, null, 2));
     } else {
@@ -92,12 +98,7 @@ export async function runCli(argv = process.argv.slice(2), runtimeOpts = {}) {
     const rawUrl = findFirstPositionalAfterSubcommand(args);
     if (!rawUrl) {
       const msg = 'Usage: npx agy-market add <github-url> [--subpath <dir>] [--isolate|--replace] [--yes] [--dest <plugins-dir>] [--mirror <prefix>] [--token <pat>] [--json]';
-      if (asJson) {
-        console.log(JSON.stringify({ ok: false, status: 'INVALID_USAGE', error: msg }, null, 2));
-      } else {
-        console.error(`✗ ${msg}`);
-      }
-      return { code: 1 };
+      return fail('INVALID_USAGE', msg);
     }
 
     const subpath = getFlagValue(args, ['--subpath', '--root']);
@@ -105,23 +106,14 @@ export async function runCli(argv = process.argv.slice(2), runtimeOpts = {}) {
     const useReplace = args.includes('--replace');
     if (useIsolate && useReplace) {
       const msg = 'ERR_CONFLICTING_FLAGS: Cannot pass both --isolate and --replace together';
-      if (asJson) {
-        console.log(JSON.stringify({ ok: false, status: 'INVALID_USAGE', error: msg }, null, 2));
-      } else {
-        console.error(`✗ ${msg}`);
-      }
-      return { code: 1 };
+      return fail('INVALID_USAGE', msg);
     }
     const confirmEscalation = args.includes('--yes') || args.includes('-y');
     const mirrorOverride = getFlagValue(args, ['--mirror']);
     const tokenOverride = getFlagValue(args, ['--token']);
 
     const resolvedDest = destPluginsDir ? resolve(destPluginsDir) : '';
-    const configDir =
-      runtimeOpts.configDir ||
-      (resolvedDest && basename(resolvedDest).toLowerCase() === 'plugins'
-        ? dirname(resolvedDest)
-        : resolveAntigravityConfigDir());
+    const configDir = runtimeOpts.configDir || resolveAntigravityConfigDir();
     const pluginsDir = runtimeOpts.pluginsDir || resolvedDest || '';
     const dataDir = runtimeOpts.dataDir || resolveMarketDataDir();
     const fetchImpl = runtimeOpts.fetchImpl || defaultProxyFetch;
@@ -184,7 +176,9 @@ export async function runCli(argv = process.argv.slice(2), runtimeOpts = {}) {
         url: rawUrl,
         pluginRoot: inspectRes.plugin.pluginRoot,
         installMode,
+        replacementKey: useReplace ? inspectRes.preflight?.replacementKey : undefined,
         confirmEscalation,
+        approvalKey: confirmEscalation ? inspectRes.escalation?.approvalKey : undefined,
         prefs,
         configDir,
         pluginsDir,
@@ -263,12 +257,7 @@ export async function runCli(argv = process.argv.slice(2), runtimeOpts = {}) {
       return { code: 1, result: installRes };
     } catch (err) {
       const safeErr = redactSecret(err?.message || String(err), effectiveToken);
-      if (asJson) {
-        console.log(JSON.stringify({ ok: false, status: 'ERROR', error: safeErr }, null, 2));
-      } else {
-        console.error(`✗ ${safeErr}`);
-      }
-      return { code: 1, error: safeErr };
+      return fail('ERROR', safeErr);
     }
   }
 
@@ -276,35 +265,21 @@ export async function runCli(argv = process.argv.slice(2), runtimeOpts = {}) {
     const targetDir = findFirstPositionalAfterSubcommand(args);
     if (!targetDir) {
       const msg = 'Usage: npx agy-market uninstall <dir> [--yes] [--dest <plugins-dir>] [--json]';
-      if (asJson) {
-        console.log(JSON.stringify({ ok: false, status: 'INVALID_USAGE', error: msg }, null, 2));
-      } else {
-        console.error(`✗ ${msg}`);
-      }
-      return { code: 1 };
+      return fail('INVALID_USAGE', msg);
     }
 
     const confirmed = args.includes('--yes') || args.includes('-y');
     const removeFavorite = args.includes('--remove-favorite');
     const resolvedDest = destPluginsDir ? resolve(destPluginsDir) : '';
-    const configDir =
-      runtimeOpts.configDir ||
-      (resolvedDest && basename(resolvedDest).toLowerCase() === 'plugins'
-        ? dirname(resolvedDest)
-        : resolveAntigravityConfigDir());
+    const configDir = runtimeOpts.configDir || resolveAntigravityConfigDir();
     const pluginsDir = runtimeOpts.pluginsDir || resolvedDest || '';
     const dataDir = runtimeOpts.dataDir || resolveMarketDataDir();
     const fetchImpl = runtimeOpts.fetchImpl || defaultProxyFetch;
     const nowMs = runtimeOpts.nowMs ?? Date.now();
 
-    if (targetDir === PLUGIN_ID) {
+    if (samePluginName(targetDir, PLUGIN_ID)) {
       const msg = 'ERR_CANNOT_SELF_DELETE: Manage agy-market itself via customization://agy-market';
-      if (asJson) {
-        console.log(JSON.stringify({ ok: false, status: 'ERROR', error: msg }, null, 2));
-      } else {
-        console.error(`✗ ${msg}`);
-      }
-      return { code: 1, error: msg };
+      return fail('ERROR', msg);
     }
 
     if (!confirmed) {
@@ -377,12 +352,7 @@ export async function runCli(argv = process.argv.slice(2), runtimeOpts = {}) {
       return { code: 1, result: payload };
     } catch (err) {
       const errMsg = err?.message || String(err);
-      if (asJson) {
-        console.log(JSON.stringify({ ok: false, status: 'ERROR', error: errMsg }, null, 2));
-      } else {
-        console.error(`✗ ${errMsg}`);
-      }
-      return { code: 1, error: errMsg };
+      return fail('ERROR', errMsg);
     }
   }
 
@@ -424,28 +394,28 @@ export async function runCli(argv = process.argv.slice(2), runtimeOpts = {}) {
 
   if (sub === 'doctor') {
     const pluginsDir = destPluginsDir ? resolve(destPluginsDir) : resolvePluginsDir();
-    const dataDir = resolveMarketDataDir();
+    const dataDir = resolveMarketDataDir(runtimeOpts.dataDir);
     const selfDir = join(pluginsDir, PLUGIN_ID);
-    const swept = sweepRetiredBinaries(dataDir, { pluginsDir });
+    const swept = trySweepRetiredBinaries(dataDir, { pluginsDir });
     const checks = [];
 
     const nodeMajor = parseInt(process.versions.node.split('.')[0], 10);
     checks.push({ check: 'node>=22', ok: nodeMajor >= 22, detail: process.version });
 
-    const installedExists = existsSync(selfDir);
-    const notSymlink = installedExists ? !lstatSync(selfDir).isSymbolicLink() : true;
-    checks.push({ check: 'real-directory-no-symlink', ok: notSymlink, detail: selfDir });
+    const realDir = lstatSync(selfDir, { throwIfNoEntry: false })?.isDirectory() === true;
+    checks.push({ check: 'real-directory-no-symlink', ok: realDir, detail: selfDir });
 
-    if (installedExists && existsSync(join(selfDir, 'plugin.json'))) {
-      const m = parseJsonc(readFileSync(join(selfDir, 'plugin.json'), 'utf8'));
-      const unknownKeys = Object.keys(m).filter((k) => !PLUGIN_JSON_ALLOWED_KEYS.has(k));
-      checks.push({ check: 'manifest-10-field-purity', ok: unknownKeys.length === 0, detail: unknownKeys.join(',') || 'clean' });
-      checks.push({
-        check: 'sidecar-ui-built',
-        ok: existsSync(join(selfDir, 'sidecars', 'market_pane', 'index.html')),
-        detail: 'sidecars/market_pane/index.html',
-      });
+    const manifestPath = join(selfDir, 'plugin.json');
+    try {
+      const m = parseJsonc(readFileSync(manifestPath, 'utf8'));
+      const unknownKeys = Object.keys(m || {}).filter((k) => !PLUGIN_JSON_ALLOWED_KEYS.has(k));
+      checks.push({ check: 'manifest-10-field-purity', ok: m?.name === PLUGIN_ID && !unknownKeys.length,
+        detail: unknownKeys.join(',') || (m?.name === PLUGIN_ID ? 'clean' : 'Unexpected plugin name') });
+    } catch (err) {
+      checks.push({ check: 'manifest-10-field-purity', ok: false, detail: err.message });
     }
+    checks.push({ check: 'sidecar-ui-built', ok: existsSync(join(selfDir, 'sidecars', 'market_pane', 'index.html')),
+      detail: 'sidecars/market_pane/index.html' });
 
     const allOk = checks.every((c) => c.ok);
     const report = { ok: allOk, checks, sweptRetiredBinaries: swept };
@@ -455,12 +425,16 @@ export async function runCli(argv = process.argv.slice(2), runtimeOpts = {}) {
       for (const c of checks) {
         console.log(`${c.ok ? '✓' : '✗'} ${c.check}: ${c.detail}`);
       }
-      console.log(`✓ Retired binary GC: removed=${swept.removed}, remaining=${swept.remaining}`);
+      console.log(swept.deferred ? `Retired binary GC deferred (${swept.deferred})` :
+        `✓ Retired binary GC: removed=${swept.removed}, remaining=${swept.remaining}`);
     }
-    return { code: allOk ? 0 : 1 };
+    return { code: allOk ? 0 : 1, result: report };
   }
 
-  throw new Error(`Unknown subcommand "${sub}". Run "npx agy-market --help".`);
+  const error = `Unknown subcommand "${sub}". Run "npx agy-market --help".`;
+  if (asJson) console.log(JSON.stringify({ ok: false, error }));
+  else console.error(error);
+  return { code: 1, error };
 }
 
 if (isMainModule(import.meta.url)) {

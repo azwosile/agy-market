@@ -46,7 +46,7 @@ When the user provides any GitHub repository URL that is not yet indexed in the 
 ### 3.1 Direct In-Sidebar Updates & One-Click Update All
 - Open `[AGY Market](sidecar://agy-market/market_pane/)` and switch to **已安装 (`Installed`)**:
   - **Per-plugin direct update**: Every installed plugin card provides an **Update (`更新`)** button. Both catalog releases and newer GitHub upstream Release/Tag or GitHub URL builds are downloaded, inspected, and synced directly inside the Sidebar without opening external browser download pages, preserving original catalog verification metadata (`track`, `repositoryId`).
-  - **One-click batch update**: Click the permanent **一键更新 (`Update All`)** button beside **检查更新 (`Check Updates`)** to check and sequentially update all installed plugins across catalog, GitHub upstream, and GitHub URL channels (scheduling `agy-market` self-update last; native `.git` clones and unversioned external plugins are excluded with read-only status pills).
+  - **One-click batch update**: Click **检查更新 (`Check Updates`)**. When installable updates are found, click **一键更新 (`Update All`)** to sequentially update all installed plugins across catalog, GitHub upstream, and GitHub URL channels (scheduling `agy-market` self-update last; native `.git` clones and unversioned external plugins are excluded with read-only status pills).
 - **`app.asar` patch plugins**: When installing or updating a plugin with `hostEnhancementKind: ["app-asar"]`, remind the user to run its bundled patch script (e.g., `node setup.cjs` per the plugin README) before restarting Antigravity, and re-run it after market updates to sync injected client code.
 
 ### 3.2 Lock-Safe Uninstall (Sidebar & CLI)

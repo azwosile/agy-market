@@ -65,6 +65,19 @@ export function classifyActivationRequirement(capabilities = {}, runtime = {}) {
       };
     }
 
+    if (rt.action === 'disable') {
+      const stepsZh = hasAsar ? '如果已修改宿主文件，请按插件文档撤销补丁。' : '';
+      const stepsEn = hasAsar ? 'If the host was patched, follow the plugin instructions to undo the patch. ' : '';
+      const locked = lockedOnDisable || hasRetiredBinaries;
+      return {
+        level: 'host-restart',
+        badgeZh: '🚀 需重启',
+        badgeEn: '🚀 Restart Required',
+        reasonZh: stepsZh + (locked ? '请重启反重力以释放被占用的文件句柄。' : '请重启反重力以完成停用。'),
+        reasonEn: stepsEn + (locked ? 'Restart Antigravity to release locked file handles.' : 'Restart Antigravity to finish disabling the plugin.'),
+      };
+    }
+
     const reasonsZh = [];
     const reasonsEn = [];
 
@@ -127,28 +140,28 @@ export function classifyActivationRequirement(capabilities = {}, runtime = {}) {
     !hasHooks;
 
   if (rt.reloadRequired === true || ((hasBackgroundBadge || hasMcp || hasHooks) && !mcpAlreadyHotRefreshed)) {
-    if (isUninstall) {
-      let reasonZh = '已卸载插件：建议关闭已打开的目标侧边栏或刷新 MCP';
-      let reasonEn = 'Plugin uninstalled: close any open target Sidebar pane or refresh MCP servers';
+    if (isUninstall || rt.action === 'disable') {
+      let reasonZh = '建议关闭已打开的目标侧边栏或刷新 MCP';
+      let reasonEn = 'close any open target Sidebar pane or refresh MCP servers';
       if (hasSidecar && hasMcp) {
-        reasonZh = '已卸载插件：建议关闭已打开的目标侧边栏并刷新 MCP';
-        reasonEn = 'Plugin uninstalled: close any open target Sidebar pane and refresh MCP servers';
+        reasonZh = '建议关闭已打开的目标侧边栏并刷新 MCP';
+        reasonEn = 'close any open target Sidebar pane and refresh MCP servers';
       } else if (hasSidecar && !hasHooks) {
-        reasonZh = '已卸载插件：建议关闭已打开的目标侧边栏';
-        reasonEn = 'Plugin uninstalled: close any open target Sidebar pane';
+        reasonZh = '建议关闭已打开的目标侧边栏';
+        reasonEn = 'close any open target Sidebar pane';
       } else if (hasMcp && !hasSidecar && !hasHooks) {
-        reasonZh = '已卸载插件：建议刷新 MCP 服务以释放已移除的工具';
-        reasonEn = 'Plugin uninstalled: refresh MCP servers to release removed tools';
+        reasonZh = '建议刷新 MCP 服务以释放相关工具';
+        reasonEn = 'refresh MCP servers to release its tools';
       } else if (hasHooks && !hasSidecar && !hasMcp) {
-        reasonZh = '已卸载插件：建议开启新会话或重开侧边栏以释放生命周期钩子';
-        reasonEn = 'Plugin uninstalled: start a new session or reopen Sidebar to release lifecycle hooks';
+        reasonZh = '建议开启新会话或重开侧边栏以释放生命周期钩子';
+        reasonEn = 'start a new session or reopen Sidebar to release lifecycle hooks';
       }
       return {
         level: 'reload-pane',
         badgeZh: '🔄 建议关闭面板',
         badgeEn: '🔄 Reload Pane',
-        reasonZh,
-        reasonEn,
+        reasonZh: (isUninstall ? '已卸载插件：' : '已停用插件：') + reasonZh,
+        reasonEn: (isUninstall ? 'Plugin uninstalled: ' : 'Plugin disabled: ') + reasonEn,
       };
     }
 

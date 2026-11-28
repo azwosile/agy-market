@@ -1,12 +1,15 @@
 // End-to-End Plugin Installer, Vault-Parking Toggle, Conflict Fixer, T+N Capability Escalation Guard & Self-Updater (`src/installer/index.mjs`).
 
-import { randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
+import { createHash, randomUUID } from 'node:crypto';
 import {
+  constants as fsConstants,
   copyFileSync,
   cpSync,
   existsSync,
   lstatSync,
   mkdirSync,
+  mkdtempSync,
   readdirSync,
   readFileSync,
   renameSync,
@@ -19,17 +22,25 @@ import {
 import { join, relative, resolve } from 'node:path';
 import {
   applyScopedIsolationRewrite,
+  findCatalogEntryForLocal,
   isDirectorySymlinkOrJunction,
+  matchLegacyLocalFavorite,
+  localUninstallKey,
   normalizeRepoUrl,
   readHostEnabledMapReadOnly,
   resolveInstallPreflight,
+  samePluginName,
+  resolveLocalPluginSource,
   scanLocalPluginComponents,
   scanLocalPluginInventory,
 } from '../preflight/index.mjs';
 import { classifyActivationRequirement } from '../shared/activation.mjs';
-import { PLUGIN_ID, toScopedPluginName } from '../shared/constants.mjs';
+import { PLUGIN_ID, SELF_CATALOG_ID, toScopedPluginName } from '../shared/constants.mjs';
 import { defaultProxyFetch } from '../shared/proxy-fetch.mjs';
+import { compareSemver, parseSemver } from '../shared/semver.mjs';
 import {
+  assertSafePluginDir,
+  isHostPluginsDir,
   resolveAntigravityConfigDir,
   resolveDisabledPluginsDir,
   resolveMarketDataDir,
@@ -38,16 +49,25 @@ import {
 import {
   buildInstallReceipt,
   computeCapabilityEscalation,
-  loadPrefsFromDisk,
+  mergeCapabilityProfiles,
+  normalizePluginRoot,
+  makeFavoriteSource,
   parseJsonc,
   sanitizeNativePluginManifest,
-  savePrefsToDisk,
+  updatePrefsOnDisk,
 } from '../shared/schemas.mjs';
-import { parseGithubRepoSlug, safeGithubCacheKey } from '../updates/index.mjs';
+import { isForeignMarketInstall, isOfficialMarketEntry, parseGithubRepoSlug, safeGithubCacheKey } from '../updates/index.mjs';
 import { fetchVerifiedPluginTarball } from './fetch-tarball.mjs';
-import { clearPendingJournal, writePendingJournal } from './journal.mjs';
 import {
+  acquirePluginMutation, bindPendingJournalRoot, clearPendingJournal, discardPendingPluginUpdate,
+  commitJournalReceipt, readJournalTargetIdentity, readPendingPluginUpdate, snapshotDigest, trackRollbackAdditions, writePendingJournal,
+} from './journal.mjs';
+import {
+  createPreserveMatcher,
+  hasLockedRemovals,
+  isRetiredPluginRemnant,
   listAllRelFiles,
+  recordLockedRemoval,
   recordRetiredBinaries,
   removeSymlinkOrJunctionOnly,
   safeRemoveDirBestEffort,
@@ -61,51 +81,32 @@ function resolveEffectiveFetch(fetchImpl) {
   return !fetchImpl || fetchImpl === fetch ? defaultProxyFetch : fetchImpl;
 }
 
-function hasNodeModulesSegment(baseRoot, targetPath) {
-  const rel = relative(baseRoot, targetPath);
-  if (!rel || rel === '.') return false;
-  return rel.split(/[\\/]/).includes('node_modules');
+export function getReplacementKey(plugin, conflict) {
+  if (!conflict?.path || conflict.scope !== 'global' || conflict.unidentified) return '';
+  return createHash('sha256').update(JSON.stringify([
+    plugin.id, plugin.repository?.url, plugin.repository?.pluginRoot || '.', plugin.distribution?.sha256,
+    conflict.dir, conflict.path, conflict.realPath, conflict.parkedByMarket,
+    readJournalTargetIdentity(conflict.path),
+  ])).digest('hex');
+}
+
+export function getUpdateEscalation(plugin, preflight, archiveSha256 = plugin.distribution?.sha256) {
+  const installed = preflight.existingInstall;
+  const escalation = computeCapabilityEscalation(installed?.receipt, plugin, installed?.capabilities);
+  if (!escalation.escalated) return escalation;
+  const approvalKey = createHash('sha256').update(JSON.stringify([
+    preflight.targetDir, installed?.version, installed?.receipt?.id || '', installed?.receipt?.sha256 || '',
+    plugin.id, normalizeRepoUrl(plugin.repository?.url), plugin.repository?.repositoryId || 0, plugin.repository?.pluginRoot || '.',
+    plugin.version, plugin.gitTag || '', plugin.commitSha || '', plugin.distribution?.sha256 || '',
+    plugin.distribution?.commitFallbackSha256 || '', String(archiveSha256 || '').toLowerCase(),
+    ...[escalation.addedBadges, escalation.addedRemoteDomains, escalation.addedHookEvents].map(items => [...items].sort()),
+  ])).digest('hex');
+  return { ...escalation, approvalKey };
 }
 
 const LOCK_ERROR_CODES = new Set(['EBUSY', 'EPERM', 'EACCES']);
 const MOVE_FALLBACK_CODES = new Set(['EXDEV', 'EBUSY', 'EPERM', 'EACCES', 'EEXIST', 'ENOTEMPTY']);
 const RETIRED_BINARY_RE = /\.old\.\d{10,}$/;
-
-function assertSafePluginDir(rawDir, errPrefix = 'ERR_INVALID_PLUGIN_DIR') {
-  const safeDir = String(rawDir || '').trim();
-  if (
-    !safeDir ||
-    safeDir === '.' ||
-    safeDir === '..' ||
-    safeDir.includes('/') ||
-    safeDir.includes('\\') ||
-    safeDir.includes('..') ||
-    /[\x00-\x1f<>:"|?*]/.test(safeDir)
-  ) {
-    throw new Error(`${errPrefix}: Invalid plugin directory name "${rawDir}"`);
-  }
-  return safeDir;
-}
-
-function mergeCapabilityProfiles(a = {}, b = {}) {
-  const capA = a && typeof a === 'object' ? a : {};
-  const capB = b && typeof b === 'object' ? b : {};
-  const badges = [...new Set([...(capA.badges || []), ...(capB.badges || [])])];
-  const hostEnhancementKind = [
-    ...new Set([...(capA.hostEnhancementKind || []), ...(capB.hostEnhancementKind || [])]),
-  ].sort();
-  if (hostEnhancementKind.length > 0 && !badges.includes('host-enhancement')) {
-    badges.push('host-enhancement');
-  }
-  return {
-    badges,
-    rulesEstimatedTokens: Math.max(Number(capA.rulesEstimatedTokens || 0), Number(capB.rulesEstimatedTokens || 0)),
-    mcpServers: [...new Set([...(capA.mcpServers || []), ...(capB.mcpServers || [])])].sort(),
-    mcpRemoteDomains: [...new Set([...(capA.mcpRemoteDomains || []), ...(capB.mcpRemoteDomains || [])])].sort(),
-    hookEvents: [...new Set([...(capA.hookEvents || []), ...(capB.hookEvents || [])])].sort(),
-    hostEnhancementKind,
-  };
-}
 
 function stripDisabledFlagFromManifest(pluginDir) {
   const manifestPath = join(pluginDir, 'plugin.json');
@@ -147,37 +148,47 @@ function annotateLockError(err, stage, relPath = '') {
 
 /**
  * Safely snapshots an existing plugin directory to `dstDir` without dereferencing symlinks/junctions.
- * Skips `node_modules`, `.git`, and retired `*.old.<ts>` binaries, retries transient lock errors 3x,
- * and skips persistently locked entries with a warning so updates are never blocked.
+ * Inside dependency and Git directories, copy the paths this operation could change.
+ * A locked item permits forward update but disqualifies the snapshot for rollback.
  */
-function snapshotBackupSafe(srcDir, dstDir, { onWarning = null } = {}) {
-  const warn = (relPath, err) => {
-    const msg = `[backup] Skipping locked item "${relPath || '.'}": ${err?.code || ''} ${err?.message || err}`.trim();
-    if (typeof onWarning === 'function') {
-      onWarning(msg);
-    } else {
-      console.warn(msg);
+function snapshotBackupSafe(srcDir, dstDir, { previousManagedFiles, incomingFiles, preservePaths }) {
+  const copied = [];
+  const isPreserved = createPreserveMatcher(preservePaths, srcDir);
+  let complete = true;
+  const affected = new Set();
+  for (const file of [...(previousManagedFiles || []), ...incomingFiles]) {
+    if (typeof file !== 'string') continue;
+    const parts = file.replace(/\\/g, '/').toLowerCase().split('/');
+    let path = '';
+    for (const part of parts) {
+      path = path ? path + '/' + part : part;
+      affected.add(path);
     }
+  }
+  const warn = (relPath, err) => {
+    complete = false;
+    const msg = `[backup] Skipping locked item "${relPath || '.'}": ${err?.code || ''} ${err?.message || err}`.trim();
+    console.warn(msg);
   };
 
   let rootLst;
   try {
-    if (!existsSync(srcDir)) return false;
+    if (!existsSync(srcDir)) return null;
     rootLst = withLockRetrySync(() => lstatSync(srcDir));
   } catch (err) {
     if (LOCK_ERROR_CODES.has(err?.code) || err?.code === 'ENOENT') {
       warn('.', err);
-      return false;
+      return null;
     }
     throw err;
   }
   if (rootLst.isSymbolicLink() || !rootLst.isDirectory()) {
-    return false;
+    return null;
   }
 
   mkdirSync(dstDir, { recursive: true });
 
-  function walk(curSrc, curDst, relPrefix) {
+  function walk(curSrc, curDst, relPrefix, selective = false) {
     let entries;
     try {
       entries = withLockRetrySync(() => readdirSync(curSrc));
@@ -190,12 +201,13 @@ function snapshotBackupSafe(srcDir, dstDir, { onWarning = null } = {}) {
     }
 
     for (const name of entries) {
-      if (name === 'node_modules' || name === '.git' || RETIRED_BINARY_RE.test(name)) {
-        continue;
-      }
       const srcItem = join(curSrc, name);
       const dstItem = join(curDst, name);
       const rel = relPrefix ? `${relPrefix}/${name}` : name;
+
+      const filterChildren = selective || name === 'node_modules' || name === '.git';
+      if (RETIRED_BINARY_RE.test(name) && !affected.has(rel.toLowerCase())) continue;
+      if (filterChildren && !affected.has(rel.toLowerCase())) continue;
 
       let lst;
       try {
@@ -209,16 +221,18 @@ function snapshotBackupSafe(srcDir, dstDir, { onWarning = null } = {}) {
       }
 
       if (lst.isSymbolicLink()) {
+        if (!isPreserved(rel) && affected.has(rel.toLowerCase())) complete = false;
         continue;
       }
 
       if (lst.isDirectory()) {
         mkdirSync(dstItem, { recursive: true });
-        walk(srcItem, dstItem, rel);
+        walk(srcItem, dstItem, rel, filterChildren);
       } else if (lst.isFile()) {
         try {
           mkdirSync(curDst, { recursive: true });
           withLockRetrySync(() => copyFileSync(srcItem, dstItem));
+          copied.push(rel);
         } catch (err) {
           if (LOCK_ERROR_CODES.has(err?.code) || err?.code === 'ENOENT') {
             warn(rel, err);
@@ -231,7 +245,7 @@ function snapshotBackupSafe(srcDir, dstDir, { onWarning = null } = {}) {
   }
 
   walk(srcDir, dstDir, '');
-  return true;
+  return complete ? copied : null;
 }
 
 /**
@@ -311,8 +325,9 @@ function cleanupLockedPluginDir({
           try {
             renameFn(full, retiredPath);
             retired.push(retiredPath);
-          } catch {
-            /* leave locked file until restart */
+          } catch (renameError) {
+            if (LOCK_ERROR_CODES.has(renameError?.code)) recordLockedRemoval(dataDir, targetDir, full);
+            else if (renameError?.code !== 'ENOENT') throw renameError;
           }
         }
       }
@@ -373,7 +388,27 @@ export async function tryOpportunisticMcpRefresh(pluginName, mcpServers = [], fe
  * Enables or disables an installed global plugin via Vault Parking (`${dataDir}/disabled-plugins/<dir>`),
  * NEVER writing `~/.gemini/config/config.json`.
  */
-export function toggleInstalledPlugin({
+function movePluginUnderLock(options, move) {
+  const dataDir = options.dataDir || resolveMarketDataDir();
+  const pluginsDir = resolvePluginsDir(options.configDir);
+  const release = acquirePluginMutation(dataDir);
+  try {
+    const src = assertSafePluginDir(options.targetDir || options.dir);
+    const paths = [join(pluginsDir, src), join(resolveDisabledPluginsDir(dataDir), src)];
+    if (readPendingPluginUpdate(dataDir, paths, pluginsDir)) {
+      throw new Error('ERR_PENDING_RECOVERY: Recover the interrupted update before moving this plugin.');
+    }
+    return move(options);
+  } finally {
+    release();
+  }
+}
+
+export function toggleInstalledPlugin(options) {
+  return movePluginUnderLock(options, toggleUnderLock);
+}
+
+function toggleUnderLock({
   dir,
   enabled,
   configDir = resolveAntigravityConfigDir(),
@@ -385,7 +420,7 @@ export function toggleInstalledPlugin({
   unlinkOverride = null,
 }) {
   const safeDir = assertSafePluginDir(dir);
-  if (safeDir === PLUGIN_ID) {
+  if (samePluginName(safeDir, PLUGIN_ID)) {
     throw new Error('ERR_CANNOT_DISABLE_SELF: Cannot disable or park agy-market from inside its own pane');
   }
   if (typeof enabled !== 'boolean') {
@@ -441,18 +476,34 @@ export function toggleInstalledPlugin({
     let lockedOnDisable = false;
     let retiredBinaries = [];
 
-    if (existsSync(parkedPath)) {
-      rmSync(parkedPath, { recursive: true, force: true });
+    if (lstatSync(parkedPath, { throwIfNoEntry: false })) {
+      throw new Error(`ERR_TARGET_DIR_EXISTS: A parked copy of "${safeDir}" already exists`);
     }
 
+    const copyToVault = source => {
+      const stagingDir = join(dataDir, 'staging');
+      mkdirSync(stagingDir, { recursive: true });
+      const staging = mkdtempSync(join(stagingDir, 'parking-'));
+      try {
+        cpSync(source, staging, { recursive: true, filter: path => {
+          if (RETIRED_BINARY_RE.test(path)) return false;
+          if (lstatSync(path).isSymbolicLink()) throw new Error('ERR_PLUGIN_LAYOUT_CONFLICT: Cannot park a nested symbolic link by copying: ' + path);
+          return true;
+        } });
+        renameSync(staging, parkedPath);
+      } finally {
+        safeRemoveDirBestEffort(staging);
+      }
+    };
     const activeLinkInfo = isDirectorySymlinkOrJunction(pluginsDir, safeDir);
     if (activeLinkInfo.isSymlink) {
-      cpSync(activePath, parkedPath, {
-        recursive: true,
-        dereference: true,
-        filter: (p) => !RETIRED_BINARY_RE.test(p),
-      });
-      removeSymlinkOrJunctionOnly(activePath);
+      copyToVault(activeLinkInfo.realPath);
+      try {
+        removeSymlinkOrJunctionOnly(activePath);
+      } catch (err) {
+        rmSync(parkedPath, { recursive: true, force: true });
+        throw err;
+      }
     } else {
       try {
         renameFn(activePath, parkedPath);
@@ -460,11 +511,14 @@ export function toggleInstalledPlugin({
         if (!MOVE_FALLBACK_CODES.has(err?.code)) {
           throw err;
         }
-        cpSync(activePath, parkedPath, {
-          recursive: true,
-          dereference: true,
-          filter: (p) => !RETIRED_BINARY_RE.test(p),
-        });
+        copyToVault(activeLinkInfo.realPath);
+        // Unload before recursive removal can delete any of the still-active plugin's files.
+        try {
+          withLockRetrySync(() => unlinkFn(join(activePath, 'plugin.json')));
+        } catch (err) {
+          rmSync(parkedPath, { recursive: true, force: true });
+          throw new Error(`ERR_PLUGIN_DISABLE_FAILED: Cannot unload "${safeDir}". Close the process holding plugin.json and retry.`, { cause: err });
+        }
         try {
           rmFn(activePath, { recursive: true, force: true });
         } catch (rmErr) {
@@ -512,7 +566,7 @@ export function toggleInstalledPlugin({
       // Ensure real non-symlink dir & clean manifest even if already active
       const activeLinkInfo = isDirectorySymlinkOrJunction(pluginsDir, safeDir);
       if (activeLinkInfo.isSymlink) {
-        fixLocalConflict({ type: 'materialize-symlink', targetDir: safeDir, configDir, dataDir });
+        fixConflictUnderLock({ type: 'materialize-symlink', targetDir: safeDir, configDir, dataDir });
       }
       stripDisabledFlagFromManifest(activePath);
       const activation = classifyActivationRequirement(baseCaps, { action: 'enable' });
@@ -534,38 +588,68 @@ export function toggleInstalledPlugin({
   let retiredBinaries = [];
   const parkedLinkInfo = isDirectorySymlinkOrJunction(disabledDir, safeDir);
 
-  if (existsSync(activePath)) {
-    // Active path still exists (e.g., leftover locked empty/retired folder from earlier Windows EBUSY disable)
-    const syncStats = syncDirectoryLockSafe({
-      stagingBundleDir: parkedPath,
-      targetPluginDir: activePath,
-      dataDir,
-      nowMs,
-    });
-    retiredBinaries = syncStats.retiredBinaries;
-    if (parkedLinkInfo.isSymlink) {
-      removeSymlinkOrJunctionOnly(parkedPath);
-    } else {
-      rmSync(parkedPath, { recursive: true, force: true });
+  function checkRestoreTarget() {
+    if (!lstatSync(activePath, { throwIfNoEntry: false })) return false;
+    if (!isRetiredPluginRemnant(activePath, dataDir)) {
+      throw new Error(`ERR_TARGET_DIR_EXISTS: Cannot enable "${safeDir}" because its active directory is occupied.`);
     }
-  } else if (parkedLinkInfo.isSymlink) {
-    cpSync(parkedPath, activePath, { recursive: true, dereference: true });
-    removeSymlinkOrJunctionOnly(parkedPath);
+    return true;
+  }
+
+  function copyIntoRemnant() {
+    const created = [];
+    try {
+      const stats = syncDirectoryLockSafe({
+        stagingBundleDir: parkedPath, targetPluginDir: activePath, dataDir, nowMs,
+        writeOverride(src, dst) {
+          copyFileSync(src, dst, fsConstants.COPYFILE_EXCL);
+          created.push(dst);
+        },
+      });
+      retiredBinaries = stats.retiredBinaries;
+    } catch (err) {
+      for (const path of created.reverse()) rmSync(path, { force: true });
+      throw err;
+    }
+  }
+
+  function restoreCopy() {
+    if (checkRestoreTarget()) {
+      copyIntoRemnant();
+    } else if (statSync(parkedPath).dev !== statSync(pluginsDir).dev) {
+      mkdirSync(activePath);
+      copyIntoRemnant();
+    } else {
+      // Prepare outside host discovery; publish in one rename on the same volume.
+      const stagingDir = join(dataDir, 'staging');
+      mkdirSync(stagingDir, { recursive: true });
+      const stage = mkdtempSync(join(stagingDir, 'unpark-'));
+      try {
+        syncDirectoryLockSafe({ stagingBundleDir: parkedPath, targetPluginDir: stage, dataDir });
+        if (checkRestoreTarget()) throw new Error(`ERR_TARGET_DIR_EXISTS: Directory "${safeDir}" appeared during restore.`);
+        try {
+          renameSync(stage, activePath);
+        } catch (err) {
+          if (err.code !== 'EXDEV') throw err;
+          mkdirSync(activePath);
+          copyIntoRemnant();
+        }
+      } finally {
+        safeRemoveDirBestEffort(stage);
+      }
+    }
+    if (parkedLinkInfo.isSymlink) removeSymlinkOrJunctionOnly(parkedPath);
+    else rmSync(parkedPath, { recursive: true, force: true });
+  }
+
+  if (checkRestoreTarget() || parkedLinkInfo.isSymlink) {
+    restoreCopy();
   } else {
     try {
       renameFn(parkedPath, activePath);
     } catch (err) {
-      if (!MOVE_FALLBACK_CODES.has(err?.code)) {
-        throw err;
-      }
-      const syncStats = syncDirectoryLockSafe({
-        stagingBundleDir: parkedPath,
-        targetPluginDir: activePath,
-        dataDir,
-        nowMs,
-      });
-      retiredBinaries = syncStats.retiredBinaries;
-      rmSync(parkedPath, { recursive: true, force: true });
+      if (!MOVE_FALLBACK_CODES.has(err?.code)) throw err;
+      restoreCopy();
     }
   }
 
@@ -573,7 +657,7 @@ export function toggleInstalledPlugin({
   stripDisabledFlagFromManifest(activePath);
   const postLinkInfo = isDirectorySymlinkOrJunction(pluginsDir, safeDir);
   if (postLinkInfo.isSymlink) {
-    fixLocalConflict({ type: 'materialize-symlink', targetDir: safeDir, configDir, dataDir });
+    fixConflictUnderLock({ type: 'materialize-symlink', targetDir: safeDir, configDir, dataDir });
   }
 
   const postInv = scanLocalPluginInventory({ configDir, dataDir });
@@ -603,7 +687,11 @@ export function toggleInstalledPlugin({
  * Applies a 1-click automated conflict remediation (`isolate-rename` or `materialize-symlink`)
  * strictly inside global `~/.gemini/config/plugins/`.
  */
-export function fixLocalConflict({
+export function fixLocalConflict(options) {
+  return movePluginUnderLock(options, fixConflictUnderLock);
+}
+
+function fixConflictUnderLock({
   type,
   targetDir,
   suggestedDir = '',
@@ -613,7 +701,7 @@ export function fixLocalConflict({
   unlinkLinkOverride = null,
 }) {
   const safeTarget = assertSafePluginDir(targetDir);
-  if (safeTarget === PLUGIN_ID) {
+  if (samePluginName(safeTarget, PLUGIN_ID)) {
     throw new Error('ERR_CANNOT_MODIFY_SELF: Cannot apply conflict rewrite to agy-market itself');
   }
 
@@ -631,46 +719,87 @@ export function fixLocalConflict({
       ? assertSafePluginDir(suggestedDir, 'ERR_INVALID_SUGGESTED_DIR')
       : toScopedPluginName('local', oldName || safeTarget);
 
-    if (newDir === PLUGIN_ID) {
+    if (samePluginName(newDir, PLUGIN_ID)) {
       throw new Error('ERR_INVALID_SUGGESTED_DIR: Suggested directory cannot be agy-market');
     }
 
     const dstPath = join(pluginsDir, newDir);
+    if (readPendingPluginUpdate(dataDir, [dstPath, join(disabledDir, newDir)], pluginsDir)) {
+      throw new Error('ERR_PENDING_RECOVERY: The new directory is reserved for an interrupted update.');
+    }
     if (existsSync(dstPath) || existsSync(join(disabledDir, newDir))) {
       throw new Error(`ERR_TARGET_DIR_EXISTS: Target plugin directory "${newDir}" already exists`);
     }
 
     const linkInfo = isDirectorySymlinkOrJunction(pluginsDir, safeTarget);
-    if (linkInfo.isSymlink) {
-      cpSync(srcPath, dstPath, { recursive: true, dereference: true });
-      removeSymlinkOrJunctionOnly(srcPath);
-    } else {
-      try {
-        renameSync(srcPath, dstPath);
-      } catch (err) {
-        if (!MOVE_FALLBACK_CODES.has(err?.code)) throw err;
-        cpSync(srcPath, dstPath, { recursive: true, dereference: true });
-        rmSync(srcPath, { recursive: true, force: true });
-      }
+    let moved = false;
+    let copying = false;
+    const originals = new Map();
+    function writeText(path, text) {
+      originals.set(path, readFileSync(path));
+      writeFileSync(path, text, 'utf8');
     }
 
-    const rw = applyScopedIsolationRewrite(dstPath, {
-      canonicalName: oldName,
-      scopedName: newDir,
-      fallbackDisplayName: rawManifest?.displayName || oldName,
-    });
-
-    const receiptPath = join(dstPath, '.agy-market-receipt.json');
-    if (existsSync(receiptPath)) {
-      try {
+    let rw;
+    try {
+      if (!linkInfo.isSymlink) {
+        try {
+          renameSync(srcPath, dstPath);
+          moved = true;
+        } catch (err) {
+          if (!MOVE_FALLBACK_CODES.has(err?.code)) throw err;
+        }
+      }
+      if (!moved) {
+        // Keep the source intact until the copy, rewrites and receipt are complete.
+        mkdirSync(dstPath);
+        copying = true;
+        cpSync(linkInfo.realPath || srcPath, dstPath, {
+          recursive: true,
+          dereference: true,
+          filter: path => {
+            if (lstatSync(path).isSymbolicLink()) throw new Error('Cannot copy a nested symbolic link: ' + path);
+            return true;
+          },
+        });
+      }
+      rw = applyScopedIsolationRewrite(dstPath, {
+        canonicalName: oldName, scopedName: newDir, fallbackDisplayName: rawManifest?.displayName || oldName, writeText,
+      });
+      const receiptPath = join(dstPath, '.agy-market-receipt.json');
+      const receiptStat = lstatSync(receiptPath, { throwIfNoEntry: false });
+      if (receiptStat) {
+        if (!receiptStat.isFile()) throw new Error('Expected a regular plugin receipt');
         const rec = JSON.parse(readFileSync(receiptPath, 'utf8'));
-        rec.installedDir = newDir;
-        rec.effectivePluginName = newDir;
-        rec.scopedRewriteApplied = true;
-        rec.updatedAt = new Date().toISOString();
-        writeFileSync(receiptPath, `${JSON.stringify(rec, null, 2)}\n`, 'utf8');
-      } catch {
-        /* non-fatal */
+        Object.assign(rec, { installedDir: newDir, effectivePluginName: newDir, scopedRewriteApplied: true,
+          updatedAt: new Date().toISOString() });
+        writeText(receiptPath, `${JSON.stringify(rec, null, 2)}\n`);
+      }
+    } catch (err) {
+      if (moved) {
+        try {
+          for (const [path, original] of originals) writeFileSync(path, original);
+        } finally {
+          renameSync(dstPath, srcPath);
+        }
+      } else if (copying) {
+        safeRemoveDirBestEffort(dstPath);
+      }
+      throw err;
+    }
+    if (!moved) {
+      try {
+        if (linkInfo.isSymlink) removeSymlinkOrJunctionOnly(srcPath);
+        else rmSync(srcPath, { recursive: true, force: true });
+      } catch (err) {
+        if (!linkInfo.isSymlink) {
+          // A failed recursive removal may have deleted part of the old tree.
+          // Keep the complete destination until all original files are back.
+          cpSync(dstPath, srcPath, { recursive: true, force: false });
+          for (const [path, original] of originals) writeFileSync(join(srcPath, relative(dstPath, path)), original);
+        }
+        safeRemoveDirBestEffort(dstPath);
+        throw err;
       }
     }
 
@@ -745,8 +874,8 @@ export function fixLocalConflict({
  * Installs or updates a catalog `plugin` entry with:
  *   1. Retired binary GC sweep
  *   2. Read-only Preflight Collision Resolution (or `<owner>--<slug>` scoped isolation)
- *   3. T+N Capability-Escalation Confirmation check (`confirmEscalation`)
- *   4. Out-of-tree staging + mandatory `sha256` verification
+ *   3. Out-of-tree staging + mandatory `sha256` verification
+ *   4. Compare declared and staged capabilities with the installed grants
  *   5. Crash-recovery `pending-journal.json` + Windows lock-safe in-place sync
  *      (if updating a currently parked/disabled plugin, syncs into `${dataDir}/disabled-plugins/<dir>` so it stays disabled!)
  *   6. `.agy-market-receipt.json` persistence, activation classification & live UI metadata
@@ -756,8 +885,15 @@ export async function installOrUpdateCatalogPlugin({
   track = plugin?.forceScopedInstall ? 'unverified' : 'verified',
   prefs = {},
   conflictStrategy = 'prompt', // 'prompt' | 'isolate' | 'replace'
+  replacementKey = '',
   preferredDir = '',
+  requireExistingDir = false,
+  allowLegacyRename = true,
+  catalogPlugins = [],
   confirmEscalation = false,
+  approvalKey = '',
+  rejectDowngrade = false,
+  resyncVersion = '',
   configDir = resolveAntigravityConfigDir(),
   pluginsDir: explicitPluginsDir = '',
   dataDir = resolveMarketDataDir(),
@@ -771,59 +907,65 @@ export async function installOrUpdateCatalogPlugin({
   if (!plugin || typeof plugin !== 'object' || !plugin.id) {
     throw new Error('ERR_INVALID_PLUGIN_ENTRY: Missing valid catalog plugin object');
   }
+  if (plugin.id === SELF_CATALOG_ID && !isOfficialMarketEntry(plugin)) {
+    throw new Error('ERR_UPDATE_TARGET_MISMATCH: The marketplace update requires its official repository and root plugin.');
+  }
 
   const pluginsDir = explicitPluginsDir ? resolve(explicitPluginsDir) : resolvePluginsDir(configDir);
   const disabledDir = resolveDisabledPluginsDir(dataDir);
   mkdirSync(pluginsDir, { recursive: true });
   mkdirSync(dataDir, { recursive: true });
 
-  // Sweep any previously retired `*.old.<ts>` binaries whose handles have closed
-  sweepRetiredBinaries(dataDir);
+  if (hasLockedRemovals(dataDir)) {
+    const unlock = acquirePluginMutation(dataDir);
+    try { sweepRetiredBinaries(dataDir); } finally { unlock(); }
+  }
+  const scanOptions = { configDir, pluginsDir, dataDir, workspaceUris, builtinPluginsDir, catalogPlugins };
+  const preflightOptions = { conflictStrategy, preferredDir, requireExistingDir, allowLegacyRename };
+  const initial = resolveInstallPreflight(plugin, scanLocalPluginInventory(scanOptions), preflightOptions);
+  if (conflictStrategy === 'replace' && replacementKey &&
+      (initial.action !== 'replace-local' || getReplacementKey(plugin, initial.conflict) !== replacementKey)) {
+    throw new Error('ERR_REPLACEMENT_TARGET_CHANGED: The conflicting copy has changed. Review the current conflict before replacing it.');
+  }
+  if (samePluginName(initial.targetDir, PLUGIN_ID) && isForeignMarketInstall(initial.existingInstall)) {
+    throw new Error('ERR_UPDATE_TARGET_MISMATCH: The market directory belongs to a different source.');
+  }
 
-  const inventory = scanLocalPluginInventory({
-    configDir,
-    pluginsDir,
-    dataDir,
-    workspaceUris,
-    builtinPluginsDir,
-  });
-  const preflight = resolveInstallPreflight(plugin, inventory, { conflictStrategy, preferredDir });
+  function guardGitCheckout(preflight) {
+    if (preflight.existingInstall?.isGitManaged) {
+      throw new Error(`ERR_UNMANAGED_GIT_OR_UNVERSIONED: "${preflight.targetDir}" is a Git checkout. Update it with Git.`);
+    }
+  }
+  guardGitCheckout(initial);
+
+  if (initial.action === 'scoped-target-occupied') {
+    throw new Error(`ERR_SCOPED_TARGET_OCCUPIED: 隔离目录或名称 "${initial.targetDir}" 已被其他安装占用。`);
+  }
 
   // Pause & ask user if Track-1 collides with a foreign local plugin
-  if (preflight.action === 'conflict-prompt') {
+  if (initial.action === 'conflict-prompt' || (initial.action === 'replace-local' && !replacementKey)) {
     return {
       ok: false,
       status: 'CONFLICT_CHOICE_REQUIRED',
       conflict: {
-        dir: preflight.conflict.dir,
-        name: preflight.conflict.name,
-        displayName: preflight.conflict.displayName,
-        scope: preflight.conflict.scope,
+        dir: initial.conflict.dir,
+        name: initial.conflict.name,
+        displayName: initial.conflict.displayName,
+        scope: initial.conflict.scope,
       },
-      scopedFallbackName: preflight.scopedFallbackName,
-      choices: preflight.choices,
+      scopedFallbackName: initial.scopedFallbackName || plugin.scopedName,
+      choices: initial.choices || ['isolate', 'replace'],
+      replacementKey: initial.choices && !initial.choices.includes('replace') ? '' : getReplacementKey(plugin, initial.conflict),
     };
   }
 
-  // T+N Update Capability-Escalation Confirmation Gate
-  const existingReceipt = preflight.existingInstall?.receipt || null;
-  const escalation = computeCapabilityEscalation(existingReceipt, plugin);
-  if (preflight.action === 'update' && escalation.escalated && !confirmEscalation) {
-    return {
-      ok: false,
-      status: 'CAPABILITY_ESCALATION_CONFIRM_REQUIRED',
-      installedVersion: existingReceipt?.installedVersion || preflight.existingInstall?.version,
-      targetVersion: plugin.version,
-      escalation,
-    };
+  if (initial.action === 'update' && rejectDowngrade && parseSemver(initial.existingInstall.version) &&
+      (!parseSemver(plugin.version) || compareSemver(plugin.version, initial.existingInstall.version) < 0)) {
+    throw new Error(`ERR_UPDATE_DOWNGRADE: Target ${plugin.version} is older than or incompatible with installed ${initial.existingInstall.version}.`);
   }
-
-  // Keep parked plugins parked when updating in-place!
-  const isUpdatingParked = Boolean(
-    preflight.existingInstall?.parkedByMarket || preflight.existingInstall?.currentlyParked,
-  );
-  if (isUpdatingParked) {
-    mkdirSync(disabledDir, { recursive: true });
+  if (resyncVersion && (compareSemver(plugin.version, resyncVersion) !== 0 ||
+      compareSemver(initial.existingInstall?.version, resyncVersion) !== 0)) {
+    throw new Error('ERR_UPDATE_TARGET_MISMATCH: The requested release does not match the installed version to resync.');
   }
 
   // Out-of-Tree Staging inside `${PLUGIN_DATA}/staging/<uuid>/`
@@ -834,6 +976,8 @@ export async function installOrUpdateCatalogPlugin({
   const backupDir = join(dataDir, 'staging', `${opId}-backup`);
   mkdirSync(stagingRootDir, { recursive: true });
 
+  let journalPending = false;
+  let releaseMutation;
   let installStage = 'staging';
   let targetPluginDirForErr = '';
 
@@ -867,6 +1011,29 @@ export async function installOrUpdateCatalogPlugin({
       }
     }
 
+    // Downloading can outlive a toggle, uninstall or another install in a different process.
+    // Use the current vault location, but require a fresh request if the approved target changed.
+    releaseMutation = acquirePluginMutation(dataDir);
+    const inventory = scanLocalPluginInventory({ ...scanOptions, bypassCache: true });
+    const preflight = resolveInstallPreflight(plugin, inventory, preflightOptions);
+    guardGitCheckout(preflight);
+    const existing = preflight.existingInstall;
+    const previous = initial.existingInstall;
+    if ((preflight.action === 'replace-local' && getReplacementKey(plugin, preflight.conflict) !== replacementKey) ||
+        initial.action !== preflight.action || initial.targetDir !== preflight.targetDir ||
+        initial.effectivePluginName !== preflight.effectivePluginName ||
+        initial.applyScopedRewrite !== preflight.applyScopedRewrite ||
+        previous?.name !== existing?.name || previous?.version !== existing?.version ||
+        previous?.repositoryUrl !== existing?.repositoryUrl || previous?.repositoryRoot !== existing?.repositoryRoot ||
+        !isDeepStrictEqual(previous?.receipt, existing?.receipt) ||
+        !isDeepStrictEqual(previous?.capabilities, existing?.capabilities)) {
+      throw new Error('ERR_UPDATE_TARGET_MISMATCH: The installed plugin changed during download. Retry the operation.');
+    }
+    const isUpdatingParked = Boolean(existing?.parkedByMarket);
+    const existingReceipt = existing?.receipt || null;
+    sweepRetiredBinaries(dataDir);
+
+    let effectivePluginName;
     let compatibilityNotes = [];
     if (preflight.applyScopedRewrite) {
       const rw = applyScopedIsolationRewrite(stagingBundleDir, {
@@ -874,18 +1041,55 @@ export async function installOrUpdateCatalogPlugin({
         scopedName: preflight.effectivePluginName,
         fallbackDisplayName: plugin.displayName,
       });
+      effectivePluginName = rw.manifest.name;
       compatibilityNotes = rw.compatibilityNotes;
     } else {
       // Ensure 10-field purity & true one-click activation (never inject disabled: true)
       const rawManifest = parseJsonc(readFileSync(manifestPath, 'utf8'));
       const cleanManifest = sanitizeNativePluginManifest(rawManifest);
       delete cleanManifest.disabled;
+      effectivePluginName = cleanManifest.name;
       writeFileSync(manifestPath, `${JSON.stringify(cleanManifest, null, 2)}\n`, 'utf8');
     }
 
-    const targetDir = preflight.targetDir;
+    if ((!existing || effectivePluginName !== existing.name) &&
+        ((samePluginName(effectivePluginName, PLUGIN_ID) && plugin.id !== SELF_CATALOG_ID) || inventory.installed.some(loc =>
+          !(existing && loc.scope === existing.scope && loc.path === existing.path) &&
+          (samePluginName(loc.name, effectivePluginName) || samePluginName(loc.dir, effectivePluginName))))) {
+      throw new Error(`ERR_UPDATE_TARGET_MISMATCH: Plugin name "${effectivePluginName}" is already in use.`);
+    }
+    const targetDir = assertSafePluginDir(preflight.targetDir);
+    const staged = scanLocalPluginComponents(stagingBundleDir, targetDir, effectivePluginName, null);
+    const capabilities = mergeCapabilityProfiles(plugin.capabilities, staged.capabilities);
+    const verifiedPlugin = { ...plugin, capabilities };
+    const escalation = getUpdateEscalation(verifiedPlugin, preflight, dlInfo.sha256);
+    if (confirmEscalation && approvalKey && !escalation.escalated) {
+      throw new Error('ERR_UPDATE_APPROVAL_CHANGED: The update changed after the capability confirmation. Refresh and retry.');
+    }
+    if ((preflight.action === 'update' || approvalKey) && escalation.escalated &&
+        (!confirmEscalation || approvalKey !== escalation.approvalKey)) {
+      safeRemoveDirBestEffort(stagingRootDir);
+      return {
+        ok: false,
+        status: 'CAPABILITY_ESCALATION_CONFIRM_REQUIRED',
+        installedVersion: existing?.version || existing?.receipt?.installedVersion,
+        targetVersion: plugin.version,
+        escalation,
+      };
+    }
+    if (samePluginName(targetDir, PLUGIN_ID) && plugin.id !== SELF_CATALOG_ID) {
+      throw new Error('ERR_UPDATE_TARGET_MISMATCH: The marketplace directory is reserved.');
+    }
     const targetRootDir = isUpdatingParked ? disabledDir : pluginsDir;
     const targetPluginDir = join(targetRootDir, targetDir);
+    // Recheck after downloading, including directories without a readable manifest and parked copies.
+    const candidateTargets = [targetPluginDir];
+    if (inventory.disabledPluginsDir) candidateTargets.push(join(inventory.disabledPluginsDir, targetDir));
+    if (!existing && candidateTargets.some(path =>
+      lstatSync(path, { throwIfNoEntry: false }))) {
+      if (preflight.action !== 'install-scoped') throw new Error(`ERR_TARGET_DIR_EXISTS: Directory "${targetDir}" is occupied.`);
+      throw new Error(`ERR_SCOPED_TARGET_OCCUPIED: 隔离目录 "${targetDir}" 已存在，请核对已安装的副本。`);
+    }
     targetPluginDirForErr = targetPluginDir;
     const preservePaths = [
       ...new Set([
@@ -893,21 +1097,39 @@ export async function installOrUpdateCatalogPlugin({
         ...(Array.isArray(plugin.distribution?.preservePaths) ? plugin.distribution.preservePaths : []),
       ]),
     ];
-    const previousManagedFiles = Array.isArray(existingReceipt?.managedFiles) ? existingReceipt.managedFiles : null;
+    const previousManagedFiles = Array.isArray(existingReceipt?.managedFiles) ? existingReceipt.managedFiles : existing ? null : [];
 
     // Snapshot lightweight lock-safe rollback backup if updating/replacing an existing directory
     installStage = 'backup';
-    snapshotBackupSafe(targetPluginDir, backupDir);
-
     const incomingManagedFiles = listAllRelFiles(stagingBundleDir, { tolerateLockErrors: false })
       .filter((rel) => rel !== '.agy-market-receipt.json')
       .sort();
 
+    if (preflight.action === 'replace-local' && !existing.isSymlink) {
+      const hostEntry = /^(?:mcp_config\.json|hooks\.json|hooks\/hooks\.json|sidecars\.json|sidecars\/[^/]+\/sidecar\.json|skills\/[^/]+\/SKILL\.md|(?:agents|rules)\/[^/]+\.md)$/i;
+      const linkedComponent = /^(?:skills|agents|rules|hooks|sidecars)(?:\/[^/]+)?$/i;
+      const preserve = createPreserveMatcher(preservePaths, targetPluginDir);
+      const links = new Set();
+      const existingFiles = listAllRelFiles(targetPluginDir, { deferredLinks: links });
+      const managed = new Set(previousManagedFiles || []);
+      const incoming = new Set(incomingManagedFiles);
+      const leftover = existingFiles.find(rel => hostEntry.test(rel) &&
+        (preserve(rel) || (!incoming.has(rel) && !managed.has(rel)))) ||
+        [...links].find(rel => (hostEntry.test(rel) || linkedComponent.test(rel)) && (!managed.has(rel) || preserve(rel)));
+      if (leftover) {
+        throw new Error(`ERR_PLUGIN_LAYOUT_CONFLICT: 替换后会保留原插件的宿主组件 "${leftover}"。请选择隔离安装，或先备份并移走该组件。 Choose isolated install or move this local component before replacing the plugin.`);
+      }
+    }
+
+    const backupFiles = snapshotBackupSafe(targetPluginDir, backupDir, {
+      previousManagedFiles, incomingFiles: incomingManagedFiles, preservePaths,
+    });
+
     const receipt = buildInstallReceipt({
-      plugin,
+      plugin: verifiedPlugin,
       track,
       installedDir: targetDir,
-      effectivePluginName: preflight.effectivePluginName,
+      effectivePluginName,
       scopedRewriteApplied: preflight.applyScopedRewrite,
       previousInstalledAt: existingReceipt?.installedAt || null,
       actualSha256: dlInfo.sha256,
@@ -916,20 +1138,32 @@ export async function installOrUpdateCatalogPlugin({
     });
 
     // Write crash-recovery journal BEFORE touching target plugin directory
-    writePendingJournal(dataDir, {
+    const journal = {
       op: preflight.action,
       dir: targetDir,
+      targetIdentity: readJournalTargetIdentity(targetPluginDir, stagingBundleDir),
+      pluginsDir: resolve(pluginsDir),
       parkedByMarket: isUpdatingParked,
       fromVersion: preflight.existingInstall?.version || null,
       toVersion: plugin.version,
       stagingRootDir,
       stagingBundleDir,
       backupDir: existsSync(backupDir) ? backupDir : null,
+      backupFiles,
+      trackAdditions: !existing || Array.isArray(backupFiles),
+      snapshotIntegrity: {
+        staging: snapshotDigest(stagingBundleDir),
+        backup: backupFiles ? snapshotDigest(backupDir, backupFiles) : null,
+      },
       preservePaths,
       previousManagedFiles,
       receipt,
       startedAt: new Date().toISOString(),
-    });
+    };
+    // Preflight only permits a changed catalog ID for the same Track 2 repository ID and plugin root.
+    if (preflight.action === 'update' && existingReceipt?.id && existingReceipt.id !== receipt.id) {
+      journal.favoriteTransfer = { id: existingReceipt.id, repositoryUrl: normalizeRepoUrl(existingReceipt.repositoryUrl) };
+    }
 
     installStage = 'sync';
     const syncStats = syncDirectoryLockSafe({
@@ -939,6 +1173,13 @@ export async function installOrUpdateCatalogPlugin({
       preservePaths,
       previousManagedFiles,
       writeOverride,
+      reserveNewFiles: !existing,
+      onFileWritten: trackRollbackAdditions(journal),
+      beforeWrite() {
+        writePendingJournal(dataDir, journal);
+        journalPending = true;
+      },
+      onRootCreated() { bindPendingJournalRoot(dataDir, journal, targetPluginDir); },
     });
 
     const verifiedManagedFiles = Array.isArray(syncStats.managedFiles)
@@ -948,22 +1189,26 @@ export async function installOrUpdateCatalogPlugin({
       receipt.managedFiles = verifiedManagedFiles;
     }
 
-    writeFileSync(join(targetPluginDir, '.agy-market-receipt.json'), `${JSON.stringify(receipt, null, 2)}\n`, 'utf8');
+    commitJournalReceipt(dataDir, targetPluginDir, journal);
 
     // Clear journal & temporary staging artifacts (best-effort so brief Windows Defender locks never fail a finished update)
     clearPendingJournal(dataDir);
+    journalPending = false;
     safeRemoveDirBestEffort(stagingRootDir);
     safeRemoveDirBestEffort(backupDir);
+
+    releaseMutation();
+    releaseMutation = null;
 
     // Check if an already-enabled MCP plugin needs server reload (skip if parked/disabled)
     const enabledByDir = readHostEnabledMapReadOnly(configDir);
     const isEnabled = !isUpdatingParked && enabledByDir.get(targetDir) !== false;
-    const mcpServers = plugin.capabilities?.mcpServers || [];
+    const mcpServers = capabilities.mcpServers;
     let reloadRequired = false;
     let mcpRefreshed = false;
 
     if (preflight.action === 'update' && isEnabled && mcpServers.length > 0) {
-      const refreshRes = await tryOpportunisticMcpRefresh(preflight.effectivePluginName, mcpServers, activeFetch);
+      const refreshRes = await tryOpportunisticMcpRefresh(effectivePluginName, mcpServers, activeFetch);
       mcpRefreshed = Boolean(refreshRes.refreshed);
       reloadRequired = !mcpRefreshed;
     }
@@ -971,7 +1216,7 @@ export async function installOrUpdateCatalogPlugin({
     // Re-scan single installed plugin for accurate Sidecar pill URI & local capabilities
     const postInventory = scanLocalPluginInventory({ configDir, pluginsDir, dataDir });
     const installedRecord = postInventory.installed.find((x) => x.dir === targetDir) || null;
-    const mergedCaps = mergeCapabilityProfiles(installedRecord?.capabilities || {}, plugin.capabilities || {});
+    const mergedCaps = mergeCapabilityProfiles(installedRecord?.capabilities, capabilities);
     const activation = classifyActivationRequirement(mergedCaps, {
       retiredBinaries: syncStats.retiredBinaries,
       reloadRequired,
@@ -984,9 +1229,9 @@ export async function installOrUpdateCatalogPlugin({
       ok: true,
       status: 'INSTALLED',
       action: preflight.action,
-      isSelfUpdate: targetDir === PLUGIN_ID,
+      isSelfUpdate: samePluginName(targetDir, PLUGIN_ID),
       installedDir: targetDir,
-      effectivePluginName: preflight.effectivePluginName,
+      effectivePluginName,
       scopedRewriteApplied: preflight.applyScopedRewrite,
       parkedByMarket: isUpdatingParked,
       version: plugin.version,
@@ -1001,20 +1246,30 @@ export async function installOrUpdateCatalogPlugin({
       receipt,
     };
   } catch (err) {
-    safeRemoveDirBestEffort(stagingRootDir);
-    safeRemoveDirBestEffort(backupDir);
-    try {
-      clearPendingJournal(dataDir);
-    } catch {
-      /* never mask original error */
+    // Recovery needs the staged bundle when syncing or persisting the receipt failed.
+    if (!journalPending) {
+      safeRemoveDirBestEffort(stagingRootDir);
+      safeRemoveDirBestEffort(backupDir);
     }
     const relPath =
       targetPluginDirForErr && err?.path ? relative(targetPluginDirForErr, String(err.path)) : '';
     throw annotateLockError(err, installStage, relPath);
+  } finally {
+    releaseMutation?.();
   }
 }
 
-function removeMarketPluginFilesInternal({
+function removeMarketPluginFilesInternal(options) {
+  const dataDir = options.dataDir || resolveMarketDataDir();
+  const release = acquirePluginMutation(dataDir);
+  try {
+    return removePluginUnderLock({ ...options, dataDir });
+  } finally {
+    release();
+  }
+}
+
+function removePluginUnderLock({
   dir,
   configDir = resolveAntigravityConfigDir(),
   pluginsDir: explicitPluginsDir = '',
@@ -1022,8 +1277,9 @@ function removeMarketPluginFilesInternal({
   workspaceUris = [],
   builtinPluginsDir = '',
   catalogCapabilities = null,
+  expectedInstall = null,
   removeFavorite = false,
-  extraFavoriteKeys = [],
+  catalogPlugins = [],
   nowMs = Date.now(),
   rmOverride = null,
   unlinkOverride = null,
@@ -1032,11 +1288,15 @@ function removeMarketPluginFilesInternal({
   unlinkLinkOverride = null,
 }) {
   const safeDir = assertSafePluginDir(dir);
-  if (safeDir === PLUGIN_ID) {
+  if (samePluginName(safeDir, PLUGIN_ID)) {
     throw new Error('ERR_CANNOT_SELF_DELETE: Manage agy-market itself via customization://agy-market');
   }
   const pluginsDir = explicitPluginsDir ? resolve(explicitPluginsDir) : resolvePluginsDir(configDir);
   const disabledDir = resolveDisabledPluginsDir(dataDir);
+  // A --dest override selects an active directory. Only the configured host
+  // plugin root owns the shared disabled vault and the host's favorite records.
+  const hostPluginsDir = resolvePluginsDir(configDir);
+  const isHostRoot = isHostPluginsDir(pluginsDir, configDir);
   const activeTarget = resolve(pluginsDir, safeDir);
   const parkedTarget = resolve(disabledDir, safeDir);
 
@@ -1044,15 +1304,16 @@ function removeMarketPluginFilesInternal({
     typeof linkInfoOverride === 'function'
       ? linkInfoOverride(pluginsDir, safeDir) || isDirectorySymlinkOrJunction(pluginsDir, safeDir)
       : isDirectorySymlinkOrJunction(pluginsDir, safeDir);
-  const parkedLinkInfo =
+  const parkedLinkInfo = !isHostRoot ? null :
     typeof linkInfoOverride === 'function'
       ? linkInfoOverride(disabledDir, safeDir) || isDirectorySymlinkOrJunction(disabledDir, safeDir)
       : isDirectorySymlinkOrJunction(disabledDir, safeDir);
 
   const hasActive = Boolean(activeLinkInfo?.lstat) || existsSync(activeTarget);
-  const hasParked = Boolean(parkedLinkInfo?.lstat) || existsSync(parkedTarget);
+  const hasParked = isHostRoot && (Boolean(parkedLinkInfo?.lstat) || existsSync(parkedTarget));
 
   if (!hasActive && !hasParked) {
+    if (expectedInstall?.key) throw new Error('ERR_UNINSTALL_TARGET_CHANGED: The selected installation has changed.');
     if ((Array.isArray(workspaceUris) && workspaceUris.length > 0) || builtinPluginsDir) {
       const inv = scanLocalPluginInventory({
         configDir,
@@ -1079,6 +1340,8 @@ function removeMarketPluginFilesInternal({
         );
       }
     }
+    const pending = readPendingPluginUpdate(dataDir, isHostRoot ? [activeTarget, parkedTarget] : [activeTarget], hostPluginsDir);
+    if (pending) discardPendingPluginUpdate(dataDir, pending);
     const activation = classifyActivationRequirement({}, { action: 'uninstall' });
     return {
       publicResult: {
@@ -1100,14 +1363,16 @@ function removeMarketPluginFilesInternal({
   sweepRetiredBinaries(dataDir);
 
   // Snapshot manifest, receipt, capabilities, MCP state, and repoSlug BEFORE removing files
-  const snapshotDir =
-    hasActive && existsSync(join(activeTarget, 'plugin.json'))
-      ? activeTarget
-      : hasParked && existsSync(join(parkedTarget, 'plugin.json'))
-        ? parkedTarget
-        : hasActive
-          ? activeTarget
-          : parkedTarget;
+  // Inventory presents the active manifest first. A parked copy under the same name
+  // becomes visible after removing the active one and can be managed separately.
+  const activeManifest = hasActive && existsSync(join(activeTarget, 'plugin.json'));
+  const parkedManifest = hasParked && existsSync(join(parkedTarget, 'plugin.json'));
+  const snapshotDir = activeManifest || (hasActive && !parkedManifest) ? activeTarget : parkedTarget;
+  const removeParked = snapshotDir === parkedTarget;
+  const removeActive = snapshotDir === activeTarget ||
+    (removeParked && lstatSync(activeTarget, { throwIfNoEntry: false })?.isDirectory() && isRetiredPluginRemnant(activeTarget, dataDir));
+  const targets = [removeActive && activeTarget, removeParked && parkedTarget].filter(Boolean);
+  const pending = readPendingPluginUpdate(dataDir, targets, resolvePluginsDir(configDir));
 
   let manifest = null;
   const snapshotManifestPath = join(snapshotDir, 'plugin.json');
@@ -1129,6 +1394,19 @@ function removeMarketPluginFilesInternal({
     }
   }
 
+  if (expectedInstall && (expectedInstall.parked !== removeParked || !existsSync(snapshotManifestPath) ||
+      (Object.hasOwn(expectedInstall, 'key') &&
+        expectedInstall.key !== localUninstallKey(snapshotDir, manifest || { name: safeDir }, receipt)) ||
+      expectedInstall.name !== String(manifest?.name || safeDir) || expectedInstall.id !== (receipt?.id || '') ||
+      (Object.hasOwn(expectedInstall, 'repositoryUrl') &&
+        expectedInstall.repositoryUrl !== resolveLocalPluginSource(snapshotDir, manifest || {}, receipt).repositoryUrl))) {
+    throw new Error('ERR_UNINSTALL_TARGET_CHANGED: The selected installation has changed.');
+  }
+  if (!activeManifest && !parkedManifest && !receipt && !pending && existsSync(snapshotDir) &&
+      !(removeParked ? parkedLinkInfo : activeLinkInfo)?.isSymlink && !isRetiredPluginRemnant(snapshotDir, dataDir)) {
+    throw new Error('ERR_UNINSTALL_TARGET_CHANGED: Cannot identify the files at the selected path.');
+  }
+
   let components = null;
   try {
     if (existsSync(snapshotDir)) {
@@ -1138,7 +1416,16 @@ function removeMarketPluginFilesInternal({
     components = null;
   }
 
-  const mergedCaps = mergeCapabilityProfiles(components?.capabilities || {}, catalogCapabilities || {});
+  const installed = isHostRoot
+    ? scanLocalPluginInventory({ configDir, pluginsDir, dataDir, workspaceUris, builtinPluginsDir,
+        linkInfoOverride, catalogPlugins, bypassCache: true }).installed
+    : [];
+  const selectedLocal = installed.find(loc => loc.scope === 'global' && loc.dir === safeDir);
+  const repository = normalizeRepoUrl(receipt?.repositoryUrl || (!selectedLocal?.inferredRepository && selectedLocal?.repositoryUrl));
+  const matchedCatalog = findCatalogEntryForLocal(selectedLocal, catalogPlugins, installed);
+  const root = receipt?.pluginRoot || selectedLocal?.repositoryRoot ||
+    (matchedCatalog && normalizePluginRoot(matchedCatalog.repository?.pluginRoot));
+  const mergedCaps = mergeCapabilityProfiles(components?.capabilities, matchedCatalog?.capabilities || catalogCapabilities);
   const mcpServers = [...new Set([...(components?.mcpServerKeys || []), ...(mergedCaps.mcpServers || [])])];
   const hadMcp = Boolean(
     components?.hasMcp ||
@@ -1212,21 +1499,55 @@ function removeMarketPluginFilesInternal({
     }
   }
 
-  const parkedRes = hasParked ? removeOneTarget(parkedTarget, parkedLinkInfo) : null;
-  const activeRes = hasActive ? removeOneTarget(activeTarget, activeLinkInfo) : null;
+  function matchesFavorite(key, sources) {
+    if (!selectedLocal) return false;
+    if (key === selectedLocal.favoriteKey) return true;
+    const pinned = sources[key];
+    if (pinned?.catalogOrigin && (!repository || createHash('sha256').update(repository).digest('hex') !== pinned.catalogOrigin)) return false;
+    if (pinned?.repositoryUrl && normalizeRepoUrl(pinned.repositoryUrl) !== repository) return false;
+    if (pinned?.pluginRoot && (!root || normalizePluginRoot(root) !== pinned.pluginRoot)) return false;
+    if (matchLegacyLocalFavorite(key, installed, pinned) === selectedLocal) return true;
+    if (key === matchedCatalog?.id) return true;
+    if (key !== safeDir && key !== receipt?.id) return false;
+    return !catalogPlugins.some(entry => entry.id === key) &&
+      !installed.some(loc => loc !== selectedLocal && (loc.dir === key || loc.receipt?.id === key));
+  }
+  if (!removeFavorite && selectedLocal) {
+    // Preserve the source before deleting its last on-disk manifest and receipt.
+    const source = makeFavoriteSource(manifest?.displayName || manifest?.name || safeDir,
+      parseGithubRepoSlug(repository)?.url, root,
+      receipt?.githubSource?.trackBranch);
+    updatePrefsOnDisk(dataDir, current => {
+      const favoriteSources = { ...current.favoriteSources };
+      const savedKeys = current.favorites.filter(key => matchesFavorite(key, current.favoriteSources));
+      if (!savedKeys.length) return null;
+      for (const key of savedKeys) {
+        const pinned = favoriteSources[key];
+        if (!pinned?.repositoryUrl && !pinned?.catalogOrigin) favoriteSources[key] = source;
+        else if (source.repositoryUrl && normalizeRepoUrl(pinned.repositoryUrl) === repository) {
+          favoriteSources[key] = { ...pinned, pluginRoot: pinned.pluginRoot || source.pluginRoot,
+            trackBranch: pinned.trackBranch || source.trackBranch };
+        }
+      }
+      return { favoriteSources };
+    });
+  }
+
+  const parkedRes = removeParked ? removeOneTarget(parkedTarget, parkedLinkInfo) : null;
+  const activeRes = removeActive ? removeOneTarget(activeTarget, activeLinkInfo) : null;
 
   const retiredBinaries = [...new Set([...(parkedRes?.retired || []), ...(activeRes?.retired || [])])];
   const locked = Boolean(parkedRes?.locked || activeRes?.locked);
   const lastError = activeRes?.error || parkedRes?.error || null;
   const manifestStillPresent =
-    (hasActive && existsSync(join(activeTarget, 'plugin.json'))) ||
-    (hasParked && existsSync(join(parkedTarget, 'plugin.json')));
+    targets.some(target => existsSync(join(target, 'plugin.json')));
   const removed =
     !manifestStillPresent &&
     Boolean((parkedRes ? parkedRes.removed : true) && (activeRes ? activeRes.removed : true));
 
   // Post-removal hygiene: purge stale GitHub cache files for this repoSlug & optional favorite cleanup
   if (removed) {
+    if (pending) discardPendingPluginUpdate(dataDir, pending);
     if (repoSlug) {
       const ghCacheDir = join(dataDir, 'cache', 'github');
       if (existsSync(ghCacheDir)) {
@@ -1253,28 +1574,14 @@ function removeMarketPluginFilesInternal({
       }
     }
 
-    if (removeFavorite) {
+    if (removeFavorite && selectedLocal) {
       try {
-        const diskPrefs = loadPrefsFromDisk(dataDir);
-        const dropSet = new Set(
-          [
-            safeDir,
-            `local:${safeDir}`,
-            receipt?.id,
-            manifest?.name,
-            manifest?.name ? `local:${manifest.name}` : '',
-            ...(Array.isArray(extraFavoriteKeys) ? extraFavoriteKeys : []),
-          ]
-            .map((v) => String(v || '').trim())
-            .filter(Boolean),
-        );
-        const prevFavs = Array.isArray(diskPrefs.favorites) ? diskPrefs.favorites : [];
-        const nextFavs = prevFavs.filter((item) => !dropSet.has(item));
-        if (nextFavs.length !== prevFavs.length) {
-          savePrefsToDisk(dataDir, { ...diskPrefs, favorites: nextFavs });
-        }
+        updatePrefsOnDisk(dataDir, current => {
+          const favorites = current.favorites.filter(key => !matchesFavorite(key, current.favoriteSources));
+          return favorites.length === current.favorites.length ? null : { favorites };
+        });
       } catch {
-        /* non-fatal */
+        /* File removal already succeeded; favorite cleanup remains best effort. */
       }
     }
   }
@@ -1298,7 +1605,7 @@ function removeMarketPluginFilesInternal({
 
   return {
     publicResult,
-    mcpServers,
+    mcpServers: isHostRoot ? mcpServers : [],
     effectivePluginName,
     mergedCaps,
   };

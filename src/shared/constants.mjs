@@ -8,7 +8,7 @@ export const SUBMIT_PLUGIN_GUIDE_URL =
 export const NOMINATE_PLUGIN_ISSUE_BASE_URL =
   'https://github.com/azwosile/agy-market-catalog/issues/new';
 export const PLUGIN_DISPLAY_NAME = 'AGY Market · 反重力插件市场';
-export const PLUGIN_VERSION = '1.7.2';
+export const PLUGIN_VERSION = '2.0.0';
 export const SIDECAR_ID = 'market_pane';
 export const SIDECAR_URI = 'sidecar://agy-market/market_pane/';
 export const CUSTOMIZATION_URI = 'customization://agy-market';

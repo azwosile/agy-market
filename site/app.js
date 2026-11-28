@@ -162,7 +162,7 @@
     const filtered = plugins.filter((p) => {
       if (cat !== 'all' && !(p.taxonomy?.categories || []).includes(cat)) return false;
       if (!q) return true;
-      const desc = typeof p.description === 'object' ? `${p.description.zh || ''} ${p.description.en || ''}` : String(p.description || '');
+      const desc = p.description && typeof p.description === 'object' ? `${p.description.zh || ''} ${p.description.en || ''}` : String(p.description || '');
       const catTerms = (p.taxonomy?.categories || [])
         .map((c) => `${c} ${CATEGORY_LABELS[c] || ''}`)
         .join(' ');
@@ -180,7 +180,7 @@
 
     grid.innerHTML = list
       .map((p) => {
-        const desc = typeof p.description === 'object' ? p.description.zh || p.description.en || '' : String(p.description || '');
+        const desc = p.description && typeof p.description === 'object' ? p.description.zh || p.description.en || '' : String(p.description || '');
         const badges = (p.capabilities?.badges || [])
           .map((b) => `<span class="badge">${escapeHtml(BADGE_LABELS[b] || b)}</span>`)
           .join('');
@@ -229,7 +229,8 @@
         if (!res.ok) continue;
         const json = await res.json();
         if (Array.isArray(json.plugins)) {
-          loaded = json.plugins;
+          loaded = json.plugins.filter(p => p && typeof p === 'object' && !Array.isArray(p) &&
+            [p.taxonomy?.categories, p.taxonomy?.tags, p.capabilities?.badges].every(list => list == null || Array.isArray(list)));
           usedChannel = candidate.includes('raw.githubusercontent.com') ? 'GitHub Raw 镜像' : 'GitHub Pages';
           break;
         }

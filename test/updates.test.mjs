@@ -1,10 +1,15 @@
 import assert from 'node:assert/strict';
+import { execFile, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import test from 'node:test';
+import { promisify } from 'node:util';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+
+import { installOrUpdateCatalogPlugin, toggleInstalledPlugin, uninstallPlugin } from '../src/installer/index.mjs';
+import { acquirePluginMutation, recoverInterruptedJournal } from '../src/installer/journal.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -154,6 +159,580 @@ function makeCatalogPlugin({
     updatedAt: '2026-11-23T12:00:00Z',
   };
 }
+
+async function openUpdateFixture(t, fetchImpl) {
+  const ws = makeTempWorkspace();
+  const server = await createMarketSidecarServer({
+    configDir: ws.configDir, dataDir: ws.dataDir, listen: false, recoveryDelayMs: -1,
+    currentSelfVersion: '1.0.0', onSelfRestart() {}, fetchImpl,
+  });
+  t.after(async () => { await server.close(); ws.cleanup(); });
+  const post = async (url, body) => (await server.inject({
+    method: 'POST', url, body, headers: { 'X-Sidecar-Token': server.sideToken },
+  })).json();
+  return { ws, server, post };
+}
+
+test('GitHub subdirectory updates check the component version and install from an archive containing that path', async t => {
+  const repo = 'https://github.com/example/tools';
+  const root = 'plugins/reader';
+  let tag = 'v10.0.0';
+  let version = '1.0.0';
+  let flat = true;
+  const reads = [];
+  const manifest = v => ({ name: 'reader', version: v, repository: repo });
+  const archive = prefix => createDeterministicTarGz({
+    'release/README.md': 'release', ['release/' + prefix + 'plugin.json']: JSON.stringify(manifest(version)),
+  });
+  const { ws, server, post } = await openUpdateFixture(t, async url => {
+    if (url.endsWith('/index.json')) return Response.json({ plugins: [] });
+    if (url.includes('/repos/example/tools/releases/')) return Response.json({ tag_name: tag, assets: [
+      { name: 'tools.tar.gz', browser_download_url: repo + '/releases/download/' + tag + '/tools.tar.gz' },
+    ] });
+    if (url.includes('/repos/example/tools/tags?')) return Response.json([{ name: tag }]);
+    if (url.includes('raw.githubusercontent.com/example/tools/') && url.endsWith(root + '/plugin.json')) return Response.json(manifest(version));
+    if (url.includes('/releases/download/')) { reads.push('asset'); return new Response(archive(flat ? '' : root + '/')); }
+    if (url.includes('/tools/archive/')) { reads.push('source'); return new Response(archive(root + '/')); }
+    return new Response('{}', { status: 404 });
+  });
+  const receipt = { id: 'example__tools--plugins-reader', track: 'github-url', repositoryUrl: repo,
+    pluginRoot: root, installedVersion: '9.0.0', gitTag: 'v9.0.0', managedFiles: ['plugin.json'] };
+  installFakeLocalPlugin(ws.pluginsDir, { dir: 'reader', manifest: manifest('7.0.0'), receipt });
+  const check = async () => (await server.inject({ url: '/api/updates?force=1' })).json().items.filter(i => i.dir === 'reader');
+  const update = targetRef => post('/api/update', { dir: 'reader', updateChannel: 'github-url', updateKind: 'semver', targetRef });
+  assert.deepEqual(await check(), []);
+  const rejected = await update(tag);
+  assert.match(rejected.error, /ERR_UPDATE_DOWNGRADE/);
+  const dir = join(ws.pluginsDir, 'reader');
+  assert.equal(JSON.parse(readFileSync(join(dir, 'plugin.json'))).version, '7.0.0');
+  assert.deepEqual(JSON.parse(readFileSync(join(dir, '.agy-market-receipt.json'))), receipt);
+  reads.length = 0;
+  const { pluginRoot, ...legacyReceipt } = receipt;
+  installFakeLocalPlugin(ws.pluginsDir, { dir: 'reader', receipt: legacyReceipt,
+    manifest: { ...manifest('7.0.0'), repository: { url: repo, directory: pluginRoot } } });
+  tag = 'v2.0.0';
+  version = '8.0.0';
+  const [offered] = await check();
+  assert.equal(offered.latestVersion, version);
+  assert.equal(offered.installedVersion, '7.0.0');
+  assert.equal((await update(offered.targetRef)).status, 'INSTALLED');
+  assert.deepEqual(reads, ['asset', 'source']);
+  assert.equal(JSON.parse(readFileSync(join(dir, '.agy-market-receipt.json'))).installedVersion, version);
+  assert.deepEqual(await check(), []);
+  reads.length = 0;
+  tag = 'v2.1.0';
+  version = '8.1.0';
+  flat = false;
+  assert.equal((await update(tag)).status, 'INSTALLED');
+  assert.deepEqual(reads, ['asset']);
+});
+
+test('upstream updates retain the installed repository when another feed reuses its ID', async t => {
+  const id = 'community__reader';
+  const repo = 'https://github.com/first/reader';
+  const other = { id, canonicalName: 'reader', version: '1.0.0', repository: { url: 'https://github.com/second/reader', repositoryId: 91 } };
+  const manifest = version => ({ name: 'reader', version, repository: repo });
+  const archive = createDeterministicTarGz({ 'reader/plugin.json': JSON.stringify(manifest('2.0.0')) });
+  const { ws, server, post } = await openUpdateFixture(t, async url => {
+    if (url.endsWith('/index.json')) return Response.json({ plugins: [other] });
+    if (url.endsWith('/repos/first/reader')) return Response.json({ id: 23, default_branch: 'main' });
+    if (url.includes('/repos/first/reader/releases/')) return Response.json({ tag_name: 'v2.0.0', assets: [
+      { name: 'reader.tar.gz', browser_download_url: repo + '/releases/download/v2.0.0/reader.tar.gz' },
+    ] });
+    if (url.includes('/repos/first/reader/tags?')) return Response.json([{ name: 'v2.0.0' }]);
+    if (url.includes('/first/reader/releases/download/') || url.includes('/first/reader/archive/')) return new Response(archive);
+    return new Response('{}', { status: 404 });
+  });
+  for (const action of ['single', 'all', 'selected']) {
+    installFakeLocalPlugin(ws.pluginsDir, { dir: 'reader', manifest: manifest('1.0.0'),
+      receipt: { id, installedVersion: '1.0.0', repositoryUrl: repo, track: 'github-url', pluginRoot: '.' } });
+    const report = (await server.inject({ url: '/api/updates?force=1' })).json();
+    const item = report.items.find(i => i.dir === 'reader');
+    assert.equal(item?.repositoryUrl, repo);
+    if (action === 'single') {
+      const result = await post('/api/update', { ...item, id, dir: 'reader' });
+      assert.equal(result.ok, true, JSON.stringify(result.error));
+    } else {
+      await post('/api/update-all', action === 'selected' ? { ids: ['reader'] } : {});
+    }
+    const saved = JSON.parse(readFileSync(join(ws.pluginsDir, 'reader', '.agy-market-receipt.json')));
+    assert.equal(saved.installedVersion, '2.0.0', action);
+    assert.equal(saved.repositoryUrl, repo);
+    assert.notEqual(saved.repositoryId, other.repository.repositoryId, action);
+  }
+});
+
+test('four-part revisions upgrade numerically and cannot be downgraded by resync', async t => {
+  const older = '2026.10.25.9', newer = '2026.10.25.10';
+  const repo = 'https://github.com/demo/calendar';
+  const manifest = version => ({ name: 'calendar', repository: repo, version });
+  const plugin = makeCatalogPlugin({ id: 'demo__calendar', canonicalName: 'calendar', displayName: 'Calendar',
+    owner: 'demo', repo: 'calendar', repoId: 42, version: newer, tarballUrl: 'https://example.com/calendar.tgz' });
+  let archive;
+  function publish(version) {
+    archive = createDeterministicTarGz({ 'plugin.json': JSON.stringify(manifest(version)) });
+    Object.assign(plugin, { version, gitTag: 'v' + version });
+    plugin.distribution.sha256 = createHash('sha256').update(archive).digest('hex');
+  }
+  publish(newer);
+  const { ws, server, post } = await openUpdateFixture(t, async url => {
+    if (url === plugin.distribution.tarballUrl) return new Response(archive);
+    if (url.endsWith('/index.json')) return Response.json({ plugins: [plugin] });
+    return new Response('{}', { status: 404 });
+  });
+  installFakeLocalPlugin(ws.pluginsDir, { dir: 'calendar', manifest: manifest(older),
+    receipt: { id: plugin.id, repositoryId: 42, repositoryUrl: repo, track: 'verified', installedVersion: older, gitTag: 'v' + older } });
+  const updates = async () => (await server.inject({ url: '/api/updates?force=1' })).json().items.filter(i => i.dir === 'calendar');
+  const req = { dir: 'calendar', id: plugin.id };
+  assert.deepEqual((await updates()).map(i => i.latestVersion), [newer]);
+  assert.equal((await post('/api/update', req)).ok, true);
+  publish(older);
+  await server.inject({ url: '/api/state?refresh=1' });
+  assert.deepEqual(await updates(), []);
+  assert.equal((await post('/api/update', req)).status, 'ALREADY_UP_TO_DATE');
+  assert.match((await post('/api/update', { ...req, forceResync: true })).error, /ERR_UPDATE_DOWNGRADE/);
+  assert.equal(JSON.parse(readFileSync(join(ws.pluginsDir, 'calendar', 'plugin.json'))).version, newer);
+});
+
+test('upstream updates follow a verified repository transfer and save the new address', async t => {
+  const oldUrl = 'https://github.com/first/reader', newUrl = 'https://github.com/second/reader';
+  const id = 'first__reader', tag = 'v2.0.0';
+  const plugin = { id, canonicalName: 'reader', version: '1.0.0', repository: { url: newUrl, repositoryId: 42 } };
+  const archive = createDeterministicTarGz({ 'reader/plugin.json': JSON.stringify({ name: 'reader', repository: newUrl, version: '2.0.0' }) });
+  let liveId = 91, archiveRequests = 0;
+  const { ws, server, post } = await openUpdateFixture(t, async url => {
+    if (url.endsWith('/index.json')) return Response.json({ plugins: [plugin] });
+    if (url.endsWith('/repos/second/reader')) return Response.json({ id: liveId });
+    if (url.includes('/repos/second/reader/releases/')) return Response.json({ tag_name: tag, assets: [] });
+    if (url.includes('/repos/second/reader/tags?')) return Response.json([{ name: tag }]);
+    if (url.includes('/second/reader/archive/')) { archiveRequests++; return new Response(archive); }
+    return new Response('{}', { status: 404 });
+  });
+  const installOld = () => installFakeLocalPlugin(ws.pluginsDir, { dir: 'reader',
+    manifest: { name: 'reader', version: '1.0.0', repository: oldUrl },
+    receipt: { id, track: 'verified', repositoryId: 42, repositoryUrl: oldUrl, installedVersion: '1.0.0', gitTag: 'v1.0.0' } });
+  installOld();
+  const report = async () => (await server.inject({ url: '/api/updates?force=1' })).json().items.find(i => i.dir === 'reader');
+  const item = await report();
+  assert.equal(item.repositoryUrl, newUrl);
+  assert.match((await post('/api/update', item)).error, /ERR_UPDATE_TARGET_MISMATCH/);
+  liveId = 42;
+  assert.match((await post('/api/update', { ...item, pluginRoot: 'plugins/other' })).error, /ERR_UPDATE_TARGET_MISMATCH/);
+  assert.match((await post('/api/update', { ...item, repositoryUrl: 'https://github.com/unrelated/reader' })).error, /ERR_UPDATE_TARGET_MISMATCH/);
+  assert.equal(archiveRequests, 0);
+  for (const action of ['single', 'batch']) {
+    installOld();
+    if (action === 'single') assert.equal((await post('/api/update', item)).ok, true);
+    else assert.equal((await post('/api/update-all', { ids: ['reader'] })).results[0].ok, true);
+    const saved = JSON.parse(readFileSync(join(ws.pluginsDir, 'reader', '.agy-market-receipt.json')));
+    assert.equal(saved.repositoryId, 42);
+    assert.equal(saved.repositoryUrl, newUrl);
+    assert.equal(saved.id, id);
+    assert.equal(saved.installedVersion, '2.0.0');
+    assert.equal(await report(), undefined);
+  }
+});
+
+test('catalog README fallback uses only the installed copy from the selected source', async t => {
+  const entry = owner => ({ id: owner + '__reader', canonicalName: 'reader', version: '1.0.0',
+    repository: { url: 'https://github.com/' + owner + '/reader' } });
+  const { ws, server } = await openUpdateFixture(t, async url => {
+    if (url.endsWith('/index.json')) return Response.json({ plugins: [entry('alice'), entry('bob')] });
+    if (url.endsWith('/readmes/bob__reader.json')) return Response.json({ id: 'bob__reader', en: 'Bob instructions' });
+    return new Response(null, { status: 404 });
+  });
+  installFakeLocalPlugin(ws.pluginsDir, { dir: 'reader',
+    manifest: { name: 'reader', version: '1.0.0', repository: entry('alice').repository.url } });
+  writeFileSync(join(ws.pluginsDir, 'reader', 'README.zh.md'), 'Alice instructions');
+  const read = async (id, dir) => (await server.inject({
+    url: '/api/readme?' + new URLSearchParams({ id, dir, locale: 'zh' }),
+  })).json().markdown;
+  // The first request can arrive before the UI has loaded /api/state.
+  assert.equal(await read('bob__reader', 'reader'), 'Bob instructions');
+  assert.equal(await read('alice__reader', ''), 'Alice instructions');
+  assert.equal(await read('missing__reader', 'reader'), '');
+  assert.equal(await read('', 'reader'), 'Alice instructions');
+});
+
+test('custom README requests use the winning feed for live, monolithic and offline documentation', async t => {
+  const id = 'demo__reader', feed = 'https://catalog.example/custom/index.json';
+  const entry = owner => ({ id, canonicalName: 'reader', version: '1.0.0', repository: { url: 'https://github.com/' + owner + '/reader' } });
+  let offline = false;
+  const { ws, server, post } = await openUpdateFixture(t, async url => {
+    if (offline) throw new Error('offline');
+    if (url.endsWith('/index.json')) return Response.json({ plugins: [entry(url.startsWith('https://catalog.example/') ? 'company' : 'community')] });
+    if (url === new URL('readmes.json', feed).href) return Response.json({ entriesEn: { [id]: 'Company instructions' } });
+    if (!url.startsWith('https://catalog.example/') && url.endsWith('/readmes/' + id + '.json')) return Response.json({ id, en: 'Community instructions' });
+    return new Response('{}', { status: 404 });
+  });
+  const read = async () => (await server.inject({ url: '/api/readme?id=' + id + '&dir=reader&locale=en' })).json().markdown;
+  await server.inject({ url: '/api/state' });
+  assert.equal(await read(), 'Community instructions');
+  const state = await post('/api/sources', { customFeeds: [feed] });
+  assert.equal(state.catalog.plugins[0].repository.url, entry('company').repository.url);
+  assert.equal(await read(), 'Company instructions');
+  offline = true;
+  const reopened = (await server.inject({ url: '/api/state?panelOpen=1' })).json();
+  assert.equal(reopened.catalog.plugins[0]._feedUrl, feed);
+  assert.equal(reopened.catalog.plugins[0].repository.url, entry('company').repository.url);
+  assert.deepEqual(reopened.catalog.failedCustomFeeds.map(f => f.url), [feed]);
+  assert.equal(await read(), 'Company instructions');
+  const cold = await createMarketSidecarServer({ configDir: ws.configDir, dataDir: ws.dataDir, listen: false,
+    recoveryDelayMs: -1, fetchImpl: async () => { throw new Error('offline'); } });
+  try {
+    const snapshot = (await cold.inject({ url: '/api/state?panelOpen=1' })).json();
+    assert.equal(snapshot.catalog.plugins[0]._feedUrl, feed);
+    assert.equal((await cold.inject({ url: '/api/readme?id=' + id + '&locale=en' })).json().markdown, 'Company instructions');
+  } finally { await cold.close(); }
+  offline = false;
+  installFakeLocalPlugin(ws.pluginsDir, { dir: 'reader', manifest: { name: 'reader', version: '1.0.0', repository: entry('community').repository.url } });
+  writeFileSync(join(ws.pluginsDir, 'reader', 'README.md'), 'Unrelated local instructions');
+  await post('/api/sources', { customFeeds: ['https://catalog.example/empty/index.json'] });
+  assert.equal(await read(), '');
+  await post('/api/sources', { customFeeds: [] });
+  assert.equal(await read(), 'Community instructions');
+});
+
+test('a transferred Track 2 entry updates its original scoped installation under the new catalog ID', async t => {
+  const dir = 'first--reader', oldUrl = 'https://github.com/first/reader', newUrl = 'https://github.com/second/reader';
+  const manifest = { name: 'reader', version: '2.0.0', repository: newUrl };
+  const archive = createDeterministicTarGz({ 'plugin.json': JSON.stringify(manifest) });
+  const plugin = makeCatalogPlugin({ id: 'second__reader', canonicalName: 'reader', displayName: 'Reader',
+    owner: 'second', repo: 'reader', repoId: 42, version: manifest.version, tarballUrl: 'https://example.com/new.tgz',
+    sha256: createHash('sha256').update(archive).digest('hex') });
+  const { ws, server, post } = await openUpdateFixture(t, async url => {
+    if (url.endsWith('/unverified-index.json')) return Response.json({ plugins: [plugin] });
+    if (url.endsWith('/index.json')) return Response.json({ plugins: [] });
+    if (url === plugin.distribution.tarballUrl || url.includes('/second/reader/archive/')) return new Response(archive);
+    if (url.endsWith('/repos/second/reader')) return Response.json({ id: 42 });
+    if (url.includes('/repos/second/reader/releases/')) return Response.json({ tag_name: 'v2.0.0', assets: [] });
+    return new Response('{}', { status: 404 });
+  });
+  await post('/api/prefs', { enableExperimentalTrack2: true });
+  for (const channel of ['catalog', 'upstream', 'recovery']) {
+    const prefsPath = join(ws.dataDir, 'prefs.json');
+    const oldId = 'first__reader';
+    const other = { catalogId: oldId, repositoryUrl: oldUrl, pluginRoot: 'plugins/other' };
+    const foreign = { catalogId: oldId, repositoryUrl: 'https://github.com/other/reader', pluginRoot: '.' };
+    writeFileSync(prefsPath, JSON.stringify({ ...JSON.parse(readFileSync(prefsPath)),
+      favorites: [oldId, 'saved:other-root', 'saved:foreign'],
+      favoriteSources: { [oldId]: { repositoryUrl: oldUrl, pluginRoot: '.', trackBranch: 'stable' },
+        'saved:other-root': other, 'saved:foreign': foreign } }));
+    installFakeLocalPlugin(ws.pluginsDir, { dir, manifest: { name: dir, version: '1.0.0', repository: oldUrl },
+      receipt: { id: 'first__reader', track: 'unverified', repositoryUrl: oldUrl, repositoryId: 42, pluginRoot: '.',
+        installedVersion: '1.0.0', scopedRewriteApplied: true, effectivePluginName: dir } });
+    const state = (await server.inject({ url: '/api/state' })).json();
+    assert.equal(state.catalog.plugins.find(p => p.id === plugin.id).installStatus.installedDir, dir);
+    let updated;
+    if (channel === 'recovery') {
+      await assert.rejects(installOrUpdateCatalogPlugin({ ...ws, plugin: state.catalog.plugins.find(p => p.id === plugin.id),
+        track: 'unverified', fetchImpl: async () => new Response(archive),
+        writeOverride() { throw new Error('interrupted transfer'); } }), /interrupted transfer/);
+      assert.equal(JSON.parse(readFileSync(prefsPath)).favoriteSources[oldId].repositoryUrl, oldUrl);
+      assert.equal(recoverInterruptedJournal(ws).action, 'completed-forward');
+      updated = (await server.inject({ url: '/api/state' })).json().prefs;
+    } else {
+      const result = channel === 'upstream'
+        ? await post('/api/update', { id: plugin.id, dir, updateChannel: 'github-upstream', targetRef: 'v2.0.0' })
+        : await post('/api/install', { id: plugin.id });
+      assert.equal(result.ok, true, JSON.stringify(result.error));
+      updated = result.state.prefs;
+    }
+    assert.deepEqual(readdirSync(ws.pluginsDir), [dir]);
+    const saved = JSON.parse(readFileSync(join(ws.pluginsDir, dir, '.agy-market-receipt.json')));
+    assert.equal(saved.id, plugin.id);
+    assert.equal(saved.repositoryUrl, newUrl);
+    assert.equal(saved.effectivePluginName, dir);
+    assert.equal(saved.installedVersion, '2.0.0');
+    assert.deepEqual(updated.favorites, [plugin.id, 'saved:other-root', 'saved:foreign']);
+    assert.equal(updated.favoriteSources[plugin.id].repositoryUrl, newUrl);
+    assert.equal(updated.favoriteSources[plugin.id].trackBranch, 'stable');
+    assert.equal(updated.favoriteSources['saved:other-root'].pluginRoot, other.pluginRoot);
+    assert.equal(updated.favoriteSources['saved:foreign'].repositoryUrl, foreign.repositoryUrl);
+    assert.deepEqual(JSON.parse(readFileSync(prefsPath)).favorites, updated.favorites);
+  }
+});
+
+test('a tracked branch rollback is skipped while same-version commits still update', async t => {
+  const installed = 'a'.repeat(40), repo = 'https://github.com/demo/reader';
+  let head = 'b'.repeat(40), version = '1.0.0';
+  const { ws, server, post } = await openUpdateFixture(t, async url => {
+    if (url.endsWith('/index.json')) return Response.json({ plugins: [] });
+    if (url.endsWith('/repos/demo/reader/commits/main')) return Response.json({ sha: head });
+    if (url.includes('/repos/demo/reader/tags?')) return Response.json([]);
+    if (url.endsWith(head + '/plugin.json')) return Response.json({ name: 'reader', version });
+    return new Response('{}', { status: 404 });
+  });
+  installFakeLocalPlugin(ws.pluginsDir, { dir: 'reader', manifest: { name: 'reader', version: '2.0.0', repository: repo },
+    receipt: { id: 'demo__reader', track: 'github-url', repositoryUrl: repo, commitSha: installed, installedVersion: '2.0.0',
+      githubSource: { trackBranch: 'main', refType: 'branch', ref: 'main' } } });
+  const offers = async () => (await server.inject({ url: '/api/updates?force=1' })).json().items.filter(i => i.dir === 'reader');
+  assert.deepEqual(await offers(), []);
+  assert.deepEqual((await post('/api/update-all', {})).results, []);
+  assert.equal((await post('/api/update-all', { ids: ['reader'] })).results[0].status, 'ALREADY_UP_TO_DATE');
+  head = 'c'.repeat(40);
+  version = '2.0.0';
+  assert.deepEqual((await offers()).map(i => [i.targetRef, i.updateKind]), [[head, 'commit']]);
+});
+
+test('monorepo branch checks use the same repository head across REST, Atom and Git refs', async t => {
+  const repo = 'https://github.com/example/tools';
+  const root = 'plugins/reader';
+  const old = 'a'.repeat(40), installed = 'b'.repeat(40), next = 'c'.repeat(40);
+  let head = installed;
+  let lastChildChange = old;
+  let channel = 'rest';
+  const { ws, server, post } = await openUpdateFixture(t, async url => {
+    if (url.endsWith('/index.json')) return Response.json({ plugins: [] });
+    if (url.includes('/repos/example/tools/tags?')) return Response.json([]);
+    if (url.endsWith('/repos/example/tools/commits/main') && channel === 'rest') return Response.json({ sha: head });
+    if (url.endsWith('/tools/commits/main.atom') && channel === 'atom') {
+      return new Response('<entry><id>Grit::Commit/' + head + '</id></entry>');
+    }
+    if (url.includes('/tools.git/info/refs') && channel === 'refs') return new Response(head + ' HEAD\n' + head + ' refs/heads/main\n');
+    if (url.includes('/repos/example/tools/commits?')) {
+      const { searchParams } = new URL(url);
+      assert.equal(searchParams.get('path'), root);
+      return Response.json([{ sha: searchParams.get('sha') === installed ? old : lastChildChange }]);
+    }
+    return new Response('{}', { status: 404 });
+  });
+  installFakeLocalPlugin(ws.pluginsDir, { dir: 'reader', manifest: { name: 'reader', version: '2.0.0', repository: repo },
+    receipt: { id: 'example__reader', track: 'github-url', repositoryUrl: repo, pluginRoot: root, commitSha: installed,
+      githubSource: { refType: 'branch', trackBranch: 'main' } } });
+  const check = async () => (await server.inject({ url: '/api/updates?force=1' })).json();
+  for (channel of ['rest', 'atom', 'refs']) {
+    const report = await check();
+    assert.deepEqual(report.items, []);
+    assert.ok(!report.uncheckedDirs.includes('reader'));
+  }
+  head = next;
+  assert.deepEqual((await check()).items, []);
+  head = 'd'.repeat(40);
+  lastChildChange = next;
+  const report = await check();
+  assert.deepEqual(report.items.map(item => [item.dir, item.targetRef]), [['reader', head]]);
+  // A legacy receipt can recover the child path from the declared repository.
+  installFakeLocalPlugin(ws.pluginsDir, { dir: 'reader', manifest: { name: 'reader', version: '2.0.0', repository: { url: repo, directory: root } },
+    receipt: { id: 'example__reader', track: 'github-url', repositoryUrl: repo, commitSha: installed,
+      githubSource: { refType: 'branch', trackBranch: 'main' } } });
+  channel = 'rest';
+  head = 'e'.repeat(40);
+  lastChildChange = old;
+  assert.deepEqual((await check()).items.filter(item => item.dir === 'reader'), []);
+  const stale = await post('/api/update', { dir: 'reader', updateChannel: 'github-url', updateKind: 'commit', targetRef: head });
+  assert.equal(stale.status, 'UPDATE_TARGET_MISMATCH');
+});
+
+test('self-update selects the official entry across a same-name fork and protects a Git checkout', async t => {
+  let official;
+  const { ws, server, post } = await openUpdateFixture(t, async url => {
+    if (!url.endsWith('/index.json')) return new Response('{}', { status: 404 });
+    const fork = { ...official, id: 'example__fork', scopedName: 'example--agy-market', forceScopedInstall: true,
+      repository: { url: 'https://github.com/example/fork', repositoryId: 11 } };
+    return Response.json({ plugins: [fork, official] });
+  });
+  const repository = 'https://github.com/azwosile/agy-market';
+  const manifest = { name: 'agy-market', version: '1.0.0', repository };
+  const tar = buildTarArtifact(ws.artifactsDir, 'market.tgz', { 'plugin.json': JSON.stringify({ ...manifest, version: '2.0.0' }) });
+  official = makeCatalogPlugin({ id: 'azwosile__agy-market', canonicalName: 'agy-market', owner: 'azwosile',
+    repo: 'agy-market', displayName: 'Market', version: '2.0.0', repoId: 12, tarballUrl: tar.url, sha256: tar.sha256 });
+  installFakeLocalPlugin(ws.pluginsDir, { dir: 'agy-market', manifest });
+  const git = join(ws.pluginsDir, 'agy-market', '.git');
+  mkdirSync(git);
+  assert.equal((await server.inject({ url: '/api/updates?force=1' })).json().selfUpdate, null);
+  assert.equal((await post('/api/self-update', {})).status, 'UNMANAGED_PLUGIN');
+  assert.deepEqual(JSON.parse(readFileSync(join(ws.pluginsDir, 'agy-market', 'plugin.json'))), manifest);
+  rmSync(git, { recursive: true });
+  await server.inject({ url: '/api/state?refresh=1' });
+  const updated = await post('/api/self-update', { targetVersion: '2.0.0' });
+  assert.equal(updated.installedDir, 'agy-market', updated.error);
+  assert.equal(updated.receipt.id, official.id);
+  assert.equal(existsSync(join(ws.pluginsDir, 'example--agy-market')), false);
+});
+
+test('single and batch capability consent follows the displayed release, archive, directory and grants', async t => {
+  let current;
+  const { ws, post, server } = await openUpdateFixture(t, async url =>
+    url.endsWith('/index.json') ? Response.json({ plugins: [current] }) : new Response('{}', { status: 404 }));
+  const id = 'owner__reader';
+  const manifest = { name: 'reader', repository: 'https://github.com/owner/reader', version: '1.0.0' };
+  installFakeLocalPlugin(ws.pluginsDir, { dir: 'reader', manifest });
+  const tar = buildTarArtifact(ws.artifactsDir, 'reader.tgz', { 'plugin.json': JSON.stringify({ ...manifest, version: '2.0.0' }) });
+  current = makeCatalogPlugin({ id, canonicalName: 'reader', owner: 'owner', repo: 'reader', repoId: 55,
+    displayName: 'Reader', version: '2.0.0', tarballUrl: tar.url, sha256: tar.sha256, badges: ['mcp-remote'] });
+  const request = { id, dir: 'reader' };
+  const first = await post('/api/update', request);
+  const firstKey = first.escalation.approvalKey;
+  assert.match(firstKey, /^[0-9a-f]{64}$/);
+  assert.equal((await post('/api/update', { ...request, confirmEscalation: true })).status, 'CAPABILITY_ESCALATION_CONFIRM_REQUIRED');
+  current.capabilities.mcpRemoteDomains = ['new.example'];
+  await server.inject({ url: '/api/state?refresh=1' });
+  const changed = await post('/api/update', { ...request, confirmEscalation: true, approvalKey: firstKey });
+  assert.equal(changed.status, 'CAPABILITY_ESCALATION_CONFIRM_REQUIRED');
+  assert.deepEqual(changed.escalation.addedRemoteDomains, ['new.example']);
+  assert.notEqual(changed.escalation.approvalKey, firstKey);
+  const stale = await post('/api/update-all', { ids: ['reader'], confirmEscalation: true, approvalKeys: { reader: firstKey } });
+  assert.equal(stale.results[0].status, 'CAPABILITY_ESCALATION_CONFIRM_REQUIRED');
+  current.distribution.commitFallbackSha256 = 'd'.repeat(64);
+  await server.inject({ url: '/api/state?refresh=1' });
+  const newFallback = await post('/api/update', { ...request, confirmEscalation: true, approvalKey: changed.escalation.approvalKey });
+  assert.equal(newFallback.status, 'CAPABILITY_ESCALATION_CONFIRM_REQUIRED');
+  assert.notEqual(newFallback.escalation.approvalKey, changed.escalation.approvalKey);
+  const sameVersionTar = buildTarArtifact(ws.artifactsDir, 'reader-repacked.tgz', {
+    'plugin.json': JSON.stringify({ ...manifest, version: '2.0.0' }), 'readme.txt': 'repacked',
+  });
+  Object.assign(current.distribution, { sha256: sameVersionTar.sha256, tarballUrl: sameVersionTar.url });
+  await server.inject({ url: '/api/state?refresh=1' });
+  const repacked = await post('/api/update-all', { ids: ['reader'], confirmEscalation: true,
+    approvalKeys: { reader: newFallback.escalation.approvalKey } });
+  assert.equal(repacked.results[0].status, 'CAPABILITY_ESCALATION_CONFIRM_REQUIRED');
+  assert.equal(JSON.parse(readFileSync(join(ws.pluginsDir, 'reader', 'plugin.json'))).version, '1.0.0');
+  const approved = await post('/api/update-all', { ids: ['reader'], confirmEscalation: true,
+    approvalKeys: { reader: repacked.results[0].escalation.approvalKey } });
+  assert.equal(approved.results[0].status, 'INSTALLED', approved.results[0].error);
+});
+
+test('catalog writes follow the active source after a withdrawal, release rollback or Track 2 toggle', async t => {
+  const feed = 'https://feed.example/catalog.json';
+  let primary = [], custom = [], experimental = [];
+  const { ws, server, post } = await openUpdateFixture(t, async url => {
+    if (url === feed) return Response.json({ plugins: custom });
+    if (url.endsWith('/index.json')) return Response.json({ plugins: primary });
+    if (url.endsWith('/unverified-index.json')) return Response.json({ plugins: experimental });
+    return new Response('{}', { status: 404 });
+  });
+  const manifest = { name: 'reader', version: '1.0.0' };
+  const tar = buildTarArtifact(ws.artifactsDir, 'reader.tgz', { 'plugin.json': JSON.stringify(manifest) });
+  const entry = makeCatalogPlugin({ id: 'owner__reader', canonicalName: 'reader', displayName: 'Reader', owner: 'owner',
+    repo: 'reader', repoId: 55, version: manifest.version, tarballUrl: tar.url, sha256: tar.sha256 });
+  primary = [entry];
+  custom = [{ ...entry, version: '2.0.0', gitTag: 'v2.0.0' }];
+  const oldCustom = (await post('/api/sources', { customFeeds: [feed] })).catalog.plugins[0];
+  await post('/api/sources', { customFeeds: [] });
+  assert.equal((await post('/api/install', { plugin: oldCustom })).status, 'CATALOG_ENTRY_CHANGED');
+  assert.equal(existsSync(join(ws.pluginsDir, 'reader')), false);
+
+  primary = [];
+  experimental = [entry];
+  const oldTrack2 = (await post('/api/prefs', { enableExperimentalTrack2: true })).catalog.plugins[0];
+  await post('/api/prefs', { enableExperimentalTrack2: false });
+  assert.equal((await post('/api/install', { plugin: oldTrack2 })).status, 'CATALOG_ENTRY_CHANGED');
+  assert.equal(existsSync(join(ws.pluginsDir, 'owner--reader')), false);
+
+  primary = [entry];
+  await server.inject({ url: '/api/state?refresh=1' });
+  const stale = { ...entry, version: '2.0.0', distribution: { tarballUrl: 'https://withdrawn.example/reader.tgz', sha256: 'f'.repeat(64) } };
+  const good = await post('/api/install', { plugin: stale });
+  assert.equal(good.version, '1.0.0', good.error);
+  primary = [];
+  await server.inject({ url: '/api/state?refresh=1' });
+  assert.equal((await post('/api/update', { dir: 'reader', plugin: stale })).status, 'CATALOG_ENTRY_CHANGED');
+  assert.equal(JSON.parse(readFileSync(join(ws.pluginsDir, 'reader', 'plugin.json'))).version, '1.0.0');
+});
+
+test('a changed installed commit invalidates branch cache and stale single-update targets', async t => {
+  const first = 'a'.repeat(40), next = 'b'.repeat(40);
+  let remote = first, probes = 0, offline = false;
+  const { ws, server, post } = await openUpdateFixture(t, async url => {
+    if (url.endsWith('/index.json')) return Response.json({ plugins: [] });
+    if (url.endsWith('/commits/preview')) {
+      probes++;
+      if (!offline) return Response.json({ sha: remote });
+    }
+    return new Response('{}', { status: 404 });
+  });
+  const repo = 'https://github.com/owner/reader';
+  const receipt = { id: 'owner__reader', track: 'github-url', repositoryUrl: repo, pluginRoot: '.', commitSha: first,
+    githubSource: { refType: 'branch', ref: 'preview', trackBranch: 'preview' } };
+  installFakeLocalPlugin(ws.pluginsDir, { dir: 'reader', manifest: { name: 'reader', version: '1.0.0', repository: repo }, receipt });
+  const check = async () => (await server.inject({ url: '/api/updates' })).json();
+  assert.deepEqual((await check()).items, []);
+  assert.equal(probes, 1);
+  assert.deepEqual((await check()).items, []);
+  assert.equal(probes, 1);
+  const receiptPath = join(ws.pluginsDir, 'reader', '.agy-market-receipt.json');
+  writeFileSync(receiptPath, JSON.stringify({ ...receipt, commitSha: next }));
+  remote = next;
+  offline = true;
+  const unchecked = await check();
+  assert.deepEqual(unchecked.items, []);
+  assert.ok(unchecked.uncheckedDirs.includes('reader'));
+  offline = false;
+  assert.deepEqual((await check()).items, []);
+  assert.equal(probes, 3);
+  const stale = await post('/api/update', { id: receipt.id, dir: 'reader', updateChannel: 'github-url', updateKind: 'commit', targetRef: first });
+  assert.equal(stale.status, 'UPDATE_TARGET_MISMATCH');
+  assert.equal(JSON.parse(readFileSync(receiptPath)).commitSha, next);
+});
+
+test('a README or homepage alone does not nominate an update source', async t => {
+  const linkedRepo = 'https://github.com/example/guide';
+  let repoRequests = 0;
+  const { ws, server, post } = await openUpdateFixture(t, async url => {
+    if (url.includes('/example/guide/')) repoRequests++;
+    if (url.endsWith('/index.json')) return Response.json({ plugins: [] });
+    return new Response('{}', { status: 404 });
+  });
+  for (const dir of ['readme-only', 'homepage-only']) {
+    const manifest = { name: dir, version: '1.0.0' };
+    if (dir === 'homepage-only') manifest.homepage = linkedRepo;
+    installFakeLocalPlugin(ws.pluginsDir, { dir, manifest });
+    if (dir === 'readme-only') writeFileSync(join(ws.pluginsDir, dir, 'README.md'), linkedRepo);
+  }
+  const report = (await server.inject({ url: '/api/updates?force=1' })).json();
+  assert.deepEqual(report.items, []);
+  assert.deepEqual(report.uncheckedDirs, ['homepage-only', 'readme-only']);
+  for (const dir of report.uncheckedDirs) {
+    const rejected = await post('/api/update', { id: dir, dir, preferUpstream: true, repositoryUrl: linkedRepo });
+    assert.equal(rejected.status, 'UNVERIFIED_UPDATE_SOURCE');
+  }
+  const batch = await post('/api/update-all', { ids: report.uncheckedDirs });
+  assert.ok(batch.results.every(item => item.status === 'UPDATE_TARGET_ERROR'));
+  assert.equal(repoRequests, 0);
+});
+
+test('a removed tracked branch cannot borrow the default branch commit', async t => {
+  const defaultSha = 'b'.repeat(40);
+  const { ws, server } = await openUpdateFixture(t, async url => {
+    if (url.endsWith('/index.json')) return Response.json({ plugins: [] });
+    if (url.includes('/info/refs')) return new Response(`${defaultSha} HEAD\n${defaultSha} refs/heads/main\n`);
+    return new Response('{}', { status: 404 });
+  });
+  const repository = 'https://github.com/owner/reader';
+  installFakeLocalPlugin(ws.pluginsDir, { dir: 'reader', manifest: { name: 'reader', version: '1.0.0', repository },
+    receipt: { id: 'owner__reader', track: 'github-url', repositoryUrl: repository, commitSha: 'a'.repeat(40),
+      githubSource: { kind: 'tree', refType: 'branch', ref: 'preview', trackBranch: 'preview' } } });
+  const report = (await server.inject({ url: '/api/updates?force=1' })).json();
+  assert.deepEqual(report.items, []);
+  assert.ok(report.uncheckedDirs.includes('reader'));
+});
+
+test('resync rejects an older catalog and malformed neighboring rows leave working entries available offline', async t => {
+  let offline = false;
+  let downloads = 0;
+  const plugin = makeCatalogPlugin({ id: 'owner__reader', canonicalName: 'reader', owner: 'owner', repo: 'reader', repoId: 55,
+    displayName: 'Reader', version: '1.0.0', tarballUrl: 'https://example.com/reader.tgz', sha256: 'a'.repeat(64) });
+  const { ws, server, post } = await openUpdateFixture(t, async url => {
+    if (url === plugin.distribution.tarballUrl) downloads++;
+    if (!offline && url.endsWith('/index.json')) return Response.json({ plugins: [
+      { id: 'old-entry' }, { ...plugin, id: 'bad-caps', capabilities: { badges: {} } }, plugin,
+    ] });
+    return new Response('{}', { status: 404 });
+  });
+  installFakeLocalPlugin(ws.pluginsDir, { dir: 'reader', manifest: { name: 'reader', version: '2.0.0', repository: plugin.repository.url } });
+  for (const isOffline of [false, true]) {
+    offline = isOffline;
+    const state = (await server.inject({ url: '/api/state?refresh=1' })).json();
+    assert.deepEqual(state.catalog.plugins.map(p => p.id), [plugin.id]);
+    assert.equal(state.installed[0].catalogId, plugin.id);
+    assert.ok(state.catalog.warnings.some(warning => warning.includes('2 invalid plugin entries')));
+  }
+  const result = await post('/api/update', { id: plugin.id, dir: 'reader', forceResync: true });
+  assert.match(result.error, /ERR_UPDATE_DOWNGRADE/);
+  assert.equal(downloads, 0);
+  assert.equal(JSON.parse(readFileSync(join(ws.pluginsDir, 'reader', 'plugin.json'))).version, '2.0.0');
+});
 
 test('GET /api/updates detects catalog updates, GitHub-only releases/tags awaiting catalog sync, and selfUpdate', async () => {
   const ws = makeTempWorkspace('agy-upd-detect-');
@@ -844,7 +1423,7 @@ test('POST /api/update-all runs sequentially, continues on failure, updates self
         method: 'POST',
         url: '/api/update-all',
         headers: { 'X-Sidecar-Token': srv.sideToken, Origin: 'http://127.0.0.1:43210' },
-        body: { ids: ['alice__esc-plug'], confirmEscalation: true },
+        body: { ids: ['alice__esc-plug'], confirmEscalation: true, approvalKeys: { 'esc-plug': payload.results[1].escalation.approvalKey } },
       });
       assert.equal(retryRes.statusCode, 200);
       const retryJson = retryRes.json();
@@ -966,6 +1545,83 @@ test('POST /api/self-update enforces CSRF, installs latest azwosile__agy-market,
     }
   } finally {
     ws.cleanup();
+  }
+});
+
+test('discussion caches follow credential changes, discard denied results, and ignore old credential responses', async t => {
+  let graphqlResponse;
+  let graphqlCalls = 0;
+  const privateTitle = 'Private discussion from account A';
+  const success = () => Response.json({ data: { repository: {
+    hasDiscussionsEnabled: true, discussions: { nodes: [{ title: privateTitle }] },
+  } } });
+  const { ws, server, post } = await openUpdateFixture(t, async (url, init) => {
+    if (String(url).endsWith('/graphql')) {
+      graphqlCalls++;
+      return graphqlResponse(init.headers.Authorization);
+    }
+    if (String(url).endsWith('/index.json')) return Response.json({ plugins: [] });
+    return new Response('{}', { status: 404 });
+  });
+  installFakeLocalPlugin(ws.pluginsDir, { dir: 'notes', manifest: {
+    name: 'notes', version: '1', repository: 'https://github.com/team/notes',
+  } });
+  const cacheDir = join(ws.dataDir, 'cache', 'github');
+  mkdirSync(cacheDir, { recursive: true });
+  writeFileSync(join(cacheDir, 'discussions-gql-team__notes.json'), JSON.stringify({
+    items: [{ title: 'legacy private item' }], checkedAtMs: Date.now(),
+  }));
+  const read = async (force = false) => (await server.inject({
+    url: '/api/discussions?id=notes' + (force ? '&force=1' : ''),
+  })).json();
+  await post('/api/prefs', { githubToken: 'fixture-account-A' });
+  graphqlResponse = success;
+  assert.equal((await read()).items[0].title, privateTitle);
+  assert.equal((await read()).items[0].title, privateTitle);
+  assert.equal(graphqlCalls, 1);
+  const started = Promise.withResolvers();
+  const delayed = Promise.withResolvers();
+  graphqlResponse = auth => {
+    assert.equal(auth, 'Bearer fixture-account-A');
+    started.resolve();
+    return delayed.promise;
+  };
+  const old = read(true);
+  await started.promise;
+  await post('/api/prefs', { githubToken: 'fixture-account-B' });
+  graphqlResponse = auth => {
+    assert.equal(auth, 'Bearer fixture-account-B');
+    return new Response(null, { status: 404 });
+  };
+  assert.deepEqual((await read()).items, []);
+  delayed.resolve(success());
+  assert.deepEqual((await old).items, []);
+  assert.deepEqual((await read()).items, []);
+
+  for (const deny of [
+    () => new Response(null, { status: 401 }),
+    () => new Response(null, { status: 403 }),
+    () => new Response(null, { status: 404 }),
+    () => Response.json({ errors: [{ type: 'NOT_FOUND', message: 'Could not resolve repository' }] }),
+    () => Response.json({ data: { repository: { discussions: { nodes: [{ title: privateTitle }] } } },
+      errors: [{ extensions: { code: 'FORBIDDEN' }, message: 'Permission denied' }] }),
+    () => Response.json({ data: { repository: null } }),
+  ]) {
+    graphqlResponse = success;
+    assert.equal((await read(true)).items.length, 1);
+    graphqlResponse = deny;
+    assert.deepEqual((await read(true)).items, []);
+    graphqlResponse = () => new Response(null, { status: 503 });
+    assert.deepEqual((await read()).items, []);
+  }
+  graphqlResponse = success;
+  await read(true);
+  graphqlResponse = () => new Response(null, { status: 503 });
+  assert.equal((await read(true)).items[0].title, privateTitle);
+  await post('/api/prefs', { clearGithubToken: true });
+  assert.deepEqual((await read()).items, []);
+  for (const f of readAllFilesRecursively(cacheDir)) {
+    assert.doesNotMatch(f.path + f.content, /fixture-account-|Private discussion from account A/);
   }
 });
 
@@ -1395,6 +2051,8 @@ test('GET /api/updates detects selfUpdate without local plugins/agy-market dir, 
       assert.equal(badTokDisc.statusCode, 200);
       assert.equal(badTokDisc.json().ok, true);
       assert.equal(badTokDisc.json().needsToken, true);
+      assert.equal(badTokDisc.json().tokenRejected, true);
+      assert.match(badTokDisc.json().warning, /401/);
       assert.equal(badTokDisc.text.includes(BAD_TOKEN), false);
     } finally {
       await srv.close();
@@ -1710,9 +2368,12 @@ test('Concurrent plugin mutation routes return HTTP 409 ERR_MUTATION_BUSY and re
         body: { id: 'alice__alpha-plug', dir: 'alpha-plug' },
       });
       await alphaStarted;
+      assert.equal(srv.canRestartForDiskUpdate(), false);
 
       // 2. Concurrent POST /api/update, POST /api/update-all, and POST /api/install must ALL receive HTTP 409 ERR_MUTATION_BUSY
-      const [dupUpdate, dupBatch, dupInstall] = await Promise.all([
+      const [dupToggle, dupFix, dupUpdate, dupBatch, dupInstall] = await Promise.all([
+        srv.inject({ method: 'POST', url: '/api/toggle-plugin', headers: authHeaders, body: { dir: 'alpha-plug', enabled: false } }),
+        srv.inject({ method: 'POST', url: '/api/fix-conflict', headers: authHeaders, body: { type: 'isolate-rename', targetDir: 'alpha-plug' } }),
         srv.inject({
           method: 'POST',
           url: '/api/update',
@@ -1734,6 +2395,8 @@ test('Concurrent plugin mutation routes return HTTP 409 ERR_MUTATION_BUSY and re
       ]);
 
       for (const [label, res] of [
+        ['POST /api/toggle-plugin', dupToggle],
+        ['POST /api/fix-conflict', dupFix],
         ['POST /api/update', dupUpdate],
         ['POST /api/update-all', dupBatch],
         ['POST /api/install', dupInstall],
@@ -1780,6 +2443,7 @@ test('Concurrent plugin mutation routes return HTTP 409 ERR_MUTATION_BUSY and re
       });
       assert.equal(postErrRes.statusCode, 200);
       assert.equal(postErrRes.json().ok, true);
+      assert.equal(srv.canRestartForDiskUpdate(), true);
     } finally {
       await srv.close();
     }
@@ -2513,4 +3177,1003 @@ test('v1.5.4 scanner version priority (RC-4): externally upgraded manifest.versi
   } finally {
     ws.cleanup();
   }
+});
+
+test('Update All updates a renamed root plugin in its original directory and skips a superseded legacy copy', async t => {
+  const oldName = 'antigravity-plugin-context-mode';
+  const repo = `https://github.com/domush/${oldName}`;
+  const id = `domush__${oldName}`;
+  const scoped = 'domush--context-mode';
+  for (const [hasManagedCopy, catalogRenamed, byId] of [[false, false, false], [false, true, false], [false, true, true], [true, true, false]]) {
+    await t.test(`managed=${hasManagedCopy} catalogRenamed=${catalogRenamed} byId=${byId}`, async () => {
+      const ws = makeTempWorkspace();
+      const oldManifest = { name: oldName, displayName: 'Context Mode', version: '2.0.0', repository: repo };
+      const newManifest = { ...oldManifest, name: 'context-mode', version: '2.0.1' };
+      const tar = createDeterministicTarGz({ 'plugin.json': JSON.stringify(newManifest) });
+      const catalogEntry = makeCatalogPlugin({ id, canonicalName: catalogRenamed ? 'context-mode' : oldName, owner: 'domush', repo: oldName,
+        displayName: 'Context Mode', version: '2.0.0', repoId: 42, sha256: 'f'.repeat(64), tarballUrl: repo + '/old.tar.gz' });
+      catalogEntry.forceScopedInstall = true;
+      installFakeLocalPlugin(ws.pluginsDir, { dir: oldName, manifest: oldManifest });
+      if (hasManagedCopy) installFakeLocalPlugin(ws.pluginsDir, { dir: scoped, manifest: { ...newManifest, name: scoped },
+        receipt: { id, repositoryId: 42, installedVersion: '2.0.1', gitTag: 'v2.0.1', repositoryUrl: repo,
+          pluginRoot: '.', scopedRewriteApplied: true, effectivePluginName: scoped } });
+      let downloads = 0;
+      const srv = await createMarketSidecarServer({ listen: false, recoveryDelayMs: -1, configDir: ws.configDir, dataDir: ws.dataDir,
+        fetchImpl: async url => {
+          const u = String(url);
+          if (u.endsWith('/unverified-index.json')) return Response.json({ schemaVersion: 1, track: 'unverified', plugins: [catalogEntry] });
+          if (u.endsWith('/index.json')) return Response.json({ schemaVersion: 1, track: 'verified', plugins: [] });
+          if (u.includes('domush/') && /releases\/(latest|tags\/v2\.0\.1)$/.test(u)) return Response.json({ tag_name: 'v2.0.1', html_url: repo + '/releases/tag/v2.0.1', assets: [] });
+          if (u.endsWith('/repos/domush/' + oldName)) return Response.json({ id: 42, full_name: 'domush/' + oldName, default_branch: 'main' });
+          if (u.includes('domush/') && u.includes('tar.gz')) { downloads++; return new Response(tar); }
+          return new Response('{}', { status: 404 });
+        } });
+      const post = (url, body) => srv.inject({ method: 'POST', url, headers: { 'x-sidecar-token': srv.sideToken }, body });
+      try {
+        const state = (await srv.inject({ method: 'GET', url: '/api/state' })).json();
+        assert.equal(state.catalog.plugins.find(p => p.id === id).installStatus.installedDir, hasManagedCopy ? scoped : oldName);
+        if (hasManagedCopy) assert.equal(state.installed.find(loc => loc.dir === oldName).successorDir, scoped);
+        const updates = async () => (await srv.inject({ method: 'GET', url: '/api/updates?force=1' })).json().items;
+        assert.equal((await updates()).some(item => item.dir === oldName), !hasManagedCopy);
+        const batch = (await post('/api/update-all', byId ? { ids: [id] } : {})).json();
+        if (hasManagedCopy) {
+          assert.equal(batch.results.length, 0);
+          assert.equal((await post('/api/update-all', { ids: [oldName] })).json().results[0].status, 'LEGACY_DUPLICATE');
+          for (const preferUpstream of [false, true]) {
+            const rejection = await post('/api/update', { id, dir: oldName, preferUpstream });
+            assert.equal(rejection.statusCode, 409);
+            assert.equal(rejection.json().successorDir, scoped);
+          }
+          const conflicts = (await srv.inject({ method: 'GET', url: '/api/conflicts' })).json();
+          assert.ok(conflicts.items.some(i => i.type === 'duplicate-repo-install' && i.paths.length === 2));
+          assert.equal(downloads, 0);
+        } else {
+          assert.equal(batch.results[0]?.ok, true, JSON.stringify(batch.results));
+          const receipt = JSON.parse(readFileSync(join(ws.pluginsDir, oldName, '.agy-market-receipt.json')));
+          assert.equal(receipt.installedDir, oldName);
+          assert.equal(receipt.effectivePluginName, newManifest.name);
+          assert.equal(receipt.installedVersion, newManifest.version);
+          assert.ok(!existsSync(join(ws.pluginsDir, scoped)));
+        }
+        assert.deepEqual(await updates(), []);
+      } finally { await srv.close(); ws.cleanup(); }
+    });
+  }
+});
+
+test('a targeted rename cannot adopt another monorepo child, a missing directory, or the market itself', () => {
+  const url = 'https://github.com/demo/legacy';
+  const local = { scope: 'global', dir: 'legacy', name: 'legacy', repositoryUrl: url };
+  const plugin = { id: 'demo__legacy', canonicalName: 'renamed', repository: { url, pluginRoot: 'plugins/b' } };
+  const target = (entry, installed, dir) => resolveInstallPreflight(entry, { installed }, { preferredDir: dir, requireExistingDir: true });
+  assert.throws(() => target(plugin, [local], local.dir), /ERR_UPDATE_TARGET_MISMATCH/);
+  assert.throws(() => target(plugin, [local], 'missing'), /ERR_UPDATE_TARGET_MISMATCH/);
+  assert.throws(() => target(plugin, [{ ...local, dir: 'agy-market' }], 'agy-market'), /ERR_CANNOT_REPLACE_SELF/);
+  const managedChild = { scope: 'global', dir: 'demo--child', name: 'demo--child',
+    receipt: { id: plugin.id, repositoryUrl: url, scopedRewriteApplied: true, pluginRoot: 'plugins/b' } };
+  assert.equal(target({ ...plugin, canonicalName: 'legacy', repository: { url, pluginRoot: '.' } },
+    [local, managedChild], local.dir).targetDir, local.dir);
+});
+
+test('manual monorepo metadata prevents root adoption, including same-name entries', () => {
+  const ws = makeTempWorkspace();
+  const url = 'https://github.com/demo/legacy';
+  try {
+    for (const [dir, repository] of [['legacy', { url, directory: 'plugins/legacy' }], ['tree', url + '/tree/main/plugins/tree']]) {
+      installFakeLocalPlugin(ws.pluginsDir, { dir, manifest: { name: dir, version: '1.0.0', repository } });
+    }
+    const inventory = scanLocalPluginInventory({ configDir: ws.configDir, dataDir: ws.dataDir });
+    for (const loc of inventory.installed) {
+      for (const canonicalName of [loc.name, 'renamed']) {
+        const plugin = { id: 'demo__legacy', canonicalName, repository: { url, pluginRoot: '.' } };
+        assert.throws(() => resolveInstallPreflight(plugin, inventory, { preferredDir: loc.dir, requireExistingDir: true }), /ERR_UPDATE_TARGET_MISMATCH/);
+      }
+    }
+  } finally { ws.cleanup(); }
+});
+
+test('two installed directories sharing a catalog ID keep their own receipts and staged manifest names', async () => {
+  const ws = makeTempWorkspace();
+  const url = 'https://github.com/demo/alias';
+  const id = 'demo__alias';
+  const dirs = ['alias', 'demo--alias'];
+  const artifact = buildTarArtifact(ws.artifactsDir, 'alias.tar.gz', {
+    'plugin.json': JSON.stringify({ name: 'real-name', version: '2.0.0', repository: url }),
+  });
+  const plugin = makeCatalogPlugin({ id, canonicalName: 'alias', owner: 'demo', repo: 'alias', displayName: 'Alias',
+    version: '2.0.0', repoId: 42, tarballUrl: artifact.url, sha256: artifact.sha256 });
+  for (const dir of dirs) {
+    installFakeLocalPlugin(ws.pluginsDir, { dir, manifest: { name: dir, version: '1.0.0', repository: url },
+      receipt: { id, repositoryId: 42, installedVersion: '1.0.0', installedDir: dir, repositoryUrl: url,
+        pluginRoot: '.', scopedRewriteApplied: dir !== 'alias', effectivePluginName: dir } });
+  }
+  const srv = await createMarketSidecarServer({ listen: false, recoveryDelayMs: -1, configDir: ws.configDir,
+    dataDir: ws.dataDir, fetchImpl: async url => String(url).endsWith('/index.json')
+      ? Response.json({ schemaVersion: 1, track: 'verified', plugins: [plugin] }) : new Response('{}', { status: 404 }) });
+  try {
+    const post = (url, body) => srv.inject({ method: 'POST', url, headers: { 'x-sidecar-token': srv.sideToken }, body });
+    const batch = (await post('/api/update-all', { ids: dirs })).json();
+    assert.deepEqual(batch.results.map(r => [r.dir, r.ok]), dirs.map(dir => [dir, true]), JSON.stringify(batch.results));
+    for (const dir of dirs) {
+      const expectedName = dir === 'alias' ? 'real-name' : dir;
+      assert.equal(JSON.parse(readFileSync(join(ws.pluginsDir, dir, 'plugin.json'))).name, expectedName);
+      assert.equal(JSON.parse(readFileSync(join(ws.pluginsDir, dir, '.agy-market-receipt.json'))).effectivePluginName, expectedName);
+    }
+    const resync = (await post('/api/update', { id, dir: 'alias', forceResync: true })).json();
+    assert.equal(resync.effectivePluginName, 'real-name');
+  } finally { await srv.close(); ws.cleanup(); }
+});
+
+test('manual source identity reconciles repository, package and same-repository homepage evidence', async () => {
+  const ws = makeTempWorkspace();
+  const url = 'https://github.com/demo/legacy';
+  const plugin = { id: 'demo__legacy', canonicalName: 'renamed', repository: { url, pluginRoot: '.' } };
+  try {
+    installFakeLocalPlugin(ws.pluginsDir, { dir: 'legacy', manifest: {
+      name: 'legacy', version: '1.0.0', repository: url, homepage: url + '/tree/main/plugins/legacy',
+    } });
+    installFakeLocalPlugin(ws.pluginsDir, { dir: 'branch', manifest: {
+      name: 'branch', version: '1.0.0', repository: url + '/tree/main',
+    } });
+    installFakeLocalPlugin(ws.pluginsDir, { dir: 'ambiguous', manifest: {
+      name: 'ambiguous', version: '1.0.0', repository: { url, directory: 'plugins/a' }, homepage: url + '/tree/main/plugins/b',
+    } });
+    const inventory = scanLocalPluginInventory({ configDir: ws.configDir, dataDir: ws.dataDir });
+    const byDir = new Map(inventory.installed.map(loc => [loc.dir, loc]));
+    assert.equal(byDir.get('legacy').repositoryRoot, 'plugins/legacy');
+    assert.equal(byDir.get('branch').repositoryRoot, '.');
+    assert.equal(byDir.get('ambiguous').repositoryRoot, null);
+    const srv = await createMarketSidecarServer({ listen: false, recoveryDelayMs: -1, configDir: ws.configDir, dataDir: ws.dataDir,
+      fetchImpl: async () => new Response('{}', { status: 404 }) });
+    try {
+      const report = (await srv.inject({ method: 'GET', url: '/api/updates?force=1' })).json();
+      assert.deepEqual(report.uncheckedDirs, ['ambiguous']);
+      const direct = await srv.inject({ method: 'POST', url: '/api/update', headers: { 'x-sidecar-token': srv.sideToken },
+        body: { dir: 'ambiguous', preferUpstream: true, targetRef: 'v1.0.0' } });
+      assert.equal(direct.json().status, 'UNRESOLVED_PLUGIN_ROOT');
+    } finally { await srv.close(); }
+    assert.throws(() => resolveInstallPreflight(plugin, inventory, { preferredDir: 'legacy', requireExistingDir: true }), /TARGET_MISMATCH/);
+  } finally { ws.cleanup(); }
+});
+
+test('scoped catalog updates reuse the receipt across equivalent root spellings and preserve user data', async () => {
+  const ws = makeTempWorkspace();
+  const dir = 'demo--reader';
+  const id = 'demo__tools__reader';
+  const url = 'https://github.com/demo/tools';
+  const artifact = buildTarArtifact(ws.artifactsDir, 'reader.tar.gz', {
+    'README.md': 'tools', 'plugins/reader/plugin.json': JSON.stringify({ name: 'reader', version: '2.0.0', repository: url }),
+    'plugins/reader/settings.json': 'new default',
+  });
+  const plugin = makeCatalogPlugin({ id, canonicalName: 'reader', owner: 'demo', repo: 'tools', displayName: 'Reader',
+    version: '2.0.0', repoId: 42, tarballUrl: artifact.url, sha256: artifact.sha256, badges: ['sidecar-ui'] });
+  plugin.forceScopedInstall = true;
+  plugin.repository.pluginRoot = './plugins/reader/';
+  installFakeLocalPlugin(ws.pluginsDir, { dir, manifest: { name: dir, version: '1.0.0' },
+    receipt: { id, repositoryId: 42, repositoryUrl: url, installedDir: dir, installedVersion: '1.0.0',
+      effectivePluginName: dir, scopedRewriteApplied: true, pluginRoot: 'plugins/reader', preservePaths: ['settings.json'],
+      grantedCapabilities: { badges: ['declarative-only'] } } });
+  writeFileSync(join(ws.pluginsDir, dir, 'settings.json'), 'my settings');
+  const srv = await createMarketSidecarServer({ listen: false, recoveryDelayMs: -1, configDir: ws.configDir, dataDir: ws.dataDir,
+    fetchImpl: async u => String(u).endsWith('/index.json') ? Response.json({ schemaVersion: 1, track: 'verified', plugins: [plugin] }) : new Response('{}', { status: 404 }) });
+  try {
+    const post = async (path, body) => (await srv.inject({ method: 'POST', url: path, headers: { 'x-sidecar-token': srv.sideToken }, body })).json();
+    const pending = await post('/api/install', { id });
+    assert.equal(pending.status, 'CAPABILITY_ESCALATION_CONFIRM_REQUIRED');
+    const updated = await post('/api/update', { id, dir, confirmEscalation: true, approvalKey: pending.escalation.approvalKey });
+    assert.equal(updated.ok, true, JSON.stringify(updated.error));
+    assert.equal(updated.receipt.pluginRoot, 'plugins/reader');
+    assert.equal(readFileSync(join(ws.pluginsDir, dir, 'settings.json'), 'utf8'), 'my settings');
+    assert.equal((await post('/api/update', { id, dir })).status, 'ALREADY_UP_TO_DATE');
+    const mismatch = await post('/api/install', { plugin: { ...plugin, version: '3.0.0',
+      repository: { ...plugin.repository, pluginRoot: 'plugins/unrelated' } } });
+    assert.equal(mismatch.status, 'CATALOG_ENTRY_CHANGED');
+    plugin.repository.pluginRoot = 'plugins/unrelated';
+    await srv.inject({ url: '/api/state?refresh=1' });
+    assert.match((await post('/api/install', { id })).error, /ERR_SCOPED_TARGET_OCCUPIED/);
+    assert.equal(JSON.parse(readFileSync(join(ws.pluginsDir, dir, '.agy-market-receipt.json'))).installedVersion, '2.0.0');
+  } finally { await srv.close(); ws.cleanup(); }
+});
+
+test('explicit catalog ID wins over an earlier directory alias when updating a renamed plugin', async () => {
+  const ws = makeTempWorkspace();
+  const dir = 'legacy';
+  const url = 'https://github.com/zzz/legacy';
+  installFakeLocalPlugin(ws.pluginsDir, { dir, manifest: { name: dir, version: '1.0.0', repository: url } });
+  const tar = buildTarArtifact(ws.artifactsDir, 'release.tgz', { 'plugin.json': JSON.stringify({ name: 'renamed', version: '2.0.0', repository: url }) });
+  const correct = makeCatalogPlugin({ id: 'zzz__legacy', owner: 'zzz', repo: dir, canonicalName: 'renamed', displayName: 'Z',
+    version: '2.0.0', repoId: 2, sha256: tar.sha256, tarballUrl: tar.url });
+  const alias = makeCatalogPlugin({ id: 'aaa__other', owner: 'aaa', repo: 'other', canonicalName: dir, displayName: 'A',
+    version: '3.0.0', repoId: 1, sha256: 'f'.repeat(64), tarballUrl: 'https://example.invalid/other.tgz' });
+  const srv = await createMarketSidecarServer({ listen: false, recoveryDelayMs: -1, configDir: ws.configDir, dataDir: ws.dataDir,
+    fetchImpl: async u => String(u).endsWith('/index.json') ? Response.json({ schemaVersion: 1, plugins: [alias, correct] }) : new Response('{}', {status: 404}) });
+  try {
+    const post = async (url, body) => (await srv.inject({ method: 'POST', url, headers: { 'x-sidecar-token': srv.sideToken }, body })).json();
+    const stale = await post('/api/update', { id: 'removed__entry', dir });
+    assert.equal(stale.status, 'UPDATE_TARGET_MISMATCH');
+    const foreign = await post('/api/update', { id: alias.id, dir, preferUpstream: true, targetRef: 'v1.0.0' });
+    assert.equal(foreign.status, 'UPDATE_TARGET_MISMATCH');
+    const result = await post('/api/update', { id: correct.id, dir, plugin: correct });
+    assert.equal(result.ok, true, result.error);
+    assert.equal(result.receipt.id, correct.id);
+    const repeat = await post('/api/update', { dir });
+    assert.equal(repeat.status, 'ALREADY_UP_TO_DATE', repeat.error);
+    const batch = await post('/api/update-all', { ids: [dir] });
+    assert.equal(batch.results[0].id, correct.id);
+  } finally { await srv.close(); ws.cleanup(); }
+});
+
+test('bare manual monorepo source resolves a unique catalog child and leaves ambiguous roots unchecked', async () => {
+  const ws = makeTempWorkspace();
+  const url = 'https://github.com/demo/tools';
+  const roots = ['plugins/reader', 'plugins/a', 'plugins/b'];
+  for (const dir of ['reader', 'shared']) {
+    installFakeLocalPlugin(ws.pluginsDir, { dir, manifest: { name: dir, version: '1.0.0', repository: url } });
+  }
+  const tar = buildTarArtifact(ws.artifactsDir, 'mono.tgz', { 'README.md': 'tools',
+    'plugins/reader/plugin.json': JSON.stringify({ name: 'reader', version: '2.0.0', repository: url }) });
+  const entries = roots.map((root, i) => {
+    const name = i ? 'shared' : 'reader';
+    const plugin = makeCatalogPlugin({ id: 'demo__tools--' + root.split('/')[1], owner: 'demo', repo: 'tools', canonicalName: name,
+      displayName: name, version: '2.0.0', repoId: 42, sha256: tar.sha256, tarballUrl: tar.url });
+    plugin.repository.pluginRoot = root;
+    return plugin;
+  });
+  const srv = await createMarketSidecarServer({ listen: false, recoveryDelayMs: -1, configDir: ws.configDir, dataDir: ws.dataDir,
+    fetchImpl: async u => String(u).endsWith('/index.json') ? Response.json({ schemaVersion: 1, plugins: entries }) : new Response('{}', {status: 404}) });
+  try {
+    const state = (await srv.inject({method: 'GET', url: '/api/state'})).json();
+    assert.equal(state.catalog.plugins.find(p => p.id === entries[0].id).installStatus.installedDir, 'reader');
+    assert.equal(state.installed.find(loc => loc.dir === 'shared').repositoryRoot, null);
+    const report = (await srv.inject({method: 'GET', url: '/api/updates?force=1'})).json();
+    assert.deepEqual(report.uncheckedDirs, ['shared']);
+    assert.equal(report.items.find(item => item.dir === 'reader').id, entries[0].id);
+    const post = async (path, body) => (await srv.inject({method: 'POST', url: path, headers: {'x-sidecar-token':srv.sideToken}, body})).json();
+    assert.equal((await post('/api/update', {id: entries[1].id, dir: 'shared'})).ok, false);
+    assert.equal((await post('/api/update', {dir: 'shared', preferUpstream: true})).status, 'UNRESOLVED_PLUGIN_ROOT');
+    assert.equal((await post('/api/update-all', {ids: ['shared']})).results[0].ok, false);
+    const batch = await post('/api/update-all', {ids: ['reader']});
+    assert.equal(batch.results[0].ok, true, JSON.stringify(batch.results));
+    assert.equal(JSON.parse(readFileSync(join(ws.pluginsDir,'reader','.agy-market-receipt.json'))).pluginRoot, roots[0]);
+    assert.ok(!existsSync(join(ws.pluginsDir,'shared','.agy-market-receipt.json')));
+  } finally { await srv.close(); ws.cleanup(); }
+});
+
+test('warm and cold update checks keep distinct raw manifests for colliding subdirectory spellings', async () => {
+  const ws = makeTempWorkspace();
+  const url = 'https://github.com/demo/tools';
+  const roots = new Map([['one','plugins/a'], ['two','plugins_a'], ['three','Plugins/A']]);
+  for (const [dir, directory] of roots) {
+    installFakeLocalPlugin(ws.pluginsDir, { dir, manifest: { name: dir, version: '1.0.0', repository: {url, directory} } });
+  }
+  let rawReads = 0;
+  const srv = await createMarketSidecarServer({ listen: false, recoveryDelayMs: -1, configDir: ws.configDir, dataDir: ws.dataDir,
+    fetchImpl: async u => {
+      const path = String(u);
+      if (path.endsWith('/index.json')) return Response.json({schemaVersion:1, plugins:[]});
+      if (path === 'https://api.github.com/repos/demo/tools/releases/latest') return Response.json({tag_name:'v2.0.0'});
+      for (const [name, root] of roots) {
+        if (path === 'https://raw.githubusercontent.com/demo/tools/v2.0.0/' + root + '/plugin.json') {
+          rawReads++; return Response.json({name,version:'2.0.0'});
+        }
+      }
+      return new Response('{}',{status:404});
+    } });
+  try {
+    for (const force of [1, 0]) {
+      const report = (await srv.inject({method:'GET',url:'/api/updates?force='+force})).json();
+      assert.deepEqual(report.items.map(item=>item.dir).sort(), [...roots.keys()].sort());
+      assert.equal(rawReads, roots.size);
+    }
+  } finally { await srv.close(); ws.cleanup(); }
+});
+
+function layoutInstaller(ws) {
+  const repo = 'https://github.com/demo/layout';
+  return async function install(version, files, options = {}) {
+    const tar = buildTarArtifact(ws.artifactsDir, version + '.tgz', {
+      'plugin.json': JSON.stringify({ name: 'layout', version, repository: repo }),
+      'a.txt': version,
+      ...files,
+    });
+    const plugin = makeCatalogPlugin({ id: 'demo__layout', owner: 'demo', repo: 'layout',
+      canonicalName: 'layout', displayName: 'Layout', repoId: 42, version, sha256: tar.sha256, tarballUrl: tar.url });
+    return installOrUpdateCatalogPlugin({ configDir: ws.configDir, dataDir: ws.dataDir, plugin, ...options });
+  };
+}
+
+test('managed layout transitions preserve user files and a failed sync can complete from its own journal', async () => {
+  const ws = makeTempWorkspace();
+  const dir = join(ws.pluginsDir, 'layout');
+  const install = layoutInstaller(ws);
+  try {
+    await install('1.0.0', { z: 'file' });
+    await install('2.0.0', { 'z/entry': 'child' });
+    assert.equal(readFileSync(join(dir, 'z/entry'), 'utf8'), 'child');
+    writeFileSync(join(dir, 'z/user'), 'keep');
+    await assert.rejects(install('3.0.0', { z: 'file again' }), /ERR_PLUGIN_LAYOUT_CONFLICT/);
+    assert.equal(readFileSync(join(dir, 'a.txt'), 'utf8'), '2.0.0');
+    assert.equal(readFileSync(join(dir, 'z/user'), 'utf8'), 'keep');
+    assert.equal(existsSync(join(ws.dataDir, 'pending-journal.json')), false);
+    rmSync(join(dir, 'z/user'));
+    await assert.rejects(install('3.0.0', { z: 'file again' }, {
+      writeOverride(src, dst, rel) {
+        if (rel === 'z') throw new Error('simulated disk failure');
+        copyFileSync(src, dst);
+      },
+    }), /simulated disk failure/);
+    const pending = join(ws.dataDir, 'pending-journal.json');
+    const journal = readFileSync(pending, 'utf8');
+    await assert.rejects(install('4.0.0', { z: 'different' }), /ERR_PENDING_RECOVERY/);
+    assert.equal(readFileSync(pending, 'utf8'), journal);
+    assert.equal(recoverInterruptedJournal(ws).action, 'completed-forward');
+    assert.equal(readFileSync(join(dir, 'z'), 'utf8'), 'file again');
+    assert.equal(JSON.parse(readFileSync(join(dir, '.agy-market-receipt.json'))).installedVersion, '3.0.0');
+    assert.equal(existsSync(pending), false);
+  } finally { ws.cleanup(); }
+});
+
+test('case-only renames keep the updated content and receipt on the actual target filesystem', async () => {
+  const ws = makeTempWorkspace();
+  try {
+    const install = layoutInstaller(ws);
+    const root = join(ws.pluginsDir, 'layout');
+    await install('1.0.0', { 'Bin/Runner.js': 'old' });
+    const out = await install('2.0.0', { 'bin/runner.js': 'new' });
+    assert.equal(readFileSync(join(root, 'bin/runner.js'), 'utf8'), 'new');
+    assert.deepEqual(readdirSync(join(root, 'bin')), ['runner.js']);
+    assert.ok(readdirSync(root).includes('bin'));
+    assert.ok(out.receipt.managedFiles.includes('bin/runner.js'));
+    await install('3.0.0', {});
+    assert.equal(existsSync(join(root, 'bin/runner.js')), false);
+  } finally { ws.cleanup(); }
+});
+
+test('live writers keep their journal; recovery and uninstall use the original destination', async () => {
+  const ws = makeTempWorkspace();
+  const custom = join(ws.root, 'custom');
+  const install = layoutInstaller(ws);
+  const moduleUrl = new URL('../src/installer/journal.mjs', import.meta.url).href;
+  const recovery = `import {recoverInterruptedJournal} from ${JSON.stringify(moduleUrl)};
+    console.log(recoverInterruptedJournal(JSON.parse(process.argv[1])).action);`;
+  const simulatedFailure = { pluginsDir: custom, writeOverride() { throw new Error('interrupted'); } };
+  try {
+    await install('1.0.0', {}, { pluginsDir: custom });
+    let liveResult;
+    await install('2.0.0', {}, { pluginsDir: custom, writeOverride(src, dst) {
+      if (!liveResult) liveResult = execFileSync(process.execPath, ['--input-type=module', '-e', recovery,
+        JSON.stringify({ dataDir: ws.dataDir, pluginsDir: ws.pluginsDir })], { encoding: 'utf8' }).trim();
+      copyFileSync(src, dst);
+    } });
+    assert.equal(liveResult, 'busy');
+    await assert.rejects(install('3.0.0', {}, simulatedFailure), /interrupted/);
+    await uninstallPlugin({ dir: 'layout', configDir: ws.configDir, dataDir: ws.dataDir });
+    // Simulate a separate writer exiting without releasing its ticket.
+    execFileSync(process.execPath, ['--input-type=module', '-e',
+      `import {acquirePluginMutation} from ${JSON.stringify(moduleUrl)}; acquirePluginMutation(process.argv[1]);`, ws.dataDir]);
+    assert.equal(recoverInterruptedJournal(ws).action, 'completed-forward');
+    assert.equal(existsSync(join(ws.pluginsDir, 'layout')), false);
+    assert.equal(JSON.parse(readFileSync(join(custom, 'layout/plugin.json'))).version, '3.0.0');
+    await assert.rejects(install('4.0.0', {}, simulatedFailure), /interrupted/);
+    assert.equal((await uninstallPlugin({ dir: 'layout', pluginsDir: custom, configDir: ws.configDir, dataDir: ws.dataDir })).removed, true);
+    assert.equal(recoverInterruptedJournal(ws).action, 'none');
+    assert.equal(existsSync(join(custom, 'layout')), false);
+  } finally { ws.cleanup(); }
+});
+
+test('manual plugins use their installed capabilities for the first managed update', async () => {
+  const ws = makeTempWorkspace();
+  try {
+    const name = 'reader';
+    const repository = 'https://github.com/demo/reader';
+    installFakeLocalPlugin(ws.pluginsDir, { dir: name, manifest: { name, version: '1.0.0', repository } });
+    const dir = join(ws.pluginsDir, name);
+    mkdirSync(join(dir, 'sidecars/pane'), { recursive: true });
+    writeFileSync(join(dir, 'sidecars/pane/sidecar.json'), JSON.stringify({ has_web_ui: true }));
+    const tar = buildTarArtifact(ws.artifactsDir, 'reader.tgz', {
+      'plugin.json': JSON.stringify({ name, version: '2.0.0', repository }),
+      'sidecars/pane/sidecar.json': JSON.stringify({ has_web_ui: true }),
+    });
+    const plugin = makeCatalogPlugin({ id: 'demo__reader', owner: 'demo', repo: name, canonicalName: name,
+      displayName: 'Reader', version: '2.0.0', repoId: 42, tarballUrl: tar.url, sha256: tar.sha256,
+      badges: ['sidecar-ui', 'mcp-remote'], mcpRemoteDomains: ['service.example'] });
+    const options = { plugin, configDir: ws.configDir, dataDir: ws.dataDir };
+    const pending = await installOrUpdateCatalogPlugin(options);
+    assert.equal(pending.status, 'CAPABILITY_ESCALATION_CONFIRM_REQUIRED');
+    assert.deepEqual(pending.escalation.addedBadges, ['mcp-remote']);
+    assert.deepEqual(pending.escalation.addedRemoteDomains, ['service.example']);
+    assert.equal(JSON.parse(readFileSync(join(dir, 'plugin.json'))).version, '1.0.0');
+    const updated = await installOrUpdateCatalogPlugin({ ...options, confirmEscalation: true, approvalKey: pending.escalation.approvalKey });
+    assert.equal(updated.ok, true);
+    assert.deepEqual(updated.receipt.grantedCapabilities.mcpRemoteDomains, ['service.example']);
+  } finally { ws.cleanup(); }
+});
+
+
+test('update commits to the current active or parked copy and never resurrects an uninstall during download', async () => {
+  const ws = makeTempWorkspace();
+  const active = join(ws.pluginsDir, 'layout', 'plugin.json');
+  const parked = join(ws.dataDir, 'disabled-plugins', 'layout', 'plugin.json');
+  const options = { configDir: ws.configDir, dataDir: ws.dataDir };
+  async function updateDuring(version, move) {
+    const tar = buildTarArtifact(ws.artifactsDir, version + '.tgz', {
+      'plugin.json': JSON.stringify({ name: 'layout', version, repository: 'https://github.com/demo/layout' }),
+    });
+    const plugin = makeCatalogPlugin({ id: 'demo__layout', owner: 'demo', repo: 'layout',
+      canonicalName: 'layout', displayName: 'Layout', repoId: 42, version, sha256: tar.sha256,
+      tarballUrl: 'https://github.com/demo/layout/releases/download/v' + version + '/layout.tgz' });
+    return installOrUpdateCatalogPlugin({ ...options, plugin, fetchImpl: async () => {
+      await move();
+      return new Response(readFileSync(tar.path));
+    } });
+  }
+  try {
+    await layoutInstaller(ws)('1.0.0', {});
+    for (const [version, enabled] of [['2.0.0', false], ['3.0.0', true]]) {
+      const result = await updateDuring(version, () => toggleInstalledPlugin({ ...options, dir: 'layout', enabled }));
+      assert.equal(result.parkedByMarket, !enabled);
+      assert.equal(existsSync(enabled ? parked : active), false);
+      assert.equal(JSON.parse(readFileSync(enabled ? active : parked)).version, version);
+    }
+    await assert.rejects(updateDuring('4.0.0', () => uninstallPlugin({ ...options, dir: 'layout' })), /ERR_UPDATE_TARGET_MISMATCH/);
+    assert.equal(existsSync(active) || existsSync(parked), false);
+  } finally { ws.cleanup(); }
+});
+
+test('npx bootstrap supersedes only its interrupted self-update after a successful install', async () => {
+  const ws = makeTempWorkspace();
+  const version = JSON.parse(readFileSync(join(REPO_ROOT, 'plugin.json'))).version;
+  const pending = join(ws.dataDir, 'pending-journal.json');
+  const cli = join(REPO_ROOT, 'bin', 'agy-market.mjs');
+  const env = { ...process.env, AGY_MARKET_DATA_DIR: ws.dataDir, ANTIGRAVITY_CONFIG_DIR: ws.configDir };
+  delete env.ELECTRON_RUN_AS_NODE;
+  function bootstrap(dest) {
+    execFileSync(process.execPath, [cli, 'install', '--dest', dest], { env, stdio: 'pipe' });
+  }
+  const target = join(ws.pluginsDir, 'agy-market');
+  async function installSelf(v, fail = false) {
+    const tar = buildTarArtifact(ws.artifactsDir, v + '.tgz', {
+      'plugin.json': JSON.stringify({ name: 'agy-market', version: v }),
+    });
+    const plugin = makeCatalogPlugin({ id: 'azwosile__agy-market', owner: 'azwosile', repo: 'agy-market',
+      canonicalName: 'agy-market', displayName: 'AGY Market', repoId: 1468650761, version: v,
+      sha256: tar.sha256, tarballUrl: tar.url });
+    return installOrUpdateCatalogPlugin({ configDir: ws.configDir, dataDir: ws.dataDir, plugin,
+      writeOverride: fail ? () => { throw new Error('interrupted self-update'); } : null });
+  }
+  try {
+    await installSelf('1.7.1');
+    await assert.rejects(installSelf('1.7.2', true), /interrupted self-update/);
+    // Older journals infer the global plugins root from the host, even when bootstrap uses --dest.
+    const journal = JSON.parse(readFileSync(pending));
+    delete journal.pluginsDir;
+    writeFileSync(pending, JSON.stringify(journal));
+    const otherRoot = join(ws.root, 'other');
+    bootstrap(otherRoot);
+    assert.deepEqual(JSON.parse(readFileSync(pending)), journal);
+    const release = acquirePluginMutation(ws.dataDir);
+    try { assert.throws(() => bootstrap(ws.pluginsDir), /Another plugin operation is active/); }
+    finally { release(); }
+    // A user-owned directory blocks a required file. Failed bootstrap must keep recovery available.
+    const blocked = join(target, 'package.json');
+    mkdirSync(blocked);
+    writeFileSync(join(blocked, 'notes'), 'user');
+    assert.throws(() => bootstrap(ws.pluginsDir), /ERR_PLUGIN_LAYOUT_CONFLICT/);
+    assert.deepEqual(JSON.parse(readFileSync(pending)), journal);
+    assert.equal(existsSync(journal.stagingBundleDir), true);
+    rmSync(blocked, { recursive: true });
+    bootstrap(ws.pluginsDir);
+    assert.equal(recoverInterruptedJournal(ws).action, 'none');
+    assert.equal(JSON.parse(readFileSync(join(target, 'plugin.json'))).version, version);
+    assert.equal(JSON.parse(readFileSync(join(target, '.agy-market-receipt.json'))).installedVersion, version);
+    assert.equal(existsSync(journal.stagingRootDir), false);
+    assert.equal(existsSync(journal.backupDir), false);
+  } finally { ws.cleanup(); }
+});
+
+test('upstream outages identify unchecked installs, preserve known updates and retry a failed forced check', async () => {
+  const ws = makeTempWorkspace();
+  let failing = false;
+  for (const name of ['alpha', 'beta']) installFakeLocalPlugin(ws.pluginsDir, {
+    dir: name, manifest: { name, version: '1.0.0', repository: 'https://github.com/demo/' + name },
+    receipt: { id: 'demo__' + name, track: 'github-url' },
+  });
+  const srv = await createMarketSidecarServer({ ...ws, listen: false, recoveryDelayMs: -1, fetchImpl: async url => {
+    const path = String(url);
+    if (path.endsWith('/index.json')) return Response.json({ schemaVersion: 1, plugins: [] });
+    if (failing && (path.includes('/demo/alpha/') || path.includes('/demo/beta/tags'))) return new Response('', { status: 502 });
+    if (path.includes('/demo/beta/releases/latest')) return Response.json({ tag_name: 'v2.0.0' });
+    if (path.includes('/tags?')) return Response.json([]);
+    return new Response('{}', { status: 404 });
+  } });
+  const check = async force => (await srv.inject({ method: 'GET', url: '/api/updates?force=' + Number(force) })).json();
+  try {
+    assert.deepEqual((await check(true)).uncheckedDirs, []);
+    failing = true;
+    for (const force of [true, false]) {
+      const report = await check(force);
+      assert.deepEqual(report.uncheckedDirs, ['alpha']);
+      assert.deepEqual(report.unavailableDirs, ['alpha']);
+      assert.ok(report.items.some(item => item.dir === 'beta' && item.latestVersion === '2.0.0'));
+    }
+    failing = false;
+    assert.deepEqual((await check(false)).uncheckedDirs, []);
+  } finally { await srv.close(); ws.cleanup(); }
+});
+
+test('favorite keys separate global, builtin and multiple workspace copies across removal and restart', async () => {
+  const ws = makeTempWorkspace();
+  const workspaceRoots = ['workspace-a', 'workspace-b'].map(name => join(ws.root, name));
+  const builtinPluginsDir = join(ws.root, 'builtin');
+  const roots = [ws.pluginsDir, builtinPluginsDir, ...workspaceRoots.map(root => join(root, '.agents', 'plugins'))];
+  roots.forEach((root, i) => installFakeLocalPlugin(root, { dir: 'reader',
+    manifest: { name: 'reader', version: '1.0.0', displayName: 'Reader', repository: 'https://github.com/team' + i + '/reader' } }));
+  const workspaceUris = workspaceRoots.map(path => pathToFileURL(path).href);
+  writeFileSync(join(ws.dataDir, 'prefs.json'), JSON.stringify({ favorites: ['local:reader'],
+    favoriteSources: { 'local:reader': { repositoryUrl: 'https://github.com/team3/reader', pluginRoot: '.' } } }));
+  const opts = { ...ws, builtinPluginsDir, listen: false, recoveryDelayMs: -1, fetchImpl: async () => Response.json({ plugins: [] }) };
+  let srv = await createMarketSidecarServer(opts);
+  const state = async () => (await srv.inject({ method: 'GET', url: '/api/state?workspaceUris=' + encodeURIComponent(workspaceUris.join(',')) })).json();
+  const post = async (url, body) => (await srv.inject({ method: 'POST', url,
+    headers: { 'x-sidecar-token': srv.sideToken }, body: { ...body, workspaceUris } })).json();
+  try {
+    let data = await state();
+    const byRepo = new Map(data.installed.map(loc => [loc.repositoryUrl, loc.favoriteKey]));
+    const keys = roots.map((_, i) => byRepo.get('https://github.com/team' + i + '/reader'));
+    assert.equal(new Set(keys).size, 4);
+    for (const key of keys) assert.match(key, /^copy:[a-f0-9]{64}$/);
+    assert.deepEqual(data.prefs.favorites, [keys[3]]);
+    for (const key of keys.slice(0, 3)) await post('/api/favorites', { key, favorite: true });
+    await srv.close();
+    srv = await createMarketSidecarServer(opts);
+    data = await state();
+    assert.deepEqual(new Set(data.prefs.favorites), new Set(keys));
+    keys.forEach((key, i) => assert.equal(data.prefs.favoriteSources[key].repositoryUrl, 'https://github.com/team' + i + '/reader'));
+    const removed = await post('/api/uninstall', { dir: 'reader', removeFavorite: true });
+    assert.equal(removed.removed, true);
+    assert.deepEqual(new Set(removed.state.prefs.favorites), new Set(keys.slice(1)));
+    assert.equal(removed.state.prefs.favoriteSources[keys[0]], undefined);
+    await srv.close();
+    writeFileSync(join(ws.dataDir, 'prefs.json'), JSON.stringify({ favorites: ['local:reader'] }));
+    srv = await createMarketSidecarServer(opts);
+    assert.deepEqual((await state()).prefs.favorites, ['saved:reader']);
+    const closedWorkspaces = (await srv.inject({ method: 'GET', url: '/api/state' })).json();
+    assert.deepEqual(closedWorkspaces.prefs.favorites, ['saved:reader']);
+  } finally { await srv.close(); ws.cleanup(); }
+});
+
+test('replacing a catalog conflict binds the displayed copy across the confirmation interval', async t => {
+  let plugin;
+  const { ws, post } = await openUpdateFixture(t, async () => Response.json({ plugins: [plugin] }));
+  const archive = buildTarArtifact(ws.artifactsDir, 'reader.tgz', { 'plugin.json': JSON.stringify({ name: 'reader', version: '2.0.0' }) });
+  plugin = makeCatalogPlugin({ id: 'demo__reader', canonicalName: 'reader', owner: 'demo', repo: 'reader',
+    displayName: 'Reader', version: '2.0.0', repoId: 221, tarballUrl: archive.url, sha256: archive.sha256 });
+  for (const dir of ['first', 'second']) installFakeLocalPlugin(ws.pluginsDir, { dir,
+    manifest: { name: 'reader', version: '1.0.0', repository: 'https://github.com/' + dir + '/reader' } });
+  const request = { id: plugin.id };
+  const preview = await post('/api/install', request);
+  assert.equal(preview.conflict.dir, 'first');
+  assert.match(preview.replacementKey, /^[a-f0-9]{64}$/);
+  rmSync(join(ws.pluginsDir, 'first'), { recursive: true });
+  const result = await post('/api/install', { ...request, conflictStrategy: 'replace', replacementKey: preview.replacementKey });
+  assert.match(result.error, /ERR_REPLACEMENT_TARGET_CHANGED/);
+  assert.equal(JSON.parse(readFileSync(join(ws.pluginsDir, 'second', 'plugin.json'))).version, '1.0.0');
+  const next = await post('/api/install', { ...request, conflictStrategy: 'replace' });
+  assert.equal(next.status, 'CONFLICT_CHOICE_REQUIRED');
+  assert.notEqual(next.replacementKey, preview.replacementKey);
+  assert.equal((await post('/api/install', { ...request, conflictStrategy: 'replace', replacementKey: next.replacementKey })).installedDir, 'second');
+});
+
+test('kept favorites retain GitHub source, tracked branch and subdirectory across uninstall and restart', async () => {
+  const ws = makeTempWorkspace();
+  const id = 'demo__tools--reader';
+  const repo = 'https://github.com/demo/tools';
+  const opts = { ...ws, listen: false, recoveryDelayMs: -1,
+    fetchImpl: async () => Response.json({ schemaVersion: 1, plugins: [] }) };
+  installFakeLocalPlugin(ws.pluginsDir, { dir: 'reader', manifest: { name: 'reader', displayName: 'Ledger Reader', version: '1.0.0' },
+    receipt: { id, track: 'github-url', repositoryUrl: repo, pluginRoot: 'plugins/reader', githubSource: { trackBranch: 'preview' } } });
+  // An existing string-only bookmark from a previous version.
+  writeFileSync(join(ws.dataDir, 'prefs.json'), JSON.stringify({ favorites: [id] }));
+  let srv = await createMarketSidecarServer(opts);
+  const post = async (url, body) => (await srv.inject({ method: 'POST', url, headers: { 'x-sidecar-token': srv.sideToken }, body })).json();
+  try {
+    const res = await post('/api/uninstall', { dir: 'reader', removeFavorite: false });
+    assert.equal(res.removed, true);
+    const expected = { displayName: 'Ledger Reader', repositoryUrl: repo, pluginRoot: 'plugins/reader', trackBranch: 'preview' };
+    assert.deepEqual(res.state.prefs.favoriteSources[id], expected);
+    await srv.close();
+    srv = await createMarketSidecarServer(opts);
+    const prefs = (await srv.inject({ method: 'GET', url: '/api/state' })).json().prefs;
+    assert.deepEqual(prefs.favorites, [id]);
+    assert.deepEqual(prefs.favoriteSources[id], expected);
+    await post('/api/favorites', { key: id, favorite: false });
+    assert.deepEqual(JSON.parse(readFileSync(join(ws.dataDir, 'prefs.json'))).favoriteSources, {});
+  } finally { await srv.close(); ws.cleanup(); }
+});
+
+
+test('native install offers isolation for unidentified active and parked directories', async () => {
+  for (const parked of [false, true]) {
+    const ws = makeTempWorkspace();
+    try {
+      const parent = parked ? join(ws.dataDir, 'disabled-plugins') : ws.pluginsDir;
+      const occupied = join(parent, 'reader');
+      mkdirSync(occupied, { recursive: true });
+      writeFileSync(join(occupied, 'notes.txt'), 'local draft');
+      const tar = buildTarArtifact(ws.artifactsDir, 'reader.tgz', {
+        'plugin.json': JSON.stringify({ name: 'reader', version: '1.0.0' }), 'notes.txt': 'package default',
+      });
+      const plugin = makeCatalogPlugin({ id: 'demo__reader', canonicalName: 'reader', owner: 'demo', repo: 'reader',
+        displayName: 'Reader', repoId: 41, version: '1.0.0', tarballUrl: tar.url, sha256: tar.sha256 });
+      const options = { plugin, configDir: ws.configDir, dataDir: ws.dataDir };
+      const prompt = await installOrUpdateCatalogPlugin(options);
+      assert.equal(prompt.status, 'CONFLICT_CHOICE_REQUIRED');
+      assert.deepEqual(prompt.choices, ['isolate']);
+      await assert.rejects(installOrUpdateCatalogPlugin({ ...options, conflictStrategy: 'replace' }), /ERR_TARGET_DIR_EXISTS/);
+      const result = await installOrUpdateCatalogPlugin({ ...options, conflictStrategy: 'isolate' });
+      assert.equal(result.installedDir, 'demo--reader');
+      assert.equal(readFileSync(join(occupied, 'notes.txt'), 'utf8'), 'local draft');
+      assert.equal(existsSync(join(occupied, 'plugin.json')), false);
+    } finally { ws.cleanup(); }
+  }
+});
+
+test('unpark refuses an occupied active directory and keeps both copies available', () => {
+  const ws = makeTempWorkspace();
+  try {
+    const dir = 'reader';
+    const toggle = enabled => toggleInstalledPlugin({ configDir: ws.configDir, dataDir: ws.dataDir, dir, enabled });
+    const active = join(ws.pluginsDir, dir);
+    const parked = join(ws.dataDir, 'disabled-plugins', dir);
+    installFakeLocalPlugin(ws.pluginsDir, { dir, manifest: { name: 'reader', version: '1.0.0' } });
+    toggle(false);
+    installFakeLocalPlugin(ws.pluginsDir, { dir, manifest: { name: 'different-plugin', version: '3.0.0' } });
+    assert.throws(() => toggle(true), /ERR_TARGET_DIR_EXISTS/);
+    assert.equal(JSON.parse(readFileSync(join(active, 'plugin.json'))).name, 'different-plugin');
+    assert.equal(JSON.parse(readFileSync(join(parked, 'plugin.json'))).name, 'reader');
+    rmSync(join(active, 'plugin.json'));
+    writeFileSync(join(active, 'notes.txt'), 'local draft');
+    assert.throws(() => toggle(true), /ERR_TARGET_DIR_EXISTS/);
+    assert.equal(readFileSync(join(active, 'notes.txt'), 'utf8'), 'local draft');
+    rmSync(join(active, 'notes.txt'));
+    assert.equal(toggle(true).enabled, true);
+    assert.equal(JSON.parse(readFileSync(join(active, 'plugin.json'))).name, 'reader');
+  } finally { ws.cleanup(); }
+});
+
+test('rollback restores bundled dependencies and retains the journal if the backup is incomplete', async () => {
+  const ws = makeTempWorkspace();
+  const dependency = 'node_modules/helper/index.js';
+  const manifest = version => JSON.stringify({ name: 'reader', version });
+  function release(version, files) {
+    const tar = buildTarArtifact(ws.artifactsDir, version + '.tgz', { 'plugin.json': manifest(version), ...files });
+    return makeCatalogPlugin({ id: 'demo__reader', canonicalName: 'reader', owner: 'demo', repo: 'reader',
+      displayName: 'Reader', repoId: 41, version, tarballUrl: tar.url, sha256: tar.sha256 });
+  }
+  try {
+    const options = { configDir: ws.configDir, dataDir: ws.dataDir };
+    const active = join(ws.pluginsDir, 'reader');
+    await installOrUpdateCatalogPlugin({ ...options, plugin: release('1.0.0', { [dependency]: 'original' }) });
+    const newOnly = 'node_modules/helper/extra.js';
+    await assert.rejects(installOrUpdateCatalogPlugin({ ...options,
+      plugin: release('2.0.0', { [dependency]: 'updated', [newOnly]: 'new' }),
+      writeOverride(src, dst, rel) {
+        if (rel === 'plugin.json') throw new Error('interrupted');
+        copyFileSync(src, dst);
+      },
+    }), /interrupted/);
+    const journalPath = join(ws.dataDir, 'pending-journal.json');
+    const record = JSON.parse(readFileSync(journalPath));
+    // Keep the new manifest but lose one required staged payload file.
+    rmSync(join(record.stagingBundleDir, dependency));
+    const savedFile = join(record.backupDir, dependency);
+    assert.equal(readFileSync(savedFile, 'utf8'), 'original');
+    rmSync(savedFile);
+    assert.match(recoverInterruptedJournal(ws).error, /ERR_INCOMPLETE_BACKUP/);
+    assert.ok(existsSync(journalPath));
+    assert.equal(readFileSync(join(active, dependency), 'utf8'), 'updated');
+    writeFileSync(savedFile, 'original');
+    assert.equal(recoverInterruptedJournal(ws).action, 'rolled-back');
+    assert.equal(readFileSync(join(active, dependency), 'utf8'), 'original');
+    assert.equal(existsSync(join(active, newOnly)), false);
+    assert.equal(JSON.parse(readFileSync(join(active, '.agy-market-receipt.json'))).installedVersion, '1.0.0');
+    assert.equal(existsSync(journalPath), false);
+  } finally { ws.cleanup(); }
+});
+
+
+test('uninstall confirmation stays bound to the selected manual copy even with identical metadata', async t => {
+  const { ws, server, post } = await openUpdateFixture(t, async () => Response.json({ plugins: [] }));
+  const dir = 'reader';
+  const manifest = { name: dir, version: '1.0.0' };
+  installFakeLocalPlugin(ws.pluginsDir, { dir, manifest });
+  const current = async () => (await server.inject({ url: '/api/state?refresh=1' })).json().installed.find(loc => loc.dir === dir);
+  const selected = await current();
+  assert.match(selected.uninstallKey, /^[\da-f]{64}$/);
+  const expected = { parked: false, id: '', name: dir, repositoryUrl: '', key: selected.uninstallKey };
+  const path = join(ws.pluginsDir, dir);
+  renameSync(path, join(ws.root, 'old-copy'));
+  installFakeLocalPlugin(ws.pluginsDir, { dir, manifest });
+  writeFileSync(join(path, 'work.txt'), 'private draft');
+  const refused = await post('/api/uninstall', { dir, expectedInstall: expected });
+  assert.match(refused.error, /ERR_UNINSTALL_TARGET_CHANGED/);
+  assert.equal(readFileSync(join(path, 'work.txt'), 'utf8'), 'private draft');
+  const next = await current();
+  assert.notEqual(next.uninstallKey, selected.uninstallKey);
+  assert.equal((await post('/api/uninstall', { dir, expectedInstall: { ...expected, key: next.uninstallKey } })).removed, true);
+});
+
+test('opening a warm panel conditionally revalidates once and a newer refresh wins on disk and in memory', async t => {
+  const old = { id: 'team__reader', canonicalName: 'reader', version: '1.0.0' };
+  const headers = [];
+  let release;
+  let started;
+  const blocked = new Promise(resolve => { started = resolve; });
+  const gate = new Promise(resolve => { release = resolve; });
+  const modified = 'Wed, 25 Nov 2026 12:00:00 GMT';
+  const { server, post } = await openUpdateFixture(t, async (url, init) => {
+    assert.ok(url.endsWith('/index.json'));
+    headers.push(new Headers(init.headers));
+    switch (headers.length) {
+      case 1: return Response.json({ plugins: [old] }, { headers: { etag: '"v1"', 'last-modified': modified } });
+      case 2: return new Response(null, { status: 304 });
+      case 3:
+        started();
+        await gate;
+        return Response.json({ plugins: [old] }, { headers: { etag: '"withdrawn"' } });
+      case 4: return Response.json({ plugins: [] }, { headers: { etag: '"v2"' } });
+      case 5: return new Response(null, { status: 304 });
+      default: return Response.json({ plugins: [old] }, { headers: { etag: '"v3"' } });
+    }
+  });
+  const state = async query => (await server.inject({ url: '/api/state' + query })).json().catalog.plugins.map(p => p.id);
+  assert.deepEqual(await state('?panelOpen=1'), [old.id]);
+  assert.deepEqual(await state(''), [old.id]);
+  assert.equal(headers.length, 1);
+  assert.deepEqual(await state('?panelOpen=1'), [old.id]);
+  assert.equal(headers[1].get('if-none-match'), '"v1"');
+  assert.equal(headers[1].get('if-modified-since'), modified);
+
+  const reopening = state('?panelOpen=1');
+  await blocked;
+  const anotherPanel = state('?panelOpen=1');
+  const reader = state('');
+  const preflight = post('/api/preflight', { id: old.id });
+  try {
+    assert.deepEqual(await state('?refresh=1'), []);
+    assert.equal(headers.length, 4);
+    assert.equal(headers[3].get('if-none-match'), null);
+  } finally { release(); }
+  for (const ids of await Promise.all([reopening, anotherPanel, reader])) assert.deepEqual(ids, []);
+  assert.match((await preflight).error, /not found in active catalog/);
+  assert.deepEqual(await state('?panelOpen=1'), []);
+  assert.equal(headers.at(-1).get('if-none-match'), '"v2"');
+  assert.deepEqual(await state('?panelOpen=1'), [old.id]);
+  assert.deepEqual(await state(''), [old.id]);
+  assert.equal(headers.length, 6);
+});
+
+test('uninstall only changes a catalog favorite when the installed source owns it', async t => {
+  const entry = { id: 'team__reader', canonicalName: 'reader', version: '1.0.0',
+    repository: { url: 'https://github.com/team/reader', pluginRoot: '.' } };
+  const { ws, server, post } = await openUpdateFixture(t, async () => Response.json({ plugins: [entry] }));
+  await server.inject({ url: '/api/state' });
+  const favorite = await post('/api/favorites', { key: entry.id, favorite: true, plugin: entry });
+  const other = 'https://github.com/other/reader';
+  for (const receipt of [null, { id: entry.id, repositoryUrl: other, pluginRoot: '.', installedVersion: '1.0.0' },
+    { id: entry.id, repositoryUrl: entry.repository.url, pluginRoot: 'plugins/other', installedVersion: '1.0.0' }]) {
+    for (const removeFavorite of [false, true]) {
+      installFakeLocalPlugin(ws.pluginsDir, { dir: 'reader', manifest: {
+        name: 'reader', version: '1.0.0', repository: receipt?.repositoryUrl || other,
+      }, receipt });
+      const result = await post('/api/uninstall', { dir: 'reader', removeFavorite });
+      assert.equal(result.removed, true, result.error);
+      assert.deepEqual(result.state.prefs.favorites, [entry.id]);
+      assert.deepEqual(result.state.prefs.favoriteSources, favorite.favoriteSources);
+    }
+  }
+  installFakeLocalPlugin(ws.pluginsDir, { dir: 'reader', manifest: {
+    name: 'reader', version: '1.0.0', repository: entry.repository.url,
+  } });
+  const result = await post('/api/uninstall', { dir: 'reader', removeFavorite: true });
+  assert.equal(result.removed, true);
+  assert.deepEqual(result.state.prefs.favorites, []);
+});
+
+test('legacy receipt ids alone cannot grant another catalog source ownership during uninstall', async t => {
+  const id = 'team__reader';
+  const catalogRepo = 'https://github.com/team/reader';
+  const oldRepo = 'https://github.com/other/reader';
+  const entry = { id, canonicalName: 'reader', version: '1.0.0', repository: { url: catalogRepo, pluginRoot: '.' },
+    capabilities: { badges: ['mcp-stdio'], mcpServers: ['reader'] } };
+  const { ws, post } = await openUpdateFixture(t, async () => Response.json({ plugins: [entry] }));
+  writeFileSync(join(ws.dataDir, 'prefs.json'), JSON.stringify({ favorites: [id] }));
+  installFakeLocalPlugin(ws.pluginsDir, { dir: 'reader', manifest: { name: 'reader', version: '1.0.0', repository: oldRepo },
+    receipt: { id, installedVersion: '1.0.0' } });
+  const removed = await post('/api/uninstall', { dir: 'reader', removeFavorite: true });
+  assert.equal(removed.removed, true);
+  assert.equal(removed.hadMcp, false);
+  assert.deepEqual(removed.state.prefs.favorites, [id]);
+  assert.equal(removed.state.prefs.favoriteSources[id].repositoryUrl, catalogRepo);
+});
+
+test('keeping a catalog favorite uses its installed receipt source across an upstream manifest URL', async t => {
+  const id = 'team__reader';
+  const repositoryUrl = 'https://github.com/team/reader';
+  const entry = { id, canonicalName: 'reader', version: '1.0.0', repository: { url: repositoryUrl, pluginRoot: '.' } };
+  const { ws, server, post } = await openUpdateFixture(t, async () => Response.json({ plugins: [entry] }));
+  await server.inject({ url: '/api/state' });
+  await post('/api/favorites', { key: id, favorite: true, plugin: entry });
+  installFakeLocalPlugin(ws.pluginsDir, { dir: 'reader', manifest: { name: 'reader', version: '1.0.0',
+    repository: 'https://github.com/upstream/reader' }, receipt: { id, track: 'verified', installedVersion: '1.0.0',
+    repositoryUrl, pluginRoot: '.' } });
+  const removed = await post('/api/uninstall', { dir: 'reader', removeFavorite: false });
+  assert.equal(removed.removed, true);
+  assert.deepEqual(removed.state.prefs.favorites, [id]);
+  assert.equal(removed.state.prefs.favoriteSources[id].repositoryUrl, repositoryUrl);
+});
+
+test('catalog favorites retain the reviewed repository and root across feed changes', async t => {
+  const key = 'team__reader';
+  const makeEntry = (repo, root) => ({ id: key, canonicalName: 'reader', version: '1.0.0', displayName: repo,
+    repository: { url: 'https://github.com/team/' + repo, pluginRoot: root } });
+  const original = makeEntry('original', 'plugins/reader');
+  let entry = original;
+  const { server, post } = await openUpdateFixture(t, async () => Response.json({ plugins: [entry] }));
+  const state = async () => (await server.inject({ url: '/api/state?refresh=1' })).json();
+  await state();
+  const added = await post('/api/favorites', { key, favorite: true, plugin: original });
+  assert.equal(added.favoriteSources[key].repositoryUrl, original.repository.url);
+  assert.equal(added.favoriteSources[key].pluginRoot, 'plugins/reader');
+  entry = makeEntry('new', '.');
+  const switched = await state();
+  const [oldBookmark] = switched.prefs.favorites;
+  assert.match(oldBookmark, /^saved:/);
+  assert.equal(switched.prefs.favoriteSources[oldBookmark].repositoryUrl, original.repository.url);
+  assert.equal((await post('/api/favorites', { key, favorite: true, plugin: original })).ok, false);
+  const second = await post('/api/favorites', { key, favorite: true, plugin: entry });
+  assert.deepEqual(new Set(second.favorites), new Set([key, oldBookmark]));
+  entry = original;
+  const restored = await state();
+  assert.equal(restored.prefs.favoriteSources[key].repositoryUrl, original.repository.url);
+  assert.deepEqual(Object.values(restored.prefs.favoriteSources).map(src => src.repositoryUrl).sort(),
+    ['https://github.com/team/new', original.repository.url]);
+});
+
+test('uninstall removes only the visible installation and keeps a different parked copy', async () => {
+  const ws = makeTempWorkspace();
+  try {
+    const dir = 'reader';
+    const parkedParent = join(ws.dataDir, 'disabled-plugins');
+    installFakeLocalPlugin(parkedParent, { dir, manifest: { name: 'old-reader', version: '1.0.0' } });
+    installFakeLocalPlugin(ws.pluginsDir, { dir, manifest: { name: 'new-reader', version: '2.0.0' } });
+    const notes = join(parkedParent, dir, 'notes.txt');
+    writeFileSync(notes, 'user notes');
+    const pending = join(ws.dataDir, 'pending-journal.json');
+    writeFileSync(pending, JSON.stringify({ dir, pluginsDir: ws.pluginsDir, parkedByMarket: true }));
+    const expectedInstall = { name: 'new-reader', id: '', parked: false };
+    await assert.rejects(uninstallPlugin({ ...ws, dir,
+      expectedInstall: { ...expectedInstall, repositoryUrl: 'https://github.com/previous/reader' },
+    }), /ERR_UNINSTALL_TARGET_CHANGED/);
+    assert.equal((await uninstallPlugin({ ...ws, dir, expectedInstall })).removed, true);
+    await assert.rejects(uninstallPlugin({ ...ws, dir, expectedInstall }), /ERR_UNINSTALL_TARGET_CHANGED/);
+    assert.equal(existsSync(join(ws.pluginsDir, dir)), false);
+    assert.equal(readFileSync(notes, 'utf8'), 'user notes');
+    assert.ok(existsSync(pending));
+    mkdirSync(join(ws.pluginsDir, dir));
+    const draft = join(ws.pluginsDir, dir, 'draft.txt');
+    writeFileSync(draft, 'unrelated');
+    assert.equal((await uninstallPlugin({ ...ws, dir })).removed, true);
+    assert.equal(existsSync(join(parkedParent, dir)), false);
+    assert.equal(readFileSync(draft, 'utf8'), 'unrelated');
+    assert.equal(existsSync(pending), false);
+    await assert.rejects(uninstallPlugin({ ...ws, dir }), /ERR_UNINSTALL_TARGET_CHANGED/);
+    assert.equal(readFileSync(draft, 'utf8'), 'unrelated');
+  } finally { ws.cleanup(); }
+});
+test('legacy managed updates require the same repository and plugin root', async t => {
+  const id = 'team__reader';
+  const repo = 'https://github.com/first/reader';
+  const entry = { id, canonicalName: 'reader', version: '2.0.0', repository: { repositoryId: 17, url: repo, pluginRoot: '.' } };
+  let catalogEntry = entry;
+  const { ws, post } = await openUpdateFixture(t, async () => Response.json({ plugins: [catalogEntry] }));
+  const plan = (receipt, repository, manifestRepo = repo) => {
+    installFakeLocalPlugin(ws.pluginsDir, { dir: 'reader', manifest: { name: 'reader', version: '1.0.0', repository: manifestRepo },
+      receipt: { id, installedVersion: '1.0.0', ...receipt } });
+    const inventory = scanLocalPluginInventory({ ...ws, bypassCache: true });
+    return resolveInstallPreflight({ ...entry, repository }, inventory, { preferredDir: 'reader', requireExistingDir: true }).action;
+  };
+  const other = { ...entry.repository, url: 'https://github.com/other/reader' };
+  assert.throws(() => plan({ repositoryUrl: repo }, other), /ERR_UPDATE_TARGET_MISMATCH/);
+  assert.throws(() => plan({}, other), /ERR_UPDATE_TARGET_MISMATCH/);
+  assert.throws(() => plan({ repositoryId: 17, repositoryUrl: repo }, { ...other, repositoryId: 0 }), /ERR_UPDATE_TARGET_MISMATCH/);
+  assert.throws(() => plan({ repositoryUrl: repo }, { ...entry.repository, pluginRoot: 'plugins/other' }), /ERR_UPDATE_TARGET_MISMATCH/);
+  assert.equal(plan({ repositoryUrl: repo + '.git' }, entry.repository, other.url), 'update');
+  assert.equal(plan({}, entry.repository), 'update');
+  assert.equal(plan({ repositoryId: 17 }, other), 'update');
+  assert.equal(plan({ pluginRoot: './plugins/reader/' }, { ...entry.repository, pluginRoot: 'plugins/reader' }), 'update');
+  assert.throws(() => plan({}, { ...entry.repository, pluginRoot: '.' },
+    { url: repo, directory: 'plugins/reader' }), /ERR_UPDATE_TARGET_MISMATCH/);
+  const pkg = join(ws.pluginsDir, 'reader', 'package.json');
+  writeFileSync(pkg, JSON.stringify({ repository: { url: repo, directory: 'plugins/reader' } }));
+  assert.throws(() => plan({ repositoryUrl: repo }, entry.repository), /ERR_UPDATE_TARGET_MISMATCH/);
+  assert.equal(plan({ repositoryUrl: repo }, { ...entry.repository, pluginRoot: 'plugins/reader' }), 'update');
+  const [legacy] = scanLocalPluginInventory({ ...ws, bypassCache: true }).installed;
+  const oldKey = createHash('sha256').update(JSON.stringify(['global', 'reader', 'reader', repo, '', id])).digest('hex');
+  assert.equal(legacy.favoriteKey, 'copy:' + oldKey);
+  rmSync(pkg);
+  assert.throws(() => plan({}, entry.repository, ''), /ERR_UPDATE_TARGET_MISMATCH/);
+  const artifact = buildTarArtifact(ws.artifactsDir, 'reader.tgz', {
+    'plugin.json': JSON.stringify({ name: 'reader', version: '2.0.0', repository: repo }),
+  });
+  const distribution = { tarballUrl: artifact.url, sha256: artifact.sha256 };
+  installFakeLocalPlugin(ws.pluginsDir, { dir: 'reader', manifest: { name: 'reader', version: '1.0.0', repository: repo },
+    receipt: { id, repositoryUrl: repo, installedVersion: '1.0.0' } });
+  catalogEntry = { ...entry, repository: other, distribution };
+  const blocked = await post('/api/update', { id, dir: 'reader' });
+  assert.match(blocked.error, /ERR_UPDATE_TARGET_MISMATCH/);
+  const manifestPath = join(ws.pluginsDir, 'reader', 'plugin.json');
+  assert.equal(JSON.parse(readFileSync(manifestPath)).version, '1.0.0');
+  catalogEntry = { ...entry, distribution };
+  await post('/api/catalog/refresh', {});
+  const updated = await post('/api/update', { id, dir: 'reader' });
+  assert.equal(updated.ok, true, updated.error);
+  assert.equal(JSON.parse(readFileSync(manifestPath)).version, '2.0.0');
+});
+
+test('independent market sessions preserve each other\'s favorite and preference edits', async t => {
+  const fetchImpl = async () => Response.json({ plugins: [] });
+  const { ws, post } = await openUpdateFixture(t, fetchImpl);
+  const second = await createMarketSidecarServer({ ...ws, listen: false, recoveryDelayMs: -1, fetchImpl });
+  t.after(() => second.close());
+  const other = async (url, body) => (await second.inject({ method: 'POST', url, body,
+    headers: { 'X-Sidecar-Token': second.sideToken } })).json();
+  const disk = () => JSON.parse(readFileSync(join(ws.dataDir, 'prefs.json'), 'utf8'));
+  await post('/api/favorites', { key: 'one', favorite: true });
+  await other('/api/prefs', { locale: 'en' });
+  assert.deepEqual(disk().favorites, ['one']);
+  await other('/api/favorites', { key: 'two', favorite: true });
+  await post('/api/favorites', { key: 'one', favorite: false });
+  assert.deepEqual(disk().favorites, ['two']);
+  assert.equal(disk().locale, 'en');
+  await other('/api/conflicts/ignore', { id: 'test-conflict', ignored: true });
+  assert.deepEqual(disk().favorites, ['two']);
+  assert.deepEqual(disk().ignoredConflictIds, ['test-conflict']);
+
+  const id = 'team__reader';
+  const repositoryUrl = 'https://github.com/team/reader';
+  installFakeLocalPlugin(ws.pluginsDir, { dir: 'reader',
+    manifest: { name: 'reader', version: '1.0.0', repository: repositoryUrl },
+    receipt: { id, installedVersion: '1.0.0', repositoryUrl, pluginRoot: '.' } });
+  await post('/api/favorites', { key: id, favorite: true });
+  assert.ok(disk().favorites.includes(id));
+  execFileSync(process.execPath, [join(REPO_ROOT, 'bin/agy-market.mjs'), 'uninstall', 'reader', '--yes', '--remove-favorite'], {
+    env: { ...process.env, ANTIGRAVITY_CONFIG_DIR: ws.configDir, AGY_MARKET_DATA_DIR: ws.dataDir }, windowsHide: true,
+  });
+  assert.deepEqual(disk().favorites, ['two']);
+  await post('/api/prefs', { locale: 'zh' });
+  assert.deepEqual(disk().favorites, ['two']);
+});
+
+test('concurrent Sidecar processes commit all favorite additions on the same disk', async t => {
+  const ws = makeTempWorkspace();
+  t.after(ws.cleanup);
+  const worker = `
+    import { createMarketSidecarServer } from './src/sidecar/server.mjs';
+    const [configDir, dataDir, prefix] = process.argv.slice(1);
+    const server = await createMarketSidecarServer({ configDir, dataDir, listen: false, recoveryDelayMs: -1 });
+    try {
+      for (let i = 0; i < 8; i++) {
+        const result = await server.inject({ method: 'POST', url: '/api/favorites',
+          headers: { 'X-Sidecar-Token': server.sideToken }, body: { key: prefix + i, favorite: true } });
+        if (result.statusCode !== 200) throw Error(result.body);
+      }
+    } finally { await server.close(); }
+  `;
+  const run = promisify(execFile);
+  const writers = ['alpha', 'beta', 'gamma', 'delta'];
+  await Promise.all(writers.map(prefix => run(process.execPath,
+    ['--input-type=module', '-e', worker, ws.configDir, ws.dataDir, prefix], { cwd: REPO_ROOT, windowsHide: true })));
+  const saved = JSON.parse(readFileSync(join(ws.dataDir, 'prefs.json'), 'utf8'));
+  assert.deepEqual(saved.favorites.sort(), writers.flatMap(name => Array.from({ length: 8 }, (_, i) => name + i)).sort());
 });

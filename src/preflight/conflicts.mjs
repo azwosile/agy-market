@@ -12,6 +12,7 @@ import { join } from 'node:path';
 import { PLUGIN_ID, toScopedPluginName } from '../shared/constants.mjs';
 import { fileUriToLocalPath, resolveAntigravityConfigDir } from '../shared/paths.mjs';
 import {
+  findManagedSuccessor,
   normalizeRepoUrl,
   parseSkillFrontmatterName,
   scanLocalPluginInventory,
@@ -229,6 +230,19 @@ export function scanLocalConflicts({
   }
 
   const items = [];
+  for (const legacy of allInstalled) {
+    const managed = findManagedSuccessor(legacy, allInstalled);
+    if (!managed) continue;
+    items.push({
+      id: `duplicate-repo-install:${legacy.dir}:${managed.dir}`,
+      type: 'duplicate-repo-install', severity: 'warning',
+      titleZh: '旧版手动安装与市场托管副本并存', titleEn: 'Legacy and managed copies are both installed',
+      summaryZh: `市场将更新 ${managed.dir}。请在已安装页核对旧目录 ${legacy.dir}。`,
+      summaryEn: `Updates target ${managed.dir}. Review the legacy copy ${legacy.dir} in Installed.`,
+      affectedPlugins: [legacy, managed].map(({ dir, name, scope, path }) => ({ dir, name, scope, path })),
+      paths: [legacy.path, managed.path], fixAction: null,
+    });
+  }
 
   // ------------------------------------------------------------------------
   // Layer 1: `duplicate-plugin-name` (critical)
@@ -285,7 +299,7 @@ export function scanLocalConflicts({
   // Layer 2: `windows-symlink-ignored` (critical)
   // ------------------------------------------------------------------------
   for (const p of allInstalled) {
-    if (p.scope !== 'global' || p.parkedByMarket || !p.isSymlink) continue;
+    if (process.platform !== 'win32' || p.scope !== 'global' || p.parkedByMarket || !p.isSymlink) continue;
     const targetPaths = [p.path];
     if (p.realPath && p.realPath !== p.path) targetPaths.push(p.realPath);
 

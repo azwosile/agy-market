@@ -12,41 +12,37 @@ export function escapeHtml(str) {
     .replace(/'/g, '&#39;');
 }
 
-function formatInline(escapedLine) {
-  // Stash inline code spans first so formatting markers inside code are preserved verbatim.
-  const codeSpans = [];
-  let text = escapedLine.replace(/`([^`]+)`/g, (_m, code) => {
-    const idx = codeSpans.length;
-    codeSpans.push(`<code class="md-code">${code}</code>`);
-    return `\u0000CODE${idx}\u0000`;
-  });
-
-  // Markdown links: http(s) open externally; internal `sidecar://` triggers Sidebar opener; `customization://` renders safely as badge
-  text = text.replace(
-    /\[([^\]]+)\]\((https?:\/\/[^\s)]+|sidecar:\/\/[^\s)]+|customization:\/\/[^\s)]+)\)/g,
-    (_m, label, url) => {
-      if (url.startsWith('sidecar://')) {
-        return `<button type="button" class="md-pill-btn" data-action="open-uri-pane" data-uri="${url}" data-label="${label}" title="打开 Sidebar 侧边栏 / Open Sidebar">${label}</button>`;
-      }
-      if (url.startsWith('customization://')) {
-        return `<span class="md-code" title="${url}">${label}</span>`;
-      }
-      return `<a href="${url}" target="_blank" rel="noopener noreferrer" class="md-link">${label}</a>`;
-    },
-  );
-
-  // Strip raw image markdown syntax into subtle text alt badge (avoids unverified external tracking pixels)
-  text = text.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (_m, alt) => {
-    const label = alt.trim();
-    return label ? `<span class="md-img-alt">[${label}]</span>` : '';
-  });
-
-  text = text
+function formatEmphasis(text) {
+  return text
     .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
     .replace(/~~([^~]+)~~/g, '<del>$1</del>')
     .replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>');
+}
 
-  return text.replace(/\u0000CODE(\d+)\u0000/g, (_m, idx) => codeSpans[Number(idx)] || '');
+function formatInline(escapedLine) {
+  const fragments = [];
+  const stash = html => {
+    fragments.push(html);
+    return '\u0000' + (fragments.length - 1) + '\u0000';
+  };
+  // Keep generated markup out of subsequent formatting passes. Linked badges
+  // use their alt text as the link label without fetching a third-party image.
+  const inline = /`([^`]+)`|\[!\[([^\]]*)\]\([^\s)]*\)\]\((https?:\/\/[^\s)]+)\)|!\[([^\]]*)\]\([^)]+\)|\[([^\]]+)\]\((https?:\/\/[^\s)]+|sidecar:\/\/[^\s)]+|customization:\/\/[^\s)]+)\)/g;
+  const text = escapedLine.replace(/\u0000/g, '').replace(inline,
+    (_match, code, badge, destination, alt, label, url) => {
+      if (code !== undefined) return stash(`<code class="md-code">${code}</code>`);
+      if (alt !== undefined) return stash(alt ? `<span class="md-img-alt">[${alt}]</span>` : '');
+      const href = destination || url;
+      const body = badge !== undefined ? (badge || href) : label.split(/(`[^`]+`)/g).map((part, i) =>
+        i % 2 ? '<code class="md-code">' + part.slice(1, -1) + '</code>' : formatEmphasis(part)).join('');
+      if (href.startsWith('sidecar://')) {
+        return stash(`<button type="button" class="md-pill-btn" data-action="open-uri-pane" data-uri="${href}" data-label="${label}" title="打开 Sidebar 侧边栏 / Open Sidebar">${body}</button>`);
+      }
+      if (href.startsWith('customization://')) return stash(`<span class="md-code" title="${href}">${body}</span>`);
+      return stash(`<a href="${href}" target="_blank" rel="noopener noreferrer" class="md-link">${body}</a>`);
+    });
+  return formatEmphasis(text)
+    .replace(/\u0000(\d+)\u0000/g, (_match, index) => fragments[index]);
 }
 
 function isTableSeparator(line) {

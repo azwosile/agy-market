@@ -1,7 +1,8 @@
 // JSONC parser, manifest purity sanitizer, prefs store, receipt schema & capability-escalation diff (`src/shared/schemas.mjs`).
 
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { acquireTicketLock, sleepSync, withLockRetrySync } from './fs-lock.mjs';
 import {
   DEFAULT_PREFS,
   MAX_FAVORITES,
@@ -13,6 +14,7 @@ import {
 export function parseJsonc(rawText) {
   const src = String(rawText || '').replace(/^\uFEFF/, '');
   let out = '';
+  let lastComma = -1;
   let inStr = false;
   let escaped = false;
   let inLineComment = false;
@@ -44,6 +46,7 @@ export function parseJsonc(rawText) {
     }
     if (ch === '"') {
       inStr = true;
+      lastComma = -1;
       out += ch;
       continue;
     }
@@ -57,10 +60,13 @@ export function parseJsonc(rawText) {
       i++;
       continue;
     }
+    if ((ch === '}' || ch === ']') && lastComma >= 0) out = out.slice(0, lastComma);
+    if (ch === ',') lastComma = out.length;
+    else if (!/\s/.test(ch)) lastComma = -1;
     out += ch;
   }
 
-  return JSON.parse(out.replace(/,\s*([}\]])/g, '$1'));
+  return JSON.parse(out);
 }
 
 /**
@@ -115,6 +121,19 @@ export function sanitizeFavorites(rawFavorites) {
   return sanitizeStringIdList(rawFavorites, MAX_FAVORITES);
 }
 
+// A favorite may outlive both the local directory and the current catalog.
+export function makeFavoriteSource(displayName, repositoryUrl, pluginRoot, trackBranch) {
+  const name = typeof displayName === 'string' ? displayName.trim().slice(0, 200) : '';
+  const url = typeof repositoryUrl === 'string' && /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+$/i.test(repositoryUrl)
+    ? repositoryUrl : '';
+  return {
+    displayName: name,
+    repositoryUrl: url,
+    pluginRoot: typeof pluginRoot === 'string' ? normalizePluginRoot(pluginRoot) : '',
+    trackBranch: typeof trackBranch === 'string' ? trackBranch.trim() : '',
+  };
+}
+
 export function sanitizeIgnoredConflictIds(rawIds) {
   return sanitizeStringIdList(rawIds, MAX_IGNORED_CONFLICTS);
 }
@@ -134,6 +153,14 @@ export function sanitizePrefs(input = {}) {
     ? [...new Set(src.customFeeds.map((u) => String(u || '').trim()).filter((u) => /^https?:\/\/|^file:\/\//i.test(u)))]
     : [];
   const favorites = sanitizeFavorites(src.favorites);
+  const favoriteSources = Object.fromEntries(favorites.flatMap(key => {
+    const entry = src.favoriteSources && Object.hasOwn(src.favoriteSources, key) ? src.favoriteSources[key] : null;
+    if (!entry) return [];
+    const source = makeFavoriteSource(entry.displayName, entry.repositoryUrl, entry.pluginRoot, entry.trackBranch);
+    if (typeof entry.catalogId === 'string' && entry.catalogId && entry.catalogId.length <= 200) source.catalogId = entry.catalogId;
+    if (typeof entry.catalogOrigin === 'string' && /^[a-f0-9]{64}$/.test(entry.catalogOrigin)) source.catalogOrigin = entry.catalogOrigin;
+    return [[key, source]];
+  }));
   const ignoredConflictIds = sanitizeIgnoredConflictIds(src.ignoredConflictIds);
 
   return {
@@ -149,6 +176,7 @@ export function sanitizePrefs(input = {}) {
     githubToken,
     customFeeds,
     favorites,
+    favoriteSources,
     ignoredConflictIds,
   };
 }
@@ -165,13 +193,33 @@ export function toPublicPrefs(prefs = {}) {
   };
 }
 
+export function mergeCapabilityProfiles(a = {}, b = {}) {
+  const capA = a && typeof a === 'object' ? a : {};
+  const capB = b && typeof b === 'object' ? b : {};
+  const badges = [...new Set([...(capA.badges || []), ...(capB.badges || [])])];
+  const hostEnhancementKind = [
+    ...new Set([...(capA.hostEnhancementKind || []), ...(capB.hostEnhancementKind || [])]),
+  ].sort();
+  if (hostEnhancementKind.length > 0 && !badges.includes('host-enhancement')) {
+    badges.push('host-enhancement');
+  }
+  return {
+    badges,
+    rulesEstimatedTokens: Math.max(Number(capA.rulesEstimatedTokens || 0), Number(capB.rulesEstimatedTokens || 0)),
+    mcpServers: [...new Set([...(capA.mcpServers || []), ...(capB.mcpServers || [])])].sort(),
+    mcpRemoteDomains: [...new Set([...(capA.mcpRemoteDomains || []), ...(capB.mcpRemoteDomains || [])])].sort(),
+    hookEvents: [...new Set([...(capA.hookEvents || []), ...(capB.hookEvents || [])])].sort(),
+    hostEnhancementKind,
+  };
+}
+
 /**
  * Computes T+N update capability escalation against `.agy-market-receipt.json`.
  * Triggers user confirmation dialog when a v1 -> v2 update introduces newly ungranted privilege classes
  * or new remote MCP domains.
  */
-export function computeCapabilityEscalation(existingReceipt, incomingPlugin) {
-  if (!existingReceipt || !existingReceipt.grantedCapabilities) {
+export function computeCapabilityEscalation(existingReceipt, incomingPlugin, installedCapabilities = null) {
+  if (!existingReceipt && !installedCapabilities) {
     return {
       escalated: false,
       addedBadges: [],
@@ -180,9 +228,10 @@ export function computeCapabilityEscalation(existingReceipt, incomingPlugin) {
     };
   }
 
-  const prevBadges = new Set(existingReceipt.grantedCapabilities.badges || []);
-  const prevDomains = new Set(existingReceipt.grantedCapabilities.mcpRemoteDomains || []);
-  const prevHooks = new Set(existingReceipt.grantedCapabilities.hookEvents || []);
+  const baseline = existingReceipt?.grantedCapabilities || installedCapabilities || {};
+  const prevBadges = new Set(baseline.badges || []);
+  const prevDomains = new Set(baseline.mcpRemoteDomains || []);
+  const prevHooks = new Set(baseline.hookEvents || []);
 
   const incomingCap = incomingPlugin?.capabilities || {};
   const addedBadges = (incomingCap.badges || []).filter(
@@ -202,12 +251,12 @@ export function computeCapabilityEscalation(existingReceipt, incomingPlugin) {
 /**
  * Loads user preferences from `${dataDir}/prefs.json` with safe schema defaults.
  */
-export function loadPrefsFromDisk(dataDir) {
-  const prefsPath = join(dataDir, 'prefs.json');
-  if (!existsSync(prefsPath)) return sanitizePrefs(DEFAULT_PREFS);
+export function loadPrefsFromDisk(dataDir, { forUpdate = false } = {}) {
   try {
-    return sanitizePrefs(JSON.parse(readFileSync(prefsPath, 'utf8')));
-  } catch {
+    const text = withLockRetrySync(() => readFileSync(join(dataDir, 'prefs.json'), 'utf8'));
+    return sanitizePrefs(JSON.parse(text));
+  } catch (err) {
+    if (forUpdate && err.code !== 'ENOENT' && !(err instanceof SyntaxError)) throw err;
     return sanitizePrefs(DEFAULT_PREFS);
   }
 }
@@ -222,14 +271,41 @@ export function savePrefsToDisk(dataDir, nextPrefs) {
   const dstPath = join(dataDir, 'prefs.json');
   const writeOpts = clean.githubToken ? { encoding: 'utf8', mode: 0o600 } : { encoding: 'utf8' };
   const serialized = `${JSON.stringify(clean, null, 2)}\n`;
-  writeFileSync(tmpPath, serialized, writeOpts);
   try {
-    renameSync(tmpPath, dstPath);
-  } catch {
-    writeFileSync(dstPath, serialized, writeOpts);
+    writeFileSync(tmpPath, serialized, writeOpts);
+    withLockRetrySync(() => renameSync(tmpPath, dstPath));
+  } finally {
     rmSync(tmpPath, { force: true });
   }
   return clean;
+}
+
+// Serialize read-modify-write across sidecars and the CLI. Only the synchronous disk
+// transaction owns a ticket, so no network operation holds up another writer.
+export function updatePrefsOnDisk(dataDir, change) {
+  const deadline = Date.now() + 2000;
+  let release;
+  while (!release) {
+    try {
+      release = acquireTicketLock(join(dataDir, 'prefs-locks'), 'ERR_PREFS_BUSY', 'Market settings are busy. Retry the change.');
+    } catch (err) {
+      if (err.code !== 'ERR_PREFS_BUSY' || Date.now() >= deadline) throw err;
+      sleepSync(10 + Math.floor(Math.random() * 20));
+    }
+  }
+  try {
+    const current = loadPrefsFromDisk(dataDir, { forUpdate: true });
+    const patch = change(current);
+    return patch ? savePrefsToDisk(dataDir, { ...current, ...patch }) : current;
+  } finally {
+    release();
+  }
+}
+
+// Receipts, catalog feeds and local metadata use POSIX paths relative to the repository.
+export function normalizePluginRoot(rawRoot) {
+  const path = String(rawRoot || '.').trim().replace(/\\/g, '/');
+  return path.replace(/^(?:\.\/)+/, '').replace(/\/+$/, '') || '.';
 }
 
 export function buildInstallReceipt({
@@ -256,8 +332,7 @@ export function buildInstallReceipt({
   const gitTag = typeof rawGitTag === 'string' && rawGitTag.trim() ? rawGitTag.trim() : null;
   const commitSha = typeof plugin?.commitSha === 'string' ? plugin.commitSha.trim() : '';
   const repositoryUrl = typeof plugin?.repository?.url === 'string' ? plugin.repository.url.trim() : '';
-  const rawPluginRoot = typeof plugin?.repository?.pluginRoot === 'string' ? plugin.repository.pluginRoot.trim() : '.';
-  const pluginRoot = rawPluginRoot.replace(/\\/g, '/').replace(/^\.\/+/, '').replace(/\/+$/, '') || '.';
+  const pluginRoot = normalizePluginRoot(plugin?.repository?.pluginRoot);
   const githubSource =
     plugin?.githubSource && typeof plugin.githubSource === 'object' ? { ...plugin.githubSource } : null;
   const cleanActualSha256 = typeof actualSha256 === 'string' ? actualSha256.trim().toLowerCase() : '';

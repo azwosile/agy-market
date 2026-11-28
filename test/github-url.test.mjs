@@ -12,6 +12,7 @@ import {
   inspectGithubPluginUrl,
   installGithubPlugin,
   parseGithubPluginUrl,
+  resolveGithubArchiveCandidates,
   sweepExpiredInspectStaging,
 } from '../src/installer/github-url.mjs';
 import {
@@ -155,6 +156,53 @@ function makeAuthHeaders(srv) {
     'content-type': 'application/json',
   };
 }
+
+test('GitHub release candidates skip incompatible architectures and retain OS-only and universal bundles', async () => {
+  const parsed = parseGithubPluginUrl('https://github.com/example/reader/releases/tag/v2.0.0');
+  const base = parsed.normalizedRepoUrl + '/releases/download/v2.0.0/';
+  const os = process.platform === 'win32' ? 'windows' : process.platform;
+  const wrong = 'reader-' + os + '-' + (process.arch === 'arm64' ? 'x64' : 'arm64') + '.tar.gz';
+  const right = 'reader-' + os + '-' + process.arch + '.tar.gz';
+  const osOnly = 'reader-' + os + '.tar.gz';
+  const universal = 'reader.tar.gz';
+  async function first(names) {
+    const fetchImpl = async () => Response.json({ assets: names.map(name => ({ name, browser_download_url: base + name })) });
+    return (await resolveGithubArchiveCandidates(parsed, { fetchImpl })).attempts[0].candidates[0].url;
+  }
+  assert.match(await first([wrong]), /\/archive\/refs\/tags\//);
+  assert.equal(await first([wrong, osOnly]), base + osOnly);
+  assert.equal(await first([osOnly, wrong, right]), base + right);
+  assert.equal(await first([osOnly, right, universal]), base + universal);
+});
+
+test('repository links skip CLI-only release assets, while explicit asset links inspect those exact bytes', async t => {
+  const ws = makeTempWorkspace();
+  t.after(ws.cleanup);
+  const repo = 'https://github.com/example/reader';
+  const asset = repo + '/releases/download/v2.0.0/reader-cli.tar.gz';
+  const cli = buildGithubArchiveTarGz({ 'README.md': 'Reader CLI' }, { topDir: 'reader-cli' });
+  const source = buildGithubArchiveTarGz({ 'plugin.json': JSON.stringify({ name: 'reader', version: '2.0.0' }) },
+    { topDir: 'reader-2.0.0', commitSha: SHA_1 });
+  const downloads = [];
+  const fetchImpl = async url => {
+    if (url === repo) return new Response(null, { status: 200 });
+    if (url === 'https://api.github.com/repos/example/reader') return jsonResponse({ id: 42, default_branch: 'main' });
+    if (url.endsWith('/releases/latest')) return jsonResponse({ tag_name: 'v2.0.0', assets: [
+      { name: 'reader-cli.tar.gz', browser_download_url: asset },
+    ] });
+    downloads.push(url);
+    if (url === asset) return binaryResponse(cli);
+    if (url === repo + '/archive/refs/tags/v2.0.0.tar.gz') return binaryResponse(source);
+    return new Response(null, { status: 404 });
+  };
+  const inspect = url => inspectGithubPluginUrl({ ...ws, url, fetchImpl });
+  const fromRepo = await inspect(repo);
+  assert.equal(fromRepo.status, 'READY');
+  assert.equal(fromRepo.plugin.sha256, createHash('sha256').update(source).digest('hex'));
+  assert.deepEqual(downloads.splice(0), [asset, repo + '/archive/refs/tags/v2.0.0.tar.gz']);
+  assert.equal((await inspect(asset)).status, 'NOT_A_PLUGIN_REPO');
+  assert.deepEqual(downloads, [asset]);
+});
 
 async function captureConsoleAsync(fn) {
   const logs = [];
@@ -445,6 +493,18 @@ test('Category 2: API 403 rate limit falls back to zero-quota codeload, extracts
     const rlReceipt = JSON.parse(readFileSync(join(ws.pluginsDir, 'rate-limit-demo', '.agy-market-receipt.json'), 'utf8'));
     assert.equal(rlReceipt.commitSha, SHA_2);
     assert.equal(rlReceipt.githubSource?.ref, 'main');
+
+    // A consumed/expired token cannot authorize a fresh download from a mutable URL.
+    const second = await inspectGithubPluginUrl({
+      url: 'https://github.com/acme/rate-limit-demo', configDir: ws.configDir,
+      dataDir: ws.dataDir, fetchImpl: mockFetch,
+    });
+    const fetchCount = urlsCalled.length;
+    await assert.rejects(installGithubPlugin({
+      inspectToken: second.inspectToken, url: 'https://github.com/acme/rate-limit-demo',
+      configDir: ws.configDir, dataDir: ws.dataDir, fetchImpl: mockFetch, nowMs: Date.parse(second.expiresAt) + 1,
+    }), /ERR_INSPECT_TOKEN_EXPIRED/);
+    assert.equal(urlsCalled.length, fetchCount);
 
     // CRITICAL SECURITY ASSERTION: Authorization header NEVER sent to third-party mirror
     assert.ok(mirrorAuthHeadersSeen.length > 0, 'Mirror candidate must have been attempted');
@@ -945,6 +1005,37 @@ test('Category 3e & 3f: NOT_A_PLUGIN_REPO friendly diagnostic + security hard bl
   }
 });
 
+test('GitHub replacement previews keep their original local target for keyed and token-only callers', async () => {
+  const ws = makeTempWorkspace();
+  const repo = 'https://github.com/acme/reader';
+  const incoming = buildGithubArchiveTarGz({ 'plugin.json': JSON.stringify({ name: 'reader', version: '2.0.0' }),
+    'skills/reader/SKILL.md': '---\nname: reader\ndescription: reader\n---\nReader' }, { topDir: 'reader-main' });
+  const fetchImpl = async url => {
+    const path = String(url);
+    if (path === 'https://api.github.com/repos/acme/reader') return jsonResponse({ id: 321, default_branch: 'main' });
+    if (path.includes('tar.gz') || path.includes('/archive/')) return binaryResponse(incoming);
+    return new Response('', { status: 404 });
+  };
+  const opts = { configDir: ws.configDir, dataDir: ws.dataDir, pluginsDir: ws.pluginsDir, fetchImpl };
+  const dir = join(ws.pluginsDir, 'reader');
+  mkdirSync(dir, { recursive: true });
+  const manifest = join(dir, 'plugin.json');
+  try {
+    writeFileSync(manifest, JSON.stringify({ name: 'reader', version: '1.0.0' }));
+    const preview = await inspectGithubPluginUrl({ ...opts, url: repo });
+    assert.match(preview.preflight.replacementKey, /^[a-f0-9]{64}$/);
+    writeFileSync(manifest, JSON.stringify({ name: 'reader', version: '1.1.0' }));
+    for (const replacementKey of ['', preview.preflight.replacementKey]) {
+      await assert.rejects(installGithubPlugin({ ...opts, inspectToken: preview.inspectToken, installMode: 'replace',
+        replacementKey }), /ERR_REPLACEMENT_TARGET_CHANGED/);
+    }
+    assert.equal(JSON.parse(readFileSync(manifest)).version, '1.1.0');
+    const cli = await captureConsoleAsync(() => runCli(['add', repo, '--replace', '--json'], opts));
+    assert.equal(cli.ret.code, 0, cli.stdout);
+    assert.equal(JSON.parse(readFileSync(manifest)).version, '2.0.0');
+  } finally { ws.cleanup(); }
+});
+
 test('Category 3g: same-name conflict isolates as <owner>--<slug> and foreign repo CANNOT replace agy-market', async () => {
   const ws = makeTempWorkspace();
   try {
@@ -1259,7 +1350,7 @@ test('Category 4a & 4b: GET /api/updates + POST /api/update (+ update-all) upgra
       method: 'POST',
       url: '/api/update',
       headers,
-      body: { id: brUpd.id, dir: 'branch-plug', confirmEscalation: true },
+      body: { id: brUpd.id, dir: 'branch-plug', confirmEscalation: true, approvalKey: bUp1.json().escalation.approvalKey },
     });
     assert.equal(bUp2.statusCode, 200);
     assert.equal(bUp2.json().status, 'INSTALLED');

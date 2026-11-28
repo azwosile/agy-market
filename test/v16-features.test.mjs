@@ -186,7 +186,7 @@ test('v1.6.0 scoped symlinks: outside-pluginRoot allowed & skipped; inside/trave
     assert.equal(existsSync(join(outDir, 'skills', 'demo', 'SKILL.md')), true);
     assert.equal(existsSync(join(outDir, '.claude')), false);
 
-    // Commit-fallback PAX check in fetchVerifiedPluginTarball also honors scoped pluginRoot
+    // Commit fallback verifies the digest of the whole scoped plugin archive
     const expectedOldSha = createHash('sha256').update(Buffer.from('drifted-tag-bytes')).digest('hex');
     const fallbackOut = await fetchVerifiedPluginTarball({
       plugin: {
@@ -197,6 +197,7 @@ test('v1.6.0 scoped symlinks: outside-pluginRoot allowed & skipped; inside/trave
         distribution: {
           tarballUrl: 'https://github.com/alice/dual-host/archive/refs/tags/v1.0.0.tar.gz',
           sha256: expectedOldSha,
+          commitFallbackSha256: createHash('sha256').update(outsideSymTar).digest('hex'),
         },
       },
       stagingDir: join(ws.artifactsDir, 'stage-fb'),
@@ -553,7 +554,7 @@ test('v1.6.0 ranking: Recommended default sort, stars fallback, Monorepo 1/(1+0.
 
   // Verify bundled UI defaults to `recommended` and renders optional STALE / ARCHIVED / Compat pills cleanly
   const bundled = bundleZeroDepEsm(join(REPO_ROOT, 'src', 'ui', 'app.mjs'));
-  const bootMarker = 'void loadState(false);\nvoid checkUpdates(false, { silent: true });';
+  const bootMarker = 'void openMarketPanel();';
   const instrumented = bundled.replace(
     bootMarker,
     'globalThis.__V16_UI__ = { state, getFilteredPlugins, renderDiscoverView, renderPluginCard, renderGithubUrlModal, renderNominationBanner };',
@@ -839,7 +840,7 @@ test('v1.6.0 nomination hook: exact zero-PII URL contract, public HEAD probe (no
 
       // (d) Verify UI renders nomination banner ONLY for public unlisted inspect/install and suppresses for private
       const bundled = bundleZeroDepEsm(join(REPO_ROOT, 'src', 'ui', 'app.mjs'));
-      const bootMarker = 'void loadState(false);\nvoid checkUpdates(false, { silent: true });';
+      const bootMarker = 'void openMarketPanel();';
       const instrumented = bundled.replace(
         bootMarker,
         'globalThis.__V16_NOM_UI__ = { state, renderGithubUrlModal, renderNominationBanner };',

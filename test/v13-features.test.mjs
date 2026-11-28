@@ -642,7 +642,11 @@ test('open-pane helpers normalize payload, filter Hub targets, and click Aux Pan
       return null;
     },
     querySelectorAll(sel) {
-      if (sel === '[data-testid="plugins-submenu-item"]') return submenuItemMounted ? [prismItem] : [];
+      if (sel === '[data-testid="plugins-submenu-item"]') return submenuItemMounted ? [
+        makeEl({ 'data-sidecar-id': 'other-plugin/prism_studio' }, 'Wallpaper Prism'),
+        makeEl({ 'data-sidecar-id': 'agy-wallpaper-prism/settings' }, 'Settings'),
+        prismItem,
+      ] : [];
       return [];
     },
     dispatchEvent() {},

@@ -9,6 +9,7 @@
 
 import { randomUUID } from 'node:crypto';
 import {
+  chmodSync,
   copyFileSync,
   createReadStream,
   createWriteStream,
@@ -28,6 +29,14 @@ function readCleanString(buf, start, length) {
   const sub = buf.subarray(start, start + length);
   const nul = sub.indexOf(0);
   return (nul === -1 ? sub : sub.subarray(0, nul)).toString('utf8');
+}
+
+function entryByteSize(header, paxSize) {
+  const size = paxSize === undefined ? parseTarOctal(header, 124, 12) : Number(paxSize);
+  if ((paxSize !== undefined && !/^\d+$/.test(paxSize)) || !Number.isSafeInteger(size) || size < 0) {
+    throw new Error('ERR_TAR_CORRUPT: Invalid entry size');
+  }
+  return size;
 }
 
 function parseTarOctal(buf, start, length) {
@@ -238,6 +247,7 @@ export function parseTarGzWithMeta(
   }
 
   const rawFiles = new Map();
+  const fileModes = new Map();
   const rawSymlinks = [];
   let offset = 0;
   let nextPax = {};
@@ -262,8 +272,7 @@ export function parseTarGzWithMeta(
     const linkNamePart = readCleanString(header, 157, 100);
     const prefixPart = readCleanString(header, 345, 155);
     const typeFlag = header[156] === 0 ? '0' : String.fromCharCode(header[156]);
-    let size = parseTarOctal(header, 124, 12);
-    if (nextPax.size !== undefined) size = Number(nextPax.size);
+    const size = entryByteSize(header, nextPax.size);
 
     if (offset + size > tarBuf.length) {
       throw new Error('ERR_TAR_TRUNCATED: Archive truncated mid-entry');
@@ -316,52 +325,26 @@ export function parseTarGzWithMeta(
     const safe = validateSafeRelPath(entryName);
     if (!safe || typeFlag === '5' || entryName.endsWith('/')) continue;
     rawFiles.set(safe, Buffer.from(payload));
+    fileModes.set(safe, 0o666 | (parseTarOctal(header, 100, 8) & 0o111));
   }
 
   let files = rawFiles;
   let symlinks = rawSymlinks;
-  let strippedTopDir = '';
-  if (stripSingleTopDir && !rawFiles.has('plugin.json') && rawFiles.size > 0) {
-    const roots = new Set();
-    let allNested = true;
-    for (const p of rawFiles.keys()) {
-      const idx = p.indexOf('/');
-      if (idx === -1) {
-        allNested = false;
-        break;
-      }
-      roots.add(p.slice(0, idx));
-    }
-    if (allNested) {
-      for (const s of rawSymlinks) {
-        const idx = s.path.indexOf('/');
-        if (idx === -1) {
-          allNested = false;
-          break;
-        }
-        roots.add(s.path.slice(0, idx));
-      }
-    }
-    if (allNested && roots.size === 1) {
-      const [onlyRoot] = roots;
-      strippedTopDir = onlyRoot;
-      const unwrapped = new Map();
-      for (const [p, buf] of rawFiles.entries()) {
-        unwrapped.set(p.slice(onlyRoot.length + 1), buf);
-      }
-      files = unwrapped;
-      symlinks = rawSymlinks.map((s) => ({
-        ...s,
-        path: s.path.slice(onlyRoot.length + 1),
-      }));
-    }
+  const strippedTopDir = unwrapSingleTopDirectory([...rawFiles.keys()], rawSymlinks, {
+    stripSingleTopDir, hasRootManifest: rawFiles.has('plugin.json'),
+  });
+  if (strippedTopDir) {
+    const prefixLen = strippedTopDir.length + 1;
+    files = new Map();
+    for (const [path, buf] of rawFiles) files.set(path.slice(prefixLen), buf);
+    symlinks = rawSymlinks.map(link => ({ ...link, path: link.path.slice(prefixLen) }));
   }
 
   if (!allowDeferredSymlinkCheck) {
     assertNoScopedSymlinks(symlinks, pluginRoot, strippedTopDir);
   }
 
-  return { files, symlinks, globalPax, strippedTopDir };
+  return { files, fileModes, symlinks, globalPax, strippedTopDir };
 }
 
 /**
@@ -380,7 +363,7 @@ export function parseTarGzToMap(
  */
 export function extractTarGzToDir(archiveSource, destDir, { pluginRoot = '.' } = {}) {
   const compressedBuf = Buffer.isBuffer(archiveSource) ? archiveSource : readFileSync(archiveSource);
-  const filesMap = parseTarGzToMap(compressedBuf, { stripSingleTopDir: true, pluginRoot });
+  const { files: filesMap, fileModes, strippedTopDir } = parseTarGzWithMeta(compressedBuf, { stripSingleTopDir: true, pluginRoot });
 
   const normRoot = normalizeTarPluginRoot(pluginRoot);
   const useSubroot = normRoot && normRoot !== '.';
@@ -402,7 +385,9 @@ export function extractTarGzToDir(archiveSource, destDir, { pluginRoot = '.' } =
       throw new Error(`ERR_TAR_ESCAPE: Resolved output path escaped destination ("${safeSub}")`);
     }
     mkdirSync(dirname(fullOut), { recursive: true });
-    writeFileSync(fullOut, buf);
+    const mode = fileModes.get(posix.join(strippedTopDir, relPath));
+    writeFileSync(fullOut, buf, { mode });
+    if (process.platform !== 'win32') chmodSync(fullOut, mode & ~process.umask());
     writtenCount++;
   }
 
@@ -445,9 +430,9 @@ function unwrapSingleTopDirectory(rawPaths, rawSymlinks, { stripSingleTopDir = t
   return strippedTopDir;
 }
 
-function writeZeroByteFileSync(filePath) {
+function writeZeroByteFileSync(filePath, mode) {
   mkdirSync(dirname(filePath), { recursive: true });
-  writeFileSync(filePath, Buffer.alloc(0));
+  writeFileSync(filePath, Buffer.alloc(0), { mode });
 }
 
 function writeStreamChunk(stream, chunk) {
@@ -568,11 +553,8 @@ async function streamParseTarGz(
           const linkNamePart = readCleanString(header, 157, 100);
           const prefixPart = readCleanString(header, 345, 155);
           const typeFlag = header[156] === 0 ? '0' : String.fromCharCode(header[156]);
-          let size = parseTarOctal(header, 124, 12);
-          if (nextPax.size !== undefined) size = Number(nextPax.size);
-          if (!Number.isFinite(size) || size < 0) {
-            throw new Error(`ERR_TAR_CORRUPT: Invalid entry size "${size}"`);
-          }
+          const size = entryByteSize(header, nextPax.size);
+
 
           if (typeFlag === 'x' || typeFlag === 'g' || typeFlag === 'L' || typeFlag === 'K') {
             if (size > MAX_TAR_METADATA_BYTES) {
@@ -634,7 +616,7 @@ async function streamParseTarGz(
           }
 
           rawPaths.push(safe);
-          activeFileCtx = await onRegularFileStart(safe, size);
+          activeFileCtx = await onRegularFileStart(safe, size, 0o666 | (parseTarOctal(header, 100, 8) & 0o111));
           if (size === 0) {
             await onRegularFileEnd(activeFileCtx);
             activeFileCtx = null;
@@ -828,18 +810,18 @@ export async function extractTarGzStreamToDir(
   try {
     const parsed = await streamParseTarGz(archivePath, {
       maxUncompressedBytes,
-      onRegularFileStart(safe, size) {
+      onRegularFileStart(safe, size, mode) {
         const outPath = resolve(rawTempDir, safe);
         if (outPath !== rawTempDir && !outPath.startsWith(rawTempPrefix)) {
           throw new Error(`ERR_TAR_ESCAPE: Resolved temp output path escaped staging ("${safe}")`);
         }
         extractedPaths.add(safe);
         if (size === 0) {
-          writeZeroByteFileSync(outPath);
+          writeZeroByteFileSync(outPath, mode);
           return { safe, stream: null };
         }
         mkdirSync(dirname(outPath), { recursive: true });
-        return { safe, stream: createWriteStream(outPath) };
+        return { safe, stream: createWriteStream(outPath, { mode }) };
       },
       async onRegularFileChunk(ctx, slice) {
         if (ctx.stream) {

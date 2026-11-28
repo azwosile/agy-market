@@ -6,6 +6,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   renameSync,
   rmSync,
   symlinkSync,
@@ -179,6 +180,11 @@ test('classifyActivationRequirement maps instant, reload-pane, and host-restart 
   assert.equal(asar.level, 'host-restart');
   assert.match(asar.reasonZh, new RegExp(ASAR_TOKEN.replace('.', '\\.')));
   assert.match(asar.reasonEn, new RegExp(ASAR_TOKEN.replace('.', '\\.')));
+
+  const disabledPatch = classifyActivationRequirement({ hostEnhancementKind: ['app-asar'] }, { action: 'disable' });
+  assert.equal(disabledPatch.level, 'host-restart');
+  assert.equal(Boolean(disabledPatch.requiresPatchScript), false);
+  assert.match(disabledPatch.reasonEn, /undo the patch/);
 
   // 4. cdp -> host-restart with specific reason
   const cdp = classifyActivationRequirement({ badges: ['host-enhancement'], hostEnhancementKind: ['cdp'] });
@@ -452,6 +458,36 @@ test('POST /api/toggle-plugin parks/unparks safely without touching config.json,
   }
 });
 
+test('failed cross-volume unpark leaves the vault intact and can be retried', () => {
+  const ws = makeTempWorkspace('agy-cross-volume-enable-');
+  // In the Linux test VM the checkout and the temporary workspace are distinct mounts.
+  const secondVolume = lstatSync(ws.root).dev !== lstatSync(REPO_ROOT).dev
+    ? mkdtempSync(join(REPO_ROOT, '.unpark-test-')) : null;
+  try {
+    const dataDir = secondVolume || ws.dataDir;
+    const options = { dir: 'reader', configDir: ws.configDir, dataDir };
+    writePluginTree(ws.pluginsDir, 'reader', { 'plugin.json': { name: 'reader', version: '1.0.0' }, 'notes.txt': 'original' });
+    toggleInstalledPlugin({ ...options, enabled: false });
+    const parked = join(dataDir, 'disabled-plugins', 'reader');
+    const active = join(ws.pluginsDir, 'reader');
+    const link = join(parked, 'local-workspace');
+    symlinkSync(ws.pluginsDir, link, 'junction');
+    const restore = () => toggleInstalledPlugin({ ...options, enabled: true,
+      renameOverride() { throw Object.assign(new Error('separate volumes'), { code: 'EXDEV' }); },
+    });
+    assert.throws(restore, /ERR_PLUGIN_LAYOUT_CONFLICT/);
+    assert.equal(existsSync(join(active, 'plugin.json')), false);
+    assert.equal(readFileSync(join(parked, 'notes.txt'), 'utf8'), 'original');
+    unlinkSync(link);
+    assert.equal(restore().enabled, true);
+    assert.equal(readFileSync(join(active, 'notes.txt'), 'utf8'), 'original');
+    assert.equal(existsSync(parked), false);
+  } finally {
+    if (secondVolume) rmSync(secondVolume, { recursive: true, force: true });
+    ws.cleanup();
+  }
+});
+
 test('Windows EBUSY lock on disable falls back to copy + lock-safe cleanup, marks restartRequired, and re-enables cleanly', () => {
   const ws = makeTempWorkspace('agy-ebusy-disable-');
   try {
@@ -462,6 +498,17 @@ test('Windows EBUSY lock on disable falls back to copy + lock-safe cleanup, mark
     });
 
     const lockedBinPath = join(ws.pluginsDir, 'busy-mcp', 'bin', 'worker.exe');
+
+    const linked = join(ws.pluginsDir, 'busy-mcp', 'user-files');
+    symlinkSync(ws.dataDir, linked, 'junction');
+    assert.throws(() => toggleInstalledPlugin({
+      dir: 'busy-mcp', enabled: false, configDir: ws.configDir, dataDir: ws.dataDir,
+      renameOverride() { throw Object.assign(new Error('locked'), { code: 'EBUSY' }); },
+    }), /ERR_PLUGIN_LAYOUT_CONFLICT/);
+    assert.ok(lstatSync(linked).isSymbolicLink());
+    assert.equal(existsSync(join(ws.dataDir, 'disabled-plugins', 'busy-mcp')), false);
+    assert.deepEqual(readdirSync(join(ws.dataDir, 'staging')), []);
+    unlinkSync(linked);
 
     const disableRes = toggleInstalledPlugin({
       dir: 'busy-mcp',
@@ -532,6 +579,28 @@ test('Windows EBUSY lock on disable falls back to copy + lock-safe cleanup, mark
   } finally {
     ws.cleanup();
   }
+});
+
+test('a manifest lock rejects disable before deleting files and permits retry after release', () => {
+  const ws = makeTempWorkspace('agy-manifest-lock-');
+  try {
+    writePluginTree(ws.pluginsDir, 'worker', {
+      'plugin.json': { name: 'worker', version: '1.0.0' },
+      'notes.md': 'local work',
+    });
+    const options = { dir: 'worker', enabled: false, configDir: ws.configDir, dataDir: ws.dataDir };
+    const busy = () => { throw Object.assign(new Error('deny delete'), { code: 'EBUSY' }); };
+    assert.throws(() => toggleInstalledPlugin({ ...options, renameOverride: busy, unlinkOverride: busy }),
+      /ERR_PLUGIN_DISABLE_FAILED/);
+    const active = join(ws.pluginsDir, 'worker');
+    assert.ok(existsSync(join(active, 'plugin.json')));
+    assert.equal(readFileSync(join(active, 'notes.md'), 'utf8'), 'local work');
+    const parked = join(ws.dataDir, 'disabled-plugins', 'worker');
+    assert.equal(existsSync(parked), false);
+    assert.ok(toggleInstalledPlugin(options).parkedByMarket);
+    assert.equal(existsSync(active), false);
+    assert.equal(readFileSync(join(parked, 'notes.md'), 'utf8'), 'local work');
+  } finally { ws.cleanup(); }
 });
 
 test('5-layer GET /api/conflicts detects all conflict classes and POST /api/fix-conflict remediates isolate-rename & materialize-symlink', async () => {
@@ -659,7 +728,7 @@ test('5-layer GET /api/conflicts detects all conflict classes and POST /api/fix-
       assert.equal(confRes.statusCode, 200);
       const report = confRes.json();
       assert.equal(report.ok, true);
-      assert.ok(report.summary.critical >= 3);
+      assert.ok(report.summary.critical >= (process.platform === 'win32' ? 3 : 2));
       assert.ok(report.summary.warning >= 4);
       assert.ok(report.summary.info >= 1);
       assert.equal(report.summary.total, report.items.length);
@@ -676,10 +745,12 @@ test('5-layer GET /api/conflicts detects all conflict classes and POST /api/fix-
       assert.equal(dupShared.fixAction.suggestedDir, 'alice--shared-tool');
 
       const symlinkItem = report.items.find((i) => i.id === 'windows-symlink-ignored:linked-plug');
-      assert.ok(symlinkItem);
-      assert.equal(symlinkItem.severity, 'critical');
-      assert.equal(symlinkItem.fixAction.type, 'materialize-symlink');
-      assert.equal(symlinkItem.fixAction.targetDir, 'linked-plug');
+      if (process.platform === 'win32') {
+        assert.ok(symlinkItem);
+        assert.equal(symlinkItem.severity, 'critical');
+        assert.equal(symlinkItem.fixAction.type, 'materialize-symlink');
+        assert.equal(symlinkItem.fixAction.targetDir, 'linked-plug');
+      } else assert.equal(symlinkItem, undefined);
 
       assert.ok(report.items.some((i) => i.type === 'mcp-collision' && i.severity === 'critical'));
       assert.ok(report.items.some((i) => i.type === 'mcp-collision' && i.severity === 'warning'));
@@ -784,8 +855,9 @@ test('Localized GET /api/readme prefers entriesZh -> local README.zh-CN.md -> fa
   const ws = makeTempWorkspace('agy-readme-zh-');
   try {
     // Local installed plugin with README.zh-CN.md (no catalog entriesZh)
+    const repository = 'https://github.com/alice/local-bilingual';
     writePluginTree(ws.pluginsDir, 'local-bilingual', {
-      'plugin.json': { name: 'local-bilingual', displayName: 'Local Bilingual', version: '1.0.0' },
+      'plugin.json': { name: 'local-bilingual', displayName: 'Local Bilingual', version: '1.0.0', repository },
       'README.md': '# Local Bilingual\nEnglish default documentation.',
       'README.zh-CN.md': '# 本地双语插件\n这是本地简体中文说明文档。',
       'README.en.md': '# Local Bilingual (EN)\nExplicit English readme.',
@@ -820,7 +892,8 @@ test('Localized GET /api/readme prefers entriesZh -> local README.zh-CN.md -> fa
       fetchImpl: async (url) => {
         const u = String(url);
         if (u.endsWith('/index.json')) {
-          return new Response(JSON.stringify({ schemaVersion: 1, plugins: [] }), { status: 200 });
+          return Response.json({ plugins: [{ id: 'alice__local-bilingual', canonicalName: 'local-bilingual',
+            version: '1.0.0', repository: { url: repository } }] });
         }
         if (u.endsWith('/readmes.json')) {
           return new Response(JSON.stringify(readmesPayload), { status: 200 });
