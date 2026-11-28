@@ -52,7 +52,7 @@ if (isMainEntry()) {
   };
 
   watchTimer = setInterval(() => {
-    if (closing) return;
+    if (closing || !instance.canRestartForDiskUpdate()) return;
     const currentVersion = readDiskPluginVersion(PLUGIN_JSON_PATH);
     const currentMtimeMs = readDiskMtimeMs(SERVER_ENTRY_PATH);
     const versionChanged = Boolean(bootPluginVersion && currentVersion && currentVersion !== bootPluginVersion);
@@ -61,11 +61,7 @@ if (isMainEntry()) {
       console.log(
         `[agy-market/market_pane] detected on-disk update (version: ${bootPluginVersion || 'unknown'} -> ${currentVersion || 'unknown'}); exiting to let host restart_policy reload`,
       );
-      if (watchTimer) {
-        clearInterval(watchTimer);
-        watchTimer = null;
-      }
-      setTimeout(() => shutdown(1), 250).unref?.();
+      shutdown(1);
     }
   }, UPDATE_POLL_INTERVAL_MS);
   watchTimer.unref?.();

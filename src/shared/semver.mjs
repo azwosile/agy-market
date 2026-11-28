@@ -2,14 +2,17 @@
 
 export function parseSemver(raw) {
   const clean = String(raw || '').trim().replace(/^v/i, '');
-  const m = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+([0-9A-Za-z.-]+))?$/.exec(clean);
+  // Plugin manifests may use a fourth numeric revision (e.g. 2026.10.25.10).
+  const m = /^(\d+)\.(\d+)\.(\d+)(?:\.(\d+))?(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/.exec(clean);
   if (!m) return null;
+  const revision = Number(m[4] || 0);
   return {
     major: Number(m[1]),
     minor: Number(m[2]),
     patch: Number(m[3]),
-    prerelease: m[4] ? m[4].split('.') : [],
-    version: `${Number(m[1])}.${Number(m[2])}.${Number(m[3])}${m[4] ? `-${m[4]}` : ''}`,
+    revision,
+    prerelease: m[5] ? m[5].split('.') : [],
+    version: m.slice(1, 5).filter(part => part !== undefined).map(Number).join('.') + (m[5] ? '-' + m[5] : ''),
   };
 }
 
@@ -22,6 +25,7 @@ export function compareSemver(a, b) {
   if (pa.major !== pb.major) return pa.major - pb.major;
   if (pa.minor !== pb.minor) return pa.minor - pb.minor;
   if (pa.patch !== pb.patch) return pa.patch - pb.patch;
+  if (pa.revision !== pb.revision) return pa.revision - pb.revision;
   if (pa.prerelease.length === 0 && pb.prerelease.length === 0) return 0;
   if (pa.prerelease.length === 0) return 1;
   if (pb.prerelease.length === 0) return -1;

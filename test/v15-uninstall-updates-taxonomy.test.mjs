@@ -17,8 +17,10 @@ import { dirname, join, resolve } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import vm from 'node:vm';
+import { makeUiSandbox } from './helpers/ui-sandbox.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+
 const REPO_ROOT = resolve(__dirname, '..');
 
 const { bundleZeroDepEsm } = await import(pathToFileURL(join(REPO_ROOT, 'scripts', 'build.mjs')).href);
@@ -42,6 +44,80 @@ const { runCli } = await import(pathToFileURL(join(REPO_ROOT, 'bin', 'agy-market
 
 const CLEAN_SVG =
   '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><rect x="16" y="16" width="96" height="96" rx="20" fill="#6366f1"/></svg>';
+
+function updateFixtures(marketVersion) {
+  const selfCat = {
+    id: 'azwosile__agy-market',
+    canonicalName: 'agy-market',
+    displayName: 'AGY Market',
+    version: marketVersion,
+    description: { zh: '市场插件', en: 'Market plugin' },
+    repository: { url: 'https://github.com/azwosile/agy-market', stars: 99 },
+    capabilities: { badges: ['sidecar-ui'] },
+    taxonomy: { categories: ['productivity'], tags: [] },
+    installStatus: { installed: true, installedDir: 'agy-market', enabled: true, scope: 'global', canUninstall: false },
+  };
+  const alphaLoc = {
+    dir: 'alpha-plug',
+    name: 'alpha-plug',
+    displayName: 'Alpha Plug',
+    version: '1.0.0',
+    scope: 'global',
+    enabled: true,
+    canUninstall: true,
+    repositoryUrl: 'https://github.com/alice/alpha-plug',
+    receipt: { id: 'alice__alpha-plug', track: 'verified', repositoryUrl: 'https://github.com/alice/alpha-plug' },
+    capabilities: { badges: ['declarative-only'] },
+  };
+  const betaLoc = {
+    dir: 'beta-plug',
+    name: 'beta-plug',
+    displayName: 'Beta Plug',
+    version: '1.0.0',
+    scope: 'global',
+    enabled: true,
+    canUninstall: true,
+    repositoryUrl: 'https://github.com/bob/beta-plug',
+    receipt: { id: 'bob__beta-plug', track: 'verified', repositoryUrl: 'https://github.com/bob/beta-plug' },
+    capabilities: { badges: ['declarative-only'] },
+  };
+  const selfLoc = {
+    dir: 'agy-market',
+    name: 'agy-market',
+    displayName: 'AGY Market',
+    version: marketVersion,
+    scope: 'global',
+    enabled: true,
+    canUninstall: false,
+    uninstallDisabledReason: 'self',
+    repositoryUrl: 'https://github.com/azwosile/agy-market',
+    receipt: { id: 'azwosile__agy-market', track: 'verified', repositoryUrl: 'https://github.com/azwosile/agy-market' },
+    capabilities: { badges: ['sidecar-ui'] },
+  };
+  const alphaDirectUpd = {
+    id: 'alice__alpha-plug',
+    dir: 'alpha-plug',
+    installedVersion: '1.0.0',
+    latestVersion: '1.2.0',
+    installable: true,
+    source: 'github-release',
+    updateChannel: 'github-upstream',
+    targetRef: 'v1.2.0',
+    repositoryUrl: 'https://github.com/alice/alpha-plug',
+  };
+  const betaCatalogUpd = {
+    id: 'bob__beta-plug',
+    dir: 'beta-plug',
+    installedVersion: '1.0.0',
+    latestVersion: '1.3.0',
+    installable: true,
+    source: 'catalog',
+    updateChannel: 'catalog',
+    targetRef: 'v1.3.0',
+    repositoryUrl: 'https://github.com/bob/beta-plug',
+  };
+  return { selfCat, alphaLoc, betaLoc, selfLoc, alphaDirectUpd, betaCatalogUpd };
+}
 
 function makeTempWorkspace(prefix = 'agy-v15-test-') {
   const baseTmp = process.env.AGY_MARKET_TEST_TMPDIR || tmpdir();
@@ -647,6 +723,14 @@ test('v1.5 CLI: bin/agy-market.mjs uninstall <dir> --yes --json (confirmation ga
     assert.equal(existsSync(join(ws.pluginsDir, 'cli-plug')), false);
 
     // 4. Alias `remove` cleans parked plugin in disabled-plugins/<dir>
+    const otherRoot = join(ws.root, 'other-config', 'plugins');
+    mkdirSync(otherRoot, { recursive: true });
+    const other = await runCli(['remove', 'cli-parked', '--yes', '--dest', otherRoot, '--json'], {
+      configDir: ws.configDir, dataDir: ws.dataDir,
+    });
+    assert.equal(other.code, 1);
+    assert.equal(other.result.status, 'NOT_FOUND');
+    assert.ok(existsSync(join(ws.dataDir, 'disabled-plugins', 'cli-parked', 'plugin.json')));
     const aliasRes = await runCli(['remove', 'cli-parked', '--yes', '--dest', ws.pluginsDir, '--json'], {
       configDir: ws.configDir,
       dataDir: ws.dataDir,
@@ -1003,7 +1087,7 @@ test('v1.5 Sidebar direct updates: GitHub upstream ahead of catalog returns inst
           dir: 'esc-verified',
           updateChannel: 'github-upstream',
           targetRef: 'v1.4.0',
-          confirmEscalation: true,
+          confirmEscalation: true, approvalKey: uEsc1.json().escalation.approvalKey,
         },
       });
       assert.equal(uEsc2.statusCode, 200);
@@ -1401,8 +1485,8 @@ test('v1.5 batch update-all: updates catalog + github-upstream + github-url toge
   }
 });
 
-test('v1.7.2 UI, taxonomy, version anchors & pure LF byte-purity assertions', () => {
-  // 1. Built sidecars/market_pane/index.html MUST contain ZERO \r bytes (0 CRLF, 0 bare CR), 0 UTF-8 BOM, and inline PLUGIN_VERSION = '1.7.2'
+test('v2.0.0 UI, taxonomy, version anchors & pure LF byte-purity assertions', () => {
+  // 1. Built sidecars/market_pane/index.html MUST contain ZERO \r bytes (0 CRLF, 0 bare CR), 0 UTF-8 BOM, and inline PLUGIN_VERSION = '2.0.0'
   const builtHtmlPath = join(REPO_ROOT, 'sidecars', 'market_pane', 'index.html');
   const htmlBuf = readFileSync(builtHtmlPath);
   let crCount = 0;
@@ -1419,8 +1503,8 @@ test('v1.7.2 UI, taxonomy, version anchors & pure LF byte-purity assertions', ()
   assert.doesNotMatch(builtHtmlText, /btn-upstream/, 'Built index.html must contain 0 btn-upstream external buttons');
   assert.match(
     builtHtmlText,
-    /const\s+PLUGIN_VERSION\s*=\s*'1\.7\.2'/,
-    'Built sidecars/market_pane/index.html must inline PLUGIN_VERSION = \'1.7.2\'',
+    /const\s+PLUGIN_VERSION\s*=\s*'2\.0\.0'/,
+    'Built sidecars/market_pane/index.html must inline PLUGIN_VERSION = \'2.0.0\'',
   );
   assert.match(builtHtmlText, /function\s+isPluginConfirmedLatest\s*\(/, 'Built index.html must include isPluginConfirmedLatest');
   assert.match(builtHtmlText, /function\s+isUpdateActionLocked\s*\(/, 'Built index.html must include isUpdateActionLocked');
@@ -1494,12 +1578,12 @@ test('v1.7.2 UI, taxonomy, version anchors & pure LF byte-purity assertions', ()
     assert.ok(CATEGORY_LABELS[key].zh && CATEGORY_LABELS[key].en, `Category "${key}" must define zh and en labels`);
   }
 
-  // 4. Version 1.7.2 anchors, pure LF / 0 BOM bootstrap scripts, & 10-field plugin.json purity
+  // 4. Version 2.0.0 anchors, pure LF / 0 BOM bootstrap scripts, & 10-field plugin.json purity
   const pkgJson = JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf8'));
   const pluginJson = JSON.parse(readFileSync(join(REPO_ROOT, 'plugin.json'), 'utf8'));
-  assert.equal(PLUGIN_VERSION, '1.7.2');
-  assert.equal(pkgJson.version, '1.7.2');
-  assert.equal(pluginJson.version, '1.7.2');
+  assert.equal(PLUGIN_VERSION, '2.0.0');
+  assert.equal(pkgJson.version, '2.0.0');
+  assert.equal(pluginJson.version, '2.0.0');
   assert.equal(pluginJson.name, PLUGIN_ID);
   for (const key of Object.keys(pluginJson)) {
     assert.ok(PLUGIN_JSON_ALLOWED_KEYS.has(key), `Disallowed key "${key}" in plugin.json`);
@@ -1511,11 +1595,11 @@ test('v1.7.2 UI, taxonomy, version anchors & pure LF byte-purity assertions', ()
   assert.equal(shBuf[0] === 0xef && shBuf[1] === 0xbb && shBuf[2] === 0xbf, false, 'install.sh must have 0 UTF-8 BOM');
   assert.equal(ps1Buf.includes(0x0d), false, 'install.ps1 must be pure LF (0 CR)');
   assert.equal(shBuf.includes(0x0d), false, 'install.sh must be pure LF (0 CR)');
-  assert.match(ps1Buf.toString('utf8'), /else\s*\{\s*"1\.7\.2"\s*\}/);
-  assert.match(shBuf.toString('utf8'), /INSTALLED_VER="1\.7\.2"/);
+  assert.match(ps1Buf.toString('utf8'), /else\s*\{\s*"2\.0\.0"\s*\}/);
+  assert.match(shBuf.toString('utf8'), /INSTALLED_VER="2\.0\.0"/);
 
   const siteHtml = readFileSync(join(REPO_ROOT, 'site', 'index.html'), 'utf8');
-  assert.match(siteHtml, /v1\.7\.1/);
+  assert.ok(siteHtml.includes('v{{MARKET_VERSION}}'));
   const docsIndexPath = join(REPO_ROOT, 'docs', 'index.html');
   if (existsSync(docsIndexPath)) {
     const docsBuf = readFileSync(docsIndexPath);
@@ -1525,19 +1609,21 @@ test('v1.7.2 UI, taxonomy, version anchors & pure LF byte-purity assertions', ()
       'docs/index.html must have 0 UTF-8 BOM',
     );
     assert.equal(docsBuf.includes(0x0d), false, 'docs/index.html must be pure LF (0 CR)');
-    assert.match(docsBuf.toString('utf8'), /v1\.7\.1/);
+    const version = JSON.parse(readFileSync(join(REPO_ROOT, 'plugin.json'), 'utf8')).version;
+    assert.equal(docsBuf.toString('utf8'), siteHtml.replaceAll('{{MARKET_VERSION}}', version));
   }
 });
 
 test('v1.5.1 UI state machine: isPluginConfirmedLatest & .state-pill.is-latest transitions (pre-check, up-to-date, direct update, single-sync no-reinstall, error handling, force re-check)', async () => {
   const bundled = bundleZeroDepEsm(join(REPO_ROOT, 'src', 'ui', 'app.mjs'));
-  const bootMarker = 'void loadState(false);\nvoid checkUpdates(false, { silent: true });';
+  const bootMarker = 'void openMarketPanel();';
   assert.ok(bundled.includes(bootMarker), 'Bundled app.mjs must contain auto-boot marker');
 
   const instrumented = bundled.replace(
     bootMarker,
     [
       'globalThis.__V151_UI__ = {',
+      '  triggerTogglePlugin,',
       '  state,',
       '  isPluginConfirmedLatest,',
       '  markPluginVerifiedLatest,',
@@ -1545,8 +1631,10 @@ test('v1.5.1 UI state machine: isPluginConfirmedLatest & .state-pill.is-latest t
       '  triggerDirectPluginUpdate,',
       '  triggerSyncInstalledPlugin,',
       '  triggerInstall,',
+      '  triggerUpdateAll,',
       '  renderInstalledCard,',
       '  renderDetailDrawer,',
+      '  getFilteredPlugins,',
       '  getUpdateMaps,',
       '  getCatalogMaps,',
       '};',
@@ -1574,34 +1662,7 @@ test('v1.5.1 UI state machine: isPluginConfirmedLatest & .state-pill.is-latest t
     sidecar: null,
     fetch: mockFetchFn,
   };
-  const mockDocument = {
-    getElementById: () => null,
-    querySelector: () => null,
-    querySelectorAll: () => [],
-    activeElement: null,
-    documentElement: { setAttribute: () => {}, classList: { toggle: () => {} } },
-    body: { classList: { toggle: () => {} } },
-    addEventListener: () => {},
-  };
-
-  const sandbox = {
-    window: mockWindow,
-    document: mockDocument,
-    fetch: mockFetchFn,
-    URL,
-    URLSearchParams,
-    Headers,
-    Response,
-    console,
-    setTimeout: () => 1,
-    clearTimeout: () => {},
-    requestAnimationFrame: (cb) => {
-      cb();
-      return 1;
-    },
-  };
-  sandbox.globalThis = sandbox;
-  sandbox.self = mockWindow;
+  const sandbox = makeUiSandbox(mockWindow, mockFetchFn);
 
   vm.runInNewContext(instrumented, sandbox, { filename: 'agy-market-v151-ui-test.js' });
   const ui = sandbox.__V151_UI__;
@@ -1719,6 +1780,43 @@ test('v1.5.1 UI state machine: isPluginConfirmedLatest & .state-pill.is-latest t
   ui.state.verifiedLatestDirs.clear();
   assert.equal(ui.isPluginConfirmedLatest(alphaLoc, null), true);
   assert.equal(ui.isPluginConfirmedLatest(selfLoc, null), true);
+  const legacyLoc = { ...alphaLoc, dir: 'old-alpha', receipt: null, successorDir: 'alice--alpha-plug' };
+  ui.state.serverState = { ...ui.state.serverState, installed: [...ui.state.serverState.installed, legacyLoc] };
+  assert.equal(ui.isPluginConfirmedLatest(legacyLoc, null), false);
+  assert.match(renderCard(legacyLoc), /旧副本.*alice--alpha-plug/);
+  assert.doesNotMatch(renderCard(legacyLoc), /state-pill is-latest|data-action="sync-installed-plugin"/);
+  const beforeLegacyClick = fetchCalls.length;
+  await ui.triggerSyncInstalledPlugin({ dir: legacyLoc.dir });
+  assert.equal(fetchCalls.length, beforeLegacyClick);
+  assert.match(ui.state.toast.message, /alice--alpha-plug/);
+  assert.equal(ui.state.verifiedLatestDirs.has(legacyLoc.dir), false);
+  const unresolved = { ...alphaLoc, dir: 'unknown-source', receipt: null, repositoryRoot: null };
+  assert.equal(ui.isPluginConfirmedLatest(unresolved, null), false);
+  assert.match(renderCard(unresolved), /无法确认/);
+  ui.state.updates.uncheckedDirs = [alphaLoc.dir];
+  ui.state.updates.unavailableDirs = [alphaLoc.dir];
+  assert.equal(ui.isPluginConfirmedLatest(alphaLoc, null), false);
+  assert.match(renderCard(alphaLoc), /检查未完成 · 重试/);
+  assert.doesNotMatch(renderCard(alphaLoc), /state-pill is-latest/);
+  ui.state.updates.uncheckedDirs = [];
+  ui.state.updates.unavailableDirs = [];
+  const searchPlugin = ui.state.serverState.catalog.plugins[0];
+  const originalCapabilities = searchPlugin.capabilities;
+  searchPlugin.capabilities = { badges: ['mcp-remote'], mcpServers: ['finance-ledger'], mcpRemoteDomains: ['ledger.example.com'] };
+  for (const query of ['finance-ledger', 'LEDGER.EXAMPLE.COM', '远程 MCP 服务', 'Remote MCP Service']) {
+    ui.state.search = query;
+    assert.ok(ui.getFilteredPlugins().some(item => item.id === searchPlugin.id));
+  }
+  ui.state.search = '';
+  searchPlugin.capabilities = originalCapabilities;
+  const twin = { id: alphaCat.id, dir: 'other-alpha' };
+  ui.state.updates.items = [{ id: alphaCat.id, dir: alphaLoc.dir }, twin];
+  ui.state.serverState.updatesAvailable = [{ id: alphaCat.id, installedDir: twin.dir }];
+  ui.markPluginVerifiedLatest(alphaLoc.dir, alphaCat.id);
+  assert.equal(ui.state.updates.items[0]?.dir, twin.dir);
+  assert.equal(ui.state.serverState.updatesAvailable[0]?.installedDir, twin.dir);
+  ui.state.updates.items = [];
+  ui.state.serverState.updatesAvailable = [];
   const globalLatestAlphaHtml = renderCard(alphaLoc);
   assert.match(globalLatestAlphaHtml, /<span class="state-pill is-latest"[^>]*>[\s\S]*?<span>最新<\/span><\/span>/);
   assert.doesNotMatch(globalLatestAlphaHtml, /data-action="sync-installed-plugin"/);
@@ -1782,6 +1880,21 @@ test('v1.5.1 UI state machine: isPluginConfirmedLatest & .state-pill.is-latest t
   assert.match(alphaDrawerHtml, /<span class="state-pill is-latest"[^>]*>[\s\S]*?已是最新版本<\/span>/);
   assert.match(alphaDrawerHtml, /重新同步/);
   ui.state.detailPlugin = null;
+
+  ui.state.detailPlugin = { ...alphaCat, installStatus: { installed: false } };
+  ui.state.detailTab = 'changelog';
+  assert.match(ui.renderDetailDrawer(), /尚未安装/);
+  assert.doesNotMatch(ui.renderDetailDrawer(), /当前已是最新版本/);
+  ui.state.detailTab = 'overview';
+  ui.state.detailPlugin = null;
+
+  for (const [level, flag] of [['reload-pane', 'reloadRequired'], ['host-restart', 'restartRequired']]) {
+    mockFetchHandler = async () => jsonResp({ ok: true, [flag]: true, activation: { level, reasonZh: '测试启停提示' } });
+    await ui.triggerTogglePlugin(alphaLoc.dir, true);
+    assert.equal(ui.state.restartBanner.level, level);
+    assert.equal(ui.state.toast.subtext, '测试启停提示');
+    ui.state.restartBanner = null;
+  }
 
   // Scenario 4: Update check error MUST NOT mark verifiedLatestDirs; keeps clickable sync button for retry
   ui.state.updates = { loading: false, checkedAt: '', items: [], selfUpdate: null, rateLimited: false, warnings: [], error: '' };
@@ -1940,11 +2053,20 @@ test('v1.5.1 UI state machine: isPluginConfirmedLatest & .state-pill.is-latest t
   assert.match(afterSyncUpdHtml, /<span class="state-pill is-latest"[^>]*>[\s\S]*?<span>最新<\/span><\/span>/);
   assert.doesNotMatch(afterSyncUpdHtml, /data-action="update-plugin-direct"/);
   assert.doesNotMatch(afterSyncUpdHtml, /data-action="sync-installed-plugin"/);
+  // A successful no-op for the market itself must not open the reconnect dialog.
+  ui.state.serverState = makeServerState();
+  mockFetchHandler = async url => url.includes('/api/update-all')
+    ? jsonResp({ ok: true, willRestart: false, results: [{ id: selfCat.id, dir: 'agy-market',
+        ok: true, alreadyUpToDate: true, status: 'ALREADY_UP_TO_DATE' }] })
+    : jsonResp({ ok: true, items: [], warnings: [] });
+  await ui.triggerUpdateAll(['agy-market']);
+  assert.equal(ui.state.batchResults[0].alreadyUpToDate, true);
+  assert.equal(ui.state.reconnecting, null);
 });
 
 test('v1.5.2 update button lock during checkUpdates, DOM/function double guard, post-check transition, reverse mutex & internal delegation chains', async () => {
   const bundled = bundleZeroDepEsm(join(REPO_ROOT, 'src', 'ui', 'app.mjs'));
-  const bootMarker = 'void loadState(false);\nvoid checkUpdates(false, { silent: true });';
+  const bootMarker = 'void openMarketPanel();';
   assert.ok(bundled.includes(bootMarker), 'Bundled app.mjs must contain auto-boot marker');
 
   const instrumented = bundled.replace(
@@ -2125,34 +2247,11 @@ test('v1.5.2 update button lock during checkUpdates, DOM/function double guard, 
     sidecar: null,
     fetch: mockFetchFn,
   };
-  const mockDocument = {
+  const sandbox = makeUiSandbox(mockWindow, mockFetchFn, {
     getElementById: (id) => (id === 'app' ? mockRoot : mockRoot.querySelector(`#${id}`)),
     querySelector: (sel) => mockRoot.querySelector(sel),
     querySelectorAll: (sel) => mockRoot.querySelectorAll(sel),
-    activeElement: null,
-    documentElement: { setAttribute: () => {}, classList: { toggle: () => {} } },
-    body: { classList: { toggle: () => {} } },
-    addEventListener: () => {},
-  };
-
-  const sandbox = {
-    window: mockWindow,
-    document: mockDocument,
-    fetch: mockFetchFn,
-    URL,
-    URLSearchParams,
-    Headers,
-    Response,
-    console,
-    setTimeout: () => 1,
-    clearTimeout: () => {},
-    requestAnimationFrame: (cb) => {
-      cb();
-      return 1;
-    },
-  };
-  sandbox.globalThis = sandbox;
-  sandbox.self = mockWindow;
+  });
 
   vm.runInNewContext(instrumented, sandbox, { filename: 'agy-market-v152-lock-test.js' });
   const ui = sandbox.__V152_UI__;
@@ -2191,42 +2290,8 @@ test('v1.5.2 update button lock during checkUpdates, DOM/function double guard, 
     taxonomy: { categories: ['automation'], tags: [] },
     installStatus: { installed: false, enabled: false },
   };
-  const selfCat = {
-    id: 'azwosile__agy-market',
-    canonicalName: 'agy-market',
-    displayName: 'AGY Market',
-    version: '1.5.2',
-    description: { zh: '市场插件', en: 'Market plugin' },
-    repository: { url: 'https://github.com/azwosile/agy-market', stars: 99 },
-    capabilities: { badges: ['sidecar-ui'] },
-    taxonomy: { categories: ['productivity'], tags: [] },
-    installStatus: { installed: true, installedDir: 'agy-market', enabled: true, scope: 'global', canUninstall: false },
-  };
+  const { selfCat, alphaLoc, betaLoc, selfLoc, alphaDirectUpd, betaCatalogUpd } = updateFixtures('1.5.2');
 
-  const alphaLoc = {
-    dir: 'alpha-plug',
-    name: 'alpha-plug',
-    displayName: 'Alpha Plug',
-    version: '1.0.0',
-    scope: 'global',
-    enabled: true,
-    canUninstall: true,
-    repositoryUrl: 'https://github.com/alice/alpha-plug',
-    receipt: { id: 'alice__alpha-plug', track: 'verified', repositoryUrl: 'https://github.com/alice/alpha-plug' },
-    capabilities: { badges: ['declarative-only'] },
-  };
-  const betaLoc = {
-    dir: 'beta-plug',
-    name: 'beta-plug',
-    displayName: 'Beta Plug',
-    version: '1.0.0',
-    scope: 'global',
-    enabled: true,
-    canUninstall: true,
-    repositoryUrl: 'https://github.com/bob/beta-plug',
-    receipt: { id: 'bob__beta-plug', track: 'verified', repositoryUrl: 'https://github.com/bob/beta-plug' },
-    capabilities: { badges: ['declarative-only'] },
-  };
   const deltaLoc = {
     dir: 'delta-gh',
     name: 'delta-gh',
@@ -2239,42 +2304,7 @@ test('v1.5.2 update button lock during checkUpdates, DOM/function double guard, 
     receipt: { id: 'dave__delta-gh', track: 'github-url', repositoryUrl: 'https://github.com/dave/delta-gh' },
     capabilities: { badges: ['declarative-only'] },
   };
-  const selfLoc = {
-    dir: 'agy-market',
-    name: 'agy-market',
-    displayName: 'AGY Market',
-    version: '1.5.2',
-    scope: 'global',
-    enabled: true,
-    canUninstall: false,
-    uninstallDisabledReason: 'self',
-    repositoryUrl: 'https://github.com/azwosile/agy-market',
-    receipt: { id: 'azwosile__agy-market', track: 'verified', repositoryUrl: 'https://github.com/azwosile/agy-market' },
-    capabilities: { badges: ['sidecar-ui'] },
-  };
 
-  const alphaDirectUpd = {
-    id: 'alice__alpha-plug',
-    dir: 'alpha-plug',
-    installedVersion: '1.0.0',
-    latestVersion: '1.2.0',
-    installable: true,
-    source: 'github-release',
-    updateChannel: 'github-upstream',
-    targetRef: 'v1.2.0',
-    repositoryUrl: 'https://github.com/alice/alpha-plug',
-  };
-  const betaCatalogUpd = {
-    id: 'bob__beta-plug',
-    dir: 'beta-plug',
-    installedVersion: '1.0.0',
-    latestVersion: '1.3.0',
-    installable: true,
-    source: 'catalog',
-    updateChannel: 'catalog',
-    targetRef: 'v1.3.0',
-    repositoryUrl: 'https://github.com/bob/beta-plug',
-  };
   const selfUpdOffer = {
     id: 'azwosile__agy-market',
     dir: 'agy-market',
@@ -2717,7 +2747,7 @@ test('v1.5.2 update button lock during checkUpdates, DOM/function double guard, 
 
 test('v1.5.3 conditional Update All visibility across Scenarios A–F & selfUpdate edge cases', async () => {
   const bundled = bundleZeroDepEsm(join(REPO_ROOT, 'src', 'ui', 'app.mjs'));
-  const bootMarker = 'void loadState(false);\nvoid checkUpdates(false, { silent: true });';
+  const bootMarker = 'void openMarketPanel();';
   assert.ok(bundled.includes(bootMarker), 'Bundled app.mjs must contain auto-boot marker');
 
   const instrumented = bundled.replace(
@@ -2796,34 +2826,9 @@ test('v1.5.3 conditional Update All visibility across Scenarios A–F & selfUpda
     sidecar: null,
     fetch: mockFetchFn,
   };
-  const mockDocument = {
+  const sandbox = makeUiSandbox(mockWindow, mockFetchFn, {
     getElementById: (id) => (id === 'app' ? mockRoot : null),
-    querySelector: () => null,
-    querySelectorAll: () => [],
-    activeElement: null,
-    documentElement: { setAttribute: () => {}, classList: { toggle: () => {} } },
-    body: { classList: { toggle: () => {} } },
-    addEventListener: () => {},
-  };
-
-  const sandbox = {
-    window: mockWindow,
-    document: mockDocument,
-    fetch: mockFetchFn,
-    URL,
-    URLSearchParams,
-    Headers,
-    Response,
-    console,
-    setTimeout: () => 1,
-    clearTimeout: () => {},
-    requestAnimationFrame: (cb) => {
-      cb();
-      return 1;
-    },
-  };
-  sandbox.globalThis = sandbox;
-  sandbox.self = mockWindow;
+  });
 
   vm.runInNewContext(instrumented, sandbox, { filename: 'agy-market-v153-update-all-visibility.js' });
   const ui = sandbox.__V153_UI__;
@@ -2851,78 +2856,8 @@ test('v1.5.3 conditional Update All visibility across Scenarios A–F & selfUpda
     taxonomy: { categories: ['productivity'], tags: [] },
     installStatus: { installed: true, installedDir: 'beta-plug', enabled: true, scope: 'global', canUninstall: true },
   };
-  const selfCat = {
-    id: 'azwosile__agy-market',
-    canonicalName: 'agy-market',
-    displayName: 'AGY Market',
-    version: '1.5.3',
-    description: { zh: '市场插件', en: 'Market plugin' },
-    repository: { url: 'https://github.com/azwosile/agy-market', stars: 99 },
-    capabilities: { badges: ['sidecar-ui'] },
-    taxonomy: { categories: ['productivity'], tags: [] },
-    installStatus: { installed: true, installedDir: 'agy-market', enabled: true, scope: 'global', canUninstall: false },
-  };
+  const { selfCat, alphaLoc, betaLoc, selfLoc, alphaDirectUpd, betaCatalogUpd } = updateFixtures('1.5.3');
 
-  const alphaLoc = {
-    dir: 'alpha-plug',
-    name: 'alpha-plug',
-    displayName: 'Alpha Plug',
-    version: '1.0.0',
-    scope: 'global',
-    enabled: true,
-    canUninstall: true,
-    repositoryUrl: 'https://github.com/alice/alpha-plug',
-    receipt: { id: 'alice__alpha-plug', track: 'verified', repositoryUrl: 'https://github.com/alice/alpha-plug' },
-    capabilities: { badges: ['declarative-only'] },
-  };
-  const betaLoc = {
-    dir: 'beta-plug',
-    name: 'beta-plug',
-    displayName: 'Beta Plug',
-    version: '1.0.0',
-    scope: 'global',
-    enabled: true,
-    canUninstall: true,
-    repositoryUrl: 'https://github.com/bob/beta-plug',
-    receipt: { id: 'bob__beta-plug', track: 'verified', repositoryUrl: 'https://github.com/bob/beta-plug' },
-    capabilities: { badges: ['declarative-only'] },
-  };
-  const selfLoc = {
-    dir: 'agy-market',
-    name: 'agy-market',
-    displayName: 'AGY Market',
-    version: '1.5.3',
-    scope: 'global',
-    enabled: true,
-    canUninstall: false,
-    uninstallDisabledReason: 'self',
-    repositoryUrl: 'https://github.com/azwosile/agy-market',
-    receipt: { id: 'azwosile__agy-market', track: 'verified', repositoryUrl: 'https://github.com/azwosile/agy-market' },
-    capabilities: { badges: ['sidecar-ui'] },
-  };
-
-  const alphaDirectUpd = {
-    id: 'alice__alpha-plug',
-    dir: 'alpha-plug',
-    installedVersion: '1.0.0',
-    latestVersion: '1.2.0',
-    installable: true,
-    source: 'github-release',
-    updateChannel: 'github-upstream',
-    targetRef: 'v1.2.0',
-    repositoryUrl: 'https://github.com/alice/alpha-plug',
-  };
-  const betaCatalogUpd = {
-    id: 'bob__beta-plug',
-    dir: 'beta-plug',
-    installedVersion: '1.0.0',
-    latestVersion: '1.3.0',
-    installable: true,
-    source: 'catalog',
-    updateChannel: 'catalog',
-    targetRef: 'v1.3.0',
-    repositoryUrl: 'https://github.com/bob/beta-plug',
-  };
   const nonInstallableUpd = {
     id: 'bob__beta-plug',
     dir: 'beta-plug',
@@ -3347,7 +3282,7 @@ test('v1.5.3 conditional Update All visibility across Scenarios A–F & selfUpda
 
 test('v1.5.4 UI regressions: cross-snapshot desync, checkUpdates(true) failure, scope/dir isolation, forceResync & ALREADY_UP_TO_DATE, RC-7 commit escalation & formatV', async () => {
   const bundled = bundleZeroDepEsm(join(REPO_ROOT, 'src', 'ui', 'app.mjs'));
-  const bootMarker = 'void loadState(false);\nvoid checkUpdates(false, { silent: true });';
+  const bootMarker = 'void openMarketPanel();';
   assert.ok(bundled.includes(bootMarker), 'Bundled app.mjs must contain auto-boot marker');
 
   const instrumented = bundled.replace(
@@ -3418,34 +3353,9 @@ test('v1.5.4 UI regressions: cross-snapshot desync, checkUpdates(true) failure, 
     sidecar: null,
     fetch: mockFetchFn,
   };
-  const mockDocument = {
+  const sandbox = makeUiSandbox(mockWindow, mockFetchFn, {
     getElementById: (id) => (id === 'app' ? mockRoot : null),
-    querySelector: () => null,
-    querySelectorAll: () => [],
-    activeElement: null,
-    documentElement: { setAttribute: () => {}, classList: { toggle: () => {} } },
-    body: { classList: { toggle: () => {} } },
-    addEventListener: () => {},
-  };
-
-  const sandbox = {
-    window: mockWindow,
-    document: mockDocument,
-    fetch: mockFetchFn,
-    URL,
-    URLSearchParams,
-    Headers,
-    Response,
-    console,
-    setTimeout: () => 1,
-    clearTimeout: () => {},
-    requestAnimationFrame: (cb) => {
-      cb();
-      return 1;
-    },
-  };
-  sandbox.globalThis = sandbox;
-  sandbox.self = mockWindow;
+  });
 
   vm.runInNewContext(instrumented, sandbox, { filename: 'agy-market-v154-ui-regressions.js' });
   const ui = sandbox.__V154_UI__;
@@ -3570,7 +3480,7 @@ test('v1.5.4 UI regressions: cross-snapshot desync, checkUpdates(true) failure, 
     assert.equal(html.includes('更新内容'), false, `[${label}] Card MUST NEVER render stale 更新内容 › button`);
     assert.equal(html.includes('更新 v1.3.0'), false, `[${label}] Card MUST NEVER render stale 更新 v1.3.0 button`);
     assert.equal(html.includes('has-update'), false, `[${label}] Card must not carry has-update class`);
-    assert.match(html, /<span class="version-tag">v1\.3\.0<\/span>/, `[${label}] Card must render plain v1.3.0 tag`);
+    assert.match(html, /<span class="version-tag"[^>]*>v1\.3\.0<\/span>/, `[${label}] Card must render plain v1.3.0 tag`);
     assert.match(html, /state-pill is-latest[\s\S]*最新/, `[${label}] Card must render 最新 pill`);
   };
 
@@ -3770,7 +3680,7 @@ test('v1.5.4 UI regressions: cross-snapshot desync, checkUpdates(true) failure, 
       catByDir,
     );
     assert.equal(cardHtml.includes('v1.3.0 → v1.3.0'), false, `[${failureMode}] No stale v1.3.0 → v1.3.0 resurrection`);
-    assert.match(cardHtml, /state-pill is-latest[\s\S]*最新/, `[${failureMode}] Must preserve 最新 pill`);
+    assert.match(cardHtml, /state-pill is-latest[\s\S]*上次检查为最新/, `[${failureMode}] Label the preserved result as the previous check`);
   }
 
   // -------------------------------------------------------------------------
@@ -3821,7 +3731,7 @@ test('v1.5.4 UI regressions: cross-snapshot desync, checkUpdates(true) failure, 
     const mainHtml = ui.renderInstalledCard(globalMain130, updById, updByDir, catById, catByDir);
     assert.equal(mainHtml.includes('→'), false, 'Global main 1.3.0 card must NOT render version delta arrow');
     assert.equal(mainHtml.includes('更新 v1.3.0'), false);
-    assert.match(mainHtml, /<span class="version-tag">v1\.3\.0<\/span>/);
+    assert.match(mainHtml, /<span class="version-tag"[^>]*>v1\.3\.0<\/span>/);
     assert.match(mainHtml, /state-pill is-latest[\s\S]*最新/);
 
     // Workspace 1.3.0 and Workspace 1.2.0 sharing same receipt.id/dir MUST NEVER borrow global updates

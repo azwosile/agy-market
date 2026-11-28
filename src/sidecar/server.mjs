@@ -1,6 +1,6 @@
 // Localhost 127.0.0.1 Sidecar HTTP Router, X-Sidecar-Token CSRF Guard & State Persistence (`src/sidecar/server.mjs`).
 
-import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { dirname, join, resolve } from 'node:path';
@@ -16,20 +16,27 @@ import {
 } from '../installer/github-url.mjs';
 import {
   fixLocalConflict,
+  getReplacementKey,
+  getUpdateEscalation,
   installOrUpdateCatalogPlugin,
   toggleInstalledPlugin,
   uninstallPlugin,
 } from '../installer/index.mjs';
-import { recoverInterruptedJournal } from '../installer/journal.mjs';
-import { sweepRetiredBinaries } from '../installer/sync-dir.mjs';
+import { recoverInterruptedJournal, trySweepRetiredBinaries } from '../installer/journal.mjs';
 import { scanLocalConflicts } from '../preflight/conflicts.mjs';
 import {
+  findManagedSuccessor,
+  matchLegacyLocalFavorite,
+  findCatalogEntryForLocal,
+  matchesInstalledSource,
+  legacyDuplicateResult,
   invalidateLocalInventoryCache,
   normalizeRepoUrl,
+  samePluginName,
   resolveInstallPreflight,
   scanLocalPluginInventory,
 } from '../preflight/index.mjs';
-import { fetchPluginReadme, resolveMarketCatalog } from '../registry/index.mjs';
+import { fetchPluginReadme, hasCachedTrack2, resolveMarketCatalog } from '../registry/index.mjs';
 import { classifyActivationRequirement } from '../shared/activation.mjs';
 import {
   CUSTOMIZATION_URI,
@@ -45,7 +52,6 @@ import {
 } from '../shared/constants.mjs';
 import {
   resolveAntigravityConfigDir,
-  resolveDisabledPluginsDir,
   resolveMarketDataDir,
   resolvePluginsDir,
 } from '../shared/paths.mjs';
@@ -53,14 +59,16 @@ import { defaultProxyFetch } from '../shared/proxy-fetch.mjs';
 import {
   computeCapabilityEscalation,
   loadPrefsFromDisk,
-  sanitizeFavorites,
+  makeFavoriteSource,
+  mergeCapabilityProfiles,
+  normalizePluginRoot,
   sanitizeIgnoredConflictIds,
   sanitizePrefs,
-  savePrefsToDisk,
+  updatePrefsOnDisk,
   toPublicPrefs,
 } from '../shared/schemas.mjs';
 import { isNewerVersion, parseSemver } from '../shared/semver.mjs';
-import { checkPluginUpdates, isCatalogPluginInstallable, isSameInstalledRelease } from '../updates/index.mjs';
+import { checkPluginUpdates, isCatalogPluginInstallable, isForeignMarketInstall, isOfficialMarketEntry, isSameInstalledRelease, parseGithubRepoSlug, probeGithubBranchHead } from '../updates/index.mjs';
 import { openSiblingSidecarPane } from './open-pane.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -80,14 +88,19 @@ const ZH_README_FILENAMES = [
 ];
 const EN_README_FILENAMES = ['README.en.md', 'readme.en.md', 'docs/README.en.md'];
 const DEFAULT_README_FILENAMES = ['README.md', 'readme.md'];
-const PLUGIN_MUTATION_ROUTES = new Set([
+const INSTALL_ROUTES = new Set([
   '/api/install',
   '/api/update',
   '/api/update-all',
   '/api/self-update',
   '/api/github/install',
+]);
+const PLUGIN_MUTATION_ROUTES = new Set([
+  ...INSTALL_ROUTES,
   '/api/uninstall',
   '/api/remove-files',
+  '/api/toggle-plugin',
+  '/api/fix-conflict',
 ]);
 
 const PRELOAD_SHIM_JS = `(function() {
@@ -179,7 +192,7 @@ function safeCompareTokens(candidate, expected) {
 }
 
 function isAllowedOriginHeader(originHeader) {
-  if (!originHeader || originHeader === 'null') return true; // isolated host iframe or same-origin non-CORS
+  if (originHeader === undefined) return true; // Non-browser clients may omit Origin.
   const orig = String(originHeader).trim().toLowerCase();
   if (orig.startsWith('vscode-webview://')) return true;
   if (orig.startsWith('plugin://')) return true;
@@ -242,6 +255,24 @@ function acceptsGzipEncoding(acceptEncodingHeader) {
     if (Number.isFinite(q) && q > 0) return true;
   }
   return false;
+}
+
+function updateListMembership(list, key, enabled, limit) {
+  if (!enabled) return list.filter(item => item !== key);
+  if (list.includes(key)) return list;
+  return [...list.slice(1 - limit), key];
+}
+
+function sendRequestError(res, err) {
+  if (err?.code === 'ERR_PREFS_BUSY') {
+    sendJson(res, 409, { ok: false, errorCode: err.code, error: err.message });
+    return;
+  }
+  if (err?.code === 'ERR_PLUGIN_OPERATION_BUSY') {
+    sendJson(res, 409, { ok: false, errorCode: 'ERR_MUTATION_BUSY', error: err.message });
+    return;
+  }
+  sendJson(res, err?.result?.status === 'LEGACY_DUPLICATE' ? 409 : 400, err?.result || { ok: false, error: err?.message || String(err) });
 }
 
 function sendJson(res, status, payload, onFlushed = null) {
@@ -311,31 +342,7 @@ function readJsonBody(req, maxBytes = MAX_JSON_BODY) {
 }
 
 function isSelfPluginCandidate(plugin, installedDir = '') {
-  return (
-    installedDir === PLUGIN_ID ||
-    plugin?.id === SELF_CATALOG_ID ||
-    plugin?.canonicalName === PLUGIN_ID
-  );
-}
-
-function mergeCapabilitiesForActivation(localCap = {}, catalogCap = {}) {
-  const a = localCap && typeof localCap === 'object' ? localCap : {};
-  const b = catalogCap && typeof catalogCap === 'object' ? catalogCap : {};
-  const badges = [...new Set([...(a.badges || []), ...(b.badges || [])])];
-  const hostEnhancementKind = [
-    ...new Set([...(a.hostEnhancementKind || []), ...(b.hostEnhancementKind || [])]),
-  ].sort();
-  if (hostEnhancementKind.length > 0 && !badges.includes('host-enhancement')) {
-    badges.push('host-enhancement');
-  }
-  return {
-    badges,
-    rulesEstimatedTokens: Math.max(Number(a.rulesEstimatedTokens || 0), Number(b.rulesEstimatedTokens || 0)),
-    mcpServers: [...new Set([...(a.mcpServers || []), ...(b.mcpServers || [])])].sort(),
-    mcpRemoteDomains: [...new Set([...(a.mcpRemoteDomains || []), ...(b.mcpRemoteDomains || [])])].sort(),
-    hookEvents: [...new Set([...(a.hookEvents || []), ...(b.hookEvents || [])])].sort(),
-    hostEnhancementKind,
-  };
+  return samePluginName(installedDir, PLUGIN_ID) || isOfficialMarketEntry(plugin);
 }
 
 function readFirstExistingReadme(pluginRootDir, candidates) {
@@ -351,11 +358,6 @@ function readFirstExistingReadme(pluginRootDir, candidates) {
     }
   }
   return '';
-}
-
-function isSafeDirSlug(raw) {
-  const s = String(raw || '').trim();
-  return Boolean(s && s !== '.' && s !== '..' && !s.includes('/') && !s.includes('\\') && !s.includes('..'));
 }
 
 function isUnmanagedLocalPlugin(loc) {
@@ -374,7 +376,6 @@ export async function createMarketSidecarServer(options = {}) {
   const configDir = resolveAntigravityConfigDir(options.configDir || '');
   const pluginsDir = resolvePluginsDir(configDir);
   const dataDir = resolveMarketDataDir(options.dataDir || '');
-  const disabledPluginsDir = resolveDisabledPluginsDir(dataDir);
   const builtinPluginsDir = options.builtinPluginsDir || '';
   const indexHtmlPath = options.indexHtmlPath || DEFAULT_INDEX_HTML_PATH;
   const fetchImpl = options.fetchImpl || defaultProxyFetch;
@@ -391,11 +392,18 @@ export async function createMarketSidecarServer(options = {}) {
   const openPaneOptions = options.openPaneOptions || null;
   const openPaneImpl =
     typeof options.openPaneImpl === 'function' ? options.openPaneImpl : openSiblingSidecarPane;
+  let restartScheduled = false;
   const onSelfRestart =
     typeof options.onSelfRestart === 'function'
       ? options.onSelfRestart
       : () => {
-          setTimeout(() => process.exit(1), 150).unref?.();
+          if (restartScheduled) return;
+          restartScheduled = true;
+          const exitWhenIdle = () => {
+            if (canRestartForDiskUpdate()) process.exit(1);
+            else setTimeout(exitWhenIdle, 150).unref?.();
+          };
+          setTimeout(exitWhenIdle, 150).unref?.();
         };
 
   mkdirSync(dataDir, { recursive: true });
@@ -420,32 +428,36 @@ export async function createMarketSidecarServer(options = {}) {
   const listenPort = options.port !== undefined ? Number(options.port) : Number.isFinite(envPort) ? envPort : 0;
 
   // Sweep retired Windows binaries & expired GitHub URL inspect staging immediately on boot
-  sweepRetiredBinaries(dataDir, { pluginsDir });
+  trySweepRetiredBinaries(dataDir, { pluginsDir });
   sweepExpiredInspectStaging(dataDir, nowFn());
 
   // Schedule 8s boot crash-recovery check for `pending-journal.json`
   const recoveryDelayMs = options.recoveryDelayMs ?? 8000;
   let recoveryTimer = null;
-  if (recoveryDelayMs >= 0) {
+  function scheduleRecovery(delay) {
     recoveryTimer = setTimeout(() => {
-      try {
-        recoverInterruptedJournal({ dataDir, pluginsDir });
-      } catch {
-        /* non-fatal */
-      }
-    }, recoveryDelayMs);
+      const result = recoverInterruptedJournal({ dataDir, pluginsDir });
+      if (result.action === 'busy') scheduleRecovery(Math.max(delay, 1000));
+      if (result.action === 'target-changed') console.warn('[recovery]', result.error, result.journalPath);
+    }, delay);
     recoveryTimer.unref?.();
   }
+  if (recoveryDelayMs >= 0) scheduleRecovery(recoveryDelayMs);
 
   let prefs = loadPrefsFromDisk(dataDir);
+  let authenticatedDiscussions = new Map();
   let lastCatalog = null;
   let lastCatalogPrefsKey = '';
-  let catalogGeneration = 0;
-  const inFlightCatalog = new Map(); // flightKey -> { generation, promise }
+  let catalogFlight = null;
   let catalogConfigQueue = Promise.resolve();
   let updateCheckGeneration = 0;
   const inFlightUpdates = new Map(); // flightKey -> { key, force, generation, promise }
+  let pendingMutationResponses = 0;
   let activeMutation = null; // { route, startedAt }
+
+  function canRestartForDiskUpdate() {
+    return !activeMutation && pendingMutationResponses === 0;
+  }
 
   function enqueueCatalogConfigOp(taskFn) {
     const next = catalogConfigQueue.then(taskFn, taskFn);
@@ -454,27 +466,23 @@ export async function createMarketSidecarServer(options = {}) {
   }
 
   function getCatalogPrefsKey(p = prefs) {
-    const clean = sanitizePrefs(p);
-    return JSON.stringify({
-      enableExperimentalTrack2: clean.enableExperimentalTrack2,
-      networkMode: clean.networkMode,
-      primaryCatalogUrl: clean.primaryCatalogUrl,
-      customFeeds: clean.customFeeds,
-    });
+    return JSON.stringify([p.enableExperimentalTrack2, p.networkMode, p.primaryCatalogUrl, p.customFeeds]);
+  }
+
+  function usePrefs(next) {
+    const catalogChanged = getCatalogPrefsKey(next) !== getCatalogPrefsKey(prefs);
+    const tokenChanged = next.githubToken !== prefs.githubToken;
+    if (catalogChanged) catalogFlight = null;
+    if (tokenChanged) authenticatedDiscussions = new Map();
+    if (catalogChanged || tokenChanged) invalidateUpdateCheckState();
+    prefs = next;
   }
 
   function hasUsableTrack2Data() {
-    if (Array.isArray(lastCatalog?.plugins) && lastCatalog.plugins.some((p) => p?._track === 'unverified')) {
+    if (lastCatalogPrefsKey === getCatalogPrefsKey() && lastCatalog?.plugins?.some(p => p?._track === 'unverified')) {
       return true;
     }
-    const cacheFile = join(dataDir, 'cache', 'unverified-index.json');
-    if (!existsSync(cacheFile)) return false;
-    try {
-      const parsed = JSON.parse(readFileSync(cacheFile, 'utf8'));
-      return Array.isArray(parsed?.plugins) && parsed.plugins.length > 0;
-    } catch {
-      return false;
-    }
+    return hasCachedTrack2(dataDir, prefs.primaryCatalogUrl);
   }
 
   function invalidateUpdateCheckState() {
@@ -483,57 +491,34 @@ export async function createMarketSidecarServer(options = {}) {
     invalidateLocalInventoryCache();
   }
 
-  function hasLoadedReadmes(cat) {
-    if (!cat) return false;
-    return (
-      Object.keys(cat.readmes || {}).length > 0 ||
-      Object.keys(cat.readmesZh || {}).length > 0 ||
-      Object.keys(cat.readmesEn || {}).length > 0
-    );
-  }
-
-  async function ensureCatalogLoaded({ forceCatalogRefresh = false, includeReadmes = false } = {}) {
+  async function ensureCatalogLoaded({ forceCatalogRefresh = false, panelOpen = false } = {}) {
     const prefsKey = getCatalogPrefsKey(prefs);
-    const needsReload =
-      !lastCatalog ||
-      forceCatalogRefresh ||
-      lastCatalogPrefsKey !== prefsKey ||
-      (includeReadmes && !hasLoadedReadmes(lastCatalog));
-
-    if (!needsReload) {
-      return lastCatalog;
+    if (catalogFlight?.prefsKey === prefsKey && (!forceCatalogRefresh || catalogFlight.forceCatalogRefresh)) {
+      return catalogFlight.promise;
     }
+    if (!forceCatalogRefresh && !panelOpen && lastCatalog && lastCatalogPrefsKey === prefsKey) return lastCatalog;
 
-    const flightKey = `${catalogGeneration}|${prefsKey}|${forceCatalogRefresh ? '1' : '0'}|${includeReadmes ? '1' : '0'}`;
-    const existing = inFlightCatalog.get(flightKey);
-    if (existing) {
-      return existing.promise;
-    }
-
-    const startGen = catalogGeneration;
-    const startPrefsSnapshot = sanitizePrefs(prefs);
-    const promise = (async () => {
-      const loaded = await resolveMarketCatalog({
-        dataDir,
-        prefs: startPrefsSnapshot,
-        forceRefresh: forceCatalogRefresh,
-        includeReadmes,
-        fetchImpl,
-        mirrors,
-      });
-      if (startGen === catalogGeneration) {
-        lastCatalog = loaded;
-        lastCatalogPrefsKey = prefsKey;
-      }
+    if (panelOpen) invalidateUpdateCheckState();
+    const flight = { prefsKey, forceCatalogRefresh };
+    catalogFlight = flight;
+    flight.promise = resolveMarketCatalog({
+      dataDir,
+      prefs: sanitizePrefs(prefs),
+      forceRefresh: forceCatalogRefresh,
+      includeReadmes: false,
+      shouldPersistCache: () => catalogFlight === flight,
+      fetchImpl,
+      mirrors,
+    }).then(loaded => {
+      // A manual refresh or source switch can finish before this request.
+      if (catalogFlight !== flight) return ensureCatalogLoaded();
+      lastCatalog = loaded;
+      lastCatalogPrefsKey = prefsKey;
       return loaded;
-    })().finally(() => {
-      if (inFlightCatalog.get(flightKey)?.promise === promise) {
-        inFlightCatalog.delete(flightKey);
-      }
+    }).finally(() => {
+      if (catalogFlight === flight) catalogFlight = null;
     });
-
-    inFlightCatalog.set(flightKey, { generation: startGen, promise });
-    return promise;
+    return flight.promise;
   }
 
   function findCatalogEntryForDir(dirName) {
@@ -549,65 +534,31 @@ export async function createMarketSidecarServer(options = {}) {
     return findCatalogEntryForDir(dirName)?.capabilities || null;
   }
 
-  function findCatalogEntryForLocal(loc, catalogPlugins = []) {
-    if (!loc) return null;
-    const list = Array.isArray(catalogPlugins) ? catalogPlugins : [];
-    if (loc.receipt?.id) {
-      const recRepoId = Number(loc.receipt.repositoryId || 0);
-      const byReceipt = list.find((p) => {
-        const pRepoId = Number(p?.repository?.repositoryId || 0);
-        if (recRepoId > 0 && pRepoId > 0) {
-          return pRepoId === recRepoId && p.id === loc.receipt.id;
-        }
-        return p.id === loc.receipt.id;
-      });
-      if (byReceipt) return byReceipt;
-    }
-    const locRepo = normalizeRepoUrl(loc.receipt?.repositoryUrl || loc.repositoryUrl || '');
-    if (locRepo) {
-      const byRepo = list.find((p) => {
-        const pRepo = normalizeRepoUrl(p?.repository?.url);
-        return (
-          pRepo &&
-          pRepo === locRepo &&
-          (p.canonicalName === loc.name || p.canonicalName === loc.dir || p.scopedName === loc.dir)
-        );
-      });
-      if (byRepo) return byRepo;
-    }
-    if (loc.dir === PLUGIN_ID || loc.name === PLUGIN_ID) {
-      return list.find((p) => p.id === SELF_CATALOG_ID || p.canonicalName === PLUGIN_ID) || null;
-    }
-    return (
-      list.find(
-        (p) => (!p.forceScopedInstall && p.canonicalName === loc.dir) || p.scopedName === loc.dir || p.id === loc.dir,
-      ) || null
-    );
-  }
-
   function getValidGithubRepoUrl(rawUrl) {
     const norm = normalizeRepoUrl(rawUrl);
     return /^https:\/\/github\.com\/[^/]+\/[^/]+$/i.test(norm) ? norm : '';
   }
 
-  function resolveCatalogPluginForMutation(catalogPlugins, explicitPlugin, { targetId = '', targetDir = '' } = {}) {
+  function resolveCatalogPluginForMutation(catalogPlugins, { targetId = '', targetDir = '' } = {}) {
     const list = Array.isArray(catalogPlugins) ? catalogPlugins : [];
-    const validExplicit = explicitPlugin && typeof explicitPlugin === 'object' ? explicitPlugin : null;
-    const serverMatch =
-      list.find(
-        (p) =>
-          (targetId && p.id === targetId) ||
-          (validExplicit?.id && p.id === validExplicit.id) ||
-          (targetDir && ((!p.forceScopedInstall && p.canonicalName === targetDir) || p.scopedName === targetDir)),
-      ) || null;
-
-    if (serverMatch && validExplicit) {
-      if (isCatalogPluginInstallable(validExplicit) && isNewerVersion(validExplicit.version, serverMatch.version)) {
-        return validExplicit;
-      }
-      return serverMatch;
+    if (targetId) {
+      const serverMatch = list.find(p => p.id === targetId);
+      if (targetId === SELF_CATALOG_ID) return isOfficialMarketEntry(serverMatch) ? serverMatch : null;
+      return serverMatch || null;
     }
-    return serverMatch || validExplicit || null;
+    return list.find(p => targetDir && ((!p.forceScopedInstall && p.canonicalName === targetDir) || p.scopedName === targetDir)) || null;
+  }
+
+  function matchesDisplayedCatalogEntry(displayed, current) {
+    if (displayed.id !== current?.id || !current) return false;
+    if (displayed._track && displayed._track !== current._track) return false;
+    if (displayed._feedUrl && displayed._feedUrl !== current._feedUrl) return false;
+    const repo = displayed.repository;
+    if (!repo) return true;
+    const selected = current.repository || {};
+    return normalizeRepoUrl(repo.url) === normalizeRepoUrl(selected.url) &&
+      normalizePluginRoot(repo.pluginRoot) === normalizePluginRoot(selected.pluginRoot) &&
+      (!repo.repositoryId || !selected.repositoryId || String(repo.repositoryId) === String(selected.repositoryId));
   }
 
 function applyIgnoredConflictsFilter(report, ignoredIds = []) {
@@ -650,40 +601,104 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
   };
 }
 
-  async function buildEnrichedState({ forceCatalogRefresh = false, workspaceUris = [] } = {}) {
-    const loadedCatalog = await ensureCatalogLoaded({ forceCatalogRefresh, includeReadmes: false });
+  function favoriteSourceForLocal(loc) {
+    return makeFavoriteSource(loc.displayName || loc.dir,
+      loc.inferredRepository ? '' : parseGithubRepoSlug(loc.receipt?.repositoryUrl || loc.repositoryUrl)?.url,
+      loc.receipt?.pluginRoot || loc.repositoryRoot, loc.receipt?.githubSource?.trackBranch);
+  }
+
+  function favoriteSourceForCatalog(plugin) {
+    const repository = normalizeRepoUrl(plugin.repository?.url);
+    const source = makeFavoriteSource(plugin.displayName || plugin.canonicalName, repository,
+      normalizePluginRoot(plugin.repository?.pluginRoot), plugin.githubSource?.trackBranch);
+    if (!source.repositoryUrl) source.catalogOrigin = createHash('sha256')
+      .update(repository || plugin._feedUrl || prefs.primaryCatalogUrl || 'official').digest('hex');
+    return source;
+  }
+
+  function favoriteMigration(currentPrefs, installed, catalogPlugins) {
+    const sources = { ...currentPrefs.favoriteSources };
+    const catalogById = new Map(catalogPlugins.map(entry => [entry.id, entry]));
+    let changed = false;
+    const favorites = currentPrefs.favorites.map(key => {
+      if (!key.startsWith('local:')) {
+        const prior = currentPrefs.favoriteSources[key];
+        const id = prior?.catalogId || key;
+        const entry = catalogById.get(id);
+        if (!entry) return key;
+        const current = favoriteSourceForCatalog(entry);
+        if (!prior?.repositoryUrl && !prior?.catalogOrigin) {
+          if (!prior) {
+            sources[key] = current;
+            changed = true;
+          }
+          return key;
+        }
+        // Free the shared catalog id for the current source while retaining
+        // the original bookmark. Restore its id if its source comes back.
+        const matches = prior.repositoryUrl.toLowerCase() === current.repositoryUrl.toLowerCase() &&
+          prior.catalogOrigin === current.catalogOrigin &&
+          (!prior.pluginRoot || prior.pluginRoot === current.pluginRoot);
+        const target = matches ? id : 'saved:' + createHash('sha256')
+          .update(JSON.stringify([id, prior.repositoryUrl || prior.catalogOrigin, prior.pluginRoot])).digest('hex');
+        if (target !== key) {
+          sources[target] = { ...prior, catalogId: id };
+          changed = true;
+        }
+        return target;
+      }
+      const loc = matchLegacyLocalFavorite(key, installed, sources[key]);
+      if (!loc) {
+        const dir = key.slice(6);
+        if (installed.filter(item => item.dir === dir).length <= 1) return key;
+        // Older keys cannot distinguish these copies. Keep the bookmark without
+        // attaching it to a different copy if a workspace closes later.
+        const saved = 'saved:' + dir;
+        sources[saved] = sources[key] || makeFavoriteSource(dir);
+        delete sources[key];
+        changed = true;
+        return saved;
+      }
+      changed = true;
+      sources[loc.favoriteKey] = sources[key] || favoriteSourceForLocal(loc);
+      delete sources[key];
+      return loc.favoriteKey;
+    });
+    return changed ? { favorites, favoriteSources: sources } : null;
+  }
+
+  async function buildEnrichedState({ forceCatalogRefresh = false, panelOpen = false, workspaceUris = [] } = {}) {
+    usePrefs(loadPrefsFromDisk(dataDir));
+    const loadedCatalog = await ensureCatalogLoaded({ forceCatalogRefresh, panelOpen });
     const activeCatalog =
       lastCatalog && lastCatalogPrefsKey === getCatalogPrefsKey(prefs) ? lastCatalog : loadedCatalog;
 
+    const catalogPlugins = activeCatalog.plugins || [];
     const inventory = scanLocalPluginInventory({
       configDir,
       dataDir,
       workspaceUris,
       builtinPluginsDir,
       linkInfoOverride,
+      catalogPlugins,
     });
+    if (favoriteMigration(prefs, inventory.installed, catalogPlugins)) {
+      usePrefs(updatePrefsOnDisk(dataDir, current => getCatalogPrefsKey(current) === lastCatalogPrefsKey
+        ? favoriteMigration(current, inventory.installed, catalogPlugins) : null));
+    }
     const updatesAvailable = [];
-    const catalogPlugins = activeCatalog.plugins || [];
 
     // Enrich installed items with merged catalog capabilities & activation classification
-    const catalogById = new Map();
-    const catalogByDir = new Map();
-    for (const cp of catalogPlugins) {
-      if (cp?.id) catalogById.set(cp.id, cp);
-      if (cp?.canonicalName && !cp?.forceScopedInstall) catalogByDir.set(cp.canonicalName, cp);
-      if (cp?.scopedName) catalogByDir.set(cp.scopedName, cp);
-    }
-
     const enrichedInstalled = inventory.installed.map((loc) => {
-      const catMatch =
-        (loc.receipt?.id && catalogById.get(loc.receipt.id)) ||
-        catalogByDir.get(loc.dir) ||
-        catalogByDir.get(loc.name) ||
-        null;
-      if (!catMatch?.capabilities) return loc;
-      const mergedCaps = mergeCapabilitiesForActivation(loc.capabilities, catMatch.capabilities);
+      const successor = findManagedSuccessor(loc, inventory.installed);
+      if (successor) return { ...loc, catalogId: null, successorDir: successor.dir };
+      const catMatch = loc.scope === 'global' ? findCatalogEntryForLocal(loc, catalogPlugins, inventory.installed) : null;
+      const catalogId = catMatch?.id || null;
+      if (!catMatch?.capabilities) return { ...loc, catalogId };
+      const mergedCaps = mergeCapabilityProfiles(loc.capabilities, catMatch.capabilities);
       return {
         ...loc,
+        catalogId,
         capabilities: mergedCaps,
         hostEnhancementKind: mergedCaps.hostEnhancementKind,
         activation: classifyActivationRequirement(mergedCaps),
@@ -713,7 +728,7 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
           !isSameInstalledRelease(localMatch.receipt, { gitTag: p.gitTag, commitSha: p.commitSha }) &&
           isNewerVersion(p.version, localMatch.version),
       );
-      const escalation = localMatch ? computeCapabilityEscalation(localMatch.receipt, p) : null;
+      const escalation = localMatch ? computeCapabilityEscalation(localMatch.receipt, p, localMatch.capabilities) : null;
       const catalogActivation = classifyActivationRequirement(p.capabilities || {});
 
       if (hasUpdate && localMatch) {
@@ -752,7 +767,7 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
           : {
               installed: false,
               hasUpdate: false,
-              ...(preflight.action === 'conflict-prompt' ? { conflictDetected: true } : {}),
+              ...(preflight.conflict ? { conflictDetected: true } : {}),
             },
       };
     });
@@ -772,6 +787,7 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
         catalogVersion: activeCatalog.catalogVersion,
         generatedAt: activeCatalog.generatedAt,
         warnings: activeCatalog.warnings,
+        failedCustomFeeds: activeCatalog.failedCustomFeeds || [],
         plugins: enrichedCatalogPlugins,
       },
       installed: enrichedInstalled,
@@ -801,7 +817,7 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
     if (!res.req) res.req = req;
     let acquiredMutationLock = false;
     const acquireMutationLock = (route) => {
-      if (activeMutation) {
+      if (activeMutation || restartScheduled) {
         sendJson(res, 409, {
           ok: false,
           errorCode: 'ERR_MUTATION_BUSY',
@@ -811,6 +827,16 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
       }
       activeMutation = { route, startedAt: nowFn() };
       acquiredMutationLock = true;
+      if (typeof res.once === 'function') {
+        pendingMutationResponses++;
+        const finished = () => {
+          res.off('finish', finished);
+          res.off('close', finished);
+          pendingMutationResponses--;
+        };
+        res.once('finish', finished);
+        res.once('close', finished);
+      }
       invalidateUpdateCheckState();
       return true;
     };
@@ -826,8 +852,25 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
   }
 
   async function dispatchRequest(req, res, acquireMutationLock) {
+    if (!/^(?:127\.0\.0\.1|localhost)(?::\d{1,5})?$/i.test(req.headers.host || '')) {
+      sendJson(res, 403, { ok: false, error: 'ERR_INVALID_HOST: Expected a loopback host' });
+      return;
+    }
     const urlObj = new URL(req.url || '/', 'http://127.0.0.1');
     const pathname = urlObj.pathname;
+    if (pathname.startsWith('/api/')) usePrefs(loadPrefsFromDisk(dataDir));
+    const selectedScope = urlObj.searchParams.get('scope');
+    const wantsScopedDetail = (pathname === '/api/readme' || pathname === '/api/discussions') &&
+      (selectedScope === 'workspace' || selectedScope === 'builtin' ||
+       (selectedScope === 'global' && urlObj.searchParams.has('localPath')));
+    const selectedLocal = wantsScopedDetail && scanLocalPluginInventory({
+      configDir, dataDir, workspaceUris: urlObj.searchParams.getAll('workspace'), builtinPluginsDir, linkInfoOverride,
+    }).installed.find(loc => loc.scope === selectedScope && loc.dir === urlObj.searchParams.get('dir') &&
+      loc.path === urlObj.searchParams.get('localPath'));
+    if (wantsScopedDetail && !selectedLocal) {
+      sendJson(res, 404, { ok: false, error: 'ERR_PLUGIN_NOT_FOUND: Refresh the plugin list' });
+      return;
+    }
 
     if (req.method === 'GET' && pathname === '/healthz') {
       sendJson(res, 200, { ok: true, plugin: PLUGIN_ID, version: currentSelfVersion });
@@ -870,12 +913,9 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
       const refresh = urlObj.searchParams.get('refresh') === '1';
       const wsParam = urlObj.searchParams.get('workspaceUris') || '';
       const workspaceUris = wsParam ? wsParam.split(',').filter(Boolean) : [];
-      if (refresh) {
-        catalogGeneration += 1;
-        inFlightCatalog.clear();
-        invalidateLocalInventoryCache();
-      }
-      const state = await buildEnrichedState({ forceCatalogRefresh: refresh, workspaceUris });
+      if (refresh) invalidateLocalInventoryCache();
+      const panelOpen = urlObj.searchParams.get('panelOpen') === '1';
+      const state = await buildEnrichedState({ forceCatalogRefresh: refresh, panelOpen, workspaceUris });
       sendJson(res, 200, state);
       return;
     }
@@ -883,10 +923,8 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
     if (req.method === 'GET' && pathname === '/api/conflicts') {
       const wsParam = urlObj.searchParams.get('workspaceUris') || '';
       const workspaceUris = wsParam ? wsParam.split(',').filter(Boolean) : [];
-      if (!lastCatalog) {
-        await ensureCatalogLoaded({ forceCatalogRefresh: false, includeReadmes: false }).catch(() => null);
-      }
-      const inventory = scanLocalPluginInventory({ configDir, dataDir, workspaceUris, builtinPluginsDir, linkInfoOverride });
+      await ensureCatalogLoaded().catch(() => null);
+      const inventory = scanLocalPluginInventory({ configDir, dataDir, workspaceUris, builtinPluginsDir, linkInfoOverride, catalogPlugins: lastCatalog?.plugins || [] });
       const report = applyIgnoredConflictsFilter(
         scanLocalConflicts({
           inventory,
@@ -921,10 +959,12 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
 
       const generation = updateCheckGeneration;
       const runCheck = async () => {
-        const loadedCat = await ensureCatalogLoaded({ forceCatalogRefresh: force, includeReadmes: false });
-        const inventory = scanLocalPluginInventory({ configDir, dataDir, workspaceUris, builtinPluginsDir, linkInfoOverride });
+        const loadedCat = await ensureCatalogLoaded({ forceCatalogRefresh: force });
+        const catalog = lastCatalog && lastCatalogPrefsKey === getCatalogPrefsKey(prefs) ? lastCatalog : loadedCat;
+        const inventory = scanLocalPluginInventory({ configDir, dataDir, workspaceUris, builtinPluginsDir, linkInfoOverride,
+          catalogPlugins: catalog.plugins });
         return checkPluginUpdates({
-          catalog: lastCatalog && lastCatalogPrefsKey === getCatalogPrefsKey(prefs) ? lastCatalog : loadedCat,
+          catalog,
           inventory,
           dataDir,
           prefs,
@@ -952,6 +992,8 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
     }
 
     if (req.method === 'GET' && pathname === '/api/discussions') {
+      const requestPrefs = prefs;
+      const requestCache = authenticatedDiscussions;
       const pluginId = String(urlObj.searchParams.get('id') || '').trim();
       if (!pluginId) {
         sendJson(res, 400, {
@@ -969,21 +1011,25 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
       const force = urlObj.searchParams.get('force') === '1' || urlObj.searchParams.get('force') === 'true';
       const wsParam = urlObj.searchParams.get('workspaceUris') || '';
       const workspaceUris = wsParam ? wsParam.split(',').filter(Boolean) : [];
-      if (!lastCatalog) {
-        await ensureCatalogLoaded({ forceCatalogRefresh: false, includeReadmes: false }).catch(() => null);
-      }
-      const inventory = scanLocalPluginInventory({ configDir, dataDir, workspaceUris, linkInfoOverride });
+      if (!selectedLocal) await ensureCatalogLoaded().catch(() => null);
+      const inventory = selectedLocal ? { installed: [selectedLocal] } : scanLocalPluginInventory({ configDir, dataDir, workspaceUris, linkInfoOverride });
       const disc = await fetchPluginDiscussions({
         id: pluginId,
-        catalog: lastCatalog || { plugins: [] },
+        catalog: (!selectedLocal && lastCatalog) || { plugins: [] },
         inventory,
         dataDir,
-        prefs,
+        prefs: requestPrefs,
+        authenticatedCache: requestCache,
         force,
         fetchImpl,
         nowMs: nowFn(),
         githubApiBaseUrl,
       });
+      usePrefs(loadPrefsFromDisk(dataDir));
+      if (requestCache !== authenticatedDiscussions || requestPrefs.githubToken !== prefs.githubToken) {
+        sendJson(res, 200, { ok: false, error: 'GitHub credentials changed. Refresh discussions.', items: [] });
+        return;
+      }
       if (!disc.ok) {
         sendJson(res, disc.statusCode || 404, {
           ok: false,
@@ -1033,73 +1079,46 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
       // Lazy per-plugin README fetch (`dist/readmes/<id>.json` w/ per-plugin ETag cache),
       // seamlessly falling back to monolithic `readmes.json`, npm mirror, or offline cache.
       let fetchedReadme = null;
-      if (pluginId) {
+      const activeCatalog = pluginId && !selectedLocal ? await ensureCatalogLoaded() : null;
+      const entry = activeCatalog?.plugins.find(p => p.id === pluginId);
+      const customFeed = entry?._track === 'custom' ? entry._feedUrl : '';
+      // In-memory README maps belong to the primary feed. Additional feeds have their own disk caches.
+      const matchingCatalog = customFeed ? null : activeCatalog;
+      if (pluginId && !selectedLocal) {
         try {
           fetchedReadme = await fetchPluginReadme({
             id: pluginId,
             dataDir,
             prefs,
-            primaryBaseUrl: lastCatalog?.primaryBaseUrl || '',
-            cachedCatalog: lastCatalog,
+            primaryBaseUrl: customFeed ? new URL('.', customFeed).href : matchingCatalog?.primaryBaseUrl || '',
+            cachedCatalog: matchingCatalog,
             forceRefresh: forceReadmeRefresh,
             fetchImpl,
             mirrors,
           });
-          if (fetchedReadme?.monolithicReadmes && typeof fetchedReadme.monolithicReadmes === 'object') {
+          if (matchingCatalog && matchingCatalog === lastCatalog && lastCatalogPrefsKey === getCatalogPrefsKey() && fetchedReadme?.monolithicReadmes) {
             const mono = fetchedReadme.monolithicReadmes;
-            if (!lastCatalog) {
-              lastCatalog = {
-                channelUsed: fetchedReadme.channel || 'monolithic',
-                primaryBaseUrl: prefs.primaryCatalogUrl || '',
-                catalogVersion: '',
-                generatedAt: null,
-                plugins: [],
-                readmes: mono.entries && typeof mono.entries === 'object' ? mono.entries : {},
-                readmesZh: mono.entriesZh && typeof mono.entriesZh === 'object' ? mono.entriesZh : {},
-                readmesEn: mono.entriesEn && typeof mono.entriesEn === 'object' ? mono.entriesEn : {},
-                warnings: [],
-              };
-            } else {
-              lastCatalog.readmes = mono.entries && typeof mono.entries === 'object' ? mono.entries : lastCatalog.readmes || {};
-              lastCatalog.readmesZh =
-                mono.entriesZh && typeof mono.entriesZh === 'object' ? mono.entriesZh : lastCatalog.readmesZh || {};
-              lastCatalog.readmesEn =
-                mono.entriesEn && typeof mono.entriesEn === 'object' ? mono.entriesEn : lastCatalog.readmesEn || {};
+            for (const [key, value] of [['readmes', mono.entries], ['readmesZh', mono.entriesZh], ['readmesEn', mono.entriesEn]]) {
+              if (value && typeof value === 'object') matchingCatalog[key] = value;
             }
           }
         } catch {
-          /* continue with local fallback */
+          fetchedReadme = { channel: 'unavailable' };
         }
       }
 
-      // Resolve optional local plugin root (active or parked)
-      let localPluginPath = '';
-      let resolvedDir = '';
-      if (isSafeDirSlug(requestedDir)) {
-        const activeCand = join(pluginsDir, requestedDir);
-        const parkedCand = join(disabledPluginsDir, requestedDir);
-        if (existsSync(activeCand)) {
-          localPluginPath = activeCand;
-          resolvedDir = requestedDir;
-        } else if (existsSync(parkedCand)) {
-          localPluginPath = parkedCand;
-          resolvedDir = requestedDir;
-        }
+      let local = selectedLocal;
+      if (!local && (entry || !pluginId)) {
+        const { installed } = scanLocalPluginInventory({ configDir, dataDir, catalogPlugins: activeCatalog?.plugins });
+        const candidates = entry ? installed.filter(loc => matchesInstalledSource(loc, entry, installed)) : installed;
+        local = candidates.find(loc => samePluginName(loc.dir, requestedDir)) || (entry && candidates[0]);
       }
-      if (!localPluginPath && pluginId) {
-        const inv = scanLocalPluginInventory({ configDir, dataDir });
-        const matched = inv.installed.find(
-          (x) => x.receipt?.id === pluginId || x.dir === pluginId || x.name === pluginId,
-        );
-        if (matched) {
-          localPluginPath = matched.path;
-          resolvedDir = matched.dir;
-        }
-      }
+      const localPluginPath = local?.path || '';
+      const resolvedDir = local?.dir || '';
 
-      const catZh = pluginId ? String(fetchedReadme?.zh || lastCatalog?.readmesZh?.[pluginId] || '') : '';
-      const catEn = pluginId ? String(fetchedReadme?.en || lastCatalog?.readmesEn?.[pluginId] || '') : '';
-      const catDefault = pluginId ? String(fetchedReadme?.default || lastCatalog?.readmes?.[pluginId] || '') : '';
+      const catZh = pluginId ? String(fetchedReadme?.zh || matchingCatalog?.readmesZh?.[pluginId] || '') : '';
+      const catEn = pluginId ? String(fetchedReadme?.en || matchingCatalog?.readmesEn?.[pluginId] || '') : '';
+      const catDefault = pluginId ? String(fetchedReadme?.default || matchingCatalog?.readmes?.[pluginId] || '') : '';
 
       const localZh = localPluginPath ? readFirstExistingReadme(localPluginPath, ZH_README_FILENAMES) : '';
       const localEn = localPluginPath ? readFirstExistingReadme(localPluginPath, EN_README_FILENAMES) : '';
@@ -1174,6 +1193,7 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
 
       sendJson(res, 200, {
         ok: true,
+        ...(readmeSource === 'none' && fetchedReadme?.channel === 'unavailable' ? { unavailable: true } : {}),
         id: pluginId || resolvedDir || requestedDir,
         dir: resolvedDir || requestedDir,
         locale,
@@ -1196,8 +1216,6 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
 
       if (pathname === '/api/catalog/refresh') {
         const state = await enqueueCatalogConfigOp(async () => {
-          catalogGeneration += 1;
-          inFlightCatalog.clear();
           invalidateUpdateCheckState();
           return buildEnrichedState({
             forceCatalogRefresh: true,
@@ -1209,32 +1227,39 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
       }
 
       if (pathname === '/api/prefs' || pathname === '/api/sources') {
+        if (pathname === '/api/sources') {
+          for (const field of ['primaryCatalogUrl', 'githubReleaseMirrorPrefix']) {
+            const value = body[field];
+            if (!value) continue;
+            if (typeof value !== 'string' || !/^https?:\/\//i.test(value.trim()) || !URL.canParse(value)) {
+              const label = field === 'primaryCatalogUrl' ? '主目录源 / Primary catalog' : '下载加速前缀 / Download mirror';
+              sendJson(res, 400, { ok: false, error: `${label} 需要完整地址 / Enter an http:// or https:// URL.` });
+              return;
+            }
+          }
+        }
+        if (Object.hasOwn(body, 'customFeeds')) {
+          const feeds = body.customFeeds;
+          const invalid = !Array.isArray(feeds) ? 0 : feeds.findIndex(value => {
+            if (typeof value !== 'string' || !/^(?:https?|file):\/\//i.test(value.trim())) return true;
+            return !URL.canParse(value);
+          });
+          if (invalid !== -1) {
+            sendJson(res, 400, { ok: false, error: `自定义源第 ${invalid + 1} 项需要完整 URL / Feed ${invalid + 1} requires an http://, https:// or file:// URL.` });
+            return;
+          }
+        }
         const state = await enqueueCatalogConfigOp(async () => {
           const prevPrefs = prefs;
-          const prevCatalogKey = getCatalogPrefsKey(prevPrefs);
-          const merged = { ...prefs, ...body };
-          if (body.clearGithubToken === true) {
-            merged.githubToken = '';
-          } else if (!Object.prototype.hasOwnProperty.call(body, 'githubToken')) {
-            merged.githubToken = prefs.githubToken || '';
-          }
-          if (!Object.prototype.hasOwnProperty.call(body, 'favorites')) {
-            merged.favorites = Array.isArray(prefs.favorites) ? [...prefs.favorites] : [];
-          }
-          if (!Object.prototype.hasOwnProperty.call(body, 'ignoredConflictIds')) {
-            merged.ignoredConflictIds = Array.isArray(prefs.ignoredConflictIds) ? [...prefs.ignoredConflictIds] : [];
-          }
-          prefs = savePrefsToDisk(dataDir, merged);
-          const nextCatalogKey = getCatalogPrefsKey(prefs);
+          usePrefs(updatePrefsOnDisk(dataDir, () => body.clearGithubToken === true ? { ...body, githubToken: '' } : body));
           const track2SwitchedOn = !prevPrefs.enableExperimentalTrack2 && Boolean(prefs.enableExperimentalTrack2);
           const needsForceCatalog = track2SwitchedOn && !hasUsableTrack2Data();
-          if (prevCatalogKey !== nextCatalogKey) {
-            catalogGeneration += 1;
-            inFlightCatalog.clear();
+          if (pathname === '/api/sources') {
+            catalogFlight = null;
           }
           invalidateUpdateCheckState();
           return buildEnrichedState({
-            forceCatalogRefresh: needsForceCatalog,
+            forceCatalogRefresh: needsForceCatalog || pathname === '/api/sources',
             workspaceUris: Array.isArray(body.workspaceUris) ? body.workspaceUris : [],
           });
         });
@@ -1248,27 +1273,52 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
           sendJson(res, 400, { ok: false, error: 'ERR_INVALID_FAVORITE_KEY: Non-empty string "key" is required' });
           return;
         }
-        const current = sanitizeFavorites(prefs.favorites);
-        const exists = current.includes(key);
-        const targetState = typeof body.favorite === 'boolean' ? body.favorite : !exists;
-        let nextFavorites;
-        if (targetState) {
-          if (exists) {
-            nextFavorites = current;
-          } else {
-            const trimmed = current.length >= MAX_FAVORITES ? current.slice(-(MAX_FAVORITES - 1)) : current;
-            nextFavorites = [...trimmed, key];
+        if (body.plugin) {
+          await catalogConfigQueue;
+          const { plugins } = await ensureCatalogLoaded();
+          if (!matchesDisplayedCatalogEntry(body.plugin, plugins.find(plugin => plugin.id === key))) {
+            sendJson(res, 409, { ok: false, error: 'Catalog entry or source changed. Refresh the plugin list.' });
+            return;
           }
-        } else {
-          nextFavorites = current.filter((item) => item !== key);
         }
-        prefs = savePrefsToDisk(dataDir, { ...prefs, favorites: nextFavorites });
+        let conflict;
+        const installed = body.favorite === false ? [] : scanLocalPluginInventory({
+          configDir, pluginsDir, dataDir, builtinPluginsDir, workspaceUris: parseWorkspaceUrisInput(body.workspaceUris),
+          catalogPlugins: lastCatalog?.plugins || [],
+        }).installed;
+        usePrefs(updatePrefsOnDisk(dataDir, latest => {
+          if (body.plugin && getCatalogPrefsKey(latest) !== lastCatalogPrefsKey) {
+            conflict = 'Catalog source changed. Refresh the plugin list.';
+            return null;
+          }
+          const targetState = typeof body.favorite === 'boolean' ? body.favorite : !latest.favorites.includes(key);
+          const favoriteSources = { ...latest.favoriteSources };
+          if (targetState) {
+            const loc = key.startsWith('copy:') ? installed.find(item => item.favoriteKey === key)
+              : matchLegacyLocalFavorite(key, installed, favoriteSources[key]) ||
+                installed.find(item => item.scope === 'global' && item.receipt?.id === key);
+            if (!loc && key.startsWith('copy:')) {
+              conflict = 'ERR_PLUGIN_NOT_FOUND: Refresh the plugin list.';
+              return null;
+            }
+            const entry = lastCatalog?.plugins?.find(plugin => plugin.id === key);
+            if (entry && !favoriteSources[key]) favoriteSources[key] = favoriteSourceForCatalog(entry);
+            else if (loc && !favoriteSources[key]) favoriteSources[key] = favoriteSourceForLocal(loc);
+          }
+          return { favorites: updateListMembership(latest.favorites, key, targetState, MAX_FAVORITES), favoriteSources };
+        }));
+        if (conflict) {
+          sendJson(res, 409, { ok: false, error: conflict });
+          return;
+        }
         const persisted = prefs.favorites || [];
         sendJson(res, 200, {
           ok: true,
           key,
           isFavorite: persisted.includes(key),
           favorites: persisted,
+          ...(body.plugin || key.startsWith('copy:') || Object.hasOwn(prefs.favoriteSources, key)
+            ? { favoriteSources: prefs.favoriteSources } : {}),
         });
         return;
       }
@@ -1291,21 +1341,9 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
         }
         const workspaceUris = parseWorkspaceUrisInput(body.workspaceUris);
         const result = await enqueueCatalogConfigOp(async () => {
-          const current = sanitizeIgnoredConflictIds(prefs.ignoredConflictIds);
-          const exists = current.includes(id);
-          let nextIgnoredIds;
-          if (body.ignored) {
-            if (exists) {
-              nextIgnoredIds = current;
-            } else {
-              const trimmed =
-                current.length >= MAX_IGNORED_CONFLICTS ? current.slice(-(MAX_IGNORED_CONFLICTS - 1)) : current;
-              nextIgnoredIds = [...trimmed, id];
-            }
-          } else {
-            nextIgnoredIds = current.filter((item) => item !== id);
-          }
-          prefs = savePrefsToDisk(dataDir, { ...prefs, ignoredConflictIds: nextIgnoredIds });
+          usePrefs(updatePrefsOnDisk(dataDir, latest => ({
+            ignoredConflictIds: updateListMembership(latest.ignoredConflictIds, id, body.ignored, MAX_IGNORED_CONFLICTS),
+          })));
           invalidateUpdateCheckState();
           const state = await buildEnrichedState({ forceCatalogRefresh: false, workspaceUris });
           const freshInv = scanLocalPluginInventory({
@@ -1371,10 +1409,8 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
 
       if (pathname === '/api/preflight') {
         const targetId = String(body.id || '').trim();
-        if (!lastCatalog) {
-          await buildEnrichedState({ forceCatalogRefresh: false });
-        }
-        const plugin = (lastCatalog?.plugins || []).find((p) => p.id === targetId);
+        const catalog = await ensureCatalogLoaded();
+        const plugin = catalog.plugins.find((p) => p.id === targetId);
         if (!plugin) {
           sendJson(res, 404, { ok: false, error: `Plugin "${targetId}" not found in active catalog` });
           return;
@@ -1383,20 +1419,36 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
           configDir,
           dataDir,
           workspaceUris: Array.isArray(body.workspaceUris) ? body.workspaceUris : [],
+          catalogPlugins: catalog.plugins,
         });
         const preflight = resolveInstallPreflight(plugin, inventory, {
           conflictStrategy: body.conflictStrategy || 'prompt',
         });
-        const escalation = computeCapabilityEscalation(preflight.existingInstall?.receipt || null, plugin);
-        sendJson(res, 200, { ok: true, preflight, escalation });
+        const escalation = getUpdateEscalation(plugin, preflight);
+        const replacementKey = preflight.choices?.includes('replace') || preflight.action === 'replace-local'
+          ? getReplacementKey(plugin, preflight.conflict) : '';
+        sendJson(res, 200, { ok: true, preflight: { ...preflight, replacementKey }, escalation });
         return;
+      }
+
+      if (PLUGIN_MUTATION_ROUTES.has(pathname) && !acquireMutationLock(pathname)) {
+        return;
+      }
+      if (INSTALL_ROUTES.has(pathname)) {
+        // An I/O failure can leave a journal long after the one-time startup check.
+        // Recover before selecting the next target or trusting its installed version.
+        const recovery = recoverInterruptedJournal({ dataDir, pluginsDir });
+        if (recovery.action === 'busy' || recovery.error) {
+          sendJson(res, 409, { ok: false, error: recovery.error ||
+            'ERR_PLUGIN_OPERATION_BUSY: Another process is recovering a plugin installation.' });
+          return;
+        }
+        if (recovery.recovered) invalidateUpdateCheckState();
       }
 
       if (pathname === '/api/toggle-plugin') {
         const workspaceUris = Array.isArray(body.workspaceUris) ? body.workspaceUris : [];
-        if (!lastCatalog) {
-          await ensureCatalogLoaded({ forceCatalogRefresh: false, includeReadmes: false }).catch(() => null);
-        }
+        await ensureCatalogLoaded().catch(() => null);
         const catalogCapabilities = findCatalogCapabilitiesForDir(String(body.dir || '').trim());
         const toggleRes = toggleInstalledPlugin({
           dir: body.dir,
@@ -1453,9 +1505,7 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
 
       if (pathname === '/api/github/inspect') {
         const workspaceUris = parseWorkspaceUrisInput(body.workspaceUris);
-        if (!lastCatalog) {
-          await ensureCatalogLoaded({ forceCatalogRefresh: false, includeReadmes: false }).catch(() => null);
-        }
+        await ensureCatalogLoaded().catch(() => null);
         const rawInspect = await inspectGithubPluginUrl({
           url: typeof body.url === 'string' ? body.url : '',
           inspectToken: typeof body.inspectToken === 'string' ? body.inspectToken.trim() : '',
@@ -1474,21 +1524,17 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
         return;
       }
 
-      if (PLUGIN_MUTATION_ROUTES.has(pathname) && !acquireMutationLock(pathname)) {
-        return;
-      }
-
       if (pathname === '/api/github/install') {
         const workspaceUris = parseWorkspaceUrisInput(body.workspaceUris);
-        if (!lastCatalog) {
-          await ensureCatalogLoaded({ forceCatalogRefresh: false, includeReadmes: false }).catch(() => null);
-        }
+        await ensureCatalogLoaded().catch(() => null);
         const rawResult = await installGithubPlugin({
           inspectToken: typeof body.inspectToken === 'string' ? body.inspectToken.trim() : '',
           url: typeof body.url === 'string' ? body.url : '',
           pluginRoot: typeof body.pluginRoot === 'string' ? body.pluginRoot.trim() : '',
           installMode: typeof body.installMode === 'string' ? body.installMode.trim() : '',
+          replacementKey: body.replacementKey,
           confirmEscalation: Boolean(body.confirmEscalation),
+          approvalKey: body.approvalKey,
           prefs,
           configDir,
           dataDir,
@@ -1508,28 +1554,36 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
       }
 
       if (pathname === '/api/install' || pathname === '/api/update') {
-        const targetId = String(body.id || '').trim();
+        const targetId = String(body.id || body.plugin?.id || '').trim();
         const targetDir = String(body.dir || '').trim();
         const workspaceUris = parseWorkspaceUrisInput(body.workspaceUris);
-        if (!lastCatalog) {
-          await buildEnrichedState({ forceCatalogRefresh: false, workspaceUris });
+        await catalogConfigQueue;
+        const catalog = await ensureCatalogLoaded();
+        const catalogPlugins = catalog.plugins || [];
+        const selectedCatalogPlugin = resolveCatalogPluginForMutation(catalogPlugins, { targetId, targetDir });
+        // A panel can outlive its catalog entry. Only the active catalog supplies install metadata.
+        if (body.plugin && !matchesDisplayedCatalogEntry(body.plugin, selectedCatalogPlugin)) {
+          sendJson(res, 409, { ok: false, status: 'CATALOG_ENTRY_CHANGED', error: 'Catalog entry or source changed. Refresh the plugin list.' });
+          return;
         }
-        const catalogPlugins = lastCatalog?.plugins || [];
 
         if (pathname === '/api/install') {
-          const explicitPlugin = body.plugin && typeof body.plugin === 'object' ? body.plugin : null;
-          const plugin = resolveCatalogPluginForMutation(catalogPlugins, explicitPlugin, { targetId, targetDir });
+          const plugin = selectedCatalogPlugin;
           if (!plugin) {
             sendJson(res, 404, { ok: false, error: `Plugin "${targetId || targetDir}" not found in active catalog` });
             return;
           }
           const result = await installOrUpdateCatalogPlugin({
+            catalogPlugins,
             plugin,
             track: plugin._track || (plugin.forceScopedInstall ? 'unverified' : 'verified'),
             prefs,
             conflictStrategy: body.conflictStrategy || 'prompt',
+            replacementKey: body.replacementKey,
             preferredDir: targetDir,
             confirmEscalation: Boolean(body.confirmEscalation),
+            approvalKey: body.approvalKey,
+            rejectDowngrade: true,
             configDir,
             dataDir,
             workspaceUris,
@@ -1562,21 +1616,34 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
             reqSource === 'github-branch',
         );
 
-        const explicitPlugin = body.plugin && typeof body.plugin === 'object' ? body.plugin : null;
-        const catPlugin = resolveCatalogPluginForMutation(catalogPlugins, explicitPlugin, { targetId, targetDir });
+        const inventory = scanLocalPluginInventory({
+          configDir,
+          dataDir,
+          workspaceUris,
+          builtinPluginsDir,
+          linkInfoOverride,
+          catalogPlugins,
+        });
+        const requestedLocal = targetDir && inventory.installed.find(loc => loc.scope === 'global' && loc.dir === targetDir);
+        const explicitMatch = targetId ? selectedCatalogPlugin : null;
+        const localMatch = findCatalogEntryForLocal(requestedLocal, catalogPlugins, inventory.installed);
+        if (!explicitMatch && targetId && requestedLocal) {
+          const slug = parseGithubRepoSlug(requestedLocal.repositoryUrl);
+          const localIds = [requestedLocal.dir, requestedLocal.name, requestedLocal.receipt?.id, localMatch?.id,
+            localMatch?.canonicalName, slug && `${slug.owner}__${slug.repo}`];
+          if (!localIds.includes(targetId)) {
+            sendJson(res, 409, { ok: false, status: 'UPDATE_TARGET_MISMATCH', error: '插件 ID 与指定的安装目录不匹配。' });
+            return;
+          }
+        }
+        const catPlugin = explicitMatch || localMatch;
 
         // (i) Direct catalog update / re-sync when catalog package is installable and upstream wasn't explicitly requested
         if (!preferUpstream && catPlugin && isCatalogPluginInstallable(catPlugin)) {
-          const preflightInventory = scanLocalPluginInventory({
-            configDir,
-            dataDir,
-            workspaceUris,
-            builtinPluginsDir,
-            linkInfoOverride,
-          });
-          const preflight = resolveInstallPreflight(catPlugin, preflightInventory, {
+          const preflight = resolveInstallPreflight(catPlugin, inventory, {
             conflictStrategy: 'prompt',
             preferredDir: targetDir,
+            requireExistingDir: true,
           });
           if (preflight.action === 'update' && isUnmanagedLocalPlugin(preflight.existingInstall)) {
             sendJson(res, 400, {
@@ -1617,12 +1684,18 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
           }
 
           const result = await installOrUpdateCatalogPlugin({
+            catalogPlugins,
             plugin: catPlugin,
             track: catPlugin._track || (catPlugin.forceScopedInstall ? 'unverified' : 'verified'),
             prefs,
             conflictStrategy: body.conflictStrategy || (isSelfPluginCandidate(catPlugin, targetDir) ? 'replace' : 'prompt'),
+            replacementKey: body.replacementKey,
             preferredDir: targetDir,
+            requireExistingDir: true,
             confirmEscalation: Boolean(body.confirmEscalation),
+            approvalKey: body.approvalKey,
+            rejectDowngrade: true,
+            resyncVersion: forceResync ? String(body.targetVersion || preflight.existingInstall?.version || '') : '',
             configDir,
             dataDir,
             workspaceUris,
@@ -1642,25 +1715,11 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
         }
 
         // (ii) Direct GitHub upstream / github-url update or on-demand re-sync
-        const inventory = scanLocalPluginInventory({
-          configDir,
-          dataDir,
-          workspaceUris,
-          builtinPluginsDir,
-          linkInfoOverride,
-        });
-        const localPlugin =
-          (targetDir && inventory.installed.find((loc) => loc.scope === 'global' && loc.dir === targetDir)) ||
-          inventory.installed.find(
-            (loc) =>
-              loc.scope === 'global' &&
-              ((targetId && (loc.receipt?.id === targetId || loc.dir === targetId || loc.name === targetId)) ||
-                (catPlugin &&
-                  (loc.receipt?.id === catPlugin.id ||
-                    loc.dir === catPlugin.canonicalName ||
-                    loc.dir === catPlugin.scopedName))),
-          ) ||
-          null;
+        const globalInstalled = inventory.installed.filter(loc => loc.scope === 'global');
+        const localPlugin = targetDir ? requestedLocal :
+          globalInstalled.find(loc => loc.receipt?.id === targetId) ||
+          (catPlugin && globalInstalled.find(loc => matchesInstalledSource(loc, catPlugin, inventory.installed))) ||
+          globalInstalled.find(loc => loc.dir === targetId || loc.name === targetId);
 
         if (!localPlugin) {
           const nonGlobal =
@@ -1680,6 +1739,19 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
           return;
         }
 
+        if (!localPlugin.receipt && localPlugin.inferredRepository) {
+          sendJson(res, 409, { ok: false, status: 'UNVERIFIED_UPDATE_SOURCE', error: 'The installed plugin does not declare a repository for updates.' });
+          return;
+        }
+        if (localPlugin.repositoryRoot === null) {
+          sendJson(res, 409, { ok: false, status: 'UNRESOLVED_PLUGIN_ROOT', error: '无法确认插件的仓库目录。' });
+          return;
+        }
+        const successor = findManagedSuccessor(localPlugin, inventory.installed);
+        if (successor) {
+          sendJson(res, 409, legacyDuplicateResult(localPlugin.dir, successor.dir));
+          return;
+        }
         if (isUnmanagedLocalPlugin(localPlugin)) {
           sendJson(res, 400, {
             ok: false,
@@ -1691,7 +1763,14 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
           return;
         }
 
-        const matchedCat = catPlugin || findCatalogEntryForLocal(localPlugin, catalogPlugins);
+        const matchedCat = findCatalogEntryForLocal(localPlugin, catalogPlugins, inventory.installed);
+        // A GitHub update targets the installed copy even when a different feed now claims its catalog ID.
+        const boundUpstream = preferUpstream && requestedLocal === localPlugin && targetId === localPlugin.receipt?.id &&
+          (localPlugin.receipt?.repositoryUrl || (!localPlugin.inferredRepository && localPlugin.repositoryUrl));
+        if (explicitMatch && !matchesInstalledSource(localPlugin, explicitMatch, inventory.installed) && !boundUpstream) {
+          sendJson(res, 409, { ok: false, status: 'UPDATE_TARGET_MISMATCH', error: '插件来源与指定的安装目录不匹配。' });
+          return;
+        }
         const updateHint =
           body.updateHint && typeof body.updateHint === 'object'
             ? body.updateHint
@@ -1738,7 +1817,8 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
           } else if (hintTargetRef) {
             const localTag = String(localPlugin.receipt?.gitTag || '').trim().toLowerCase();
             const targetTag = hintTargetRef.toLowerCase();
-            const targetSem = parseSemver(hintTargetRef);
+            const isRoot = normalizePluginRoot(localPlugin.receipt?.pluginRoot || localPlugin.repositoryRoot) === '.';
+            const targetSem = isRoot && parseSemver(hintTargetRef);
             if (
               (localTag && localTag === targetTag) ||
               (targetSem && !isNewerVersion(targetSem.version, localPlugin.version))
@@ -1762,6 +1842,21 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
             });
             return;
           }
+          const source = localPlugin.receipt?.githubSource;
+          if (/^[a-f0-9]{40}$/i.test(hintTargetRef) && localPlugin.receipt?.track === 'github-url' &&
+              localPlugin.receipt.commitSha && (source?.trackBranch || source?.refType === 'branch' || updateHint.updateKind === 'commit')) {
+            const repo = parseGithubRepoSlug(matchedCat?.repository?.url || localPlugin.receipt.repositoryUrl || localPlugin.repositoryUrl);
+            const branch = source?.trackBranch || (source?.refType === 'branch' && source.ref) || 'HEAD';
+            const probe = repo && await probeGithubBranchHead({
+              owner: repo.owner, repo: repo.repo, branch, pluginRoot: localPlugin.receipt.pluginRoot || localPlugin.repositoryRoot,
+              installedCommitSha: localPlugin.receipt.commitSha, dataDir, prefs, fetchImpl, githubApiBaseUrl,
+              nowMs: nowFn(), ttlMs: updateCheckTtlMs,
+            });
+            if (!probe?.checked || probe.head?.commitSha !== hintTargetRef.toLowerCase() || probe.head.subtreeChanged === false) {
+              sendJson(res, 409, { ok: false, status: 'UPDATE_TARGET_MISMATCH', error: 'The tracked branch changed or could not be verified. Check for updates again.' });
+              return;
+            }
+          }
         }
 
         const rawResult = await resolveAndStageGithubUpdate({
@@ -1769,6 +1864,8 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
           catPlugin: matchedCat,
           updateHint,
           confirmEscalation: Boolean(body.confirmEscalation),
+          approvalKey: body.approvalKey,
+          resyncVersion: forceResync ? String(body.targetVersion || localPlugin.version) : '',
           prefs,
           configDir,
           dataDir,
@@ -1799,15 +1896,16 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
         const confirmEscalation = Boolean(body.confirmEscalation);
         const forceCheck = Boolean(body.forceCheck);
         const generation = updateCheckGeneration;
-        await ensureCatalogLoaded({ forceCatalogRefresh: forceCheck, includeReadmes: false });
+        await ensureCatalogLoaded({ forceCatalogRefresh: forceCheck });
+        const catalogPlugins = lastCatalog?.plugins || [];
         const inventory = scanLocalPluginInventory({
           configDir,
           dataDir,
           workspaceUris,
           builtinPluginsDir,
           linkInfoOverride,
+          catalogPlugins,
         });
-        const catalogPlugins = lastCatalog?.plugins || [];
         const globalInstalled = inventory.installed.filter((loc) => loc.scope === 'global');
 
         const updateReport = await checkPluginUpdates({
@@ -1839,21 +1937,23 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
             if (!reqId || seenReqIds.has(reqId)) continue;
             seenReqIds.add(reqId);
 
-            const upd = updByDir.get(reqId) || updById.get(reqId) || null;
-            const plugin = catalogPlugins.find((p) => p.id === reqId || p.canonicalName === reqId) || null;
-            const localLoc =
-              (upd?.dir && globalInstalled.find((loc) => loc.dir === upd.dir)) ||
-              globalInstalled.find((loc) => loc.dir === reqId) ||
-              globalInstalled.find(
-                (loc) =>
-                  loc.receipt?.id === reqId ||
-                  loc.name === reqId ||
-                  (plugin && (loc.dir === plugin.canonicalName || loc.dir === plugin.scopedName)),
-              ) ||
-              null;
+            const requestedUpdate = updByDir.get(reqId) || updById.get(reqId);
+            const exactDir = globalInstalled.find(loc => loc.dir === reqId);
+            const requestedPlugin = catalogPlugins.find(p => p.id === reqId || p.canonicalName === reqId);
+            const localLoc = exactDir || globalInstalled.find(loc => loc.dir === requestedUpdate?.dir) ||
+              globalInstalled.find(loc => loc.receipt?.id === reqId) ||
+              (requestedPlugin && globalInstalled.find(loc => matchesInstalledSource(loc, requestedPlugin, inventory.installed))) ||
+              globalInstalled.find(loc => loc.name === reqId);
+            const upd = localLoc ? updByDir.get(localLoc.dir) : requestedUpdate;
+            const plugin = localLoc ? findCatalogEntryForLocal(localLoc, catalogPlugins, inventory.installed) : requestedPlugin;
             const isSelf = Boolean(upd?.isSelf || isSelfPluginCandidate(plugin, localLoc?.dir || reqId));
 
-            if (localLoc && !isSelf && isUnmanagedLocalPlugin(localLoc)) {
+            const successor = findManagedSuccessor(localLoc, globalInstalled);
+            if (successor) {
+              queue.push({ id: reqId, dir: localLoc.dir, successorDir: successor.dir });
+              continue;
+            }
+            if (isUnmanagedLocalPlugin(localLoc)) {
               queue.push({
                 id: reqId,
                 dir: localLoc.dir,
@@ -1861,6 +1961,11 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
                 unmanagedLoc: localLoc,
                 isSelf: false,
               });
+              continue;
+            }
+
+            if (!upd && localLoc && updateReport.uncheckedDirs.includes(localLoc.dir)) {
+              queue.push({ id: reqId, dir: localLoc.dir, targetError: '无法确认上游版本 / Could not verify the upstream version' });
               continue;
             }
 
@@ -1878,10 +1983,15 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
             }
 
             if (plugin && isCatalogPluginInstallable(plugin)) {
-              const preflight = resolveInstallPreflight(plugin, inventory, {
-                conflictStrategy: 'prompt',
-                preferredDir: localLoc?.dir || '',
-              });
+              let preflight;
+              try {
+                preflight = resolveInstallPreflight(plugin, inventory, {
+                  conflictStrategy: 'prompt', preferredDir: localLoc?.dir || '', requireExistingDir: true,
+                });
+              } catch (err) {
+                queue.push({ id: reqId, dir: localLoc?.dir, targetError: err.message });
+                continue;
+              }
               const localDir = preflight.existingInstall?.dir || localLoc?.dir || plugin.canonicalName;
               if (
                 !upd &&
@@ -1914,6 +2024,11 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
             }
 
             if (localLoc) {
+              if (!upd && localLoc.receipt?.track === 'github-url' && localLoc.receipt.githubSource?.refType === 'branch') {
+                queue.push({ id: reqId, dir: localLoc.dir, displayName: localLoc.displayName, version: localLoc.version,
+                  parkedByMarket: localLoc.parkedByMarket, alreadyUpToDate: true });
+                continue;
+              }
               const candidateRepoUrl = getValidGithubRepoUrl(
                 upd?.repositoryUrl ||
                   localLoc.receipt?.repositoryUrl ||
@@ -1974,9 +2089,8 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
           for (const upd of updateReport.items || []) {
             if (!upd?.installable || queuedDirs.has(upd.dir)) continue;
             const localLoc = globalInstalled.find((loc) => loc.dir === upd.dir) || null;
-            if (localLoc && !upd.isSelf && isUnmanagedLocalPlugin(localLoc)) continue;
-            const catPlugin =
-              catalogPlugins.find((p) => p.id === upd.id) || findCatalogEntryForLocal(localLoc, catalogPlugins);
+            if (isUnmanagedLocalPlugin(localLoc)) continue;
+            const catPlugin = findCatalogEntryForLocal(localLoc, catalogPlugins, inventory.installed);
             const isSelf = Boolean(upd.isSelf || isSelfPluginCandidate(catPlugin, upd.dir));
 
             if ((upd.updateChannel === 'catalog' || upd.source === 'catalog') && catPlugin && isCatalogPluginInstallable(catPlugin)) {
@@ -2021,6 +2135,14 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
               status: 'NOT_FOUND',
               error: `Plugin "${item.id}" not found in active catalog`,
             });
+            continue;
+          }
+          if (item.targetError) {
+            results.push({ id: item.id, dir: item.dir, ok: false, status: 'UPDATE_TARGET_ERROR', error: item.targetError });
+            continue;
+          }
+          if (item.successorDir) {
+            results.push({ id: item.id, ...legacyDuplicateResult(item.dir, item.successorDir) });
             continue;
           }
           if (item.noUpdateSource) {
@@ -2086,6 +2208,7 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
                 catPlugin: item.catPlugin || null,
                 updateHint: item.updateHint || null,
                 confirmEscalation,
+                approvalKey: body.approvalKeys?.[item.dir],
                 prefs,
                 configDir,
                 dataDir,
@@ -2137,12 +2260,16 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
           const plugin = item.plugin;
           try {
             const out = await installOrUpdateCatalogPlugin({
+              catalogPlugins,
               plugin,
               track: plugin._track || (plugin.forceScopedInstall ? 'unverified' : 'verified'),
               prefs,
               conflictStrategy: item.isSelf ? 'replace' : 'prompt',
               preferredDir: item.dir || '',
+              requireExistingDir: globalInstalled.some(loc => loc.dir === item.dir),
               confirmEscalation,
+              approvalKey: body.approvalKeys?.[item.dir],
+              rejectDowngrade: true,
               configDir,
               dataDir,
               workspaceUris,
@@ -2213,14 +2340,14 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
         const targetVersion = String(body.targetVersion || '').trim();
         const targetRef = String(body.targetRef || '').trim();
 
-        await ensureCatalogLoaded({ forceCatalogRefresh: forceRefresh, includeReadmes: false });
+        await ensureCatalogLoaded({ forceCatalogRefresh: forceRefresh });
         let selfPlugin =
-          (lastCatalog?.plugins || []).find((p) => p.id === SELF_CATALOG_ID || p.canonicalName === PLUGIN_ID) || null;
+          (lastCatalog?.plugins || []).find(isOfficialMarketEntry) || null;
 
         if (!selfPlugin && !forceRefresh) {
-          await ensureCatalogLoaded({ forceCatalogRefresh: true, includeReadmes: false }).catch(() => null);
+          await ensureCatalogLoaded({ forceCatalogRefresh: true }).catch(() => null);
           selfPlugin =
-            (lastCatalog?.plugins || []).find((p) => p.id === SELF_CATALOG_ID || p.canonicalName === PLUGIN_ID) || null;
+            (lastCatalog?.plugins || []).find(isOfficialMarketEntry) || null;
         }
 
         const catalogCanDirectSelf = Boolean(selfPlugin && isCatalogPluginInstallable(selfPlugin));
@@ -2230,27 +2357,22 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
         const useGithubUpstreamSelf =
           reqChannel === 'github-upstream' || !catalogCanDirectSelf || catalogBehindTarget;
 
+        const inventory = scanLocalPluginInventory({ configDir, dataDir, workspaceUris, builtinPluginsDir, linkInfoOverride });
+        const installedSelf = inventory.installed.find(loc => loc.scope === 'global' && samePluginName(loc.dir, PLUGIN_ID));
+        if (isUnmanagedLocalPlugin(installedSelf)) {
+          sendJson(res, 400, { ok: false, status: 'UNMANAGED_PLUGIN', error: buildUnmanagedUpdateErrorMessage(installedSelf) });
+          return;
+        }
+        if (isForeignMarketInstall(installedSelf)) {
+          sendJson(res, 409, { ok: false, status: 'UPDATE_TARGET_MISMATCH', error: 'The market directory belongs to a different source.' });
+          return;
+        }
         let result;
         if (useGithubUpstreamSelf) {
-          const inventory = scanLocalPluginInventory({
-            configDir,
-            dataDir,
-            workspaceUris,
-            builtinPluginsDir,
-            linkInfoOverride,
-          });
-          const existingSelf =
-            inventory.installed.find(
-              (loc) => loc.scope === 'global' && (loc.dir === PLUGIN_ID || loc.name === PLUGIN_ID),
-            ) || {
-              dir: PLUGIN_ID,
-              name: PLUGIN_ID,
-              scope: 'global',
-              displayName: PLUGIN_DISPLAY_NAME,
-              version: currentSelfVersion,
-              repositoryUrl: SELF_REPO_URL,
-              receipt: null,
-            };
+          const existingSelf = installedSelf || {
+            dir: PLUGIN_ID, name: PLUGIN_ID, scope: 'global', displayName: PLUGIN_DISPLAY_NAME,
+            version: currentSelfVersion, repositoryUrl: SELF_REPO_URL, receipt: null,
+          };
           const rawResult = await resolveAndStageGithubUpdate({
             loc: existingSelf,
             catPlugin: selfPlugin,
@@ -2260,6 +2382,7 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
               ...(targetRef ? { targetRef, updateKind: 'semver' } : {}),
             },
             confirmEscalation: Boolean(body.confirmEscalation),
+            approvalKey: body.approvalKey,
             prefs,
             configDir,
             dataDir,
@@ -2277,8 +2400,12 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
             plugin: selfPlugin,
             track: selfPlugin._track || 'verified',
             prefs,
-            conflictStrategy: 'replace',
+            preferredDir: installedSelf?.dir || '',
+            requireExistingDir: Boolean(installedSelf),
+            conflictStrategy: 'prompt',
             confirmEscalation: Boolean(body.confirmEscalation),
+            approvalKey: body.approvalKey,
+            rejectDowngrade: true,
             configDir,
             dataDir,
             workspaceUris,
@@ -2302,19 +2429,16 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
       if (pathname === '/api/uninstall' || pathname === '/api/remove-files') {
         const workspaceUris = parseWorkspaceUrisInput(body.workspaceUris);
         const targetDir = String(body.dir || '').trim();
-        if (!lastCatalog) {
-          await ensureCatalogLoaded({ forceCatalogRefresh: false, includeReadmes: false }).catch(() => null);
-        }
-        const matchedCat = findCatalogEntryForDir(targetDir);
+        const catalog = await ensureCatalogLoaded().catch(() => null);
         const out = await uninstallPlugin({
           dir: targetDir,
+          expectedInstall: body.expectedInstall,
           configDir,
           dataDir,
           workspaceUris,
           builtinPluginsDir,
-          catalogCapabilities: matchedCat?.capabilities || null,
+          catalogPlugins: catalog?.plugins || [],
           removeFavorite: Boolean(body.removeFavorite),
-          extraFavoriteKeys: matchedCat?.id ? [matchedCat.id] : [],
           nowMs: nowFn(),
           rmOverride,
           unlinkOverride,
@@ -2323,9 +2447,7 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
           unlinkLinkOverride,
           fetchImpl,
         });
-        if (body.removeFavorite) {
-          prefs = loadPrefsFromDisk(dataDir);
-        }
+        usePrefs(loadPrefsFromDisk(dataDir));
         invalidateUpdateCheckState();
         const state = await buildEnrichedState({ forceCatalogRefresh: false, workspaceUris });
         sendJson(res, 200, { ok: true, ...out, conflictsSummary: state.conflictsSummary, state });
@@ -2345,7 +2467,7 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
     server = createServer((req, res) => {
       handleRequest(req, res).catch((err) => {
         if (!res.headersSent) {
-          sendJson(res, 400, { ok: false, error: err?.message || String(err) });
+          sendRequestError(res, err);
         }
       });
     });
@@ -2406,7 +2528,7 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
    * Fast in-process HTTP request injector for sandboxed tests without TCP loopback dependencies.
    */
   const inject = async ({ method = 'GET', url = '/', headers = {}, body = null } = {}) => {
-    const lowerHeaders = {};
+    const lowerHeaders = { host: '127.0.0.1' };
     for (const [k, v] of Object.entries(headers || {})) {
       lowerHeaders[k.toLowerCase()] = String(v);
     }
@@ -2475,7 +2597,7 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
       await handleRequest(req, res);
     } catch (err) {
       if (!res.headersSent) {
-        sendJson(res, 400, { ok: false, error: err?.message || String(err) });
+        sendRequestError(res, err);
       }
     }
     return donePromise;
@@ -2485,6 +2607,7 @@ function applyIgnoredConflictsFilter(report, ignoredIds = []) {
     server,
     port: actualPort,
     origin,
+    canRestartForDiskUpdate,
     sideToken: generatedSideToken,
     dataDir,
     configDir,

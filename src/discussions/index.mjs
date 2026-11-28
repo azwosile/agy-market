@@ -6,6 +6,7 @@
 //   - Disabled detection via GraphQL `hasDiscussionsEnabled` (with token) or cached REST `has_discussions` (without token)
 // Strictly never logs or persists `prefs.githubToken` to cache files.
 
+import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
@@ -194,6 +195,7 @@ export async function fetchPluginDiscussions({
   inventory = { installed: [] },
   dataDir,
   prefs = {},
+  authenticatedCache = new Map(),
   force = false,
   fetchImpl = defaultProxyFetch,
   nowMs = Date.now(),
@@ -252,118 +254,64 @@ export async function fetchPluginDiscussions({
     };
   }
 
-  // Authenticated path: query GitHub GraphQL API with short cache (never caching token)
-  const cacheDir = getGithubCacheDir(dataDir);
-  const cachePath = join(cacheDir, `discussions-gql-${safeGithubCacheKey(owner, repo)}.json`);
-  const cached = readJsonSafe(cachePath);
+  // Private titles stay in this credential's in-memory session. Old unscoped disk caches are never read.
+  const apiBase = String(githubApiBaseUrl || GITHUB_API_BASE_URL).replace(/\/+$/, '');
+  const cacheKey = createHash('sha256').update(JSON.stringify([token, apiBase, fullName])).digest('hex');
+  const entry = authenticatedCache.get(cacheKey) || {};
+  const base = { ok: true, id: resolved.id, repo: fullName, url: discussionsUrl, newDiscussionUrl,
+    items: [], disabled: false, needsToken: false, rateLimited: false };
+  if (entry.pending) return { ...base, ...await entry.pending };
+  if (!force && entry.data && nowMs - entry.checkedAtMs < ttlMs) return { ...base, ...entry.data };
 
-  if (!force && cached && Number.isFinite(cached.checkedAtMs) && nowMs - cached.checkedAtMs < ttlMs) {
-    return {
-      ok: true,
-      id: resolved.id,
-      repo: fullName,
-      url: discussionsUrl,
-      newDiscussionUrl,
-      items: Array.isArray(cached.items) ? cached.items : [],
-      disabled: Boolean(cached.disabled),
-      needsToken: false,
-      rateLimited: false,
-    };
+  function rejectCached(warning, flags = {}) {
+    authenticatedCache.delete(cacheKey);
+    return { warning, ...flags };
+  }
+  function temporarilyUnavailable(warning, flags = {}) {
+    return { ...entry.data, warning, ...flags };
   }
 
-  const apiBase = String(githubApiBaseUrl || GITHUB_API_BASE_URL).replace(/\/+$/, '');
-  const graphqlEndpoint = `${apiBase}/graphql`;
+  async function query() {
+    try {
+      const res = await activeFetch(`${apiBase}/graphql`, {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json', 'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`, 'User-Agent': 'agy-market-discussions/1.0',
+        },
+        body: JSON.stringify({ query: DISCUSSIONS_GRAPHQL_QUERY, variables: { owner, repo } }),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (res.status === 401) {
+        return rejectCached('GitHub token was rejected (HTTP 401); showing direct Discussions link.',
+          { needsToken: true, tokenRejected: true });
+      }
+      if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        // An empty or ambiguous 403 does not establish that this credential can still see the repository.
+        if (res.status === 429) return temporarilyUnavailable('GitHub GraphQL rate limit reached (HTTP 429).', { rateLimited: true });
+        const warning = `GitHub GraphQL request failed (HTTP ${res.status}).`;
+        if (res.status === 403) return rejectCached(warning, { rateLimited: /rate\s*limit|secondary rate/i.test(body) });
+        return res.status >= 500 ? temporarilyUnavailable(warning) : rejectCached(warning);
+      }
 
-  try {
-    const res = await activeFetch(graphqlEndpoint, {
-      method: 'POST',
-      headers: {
-        Accept: 'application/json',
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`,
-        'User-Agent': 'agy-market-discussions/1.0',
-      },
-      body: JSON.stringify({
-        query: DISCUSSIONS_GRAPHQL_QUERY,
-        variables: { owner, repo },
-      }),
-      signal: AbortSignal.timeout(timeoutMs),
-    });
+      const payload = await res.json().catch(() => null);
+      const errors = Array.isArray(payload?.errors) ? payload.errors : [];
+      if (errors.length) {
+        const warning = redactSecret(errors.map(e => e?.message || 'GraphQL error').join('; '), token);
+        const limited = errors.every(e => {
+          const type = e?.type || e?.extensions?.code;
+          return type ? ['RATE_LIMITED', 'RATE_LIMIT_EXCEEDED'].includes(type) : /rate\s*limit/i.test(e?.message || '');
+        });
+        if (limited) return temporarilyUnavailable(warning, { rateLimited: true });
+        return rejectCached(warning, { disabled: errors.some(e => /discussions.*disabled|not enabled/i.test(e?.message || '')) });
+      }
 
-    if (res.status === 401) {
-      return {
-        ok: true,
-        id: resolved.id,
-        repo: fullName,
-        url: discussionsUrl,
-        newDiscussionUrl,
-        items: [],
-        disabled: false,
-        needsToken: true,
-        rateLimited: false,
-        warning: 'GitHub token was rejected (HTTP 401); showing direct Discussions link.',
-      };
-    }
-
-    if (!res.ok) {
-      const bodyText = await res.text().catch(() => '');
-      const rl = isRateLimitResponse(res, bodyText);
-      return {
-        ok: true,
-        id: resolved.id,
-        repo: fullName,
-        url: discussionsUrl,
-        newDiscussionUrl,
-        items: Array.isArray(cached?.items) ? cached.items : [],
-        disabled: Boolean(cached?.disabled),
-        needsToken: false,
-        rateLimited: rl,
-        warning: rl
-          ? `GitHub GraphQL rate limit reached (HTTP ${res.status}).`
-          : `GitHub GraphQL request failed (HTTP ${res.status}).`,
-      };
-    }
-
-    const payload = await res.json();
-    const gqlErrors = Array.isArray(payload?.errors) ? payload.errors : [];
-    const repoNode = payload?.data?.repository || null;
-
-    if (!repoNode && gqlErrors.length > 0) {
-      const isRl = gqlErrors.some((e) => e?.type === 'RATE_LIMITED' || /rate\s*limit/i.test(String(e?.message || '')));
-      const isDisabledErr = gqlErrors.some((e) => /discussions.*disabled|not enabled/i.test(String(e?.message || '')));
-      return {
-        ok: true,
-        id: resolved.id,
-        repo: fullName,
-        url: discussionsUrl,
-        newDiscussionUrl,
-        items: Array.isArray(cached?.items) && isRl ? cached.items : [],
-        disabled: isDisabledErr,
-        needsToken: false,
-        rateLimited: isRl,
-        warning: redactSecret(gqlErrors.map((e) => e?.message || 'GraphQL error').join('; '), token),
-      };
-    }
-
-    if (!repoNode) {
-      return {
-        ok: true,
-        id: resolved.id,
-        repo: fullName,
-        url: discussionsUrl,
-        newDiscussionUrl,
-        items: [],
-        disabled: true,
-        needsToken: false,
-        rateLimited: false,
-      };
-    }
-
-    const disabled = repoNode.hasDiscussionsEnabled === false;
-    const rawNodes = disabled ? [] : Array.isArray(repoNode.discussions?.nodes) ? repoNode.discussions.nodes : [];
-    const items = rawNodes
-      .filter(Boolean)
-      .map((node) => ({
+      const repository = payload?.data?.repository;
+      const nodes = repository?.discussions?.nodes;
+      const disabled = repository?.hasDiscussionsEnabled === false;
+      if (!disabled && !Array.isArray(nodes)) return rejectCached('GitHub did not return discussion data for this repository.');
+      const items = (disabled ? [] : nodes).filter(Boolean).map(node => ({
         title: String(node.title || ''),
         url: String(node.url || discussionsUrl),
         author: String(node.author?.login || 'ghost'),
@@ -371,39 +319,20 @@ export async function fetchPluginDiscussions({
         updatedAt: String(node.updatedAt || ''),
         ...(node.category?.name ? { category: String(node.category.name) } : {}),
       }));
+      entry.data = { items, disabled };
+      entry.checkedAtMs = nowMs;
+      return entry.data;
+    } catch (err) {
+      return temporarilyUnavailable(redactSecret(`GitHub Discussions query failed: ${err?.message || String(err)}`, token));
+    }
+  }
 
-    writeJsonSafe(cachePath, {
-      schemaVersion: 1,
-      repo: fullName,
-      disabled,
-      items,
-      checkedAt: new Date(nowMs).toISOString(),
-      checkedAtMs: nowMs,
-    });
-
-    return {
-      ok: true,
-      id: resolved.id,
-      repo: fullName,
-      url: discussionsUrl,
-      newDiscussionUrl,
-      items,
-      disabled,
-      needsToken: false,
-      rateLimited: false,
-    };
-  } catch (err) {
-    return {
-      ok: true,
-      id: resolved.id,
-      repo: fullName,
-      url: discussionsUrl,
-      newDiscussionUrl,
-      items: Array.isArray(cached?.items) ? cached.items : [],
-      disabled: Boolean(cached?.disabled),
-      needsToken: false,
-      rateLimited: false,
-      warning: redactSecret(`GitHub Discussions query failed: ${err?.message || String(err)}`, token),
-    };
+  authenticatedCache.set(cacheKey, entry);
+  entry.pending = query();
+  try {
+    return { ...base, ...await entry.pending };
+  } finally {
+    delete entry.pending;
+    if (!entry.data && authenticatedCache.get(cacheKey) === entry) authenticatedCache.delete(cacheKey);
   }
 }

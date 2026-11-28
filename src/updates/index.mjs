@@ -7,9 +7,10 @@
 //       using ETag (`If-None-Match`) + 30-minute TTL caching under `${dataDir}/cache/github`, graceful 403/429
 //       rate-limit degradation, and optional `prefs.githubToken` (strictly never logged or cached).
 
+import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { normalizeRepoUrl } from '../preflight/index.mjs';
+import { findCatalogEntryForLocal, findManagedSuccessor, normalizeRepoUrl, resolveCatalogPluginRoot, samePluginName } from '../preflight/index.mjs';
 import {
   GITHUB_API_BASE_URL,
   PLUGIN_DISPLAY_NAME,
@@ -20,7 +21,7 @@ import {
   UPDATE_CHECK_CACHE_TTL_MS,
 } from '../shared/constants.mjs';
 import { defaultProxyFetch } from '../shared/proxy-fetch.mjs';
-import { computeCapabilityEscalation, parseJsonc, sanitizePrefs } from '../shared/schemas.mjs';
+import { computeCapabilityEscalation, normalizePluginRoot, parseJsonc, sanitizePrefs } from '../shared/schemas.mjs';
 import { compareSemver, isNewerVersion, parseSemver } from '../shared/semver.mjs';
 
 const MAX_CHANGELOG_CHARS = 8000;
@@ -54,6 +55,10 @@ export function safeGithubCacheKey(owner, repo) {
   return `${String(owner || '').toLowerCase()}__${String(repo || '').toLowerCase()}`.replace(/[^a-z0-9_.-]/gi, '_');
 }
 
+function refCacheKey(ref, pluginRoot) {
+  return createHash('sha256').update(JSON.stringify([ref, pluginRoot])).digest('hex');
+}
+
 export function parseGithubRepoSlug(rawUrl) {
   const norm = normalizeRepoUrl(rawUrl);
   if (!norm) return null;
@@ -69,24 +74,21 @@ export function parseGithubRepoSlug(rawUrl) {
   };
 }
 
-function inferRepoSlugFromReceiptId(receiptId) {
-  const id = String(receiptId || '').trim();
-  const m = /^([A-Za-z0-9-]+)__([A-Za-z0-9_.-]+?)(?:--.*)?$/.exec(id);
-  if (!m) return null;
-  const owner = m[1].toLowerCase();
-  const repo = m[2].toLowerCase();
-  return {
-    owner,
-    repo,
-    fullName: `${owner}/${repo}`,
-    url: `https://github.com/${owner}/${repo}`,
-  };
-}
-
 export function isCatalogPluginInstallable(plugin) {
   const tarballUrl = String(plugin?.distribution?.tarballUrl || '').trim();
   const sha256 = String(plugin?.distribution?.sha256 || '').trim();
   return Boolean(tarballUrl && /^[0-9a-f]{64}$/i.test(sha256));
+}
+
+export function isOfficialMarketEntry(plugin) {
+  return plugin?.id === SELF_CATALOG_ID && plugin.canonicalName === PLUGIN_ID &&
+    normalizeRepoUrl(plugin.repository?.url) === SELF_REPO_URL &&
+    normalizePluginRoot(plugin.repository?.pluginRoot) === '.' && !plugin.forceScopedInstall;
+}
+
+export function isForeignMarketInstall(loc) {
+  const repo = normalizeRepoUrl(loc?.receipt?.repositoryUrl || loc?.repositoryUrl);
+  return Boolean((loc?.receipt?.id && loc.receipt.id !== SELF_CATALOG_ID) || (repo && repo !== SELF_REPO_URL));
 }
 
 export function isRateLimitResponse(res, bodyText = '') {
@@ -170,54 +172,24 @@ function buildGithubHeaders(token = '', etag = '') {
 }
 
 export function pickBestGithubReleaseOrTag({ latestRelease = null, highestTag = null } = {}) {
-  if (latestRelease && highestTag) {
-    if (compareSemver(latestRelease.version, highestTag.version) >= 0) {
-      return {
-        version: latestRelease.version,
-        tagName: latestRelease.tagName,
-        source: 'github-release',
-        releaseUrl: latestRelease.releaseUrl,
-        changelog: latestRelease.changelog || '',
-        publishedAt: latestRelease.publishedAt || null,
-      };
-    }
-    return {
-      version: highestTag.version,
-      tagName: highestTag.tagName,
-      source: 'github-tag',
-      releaseUrl: highestTag.releaseUrl,
-      changelog: '',
-      publishedAt: null,
-    };
-  }
-  if (latestRelease) {
-    return {
-      version: latestRelease.version,
-      tagName: latestRelease.tagName,
-      source: 'github-release',
-      releaseUrl: latestRelease.releaseUrl,
-      changelog: latestRelease.changelog || '',
-      publishedAt: latestRelease.publishedAt || null,
-    };
-  }
-  if (highestTag) {
-    return {
-      version: highestTag.version,
-      tagName: highestTag.tagName,
-      source: 'github-tag',
-      releaseUrl: highestTag.releaseUrl,
-      changelog: '',
-      publishedAt: null,
-    };
-  }
-  return null;
+  if (!latestRelease && !highestTag) return null;
+  const useRelease = latestRelease && (!highestTag || compareSemver(latestRelease.version, highestTag.version) >= 0);
+  const best = useRelease ? latestRelease : highestTag;
+  return {
+    version: best.version,
+    tagName: best.tagName,
+    source: useRelease ? 'github-release' : 'github-tag',
+    releaseUrl: best.releaseUrl,
+    changelog: useRelease ? best.changelog || '' : '',
+    publishedAt: useRelease ? best.publishedAt || null : null,
+  };
 }
 
-function readRateLimitState(cacheDir) {
+export function readRateLimitState(cacheDir) {
   return readJsonSafe(join(cacheDir, '_ratelimit.json'));
 }
 
-function writeRateLimitState(cacheDir, { resetAtMs, authenticated, nowMs }) {
+export function writeRateLimitState(cacheDir, { resetAtMs, authenticated, nowMs }) {
   writeJsonSafe(join(cacheDir, '_ratelimit.json'), {
     schemaVersion: 1,
     resetAtMs,
@@ -226,7 +198,7 @@ function writeRateLimitState(cacheDir, { resetAtMs, authenticated, nowMs }) {
   });
 }
 
-function isRateLimitBackoffActive(rateLimitState, { nowMs, authenticated }) {
+export function isRateLimitBackoffActive(rateLimitState, { nowMs, authenticated }) {
   if (!rateLimitState || !Number.isFinite(rateLimitState.resetAtMs)) return false;
   // Adding a GitHub token immediately lifts an unauthenticated rate-limit pause
   if (!rateLimitState.authenticated && authenticated) return false;
@@ -279,15 +251,6 @@ function encodePathSegments(rawPath) {
     .filter(Boolean)
     .map((seg) => encodeURIComponent(seg))
     .join('/');
-}
-
-function normalizePluginRootForUpdate(rawRoot = '.') {
-  const s = String(rawRoot || '.')
-    .trim()
-    .replace(/\\/g, '/')
-    .replace(/^\.\/+/, '')
-    .replace(/\/+$/, '');
-  return s || '.';
 }
 
 function decodeXmlEntities(raw) {
@@ -425,7 +388,7 @@ export async function probeGithubBranchAtom({
   timeoutMs = DEFAULT_GITHUB_TIMEOUT_MS,
 }) {
   const activeFetch = resolveEffectiveFetch(fetchImpl);
-  const normRoot = normalizePluginRootForUpdate(pluginRoot);
+  const normRoot = normalizePluginRoot(pluginRoot);
   const subPart = normRoot !== '.' ? `/${encodePathSegments(normRoot)}` : '';
   const refSeg = encodePathSegments(branch || 'HEAD');
   const url = `https://github.com/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/commits/${refSeg}${subPart}.atom`;
@@ -468,11 +431,13 @@ async function probeRawPluginManifest({
   repo,
   ref,
   pluginRoot = '.',
+  token = '',
+  githubApiBaseUrl = GITHUB_API_BASE_URL,
   fetchImpl = defaultProxyFetch,
   timeoutMs = 4000,
 }) {
   const activeFetch = resolveEffectiveFetch(fetchImpl);
-  const normRoot = normalizePluginRootForUpdate(pluginRoot);
+  const normRoot = normalizePluginRoot(pluginRoot);
   const candidates =
     normRoot !== '.'
       ? [`${normRoot}/plugin.json`, `${normRoot}/.antigravity-plugin/plugin.json`]
@@ -480,11 +445,21 @@ async function probeRawPluginManifest({
 
   let saw404 = false;
   let sawError = false;
-  for (const relPath of candidates) {
-    const url = `https://raw.githubusercontent.com/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${encodeURIComponent(ref)}/${encodePathSegments(relPath)}`;
+  const requests = candidates.map(path => ({
+    url: `https://raw.githubusercontent.com/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${encodeURIComponent(ref)}/${encodePathSegments(path)}`,
+    headers: { 'User-Agent': 'agy-market-updater/1.0' },
+  }));
+  if (token) {
+    const base = githubApiBaseUrl.replace(/\/+$/, '');
+    requests.unshift(...candidates.map(path => ({
+      url: `${base}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${encodePathSegments(path)}?ref=${encodeURIComponent(ref)}`,
+      headers: { ...buildGithubHeaders(token), Accept: 'application/vnd.github.raw+json' },
+    })));
+  }
+  for (const { url, headers } of requests) {
     try {
       const res = await activeFetch(url, {
-        headers: { 'User-Agent': 'agy-market-updater/1.0' },
+        headers,
         signal: AbortSignal.timeout(timeoutMs),
       });
       if (res.status === 404 || res.status === 410) {
@@ -525,6 +500,8 @@ async function probeRawManifestVersion({
   repo,
   commitSha,
   pluginRoot = '.',
+  token = '',
+  githubApiBaseUrl = GITHUB_API_BASE_URL,
   fetchImpl = defaultProxyFetch,
   timeoutMs = 4000,
 }) {
@@ -533,6 +510,7 @@ async function probeRawManifestVersion({
     repo,
     ref: commitSha,
     pluginRoot,
+    token, githubApiBaseUrl,
     fetchImpl,
     timeoutMs,
   });
@@ -544,6 +522,8 @@ async function probeRawManifestForTagCached({
   repo,
   tagName,
   pluginRoot = '.',
+  token = '',
+  githubApiBaseUrl = GITHUB_API_BASE_URL,
   dataDir,
   force = false,
   fetchImpl = defaultProxyFetch,
@@ -552,9 +532,9 @@ async function probeRawManifestForTagCached({
   timeoutMs = DEFAULT_GITHUB_TIMEOUT_MS,
   shouldPersistCache = () => true,
 }) {
-  const normRoot = normalizePluginRootForUpdate(pluginRoot);
+  const normRoot = normalizePluginRoot(pluginRoot);
   const cacheDir = dataDir ? getGithubCacheDir(dataDir) : '';
-  const tagSlug = `${tagName}__${normRoot}`.toLowerCase().replace(/[^a-z0-9_.-]/gi, '_');
+  const tagSlug = refCacheKey(tagName, normRoot) + (token ? '-auth' : '');
   const cachePath = cacheDir ? join(cacheDir, `raw-${safeGithubCacheKey(owner, repo)}-${tagSlug}.json`) : '';
   const cached = cachePath ? readJsonSafe(cachePath) : null;
 
@@ -567,6 +547,7 @@ async function probeRawManifestForTagCached({
     repo,
     ref: tagName,
     pluginRoot: normRoot,
+    token, githubApiBaseUrl,
     fetchImpl,
     timeoutMs: Math.min(timeoutMs, 5000),
   });
@@ -612,17 +593,22 @@ export async function probeGithubBranchHead({
   const cleanPrefs = sanitizePrefs(prefs);
   const token = cleanPrefs.githubToken;
   const authenticated = Boolean(token);
-  const normRoot = normalizePluginRootForUpdate(pluginRoot);
+  const normRoot = normalizePluginRoot(pluginRoot);
   const requestedBranch = String(branch || '').trim() || 'HEAD';
   const cacheDir = getGithubCacheDir(dataDir);
-  const branchSlug = `${requestedBranch}__${normRoot}`.toLowerCase().replace(/[^a-z0-9_.-]/gi, '_');
+  const branchSlug = refCacheKey(requestedBranch, normRoot);
   const cachePath = join(cacheDir, `branch-${safeGithubCacheKey(owner, repo)}-${branchSlug}.json`);
-  const cached = readJsonSafe(cachePath);
+  // Older subdirectory entries mixed whole-archive SHAs with path-limited commit history.
+  const stored = readJsonSafe(cachePath);
+  const cached = stored?.schemaVersion === 4 ? stored : null;
+  const installedSha = String(installedCommitSha || '').trim().toLowerCase();
   const apiBase = String(githubApiBaseUrl || GITHUB_API_BASE_URL).replace(/\/+$/, '');
   const fullName = `${owner}/${repo}`;
 
-  if (!force && cached && Number.isFinite(cached.checkedAtMs) && nowMs - cached.checkedAtMs < ttlMs) {
+  if (!force && cached && (cached.installedCommitSha === installedSha || cached.head?.commitSha === installedSha) &&
+      Number.isFinite(cached.checkedAtMs) && nowMs - cached.checkedAtMs < ttlMs) {
     return {
+      checked: Boolean(cached.head),
       head: cached.head || null,
       fromCache: true,
       rateLimited: false,
@@ -643,10 +629,7 @@ export async function probeGithubBranchHead({
 
   // Layer 1: GitHub REST API commit check (with ETag 304)
   if (!rateLimited) {
-    const apiUrl =
-      normRoot !== '.'
-        ? `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/commits?sha=${encodeURIComponent(requestedBranch)}&path=${encodeURIComponent(normRoot)}&per_page=1`
-        : `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/commits/${encodeURIComponent(requestedBranch)}`;
+    const apiUrl = `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/commits/${encodeURIComponent(requestedBranch)}`;
     try {
       const res = await activeFetch(apiUrl, {
         headers: buildGithubHeaders(token, apiEtag),
@@ -668,6 +651,7 @@ export async function probeGithubBranchHead({
             remoteVersion: head?.commitSha === sha ? head.remoteVersion || '' : '',
           };
           apiEtag = res.headers?.get?.('etag') || '';
+          atomEtag = '';
           anySuccess = true;
         }
       } else if (res.status === 403 || res.status === 429) {
@@ -690,7 +674,6 @@ export async function probeGithubBranchHead({
       owner,
       repo,
       branch: resolvedBranch || requestedBranch,
-      pluginRoot: normRoot,
       etag: atomEtag,
       fetchImpl: activeFetch,
       timeoutMs,
@@ -706,15 +689,18 @@ export async function probeGithubBranchHead({
         remoteVersion: head?.commitSha === atomRes.commitSha ? head.remoteVersion || '' : '',
       };
       atomEtag = atomRes.etag || '';
+      apiEtag = '';
       anySuccess = true;
     } else {
       const gitRefs = await probeGithubGitRefs({ owner, repo, fetchImpl: activeFetch, timeoutMs });
       if (gitRefs) {
         const targetBranch =
           requestedBranch !== 'HEAD' ? requestedBranch : gitRefs.defaultBranch || 'main';
-        const sha = gitRefs.heads.get(targetBranch) || gitRefs.headSha || '';
+        const sha = gitRefs.heads.get(targetBranch) || (requestedBranch === 'HEAD' ? gitRefs.headSha : '');
         if (/^[0-9a-f]{40}$/.test(sha)) {
           resolvedBranch = targetBranch;
+          apiEtag = '';
+          atomEtag = '';
           head = {
             commitSha: sha,
             message: head?.commitSha === sha ? head.message || '' : '',
@@ -723,14 +709,52 @@ export async function probeGithubBranchHead({
             remoteVersion: head?.commitSha === sha ? head.remoteVersion || '' : '',
           };
           anySuccess = true;
+        } else if (requestedBranch !== 'HEAD') {
+          head = null;
+          warnings.push(`Tracked branch "${requestedBranch}" was not advertised by ${fullName}.`);
         }
       }
     }
   }
 
+  // Receipts identify the archived repository commit. When the branch moves,
+  // check the selected directory at both immutable revisions before offering an update.
+  if (anySuccess && normRoot !== '.' && installedSha && head?.commitSha && head.commitSha !== installedSha) {
+    const previous = cached?.head;
+    if (previous?.commitSha === head.commitSha && cached.installedCommitSha === installedSha &&
+        typeof previous.subtreeChanged === 'boolean') {
+      head = { ...head, subtreeChanged: previous.subtreeChanged };
+    } else {
+      const lastChangeAt = async sha => {
+        if (!rateLimited) {
+          const url = new URL(`${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/commits`);
+          url.search = new URLSearchParams({ sha, path: normRoot, per_page: '1' });
+          try {
+            const res = await activeFetch(url.href, { headers: buildGithubHeaders(token), signal: AbortSignal.timeout(timeoutMs) });
+            if (res.ok) {
+              const id = (await res.json())?.[0]?.sha;
+              if (FULL_COMMIT_SHA_RE.test(id)) return id.toLowerCase();
+            }
+          } catch { /* Try the immutable revision's Atom history. */ }
+        }
+        return (await probeGithubBranchAtom({ owner, repo, branch: sha, pluginRoot: normRoot, fetchImpl: activeFetch, timeoutMs }))?.commitSha || '';
+      };
+      const [installedChange, latestChange] = await Promise.all([lastChangeAt(installedSha), lastChangeAt(head.commitSha)]);
+      if (installedChange && latestChange) {
+        head = { ...head, subtreeChanged: installedChange !== latestChange };
+      } else {
+        anySuccess = false;
+        head = { ...head, subtreeChanged: null };
+        warnings.push(`Could not verify changes to ${normRoot} in ${fullName}.`);
+      }
+    }
+  } else if (head) {
+    head = { ...head, subtreeChanged: null };
+  }
+
   // Optional raw `plugin.json` version lookup when commit SHA changed
   if (
-    head?.commitSha &&
+    anySuccess && head?.subtreeChanged !== false && head?.commitSha &&
     installedCommitSha &&
     head.commitSha.toLowerCase() !== String(installedCommitSha).trim().toLowerCase() &&
     !head.remoteVersion
@@ -740,6 +764,7 @@ export async function probeGithubBranchHead({
       repo,
       commitSha: head.commitSha,
       pluginRoot: normRoot,
+      token, githubApiBaseUrl,
       fetchImpl: activeFetch,
       timeoutMs: Math.min(4000, timeoutMs),
     });
@@ -748,14 +773,15 @@ export async function probeGithubBranchHead({
     }
   }
 
-  if (anySuccess && shouldPersistCache()) {
+  if ((anySuccess || cached) && shouldPersistCache()) {
     writeJsonSafe(cachePath, {
-      schemaVersion: 1,
+      schemaVersion: 4,
+      installedCommitSha: installedSha,
       repo: fullName,
       branch: resolvedBranch || requestedBranch,
       pluginRoot: normRoot,
       checkedAt: new Date(nowMs).toISOString(),
-      checkedAtMs: nowMs,
+      checkedAtMs: anySuccess ? nowMs : null,
       resolvedBranch,
       apiEtag,
       atomEtag,
@@ -765,6 +791,7 @@ export async function probeGithubBranchHead({
 
   return {
     head,
+    checked: anySuccess && Boolean(head),
     fromCache: false,
     rateLimited,
     warning: warnings.length > 0 ? warnings.join(' ') : null,
@@ -802,6 +829,7 @@ export async function probeGithubRepoUpdates({
   // 1. Local TTL cache hit when not forced
   if (!force && cached && Number.isFinite(cached.checkedAtMs) && nowMs - cached.checkedAtMs < ttlMs) {
     return {
+      checked: true,
       latest: pickBestGithubReleaseOrTag(cached),
       fromCache: true,
       rateLimited: false,
@@ -821,6 +849,7 @@ export async function probeGithubRepoUpdates({
         ? redirectFallback
         : cached?.latestRelease || null;
     return {
+      checked: false, // The redirect cannot verify tags during rate limiting.
       latest: pickBestGithubReleaseOrTag({ latestRelease: mergedRelease, highestTag: cached?.highestTag || null }),
       fromCache: Boolean(cached) && !redirectFallback,
       rateLimited: true,
@@ -952,12 +981,12 @@ export async function probeGithubRepoUpdates({
   // Persist sanitized cache (strictly zero secrets/tokens).
   // Mirrors dsh-market's partial-failure rule: preserve confirmed data, but do not stamp a fresh
   // 30-min TTL when a sub-probe failed so the next refresh can retry immediately.
-  if (anySuccess && shouldPersistCache()) {
+  if ((anySuccess || cached) && shouldPersistCache()) {
     writeJsonSafe(cachePath, {
       schemaVersion: 1,
       repo: fullName,
       checkedAt: new Date(nowMs).toISOString(),
-      checkedAtMs: partialFailure ? Number(cached?.checkedAtMs || 0) : nowMs,
+      checkedAtMs: partialFailure ? null : nowMs,
       releaseEtag,
       tagsEtag,
       latestRelease,
@@ -966,45 +995,12 @@ export async function probeGithubRepoUpdates({
   }
 
   return {
+    checked: anySuccess && !partialFailure,
     latest: pickBestGithubReleaseOrTag({ latestRelease, highestTag }),
     fromCache: false,
     rateLimited,
     warning: warnings.length > 0 ? warnings.join(' ') : null,
   };
-}
-
-function findMatchingCatalogPlugin(loc, catalogPlugins) {
-  const list = Array.isArray(catalogPlugins) ? catalogPlugins : [];
-
-  if (loc.receipt) {
-    const recRepoId = Number(loc.receipt.repositoryId || 0);
-    const byReceipt = list.find((p) => {
-      const pRepoId = Number(p?.repository?.repositoryId || 0);
-      if (recRepoId > 0 && pRepoId > 0) {
-        return pRepoId === recRepoId && p.id === loc.receipt.id;
-      }
-      return p.id === loc.receipt.id;
-    });
-    if (byReceipt) return byReceipt;
-  }
-
-  if (loc.repositoryUrl) {
-    const locRoot = normalizePluginRootForUpdate(loc.receipt?.pluginRoot || '.');
-    const byRepo = list.find((p) => {
-      const pRepo = normalizeRepoUrl(p?.repository?.url);
-      if (!pRepo || pRepo !== loc.repositoryUrl) return false;
-      const pRoot = normalizePluginRootForUpdate(p?.repository?.pluginRoot || '.');
-      if (loc.receipt?.pluginRoot && pRoot !== locRoot) return false;
-      return p.canonicalName === loc.name || p.canonicalName === loc.dir;
-    });
-    if (byRepo) return byRepo;
-  }
-
-  if (loc.dir === PLUGIN_ID || loc.name === PLUGIN_ID) {
-    return list.find((p) => p.id === SELF_CATALOG_ID || p.canonicalName === PLUGIN_ID) || null;
-  }
-
-  return null;
 }
 
 const FULL_COMMIT_SHA_RE = /^[0-9a-f]{40}$/i;
@@ -1048,7 +1044,9 @@ function buildUpdateItem({
   installedVersion,
   catPlugin,
   receipt,
+  installedCapabilities = null,
   repositoryUrl = '',
+  repositoryRoot,
   ghSlug,
   ghLatest,
   branchHead = null,
@@ -1068,13 +1066,13 @@ function buildUpdateItem({
   const githubHasUpdate = Boolean(ghLatest && !sameGithubRelease && isNewerVersion(ghLatest.version, installedVersion));
   const resolvedRepoUrl = normalizeRepoUrl(
     catPlugin?.repository?.url ||
-      repositoryUrl ||
       receipt?.repositoryUrl ||
+      repositoryUrl ||
       (ghSlug ? ghSlug.url : '') ||
       (isSelf ? SELF_REPO_URL : ''),
   );
-  const resolvedPluginRoot = normalizePluginRootForUpdate(
-    receipt?.pluginRoot || catPlugin?.repository?.pluginRoot || '.',
+  const resolvedPluginRoot = normalizePluginRoot(
+    receipt?.pluginRoot || catPlugin?.repository?.pluginRoot || repositoryRoot || '.',
   );
 
   // Scenario A: Catalog has a direct-installable update and is not behind GitHub upstream
@@ -1094,7 +1092,7 @@ function buildUpdateItem({
         fallbackUrl = `https://github.com/${ghSlug.fullName}`;
       }
     }
-    const escalation = computeCapabilityEscalation(receipt, catPlugin);
+    const escalation = computeCapabilityEscalation(receipt, catPlugin, installedCapabilities);
     return enforceUpdateItemInvariant({
       id: catPlugin.id,
       dir,
@@ -1136,10 +1134,11 @@ function buildUpdateItem({
   }
 
   // Scenario C: Default-branch / branch-tracked tagless `github-url` plugins (Commit SHA / version diff)
-  if (isGithubUrlTrack && branchHead?.commitSha) {
+  if (isGithubUrlTrack && branchHead?.commitSha && branchHead.subtreeChanged !== false) {
     const installedSha = String(receipt?.commitSha || '').trim().toLowerCase();
     const remoteSha = String(branchHead.commitSha || '').trim().toLowerCase();
     const remoteVersion = String(branchHead.remoteVersion || '').trim();
+    if (remoteVersion && compareSemver(remoteVersion, installedVersion) < 0) return null;
     const versionBumped = Boolean(remoteVersion && isNewerVersion(remoteVersion, installedVersion));
     const commitChanged = Boolean(installedSha && remoteSha && remoteSha !== installedSha);
 
@@ -1197,7 +1196,8 @@ export async function checkPluginUpdates({
   const activeFetch = resolveEffectiveFetch(fetchImpl);
   const checkedAt = new Date(nowMs).toISOString();
   const catalogPlugins = Array.isArray(catalog?.plugins) ? catalog.plugins : [];
-  const globalInstalled = (inventory?.installed || []).filter((loc) => loc.scope === 'global');
+  const globalInstalled = (inventory?.installed || []).filter(loc => loc.scope === 'global')
+    .map(loc => resolveCatalogPluginRoot(loc, catalogPlugins));
 
   const probeMemo = new Map();
   const branchProbeMemo = new Map();
@@ -1235,7 +1235,7 @@ export async function checkPluginUpdates({
         if (!res.fromCache || res.rateLimited) {
           firstLiveChecked = true;
         }
-        return res.latest;
+        return res;
       };
       if (!isGateLeader) {
         return runProbe();
@@ -1263,8 +1263,8 @@ export async function checkPluginUpdates({
         ? loc.receipt.githubSource.ref
         : '') ||
       'HEAD';
-    const pluginRoot = normalizePluginRootForUpdate(loc.receipt?.pluginRoot || '.');
-    const memoKey = `${ghSlug.fullName}|${branch}|${pluginRoot}`;
+    const pluginRoot = normalizePluginRoot(loc.receipt?.pluginRoot || loc.repositoryRoot || '.');
+    const memoKey = JSON.stringify([ghSlug.fullName, branch, pluginRoot, loc.receipt.commitSha || '']);
     if (branchProbeMemo.has(memoKey)) return branchProbeMemo.get(memoKey);
 
     const pending = (async () => {
@@ -1287,7 +1287,7 @@ export async function checkPluginUpdates({
       });
       if (res.rateLimited) rateLimited = true;
       if (res.warning) warnings.push(res.warning);
-      return res.head;
+      return res;
     })();
     branchProbeMemo.set(memoKey, pending);
     return pending;
@@ -1295,14 +1295,15 @@ export async function checkPluginUpdates({
 
   function probeRawManifestOnce(ghSlug, tagName, pluginRoot = '.') {
     if (!ghSlug || !tagName) return Promise.resolve(null);
-    const normRoot = normalizePluginRootForUpdate(pluginRoot);
-    const memoKey = `${ghSlug.fullName}|${tagName}|${normRoot}`;
+    const normRoot = normalizePluginRoot(pluginRoot);
+    const memoKey = JSON.stringify([ghSlug.fullName, tagName, normRoot]);
     if (rawManifestMemo.has(memoKey)) return rawManifestMemo.get(memoKey);
     const pending = probeRawManifestForTagCached({
       owner: ghSlug.owner,
       repo: ghSlug.repo,
       tagName,
       pluginRoot: normRoot,
+      token: prefs?.githubToken || '', githubApiBaseUrl,
       dataDir,
       force,
       fetchImpl: activeFetch,
@@ -1319,6 +1320,8 @@ export async function checkPluginUpdates({
   let sawInstalledSelf = false;
   let selfUpdate = null;
 
+  const uncheckedDirs = new Set();
+  const unavailableDirs = new Set();
   const probeSlots = new Array(globalInstalled.length);
   let nextSlot = 0;
   const workerCount = Math.min(UPDATE_PROBE_CONCURRENCY, globalInstalled.length);
@@ -1327,36 +1330,41 @@ export async function checkPluginUpdates({
     while (nextSlot < globalInstalled.length) {
       const idx = nextSlot++;
       const loc = globalInstalled[idx];
-      const isSelf = loc.dir === PLUGIN_ID || loc.name === PLUGIN_ID || loc.receipt?.id === SELF_CATALOG_ID;
+      const isSelf = samePluginName(loc.dir, PLUGIN_ID);
       if (isSelf) sawInstalledSelf = true;
+      if (!loc.receipt && loc.inferredRepository) {
+        uncheckedDirs.add(loc.dir);
+        continue;
+      }
 
       // Issue #3A: Exclude native `.git` clones and unversioned unmanaged plugins from update checks
-      if (!isSelf && isUnmanagedNonUpdatableLocal(loc)) {
+      if (isUnmanagedNonUpdatableLocal(loc) || (isSelf ? isForeignMarketInstall(loc) : findManagedSuccessor(loc, globalInstalled))) {
         probeSlots[idx] = null;
         continue;
       }
 
-      const catPlugin = findMatchingCatalogPlugin(loc, catalogPlugins);
+      const catPlugin = isSelf ? catalogPlugins.find(isOfficialMarketEntry) :
+        findCatalogEntryForLocal(loc, catalogPlugins, inventory.installed);
       const ghSlug =
+        (isSelf && parseGithubRepoSlug(SELF_REPO_URL)) ||
         parseGithubRepoSlug(catPlugin?.repository?.url) ||
-        parseGithubRepoSlug(loc.repositoryUrl) ||
-        inferRepoSlugFromReceiptId(loc.receipt?.id) ||
-        (isSelf ? parseGithubRepoSlug(SELF_REPO_URL) : null);
+        parseGithubRepoSlug(loc.receipt?.repositoryUrl || loc.repositoryUrl);
 
-      const rawGhLatest = await probeOnce(ghSlug);
-      let ghLatest = rawGhLatest;
+      if (!isSelf && (loc.repositoryRoot === null || (!catPlugin && !ghSlug))) {
+        uncheckedDirs.add(loc.dir);
+        continue;
+      }
+      const repoProbe = await probeOnce(ghSlug);
+      let ghLatest = repoProbe?.latest || null;
+      let incomplete = Boolean(repoProbe && !repoProbe.checked);
 
-      // Issue #2B: For unreceipted & non-catalog plugins (e.g. monorepo plugins like upstash/context7),
-      // verify raw `<tag>/<resolvedPluginRoot>/plugin.json` exists, matches plugin name, and declares a newer version.
+      const resolvedRoot = normalizePluginRoot(loc.receipt?.pluginRoot || loc.repositoryRoot || '.');
+      const manualSource = !loc.receipt && !catPlugin;
+      // Repository tags order releases, but a monorepo child's version belongs to its manifest.
       if (
-        ghLatest &&
-        !loc.receipt &&
-        !catPlugin &&
-        !isSelf &&
-        ghSlug &&
-        isNewerVersion(ghLatest.version, loc.version)
+        ghLatest && !isSelf && ghSlug &&
+        (resolvedRoot !== '.' || (manualSource && isNewerVersion(ghLatest.version, loc.version)))
       ) {
-        const resolvedRoot = normalizePluginRootForUpdate(loc.receipt?.pluginRoot || '.');
         const rawMeta = await probeRawManifestOnce(ghSlug, ghLatest.tagName, resolvedRoot);
         const localNames = new Set(
           [loc.name, loc.dir].filter(Boolean).map((s) => String(s).trim().toLowerCase()),
@@ -1365,8 +1373,13 @@ export async function checkPluginUpdates({
         const remoteVersion = String(rawMeta?.version || '').trim();
         const nameMatches = Boolean(remoteName && localNames.has(remoteName));
         const versionIsNewer = Boolean(remoteVersion && isNewerVersion(remoteVersion, loc.version));
-        if (!rawMeta?.found || !nameMatches || !versionIsNewer) {
+        if (rawMeta?.transientError) incomplete = true;
+        else if (loc.implicitRepositoryRoot && (!rawMeta?.found || !nameMatches)) uncheckedDirs.add(loc.dir);
+        if (!rawMeta?.found || (manualSource && !nameMatches) || !remoteVersion ||
+            (resolvedRoot === '.' && !versionIsNewer)) {
           ghLatest = null;
+        } else if (resolvedRoot !== '.') {
+          ghLatest = { ...ghLatest, version: remoteVersion };
         }
       }
 
@@ -1374,9 +1387,12 @@ export async function checkPluginUpdates({
         loc.receipt?.track === 'github-url' &&
           !isSelf &&
           ghSlug &&
-          (loc.receipt?.githubSource?.refType === 'branch' || (!ghLatest && Boolean(loc.receipt?.commitSha))),
+          (loc.receipt?.githubSource?.refType === 'branch' || (!repoProbe?.latest && Boolean(loc.receipt?.commitSha))),
       );
-      const branchHead = shouldProbeBranch ? await probeBranchOnce(ghSlug, loc) : null;
+      const branchProbe = shouldProbeBranch ? await probeBranchOnce(ghSlug, loc) : null;
+      if (branchProbe && !branchProbe.checked) incomplete = true;
+      // Unlike a newer SemVer, a cached, different SHA can be an ancestor of the installed commit.
+      const branchHead = branchProbe?.checked ? branchProbe.head : null;
       const fallbackId = catPlugin?.id || loc.receipt?.id || (ghSlug ? `${ghSlug.owner}__${ghSlug.repo}` : loc.dir);
 
       const item = buildUpdateItem({
@@ -1386,13 +1402,19 @@ export async function checkPluginUpdates({
         installedVersion: loc.version,
         catPlugin,
         receipt: loc.receipt || null,
+        installedCapabilities: loc.capabilities || {},
         repositoryUrl: loc.repositoryUrl || '',
+        repositoryRoot: loc.repositoryRoot,
         ghSlug,
         ghLatest,
         branchHead,
         isSelf,
       });
 
+      if (!item && incomplete) {
+        uncheckedDirs.add(loc.dir);
+        unavailableDirs.add(loc.dir);
+      }
       probeSlots[idx] = { isSelf, item };
     }
   }
@@ -1425,9 +1447,9 @@ export async function checkPluginUpdates({
 
   // If `agy-market` is not present inside `configDir/plugins/` (e.g., dev/sandbox run), still check self against PLUGIN_VERSION
   if (!sawInstalledSelf) {
-    const selfCat = catalogPlugins.find((p) => p.id === SELF_CATALOG_ID || p.canonicalName === PLUGIN_ID) || null;
+    const selfCat = catalogPlugins.find(isOfficialMarketEntry) || null;
     const selfSlug = parseGithubRepoSlug(selfCat?.repository?.url) || parseGithubRepoSlug(SELF_REPO_URL);
-    const selfGhLatest = await probeOnce(selfSlug);
+    const selfProbe = await probeOnce(selfSlug);
     const selfItem = buildUpdateItem({
       id: selfCat?.id || SELF_CATALOG_ID,
       dir: PLUGIN_ID,
@@ -1437,9 +1459,13 @@ export async function checkPluginUpdates({
       receipt: null,
       repositoryUrl: selfCat?.repository?.url || SELF_REPO_URL,
       ghSlug: selfSlug,
-      ghLatest: selfGhLatest,
+      ghLatest: selfProbe?.latest,
       isSelf: true,
     });
+    if (!selfItem && selfProbe && !selfProbe.checked) {
+      uncheckedDirs.add(PLUGIN_ID);
+      unavailableDirs.add(PLUGIN_ID);
+    }
     if (selfItem) {
       selfUpdate = {
         id: selfItem.id,
@@ -1470,6 +1496,8 @@ export async function checkPluginUpdates({
     items,
     selfUpdate,
     rateLimited,
+    uncheckedDirs: [...uncheckedDirs].sort(),
+    unavailableDirs: [...unavailableDirs].sort(),
     warnings: [...new Set(warnings)],
   };
 }

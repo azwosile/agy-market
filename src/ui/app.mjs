@@ -24,6 +24,12 @@ function formatV(ver) {
   return `v${cleaned}`;
 }
 
+function renderCardVersion(from, to = '', commitDelta = '') {
+  const full = formatV(from) + (to ? ' → ' + formatV(to) : '') + commitDelta;
+  const compact = full.replace(/(v\d+\.\d+\.\d+)-git\.\d{14}\.[0-9a-f]{7,40}\b/gi, '$1 · git');
+  return `<span class="${to || commitDelta ? 'version-delta' : 'version-tag'}" title="${escapeHtml(full)}">${escapeHtml(compact)}</span>`;
+}
+
 const SELF_OFFER_DISMISSED_KEY = 'agy-market-self-offer-dismissed';
 const HERO_COLLAPSED_KEY = 'agy-market-hero-collapsed';
 const FAVS_SHELF_COLLAPSED_KEY = 'agy-market-favs-shelf-collapsed';
@@ -126,6 +132,8 @@ const state = {
   prefsSaving: false, // true only while a /api/prefs request is in flight (Track 2 toggle lock)
   visibleLimit: 48, // incremental Discover page window
   discoverFilterKey: '',
+  catalogError: '',
+  detailReadmeError: '',
   loading: false, // loadState(false) sets loading=true synchronously on boot; default false keeps idle VM harnesses unlocked
   busyId: '',
   togglingDir: '',
@@ -227,8 +235,12 @@ let updatesRequestSeq = 0;
 let readmeRequestSeq = 0;
 let githubInspectSeq = 0;
 let stateRequestSeq = 0;
+// A workspace refresh can supersede the opening request while the host resolves its workspace URIs.
+let panelOpening = ''; // '' | 'pending' | 'requested'
 let prefsRequestSeq = 0;
 let prefsInFlight = 0;
+let credentialSavesInFlight = 0;
+let refreshAfterPrefs = false;
 const prefsLastSeq = Object.create(null);
 let lastForcedUpdatesAt = 0;
 let loadMoreObserver = null;
@@ -237,6 +249,7 @@ let lastFiltered = { key: '', pluginsRef: null, totalLen: 0, plugins: null };
 let searchDebounceTimer = null;
 let isComposingSearch = false;
 let lastRenderedTab = 'discover';
+let lastDrawerKey = '';
 
 function isSelfBannerVisible() {
   const su = state.updates.selfUpdate;
@@ -258,6 +271,8 @@ function isPluginMutationBusy() {
       state.batchUpdating ||
       state.selfUpdateBusy ||
       state.removingDir ||
+      state.togglingDir ||
+      state.fixingKey ||
       (state.githubUrlModal && state.githubUrlModal.phase === 'installing'),
   );
 }
@@ -279,6 +294,52 @@ function getFetchImpl() {
   );
 }
 
+// Keep backend diagnostics stable for CLI callers while presenting actionable UI messages.
+const apiErrorMessages = {
+  ERR_EMPTY_URL: ['请粘贴 GitHub 仓库链接。', 'Paste a GitHub repository URL.'],
+  ERR_INVALID_URL: ['请输入完整的 GitHub HTTPS 链接。', 'Enter a complete GitHub HTTPS URL.'],
+  ERR_UNSUPPORTED_URL_HOST: ['请使用 github.com 或 codeload.github.com 的 HTTPS 链接。', 'Use an HTTPS URL on github.com or codeload.github.com.'],
+  ERR_INVALID_GITHUB_REPO_URL: ['链接须包含仓库所有者和仓库名。', 'Include the repository owner and name in the URL.'],
+  ERR_INVALID_GITHUB_OWNER: ['请检查链接中的 GitHub 所有者名称。', 'Check the GitHub owner name in the URL.'],
+  ERR_INVALID_GITHUB_REPO: ['请检查链接中的 GitHub 仓库名。', 'Check the GitHub repository name in the URL.'],
+  ERR_INVALID_CODELOAD_URL: ['请粘贴仓库主页或完整的 tar.gz 下载链接。', 'Paste the repository homepage or a complete tar.gz download URL.'],
+  ERR_UNSUPPORTED_ARCHIVE_FORMAT: ['请改用仓库主页、.tar.gz 或 .tgz 链接。', 'Use the repository homepage or a .tar.gz or .tgz archive.'],
+  ERR_UNSUPPORTED_GITHUB_URL_PATH: ['请使用仓库主页、插件子目录或发行归档链接。', 'Use the repository homepage, a plugin subdirectory, or a release archive URL.'],
+  ERR_GITHUB_REPO_NOT_FOUND: ['仓库不存在或无法访问。私有仓库需要在设置中配置有读取权限的 GitHub Token。', 'Repository not found or inaccessible. For a private repository, configure a GitHub token with read access in Settings.'],
+  ERR_HOST_DISABLED: ['请先在反重力设置中重新启用这个插件。', 'Re-enable this plugin in Antigravity Settings first.'],
+  ERR_DOWNLOAD_TOO_LARGE: ['下载文件超过了配置的大小上限。', 'The download exceeds the configured size limit.'],
+  ERR_NOT_GZIP_ARCHIVE: ['下载内容不是有效的 gzip 归档。请检查下载源。', 'The download is not a valid gzip archive. Check the download source.'],
+  ERR_NO_TARBALL_URL: ['目录条目缺少归档下载链接。', 'The catalog entry has no archive download URL.'],
+  ERR_MISSING_EXPECTED_SHA256: ['目录条目缺少有效的 SHA-256 校验值。', 'The catalog entry has no valid SHA-256 digest.'],
+  INTEGRITY_SHA256_MISMATCH: ['归档的 SHA-256 校验失败，安装已中止。', 'The archive failed SHA-256 verification. Installation stopped.'],
+  ERR_TARBALL_DOWNLOAD_FAILED: ['归档下载失败，请检查网络和下载源。', 'Archive download failed. Check your network and download source.'],
+  ERR_GITHUB_DOWNLOAD_FAILED: ['无法下载 GitHub 归档，请检查网络、访问权限与版本。', 'Could not download the GitHub archive. Check network access, repository permissions and the selected revision.'],
+  ERR_INVALID_INSPECT_TOKEN: ['请重新预检仓库，再继续安装。', 'Inspect the repository again before installing.'],
+  ERR_INSPECT_TOKEN_EXPIRED: ['预检已过期，请重新预检。', 'The inspection expired. Inspect the repository again.'],
+  ERR_CANNOT_REPLACE_SELF: ['市场本体只能从官方来源更新。请为其他插件选择隔离安装。', 'Only official updates can replace AGY Market. Choose an isolated install for another plugin.'],
+  ERR_PLUGIN_NOT_FOUND: ['找不到所选插件，请刷新列表。', 'The selected plugin could not be found. Refresh the list.'],
+  ERR_UNINSTALL_TARGET_CHANGED: ['待卸载的本地副本已变化，请刷新后重新选择。', 'The local copy changed. Refresh Installed and select it again.'],
+  ERR_TARGET_DIR_EXISTS: ['目标目录已被占用。请检查本地副本后重试。', 'The destination is occupied. Check the local copies before retrying.'],
+  ERR_UPDATE_TARGET_MISMATCH: ['所选目录与插件来源不一致。请刷新已安装列表。', 'The selected directory and plugin source do not match. Refresh Installed.'],
+  ERR_REPLACEMENT_TARGET_CHANGED: ['待替换的副本已变化，请重新预检并确认。', 'The copy to replace has changed. Review the conflict again.'],
+  ERR_MUTATION_BUSY: ['已有插件操作正在进行，请稍后重试。', 'Another plugin operation is in progress. Try again when it finishes.'],
+};
+
+function localizeApiError(result) {
+  if (!result?.error) return;
+  const codes = String(result.error).match(/\b(?:ERR_[A-Z0-9_]+|INTEGRITY_SHA256_MISMATCH)\b/g) || [];
+  if (result.errorCode) codes.unshift(result.errorCode);
+  // Download errors can wrap a specific integrity, size or format error.
+  for (const code of codes.reverse()) {
+    const message = apiErrorMessages[code];
+    if (message) {
+      result.errorCode ||= code;
+      result.error = t(...message);
+      return;
+    }
+  }
+}
+
 async function apiFetch(path, { method = 'GET', body = null } = {}) {
   const token = getBootToken();
   const headers = {};
@@ -292,8 +353,10 @@ async function apiFetch(path, { method = 'GET', body = null } = {}) {
     body: body !== null ? JSON.stringify(body) : undefined,
   });
   const data = await res.json().catch(() => ({ ok: false, error: `HTTP ${res.status}` }));
+  localizeApiError(data);
+  if (Array.isArray(data?.results)) data.results.forEach(localizeApiError);
   if (!res.ok && !data.status && !Array.isArray(data.results)) {
-    throw new Error(data.error || `HTTP ${res.status}`);
+    throw Object.assign(new Error(data.error || `HTTP ${res.status}`), { code: data.errorCode });
   }
   return data;
 }
@@ -491,6 +554,10 @@ function syncFavoritesFromServerState() {
 }
 
 function getLocalFavoriteKey(loc, catEntry = null) {
+  if (loc?.scope === 'global' && !catEntry && loc.receipt?.id && isFavoritedKey(loc.receipt.id) &&
+      !state.serverState?.catalog?.plugins?.some(p => p.id === loc.receipt.id) &&
+      matchesFavoriteSource(loc.receipt.id, loc.receipt.repositoryUrl || loc.repositoryUrl, loc.receipt.pluginRoot || loc.repositoryRoot)) return loc.receipt.id;
+  if (loc?.favoriteKey && (loc.scope !== 'global' || !catEntry || isFavoritedKey(loc.favoriteKey))) return loc.favoriteKey;
   if (catEntry?.id) return String(catEntry.id);
   if (loc?.receipt?.id) return String(loc.receipt.id);
   return loc?.dir ? `local:${loc.dir}` : '';
@@ -504,10 +571,10 @@ function isPluginDirFavorited(dir, extraFavKey = '') {
   if (extraFavKey && isFavoritedKey(extraFavKey)) return true;
   const cleanDir = String(dir || '').trim();
   if (!cleanDir) return false;
-  if (isFavoritedKey(`local:${cleanDir}`) || isFavoritedKey(cleanDir)) return true;
   const loc = getInstalledByDirMap().get(cleanDir) || null;
+  if (loc?.favoriteKey && isFavoritedKey(loc.favoriteKey)) return true;
   const { byId: catById, byDir: catByDir } = getCatalogMaps();
-  const catEntry = (loc?.receipt?.id && catById.get(loc.receipt.id)) || catByDir.get(cleanDir) || null;
+  const catEntry = catalogEntryForInstalled(loc, catById, catByDir);
   if (catEntry?.id && isFavoritedKey(catEntry.id)) return true;
   if (loc?.receipt?.id && isFavoritedKey(loc.receipt.id)) return true;
   return false;
@@ -789,46 +856,37 @@ function maybeTriggerRestartBanner({
 
   if (!level) return null;
 
-  const existing = state.restartBanner;
-  const sameOp = existing && existing.operation === op;
-  const nextLevel =
-    (sameOp && existing.level === 'host-restart') || level === 'host-restart' ? 'host-restart' : 'reload-pane';
-  const plugins = [...new Set([...(sameOp ? existing.plugins || [] : []), ...(pluginName ? [pluginName] : [])])];
-  const reasons = [...new Set([...(sameOp ? existing.reasons || [] : []), ...(reason ? [reason] : [])])];
-  const prevTargets = sameOp && Array.isArray(existing.patchTargets) ? existing.patchTargets : [];
-  const nextTargets = [...prevTargets];
-  if (needsPatchScript && (pluginDir || pluginName || pluginId)) {
-    const cleanDir = String(pluginDir || '').trim();
-    const loc = cleanDir ? getInstalledByDirMap().get(cleanDir) || null : null;
-    const localPath = cleanDir ? resolvePluginLocalDirPath(cleanDir, loc) : '';
-    const targetKey = cleanDir || pluginId || pluginName;
-    if (!nextTargets.some((item) => (item.dir || item.id || item.name) === targetKey)) {
-      nextTargets.push({
-        dir: cleanDir,
-        id: String(pluginId || '').trim(),
-        name: String(pluginName || cleanDir || pluginId).trim(),
-        path: localPath,
-      });
-    }
+  const key = pluginDir || pluginId || pluginName;
+  const pending = state.restartBanner?.pending || [];
+  const previous = pending.find(item => item.key === key);
+  const replace = op === 'disable' || op === 'uninstall' || !previous ||
+    (needsPatchScript || (!previous.target && (level === 'host-restart' || previous.level !== 'host-restart')));
+  if (replace) {
+    const target = needsPatchScript && key ? {
+      dir: pluginDir, id: pluginId, name: pluginName || key,
+      path: pluginDir ? resolvePluginLocalDirPath(pluginDir, getInstalledByDirMap().get(pluginDir)) : '',
+    } : null;
+    const next = [...pending.filter(item => item.key !== key), { key, op, level, reason, pluginName, target }];
+    const leading = next.find(item => item.target) || next.find(item => item.level === 'host-restart') || next[0];
+    state.restartBanner = {
+      pending: next, operation: leading.op, level: leading.level,
+      plugins: [...new Set(next.map(item => item.pluginName).filter(Boolean))],
+      reasons: [...new Set(next.map(item => item.reason).filter(Boolean))],
+      patchTargets: next.map(item => item.target).filter(Boolean),
+      requiresPatchScript: Boolean(leading.target),
+    };
   }
-  state.restartBanner = {
-    level: nextLevel,
-    operation: op,
-    plugins,
-    reasons,
-    requiresPatchScript: Boolean((sameOp && existing.requiresPatchScript) || needsPatchScript),
-    patchTargets: nextTargets,
-  };
   return { level, reason, requiresPatchScript: needsPatchScript };
 }
 
+function isSelfTarget(dir, id) {
+  return dir ? dir === 'agy-market' : id === 'azwosile__agy-market';
+}
+
 function isSelfPluginIdentity(pluginOrCat, loc = null) {
-  return Boolean(
-    pluginOrCat?.id === 'azwosile__agy-market' ||
-      pluginOrCat?.canonicalName === 'agy-market' ||
-      pluginOrCat?.installStatus?.installedDir === 'agy-market' ||
-      loc?.dir === 'agy-market',
-  );
+  const scope = loc?.scope || pluginOrCat?.installStatus?.scope;
+  return (!scope || scope === 'global') &&
+    isSelfTarget(loc?.dir || pluginOrCat?.installStatus?.installedDir, pluginOrCat?.id);
 }
 
 function sanitizeSelfDescription(text, locale = getLocale()) {
@@ -841,7 +899,7 @@ function sanitizeSelfDescription(text, locale = getLocale()) {
 
 function resolveCatalogDescription(plugin, locale = getLocale()) {
   const rawDesc =
-    typeof plugin?.description === 'object'
+    plugin?.description && typeof plugin.description === 'object'
       ? plugin.description[locale] || plugin.description.zh || plugin.description.en || ''
       : String(plugin?.description || '');
   return isSelfPluginIdentity(plugin) ? sanitizeSelfDescription(rawDesc, locale) : rawDesc;
@@ -931,7 +989,7 @@ function isUpdateEffectiveForLocal(upd, loc = null) {
 }
 
 function findUpdateForLocal(loc, updById, updByDir) {
-  if (!loc || loc.scope !== 'global') return null;
+  if (!loc || loc.scope !== 'global' || installedUpdateNotice(loc)) return null;
   const dir = String(loc.dir || '').trim();
   if (dir && state.verifiedLatestDirs.has(dir)) return null;
   const candidates = [];
@@ -960,7 +1018,7 @@ function findUpdateForLocal(loc, updById, updByDir) {
 }
 
 function hasStaleSafeCatalogUpdate(catEntry, loc = null) {
-  if (!catEntry) return false;
+  if (!catEntry || installedUpdateNotice(loc)) return false;
   if (isLocalPluginUpdateManagedExternally(loc)) return false;
   if (state.updates.checkedAt && !state.updates.error) return false;
   const st = catEntry.installStatus || {};
@@ -987,7 +1045,7 @@ function reconcileUpdatesWithServerState() {
     state.updates.items = state.updates.items.filter((item) => {
       if (!item) return false;
       const itemDir = String(item.dir || '').trim();
-      const isSelfItem = Boolean(item.isSelf || itemDir === 'agy-market' || item.id === 'azwosile__agy-market');
+      const isSelfItem = item.isSelf || isSelfTarget(itemDir, item.id);
       if (itemDir && globalByDir.has(itemDir)) {
         return isUpdateEffectiveForLocal(item, globalByDir.get(itemDir));
       }
@@ -1029,6 +1087,8 @@ function reconcileUpdatesWithServerState() {
 
 function applyServerState(nextState) {
   state.serverState = nextState;
+  state.catalogError = nextState?.catalog?.channelUsed === 'offline-empty' && !nextState.catalog.plugins?.length
+    ? t('目录源暂时不可用', 'Catalog sources are unavailable') : '';
   syncFavoritesFromServerState();
   syncDetailPluginReference();
   reconcileUpdatesWithServerState();
@@ -1054,7 +1114,7 @@ function getEffectiveUpdateItems() {
       changelog: '',
       escalation: u.escalation || null,
       installable: true,
-      isSelf: u.installedDir === 'agy-market' || u.id === 'azwosile__agy-market',
+      isSelf: isSelfTarget(u.installedDir || u.dir, u.id),
     }));
   }
 
@@ -1062,7 +1122,7 @@ function getEffectiveUpdateItems() {
     if (!item) return false;
     const dir = String(item.dir || '').trim();
     if (dir && state.verifiedLatestDirs.has(dir)) return false;
-    const isSelfItem = Boolean(item.isSelf || dir === 'agy-market' || item.id === 'azwosile__agy-market');
+    const isSelfItem = item.isSelf || isSelfTarget(dir, item.id);
     if (isSelfItem && state.verifiedLatestDirs.has('agy-market')) {
       return false;
     }
@@ -1070,7 +1130,7 @@ function getEffectiveUpdateItems() {
     if (hasServerState && dir && !loc && !isSelfItem) {
       return false;
     }
-    return isUpdateEffectiveForLocal(item, loc);
+    return !installedUpdateNotice(loc) && isUpdateEffectiveForLocal(item, loc);
   });
 
   const su = state.updates.selfUpdate;
@@ -1079,7 +1139,7 @@ function getEffectiveUpdateItems() {
     su &&
     selfLoc &&
     !state.verifiedLatestDirs.has('agy-market') &&
-    !base.some((item) => item?.isSelf || item?.dir === 'agy-market' || item?.id === 'azwosile__agy-market')
+    !base.some((item) => item.isSelf || isSelfTarget(item.dir, item.id))
   ) {
     const normalizedSelf = { ...su, id: su.id || 'azwosile__agy-market', dir: 'agy-market', isSelf: true };
     if (isUpdateEffectiveForLocal(normalizedSelf, selfLoc)) {
@@ -1105,7 +1165,7 @@ function getInstallableUpdates() {
 }
 
 function isPluginConfirmedLatest(loc, upd) {
-  if (upd) return false;
+  if (installedUpdateNotice(loc) || upd) return false;
   if (state.updates.loading) return false;
   const dir = String(loc?.dir || loc?.installedDir || '').trim();
   if (!dir) return false;
@@ -1127,24 +1187,25 @@ function markPluginVerifiedLatest(dir, id = '') {
   if (cleanDir) {
     state.verifiedLatestDirs.add(cleanDir);
   }
-  const isSelf = cleanDir === 'agy-market' || cleanId === 'azwosile__agy-market';
+  const isSelf = isSelfTarget(cleanDir, cleanId);
   if (isSelf) {
     state.verifiedLatestDirs.add('agy-market');
     state.updates.selfUpdate = null;
   }
   if (Array.isArray(state.updates.items) && state.updates.items.length > 0) {
     state.updates.items = state.updates.items.filter((item) => {
-      if (cleanDir && item.dir === cleanDir) return false;
+      if (cleanDir && item.dir) return item.dir !== cleanDir;
       if (cleanId && item.id === cleanId) return false;
-      if (isSelf && (item.isSelf || item.dir === 'agy-market' || item.id === 'azwosile__agy-market')) return false;
+      if (isSelf && (item.isSelf || isSelfTarget(item.dir, item.id))) return false;
       return true;
     });
   }
   if (Array.isArray(state.serverState?.updatesAvailable) && state.serverState.updatesAvailable.length > 0) {
     state.serverState.updatesAvailable = state.serverState.updatesAvailable.filter((item) => {
-      if (cleanDir && (item.installedDir === cleanDir || item.dir === cleanDir)) return false;
+      const itemDir = item.installedDir || item.dir;
+      if (cleanDir && itemDir) return itemDir !== cleanDir;
       if (cleanId && item.id === cleanId) return false;
-      if (isSelf && (item.installedDir === 'agy-market' || item.dir === 'agy-market' || item.id === 'azwosile__agy-market')) {
+      if (isSelf && isSelfTarget(itemDir, item.id)) {
         return false;
       }
       return true;
@@ -1157,8 +1218,7 @@ function getCatalogMaps() {
   const byDir = new Map();
   for (const p of state.serverState?.catalog?.plugins || []) {
     byId.set(p.id, p);
-    if (p.installStatus?.installedDir) byDir.set(p.installStatus.installedDir, p);
-    if (p.canonicalName && !byDir.has(p.canonicalName)) byDir.set(p.canonicalName, p);
+    if (p.installStatus?.installed && p.installStatus.installedDir) byDir.set(p.installStatus.installedDir, p);
   }
   return { byId, byDir };
 }
@@ -1172,6 +1232,12 @@ function getInstalledByDirMap() {
     }
   }
   return byDir;
+}
+
+function catalogEntryForInstalled(loc, byId, byDir) {
+  if (loc?.scope !== 'global') return null;
+  if (loc.catalogId !== undefined) return byId.get(loc.catalogId) || null;
+  return byDir.get(loc.dir) || byId.get(loc.receipt?.id) || null;
 }
 
 function getConflictsSummary() {
@@ -1192,10 +1258,44 @@ function getConflictsSummary() {
   return { total: 0, critical: 0, warning: 0, info: 0, healthyCount: installedCount, ignoredCount: 0 };
 }
 
+function localDetailAttrs(loc) {
+  return `data-action="detail-local" data-dir="${escapeHtml(loc.dir)}" data-scope="${escapeHtml(loc.scope || 'global')}" data-path="${escapeHtml(loc.path || '')}"`;
+}
+
+function findSelectedLocal({ dir, scope, path }) {
+  return (state.serverState?.installed || []).find(x =>
+    x.dir === dir && (!scope || x.scope === scope) && (!path || x.path === path));
+}
+
 function buildLocalDetailModel(loc, catEntry) {
+  const selection = { dir: loc.dir, scope: loc.scope || 'global', path: loc.path || '' };
+  const installStatus = {
+    ...(catEntry ? catEntry.installStatus : { hasUpdate: false }),
+    scope: selection.scope,
+    installed: true,
+    installedDir: loc.dir,
+    installedVersion: loc.version,
+    enabled: loc.enabled,
+    parkedByMarket: Boolean(loc.parkedByMarket),
+    hostDisabled: Boolean(loc.hostDisabled),
+    canToggle: loc.canToggle ?? (loc.scope === 'global' && loc.dir !== 'agy-market' && !loc.hostDisabled),
+    toggleDisabledReason:
+      loc.toggleDisabledReason ??
+      (loc.dir === 'agy-market' ? 'self' : loc.hostDisabled ? 'host-disabled' : loc.scope !== 'global' ? loc.scope : ''),
+    canUninstall: loc.canUninstall ?? (loc.scope === 'global' && loc.dir !== 'agy-market'),
+    uninstallDisabledReason:
+      loc.uninstallDisabledReason ??
+      (loc.dir === 'agy-market' ? 'self' : loc.scope !== 'global' ? loc.scope : ''),
+    isGitManaged: Boolean(loc.isGitManaged),
+    hasDeclaredVersion: loc.hasDeclaredVersion,
+    unmanagedReason: loc.unmanagedReason || null,
+    hasReceipt: Boolean(loc.receipt),
+    sidecarPane: loc.sidecarPane || catEntry?.installStatus?.sidecarPane || null,
+  };
   if (catEntry) {
     return {
       ...catEntry,
+      _localSelection: selection,
       commitSha: catEntry.commitSha || loc.receipt?.commitSha || '',
       repository: {
         ...(catEntry.repository || {}),
@@ -1204,28 +1304,7 @@ function buildLocalDetailModel(loc, catEntry) {
       },
       capabilities: catEntry.capabilities || loc.capabilities || loc.receipt?.grantedCapabilities || { badges: [] },
       activation: catEntry.activation || loc.activation,
-      installStatus: {
-        ...(catEntry.installStatus || {}),
-        installed: true,
-        installedDir: loc.dir,
-        installedVersion: loc.version,
-        enabled: loc.enabled,
-        parkedByMarket: Boolean(loc.parkedByMarket),
-        hostDisabled: Boolean(loc.hostDisabled),
-        canToggle: loc.canToggle ?? (loc.scope === 'global' && loc.dir !== 'agy-market' && !loc.hostDisabled),
-        toggleDisabledReason:
-          loc.toggleDisabledReason ??
-          (loc.dir === 'agy-market' ? 'self' : loc.hostDisabled ? 'host-disabled' : loc.scope !== 'global' ? loc.scope : ''),
-        canUninstall: loc.canUninstall ?? (loc.scope === 'global' && loc.dir !== 'agy-market'),
-        uninstallDisabledReason:
-          loc.uninstallDisabledReason ??
-          (loc.dir === 'agy-market' ? 'self' : loc.scope !== 'global' ? loc.scope : ''),
-        isGitManaged: Boolean(loc.isGitManaged),
-        hasDeclaredVersion: loc.hasDeclaredVersion,
-        unmanagedReason: loc.unmanagedReason || null,
-        hasReceipt: Boolean(loc.receipt),
-        sidecarPane: loc.sidecarPane || catEntry.installStatus?.sidecarPane || null,
-      },
+      installStatus,
       _track: loc.receipt?.track || catEntry._track || 'verified',
     };
   }
@@ -1256,49 +1335,27 @@ function buildLocalDetailModel(loc, catEntry) {
     },
     capabilities: loc.capabilities || loc.receipt?.grantedCapabilities || { badges: [] },
     activation: loc.activation || null,
-    installStatus: {
-      installed: true,
-      installedDir: loc.dir,
-      installedVersion: loc.version,
-      scope: loc.scope || 'global',
-      enabled: loc.enabled,
-      parkedByMarket: Boolean(loc.parkedByMarket),
-      hostDisabled: Boolean(loc.hostDisabled),
-      canToggle: loc.canToggle ?? (loc.scope === 'global' && loc.dir !== 'agy-market' && !loc.hostDisabled),
-      toggleDisabledReason:
-        loc.toggleDisabledReason ??
-        (loc.dir === 'agy-market' ? 'self' : loc.hostDisabled ? 'host-disabled' : loc.scope !== 'global' ? loc.scope : ''),
-      canUninstall: loc.canUninstall ?? (loc.scope === 'global' && loc.dir !== 'agy-market'),
-      uninstallDisabledReason:
-        loc.uninstallDisabledReason ??
-        (loc.dir === 'agy-market' ? 'self' : loc.scope !== 'global' ? loc.scope : ''),
-      isGitManaged: Boolean(loc.isGitManaged),
-      hasDeclaredVersion: loc.hasDeclaredVersion,
-      unmanagedReason: loc.unmanagedReason || null,
-      hasReceipt: Boolean(loc.receipt),
-      hasUpdate: false,
-      sidecarPane: loc.sidecarPane || null,
-    },
+    installStatus,
     _track: loc.receipt?.track || 'local',
     _localOnly: true,
+    _localSelection: selection,
   };
 }
 
 function syncDetailPluginReference() {
   if (!state.detailPlugin) return;
-  const fresh = (state.serverState?.catalog?.plugins || []).find((p) => p.id === state.detailPlugin.id);
-  if (fresh) {
-    state.detailPlugin = fresh;
-    return;
+  const p = state.detailPlugin;
+  const { byId, byDir } = getCatalogMaps();
+  if (p._localSelection) {
+    const loc = findSelectedLocal(p._localSelection);
+    const catEntry = catalogEntryForInstalled(loc, byId, byDir);
+    state.detailPlugin = loc ? buildLocalDetailModel(loc, catEntry) : null;
+  } else {
+    state.detailPlugin = byId.get(p.id) || null;
   }
-  const dir = state.detailPlugin.installStatus?.installedDir;
-  if (dir) {
-    const loc = (state.serverState?.installed || []).find((x) => x.dir === dir);
-    if (loc) {
-      state.detailPlugin = buildLocalDetailModel(loc, null);
-    } else if (state.detailPlugin._localOnly) {
-      state.detailPlugin = null;
-    }
+  const current = state.detailPlugin;
+  if (current && detailSourceKey(p) !== detailSourceKey(current)) {
+    void openPluginDetail(current, state.detailTab);
   }
 }
 
@@ -1324,23 +1381,37 @@ async function loadState(forceRefresh = false) {
         body: { workspaceUris: state.workspaceUris },
       });
     } else {
-      const qs = state.workspaceUris.length
-        ? `?workspaceUris=${encodeURIComponent(state.workspaceUris.join(','))}`
-        : '';
-      nextState = await apiFetch(`/api/state${qs}`);
+      const qs = new URLSearchParams();
+      if (state.workspaceUris.length) qs.set('workspaceUris', state.workspaceUris.join(','));
+      if (panelOpening === 'pending') {
+        qs.set('panelOpen', '1');
+        panelOpening = 'requested';
+      }
+      nextState = await apiFetch(qs.size ? `/api/state?${qs}` : '/api/state');
     }
     if (seq !== stateRequestSeq) return;
     // Do not overwrite newer optimistic or committed prefs with a stale /api/state snapshot.
-    if (prefsInFlight > 0 || prefsRequestSeq !== startPrefsSeq) return;
+    if (prefsInFlight > 0 || prefsRequestSeq !== startPrefsSeq) {
+      if (forceRefresh || !state.serverState) {
+        if (prefsInFlight) refreshAfterPrefs = true;
+        else await loadState(forceRefresh);
+      }
+      return;
+    }
     applyServerState(nextState);
   } catch (err) {
     if (seq === stateRequestSeq) {
+      state.catalogError = err?.message || String(err);
       showToast(`${t('加载失败', 'Load failed')}: ${err?.message || String(err)}`, { tone: 'danger' });
     }
   } finally {
     if (seq === stateRequestSeq) {
       state.loading = false;
       render();
+      if (panelOpening && !prefsInFlight && !refreshAfterPrefs) {
+        panelOpening = '';
+        await checkUpdates(false, { silent: true });
+      }
     }
   }
 }
@@ -1389,6 +1460,7 @@ async function loadConflicts({ silent = true } = {}) {
 }
 
 async function triggerFixConflict({ type, targetDir, suggestedDir = '' }) {
+  if (isPluginMutationBusy()) return;
   const fixKey = `${type}:${targetDir}`;
   state.fixingKey = fixKey;
   render();
@@ -1472,6 +1544,7 @@ async function triggerIgnoreConflict(conflictId, ignored) {
       state.conflicts.data = {
         ...state.conflicts.data,
         items: nextItems,
+        uncheckedDirs: res.uncheckedDirs || [],
         summary: res.conflictsSummary || state.conflicts.data.summary,
       };
     }
@@ -1494,7 +1567,7 @@ async function triggerIgnoreConflict(conflictId, ignored) {
 }
 
 async function triggerTogglePlugin(dir, nextEnabled) {
-  if (!dir || dir === 'agy-market') return;
+  if (!dir || dir === 'agy-market' || isPluginMutationBusy()) return;
   state.togglingDir = dir;
   render();
   try {
@@ -1521,25 +1594,11 @@ async function triggerTogglePlugin(dir, nextEnabled) {
       const label = nextEnabled
         ? t(`已启用插件「${dir}」`, `Enabled "${dir}"`)
         : t(`已将「${dir}」移入停放仓并禁用`, `Parked & disabled "${dir}"`);
-      const hasLockedOrRetired =
-        Boolean(res.lockedOnDisable) ||
-        (Array.isArray(res.retiredBinaries) && res.retiredBinaries.length > 0);
-      if (hasLockedOrRetired) {
-        maybeTriggerRestartBanner({
-          pluginName: dir,
-          operation: 'toggle',
-          restartRequired: true,
-          retiredBinaries: res.retiredBinaries || [],
-          lockedOnDisable: Boolean(res.lockedOnDisable),
-          activation: res.activation || null,
-        });
-      }
+      const banner = maybeTriggerRestartBanner({
+        ...res, pluginName: dir, pluginDir: dir, operation: nextEnabled ? 'enable' : 'disable',
+      });
       showToast(label, {
-        subtext: hasLockedOrRetired
-          ? t('检测到后台进程占用句柄，重启 Antigravity 后即可彻底释放', 'Background handle lock detected; restart Antigravity to release')
-          : nextEnabled
-            ? t('宿主热监听将在约 1 秒内加载其技能与侧边栏', 'Antigravity hot-watcher will activate skills/Sidebar shortly')
-            : t('仍保留在列表中支持版本检测与一键恢复', 'Kept in Installed list for update checks & 1-click re-enable'),
+        subtext: banner?.reason || (nextEnabled ? '' : t('仍可在已安装列表中重新启用', 'You can re-enable it from Installed')),
         tone: 'ok',
       });
     } else {
@@ -1566,6 +1625,7 @@ async function triggerUninstallPlugin(dir, { removeFavorite = false, displayName
       method: 'POST',
       body: {
         dir: cleanDir,
+        expectedInstall: state.removeConfirmModal?.expectedInstall,
         removeFavorite: Boolean(removeFavorite),
         workspaceUris: state.workspaceUris,
       },
@@ -1665,14 +1725,17 @@ async function toggleFavorite(key, displayName = '') {
   render();
 
   try {
+    const catalogEntry = state.serverState?.catalog?.plugins?.find(plugin => plugin.id === cleanKey);
     const res = await apiFetch('/api/favorites', {
       method: 'POST',
-      body: { key: cleanKey, favorite: !wasFav },
+      body: { key: cleanKey, favorite: !wasFav, workspaceUris: state.workspaceUris,
+        ...(catalogEntry ? { plugin: { id: cleanKey, repository: catalogEntry.repository, _feedUrl: catalogEntry._feedUrl, _track: catalogEntry._track } } : {}) },
     });
     if (Array.isArray(res?.favorites)) {
       state.favorites = [...new Set(res.favorites.map((x) => String(x || '').trim()).filter(Boolean))];
       if (state.serverState?.prefs) {
         state.serverState.prefs.favorites = state.favorites;
+        if (res.favoriteSources) state.serverState.prefs.favoriteSources = res.favoriteSources;
       }
       render();
     }
@@ -1690,6 +1753,7 @@ async function toggleFavorite(key, displayName = '') {
     if (state.serverState?.prefs) {
       state.serverState.prefs.favorites = prev;
     }
+    render();
     showToast(`${t('收藏状态保存失败', 'Failed to save favorite')}: ${err?.message || String(err)}`, {
       tone: 'danger',
       durationMs: 5000,
@@ -1734,7 +1798,7 @@ async function openSiblingSidecarPane({ dir, folder, viewPath, title, uri }) {
 
   // Standalone external browser mode only: ask backend loopback CDP helper to wake host Sidebar.
   try {
-    await apiFetch('/api/open-pane', {
+    const result = await apiFetch('/api/open-pane', {
       method: 'POST',
       body: {
         dir: cleanDir,
@@ -1744,8 +1808,10 @@ async function openSiblingSidecarPane({ dir, folder, viewPath, title, uri }) {
         uri: paneUri,
       },
     });
+    const message = getLocale() === 'en' ? result.messageEn : result.messageZh;
+    if (message) showToast(message, { tone: result.opened ? 'ok' : 'info' });
   } catch {
-    /* ignore when external CDP hub is unavailable */
+    showToast(t(`请在反重力侧栏的「+ → Plugins」中打开 ${safeTitle}`, `Open ${safeTitle} from + → Plugins in the Antigravity sidebar.`), { tone: 'warn' });
   }
 }
 
@@ -1772,6 +1838,8 @@ async function checkUpdates(force = false, { silent = true, allowWhileBusy = fal
         loading: false,
         checkedAt: res.checkedAt || new Date().toISOString(),
         items: nextItems,
+        uncheckedDirs: res.uncheckedDirs || [],
+        unavailableDirs: res.unavailableDirs || [],
         selfUpdate: nextSelfUpdate,
         rateLimited: Boolean(res.rateLimited),
         warnings: Array.isArray(res.warnings) ? res.warnings : [],
@@ -1786,12 +1854,13 @@ async function checkUpdates(force = false, { silent = true, allowWhileBusy = fal
       }
       if (!silent) {
         const count = getEffectiveUpdateItems().length;
-        showToast(
-          count > 0
-            ? t(`检查完成：发现 ${count} 个插件更新`, `Update check complete: ${count} update(s) found`)
-            : t('所有已安装插件均为最新版本', 'All installed plugins are up to date'),
-          { tone: 'ok' },
-        );
+        const missed = state.updates.uncheckedDirs.length;
+        const message = count > 0
+          ? t(`发现 ${count} 个更新`, `Found ${count} update(s)`)
+          : noUpdatesMessage();
+        showToast(count && missed
+          ? t(`${message}，另有 ${missed} 个插件未能完成检查`, `${message}. Could not check ${missed} other plugin(s).`)
+          : message, { tone: missed ? 'warn' : 'ok' });
       }
     } else {
       state.updates.loading = false;
@@ -1811,13 +1880,36 @@ async function checkUpdates(force = false, { silent = true, allowWhileBusy = fal
   }
 }
 
+function resyncRequest(loc, catalogPlugin) {
+  const receipt = loc?.receipt;
+  const targetVersion = loc?.version || catalogPlugin?.installStatus?.installedVersion || '';
+  const versionMatchesReceipt = loc?.legacyRepoTagVersion || !receipt?.installedVersion || compareSemver(targetVersion, receipt.installedVersion) === 0;
+  const useCatalog = catalogPlugin && !receipt?.githubSource && receipt?.track !== 'github-url' &&
+    compareSemver(targetVersion, catalogPlugin.version) === 0 &&
+    !(receipt?.commitSha && catalogPlugin.commitSha && receipt.commitSha !== catalogPlugin.commitSha);
+  if (useCatalog) return { forceResync: true, updateChannel: 'catalog', targetVersion };
+
+  const source = receipt?.githubSource;
+  const gitTag = versionMatchesReceipt && receipt?.gitTag;
+  const commit = versionMatchesReceipt && receipt?.commitSha;
+  const trackedBranch = source?.trackBranch || (source?.refType === 'branch' && source.ref !== 'HEAD' ? source.ref : '');
+  const targetRef = (trackedBranch && commit) || gitTag || commit;
+  return {
+    forceResync: true,
+    updateChannel: receipt?.track === 'github-url' ? 'github-url' : 'github-upstream',
+    targetVersion,
+    ...(targetRef ? { targetRef, updateKind: targetRef === commit ? 'commit' : 'semver' } : {}),
+    ...(trackedBranch ? { trackBranch: trackedBranch } : {}),
+  };
+}
+
 async function triggerInstall(
   plugin,
-  { conflictStrategy = 'prompt', confirmEscalation = false, forceResync = false, dir = '', _internalDelegated = false } = {},
+  { conflictStrategy = 'prompt', replacementKey = '', confirmEscalation = false, approvalKey = '', forceResync = false, dir = '', _internalDelegated = false } = {},
 ) {
   if (!plugin) return;
   if (!_internalDelegated && isUpdateActionLocked()) return;
-  const isUpdate = Boolean(plugin.installStatus?.installed);
+  const isUpdate = forceResync || Boolean(plugin.installStatus?.installed);
   const pluginName = plugin.displayName || plugin.canonicalName || plugin.id;
   const targetDir = String(dir || plugin.installStatus?.installedDir || '').trim();
   state.busyId = plugin.id;
@@ -1830,10 +1922,12 @@ async function triggerInstall(
       body: {
         id: plugin.id,
         ...(isUpdate ? { dir: targetDir } : {}),
-        ...(forceResync ? { forceResync: true } : {}),
+        ...(forceResync ? resyncRequest(getGlobalInstalledByDirMap().get(targetDir), plugin) : {}),
         plugin,
         conflictStrategy,
+        ...(conflictStrategy === 'replace' && replacementKey ? { replacementKey } : {}),
         confirmEscalation,
+        ...(confirmEscalation && approvalKey ? { approvalKey } : {}),
         workspaceUris: state.workspaceUris,
       },
     });
@@ -1845,6 +1939,7 @@ async function triggerInstall(
     if (res.status === 'CONFLICT_CHOICE_REQUIRED') {
       state.conflictModal = {
         plugin,
+        opts: { dir: targetDir, forceResync, confirmEscalation, approvalKey, replacementKey: res.replacementKey },
         conflict: res.conflict,
         scopedFallbackName: res.scopedFallbackName,
         choices: res.choices || ['isolate'],
@@ -1861,6 +1956,8 @@ async function triggerInstall(
             id: plugin.id,
             dir: targetDir,
             forceResync: Boolean(forceResync),
+            conflictStrategy,
+            replacementKey,
             displayName: pluginName,
             installedVersion: res.installedVersion || plugin.installStatus?.installedVersion || '?',
             targetVersion: res.targetVersion || plugin.version || '?',
@@ -1927,23 +2024,14 @@ async function triggerInstall(
       await checkUpdates(false, { silent: true, allowWhileBusy: true });
       if (state.conflicts.loaded) void loadConflicts({ silent: true });
     } else {
-      const errMsg = res.error || res.status || t('安装或更新未能完成', 'Install or update did not complete');
-      setErrorBanner({
-        title: t(isUpdate ? '插件更新失败' : '插件安装失败', isUpdate ? 'Plugin Update Failed' : 'Plugin Install Failed'),
-        items: [{ pluginName, message: errMsg }],
-        retryAction: { type: 'install', plugin, opts: { conflictStrategy, confirmEscalation, forceResync, dir: targetDir } },
-      });
-      showToast(
-        `${t(isUpdate ? '更新失败' : '安装失败', isUpdate ? 'Update failed' : 'Install failed')} (${pluginName}): ${errMsg}`,
-        { tone: 'danger', durationMs: 8000 },
-      );
+      throw new Error(res.error || res.status || t('安装或更新未能完成', 'Install or update did not complete'));
     }
   } catch (err) {
     const errMsg = err?.message || String(err);
     setErrorBanner({
       title: t(isUpdate ? '插件更新失败' : '插件安装失败', isUpdate ? 'Plugin Update Failed' : 'Plugin Install Failed'),
       items: [{ pluginName, message: errMsg }],
-      retryAction: { type: 'install', plugin, opts: { conflictStrategy, confirmEscalation, forceResync, dir: targetDir } },
+      retryAction: { type: 'install', plugin, opts: { conflictStrategy, forceResync, dir: targetDir } },
     });
     showToast(
       `${t(isUpdate ? '更新失败' : '安装失败', isUpdate ? 'Update failed' : 'Install failed')} (${pluginName}): ${errMsg}`,
@@ -1955,9 +2043,9 @@ async function triggerInstall(
   }
 }
 
-async function triggerUpdateAll(ids = null, { confirmEscalation = false, _internalDelegated = false } = {}) {
+async function triggerUpdateAll(ids = null, { confirmEscalation = false, approvalKeys = null, _internalDelegated = false } = {}) {
   if (!_internalDelegated && isUpdateActionLocked()) return;
-  let targetIds = Array.isArray(ids) && ids.length ? ids : getInstallableUpdates().map((u) => u.id);
+  let targetIds = Array.isArray(ids) && ids.length ? ids : getInstallableUpdates().map((u) => u.dir || u.id);
   let didLiveCheck = false;
 
   if (!targetIds.length && (!Array.isArray(ids) || ids.length === 0)) {
@@ -1969,7 +2057,7 @@ async function triggerUpdateAll(ids = null, { confirmEscalation = false, _intern
     render();
     didLiveCheck = true;
     await checkUpdates(true, { silent: true, allowWhileBusy: true });
-    targetIds = getInstallableUpdates().map((u) => u.id);
+    targetIds = getInstallableUpdates().map((u) => u.dir || u.id);
     if (!targetIds.length) {
       state.batchUpdating = false;
       state.batchTargetIds = [];
@@ -1980,8 +2068,8 @@ async function triggerUpdateAll(ids = null, { confirmEscalation = false, _intern
           durationMs: 7000,
         });
       } else {
-        showToast(t('全部已安装插件均已是最新版本', 'All installed plugins are already up to date'), {
-          tone: 'ok',
+        showToast(noUpdatesMessage(), {
+          tone: state.updates.uncheckedDirs?.length ? 'warn' : 'ok',
         });
       }
       return;
@@ -1989,8 +2077,8 @@ async function triggerUpdateAll(ids = null, { confirmEscalation = false, _intern
   }
 
   if (!targetIds.length) {
-    showToast(t('全部已安装插件均已是最新版本', 'All installed plugins are already up to date'), {
-      tone: 'ok',
+    showToast(noUpdatesMessage(), {
+      tone: state.updates.uncheckedDirs?.length ? 'warn' : 'ok',
     });
     return;
   }
@@ -1999,7 +2087,7 @@ async function triggerUpdateAll(ids = null, { confirmEscalation = false, _intern
   state.batchResultsAutoClose = null;
   state.batchUpdating = true;
   state.batchTargetIds = targetIds;
-  state.errorBanner = null;
+  if (!Array.isArray(ids)) state.errorBanner = null;
   render();
 
   try {
@@ -2008,6 +2096,7 @@ async function triggerUpdateAll(ids = null, { confirmEscalation = false, _intern
       body: {
         ids: targetIds,
         confirmEscalation,
+        ...(confirmEscalation && approvalKeys ? { approvalKeys } : {}),
         ...(didLiveCheck ? { forceCheck: true } : {}),
         workspaceUris: state.workspaceUris,
       },
@@ -2018,15 +2107,16 @@ async function triggerUpdateAll(ids = null, { confirmEscalation = false, _intern
     }
 
     const results = Array.isArray(res.results) ? res.results : [];
-    if (confirmEscalation && Array.isArray(state.batchResults)) {
-      const merged = new Map(state.batchResults.map((r) => [r.id, r]));
-      for (const r of results) merged.set(r.id, r);
+    if (res.ok === false && results.length === 0) throw new Error(res.error || t('批量更新请求返回异常', 'Batch update returned an error'));
+    if (Array.isArray(ids) && Array.isArray(state.batchResults)) {
+      const merged = new Map(state.batchResults.map((r) => [r.dir || r.installedDir || r.id, r]));
+      for (const r of results) merged.set(r.dir || r.installedDir || r.id, r);
       state.batchResults = [...merged.values()];
     } else {
       state.batchResults = results;
     }
 
-    const { byId: updById } = getUpdateMaps();
+    const { byId: updById, byDir: updByDir } = getUpdateMaps();
     const { byId: catById, byDir: catByDir } = getCatalogMaps();
     const globalByDir = getGlobalInstalledByDirMap();
 
@@ -2036,7 +2126,7 @@ async function triggerUpdateAll(ids = null, { confirmEscalation = false, _intern
         if (!r.alreadyUpToDate && r.status !== 'ALREADY_UP_TO_DATE') {
           const rDir = r.installedDir || r.dir || '';
           const rLoc = rDir ? globalByDir.get(rDir) || null : null;
-          const rCat = (r.id && catById.get(r.id)) || (rDir && catByDir.get(rDir)) || null;
+          const rCat = rLoc ? catalogEntryForInstalled(rLoc, catById, catByDir) : catById.get(r.id);
           const act = resolveActivationInfo(
             r.activation ? { ...(rCat || rLoc || {}), activation: r.activation } : rCat || rLoc || {},
             rCat?.capabilities || rLoc?.capabilities || {},
@@ -2058,15 +2148,16 @@ async function triggerUpdateAll(ids = null, { confirmEscalation = false, _intern
       }
     }
 
-    const escalated = results.filter((r) => r.status === 'CAPABILITY_ESCALATION_CONFIRM_REQUIRED');
-    if (escalated.length > 0 && !confirmEscalation) {
+    const escalated = state.batchResults.filter((r) => r.status === 'CAPABILITY_ESCALATION_CONFIRM_REQUIRED');
+    if (escalated.length > 0) {
       state.escalationModal = {
         mode: 'batch',
         items: escalated.map((r) => {
-          const upd = updById.get(r.id);
+          const upd = updByDir.get(r.dir) || updById.get(r.id);
           const cat = catById.get(r.id);
           return {
             id: r.id,
+            dir: r.dir || r.installedDir,
             displayName: r.displayName || upd?.displayName || cat?.displayName || r.id,
             installedVersion: r.installedVersion || upd?.installedVersion || cat?.installStatus?.installedVersion || '?',
             targetVersion: r.targetVersion || upd?.latestVersion || cat?.version || '?',
@@ -2081,13 +2172,9 @@ async function triggerUpdateAll(ids = null, { confirmEscalation = false, _intern
       state.escalationModal = null;
     }
 
-    const okCount = results.filter((r) => r.ok).length;
-    const failedItems = results.filter((r) => !r.ok && r.status !== 'CAPABILITY_ESCALATION_CONFIRM_REQUIRED');
+    const okCount = state.batchResults.filter((r) => r.ok).length;
+    const failedItems = state.batchResults.filter((r) => !r.ok && r.status !== 'CAPABILITY_ESCALATION_CONFIRM_REQUIRED');
     const failCount = failedItems.length;
-    const selfUpdated = Boolean(
-      res.willRestart || results.some((r) => r.ok && (r.isSelfUpdate || r.installedDir === 'agy-market' || r.id === 'azwosile__agy-market')),
-    );
-
     if (failCount > 0) {
       setErrorBanner({
         title: t(
@@ -2095,22 +2182,17 @@ async function triggerUpdateAll(ids = null, { confirmEscalation = false, _intern
           `Batch update failed: ${failCount} plugin(s) did not complete`,
         ),
         items: failedItems.map((r) => ({
-          pluginName: r.displayName || r.installedDir || r.dir || r.id,
+          pluginName: r.displayName || r.installedDir || r.dir || r.installedDir || r.id,
           message: r.error || r.status || t('更新失败', 'Update failed'),
         })),
-        retryAction: { type: 'update-all', ids: failedItems.map((r) => r.id).filter(Boolean) },
+        retryAction: { type: 'update-all', ids: failedItems.map((r) => r.dir || r.installedDir || r.id).filter(Boolean) },
       });
-    } else if (res.ok === false && results.length === 0) {
-      const errMsg = res.error || t('批量更新请求返回异常', 'Batch update returned an error');
-      setErrorBanner({
-        title: t('批量更新失败', 'Batch Update Failed'),
-        items: [{ pluginName: t('批量更新队列', 'Batch Update Queue'), message: errMsg }],
-        retryAction: { type: 'update-all', ids: targetIds },
-      });
+    } else if (state.errorBanner?.retryAction?.type === 'update-all') {
+      state.errorBanner = null;
     }
 
-    if (selfUpdated) {
-      const selfItem = results.find((r) => r.isSelfUpdate || r.installedDir === 'agy-market' || r.id === 'azwosile__agy-market');
+    if (res.willRestart) {
+      const selfItem = results.find((r) => r.isSelfUpdate || isSelfTarget(r.installedDir || r.dir, r.id));
       startReconnectPolling(selfItem?.version || state.updates.selfUpdate?.latestVersion || '');
       return;
     }
@@ -2125,11 +2207,6 @@ async function triggerUpdateAll(ids = null, { confirmEscalation = false, _intern
         ),
         { tone: 'danger', durationMs: 8000 },
       );
-    } else if (res.ok === false && results.length === 0) {
-      showToast(`${t('批量更新失败', 'Batch update failed')}: ${res.error || t('请求异常', 'Request error')}`, {
-        tone: 'danger',
-        durationMs: 8000,
-      });
     } else if (escalated.length > 0) {
       showToast(
         t(
@@ -2153,10 +2230,15 @@ async function triggerUpdateAll(ids = null, { confirmEscalation = false, _intern
     clearBatchResultsAutoCloseTimer();
     state.batchResultsAutoClose = null;
     const errMsg = err?.message || String(err);
+    const priorFailures = (Array.isArray(ids) ? state.batchResults || [] : [])
+      .filter(r => !r.ok && r.status !== 'CAPABILITY_ESCALATION_CONFIRM_REQUIRED');
     setErrorBanner({
       title: t('批量更新失败', 'Batch Update Failed'),
-      items: [{ pluginName: t('批量更新队列', 'Batch Update Queue'), message: errMsg }],
-      retryAction: { type: 'update-all', ids: targetIds },
+      items: [
+        ...priorFailures.map(r => ({ pluginName: r.displayName || r.dir || r.installedDir || r.id, message: r.error || r.status })),
+        { pluginName: t('批量更新队列', 'Batch Update Queue'), message: errMsg },
+      ],
+      retryAction: { type: 'update-all', ids: [...new Set([...targetIds, ...priorFailures.map(r => r.dir || r.installedDir || r.id)])] },
     });
     showToast(`${t('批量更新失败', 'Batch update error')}: ${errMsg}`, { tone: 'danger', durationMs: 8000 });
   } finally {
@@ -2168,6 +2250,7 @@ async function triggerUpdateAll(ids = null, { confirmEscalation = false, _intern
 
 async function triggerSelfUpdate({
   confirmEscalation = false,
+  approvalKey = '',
   updateChannel = '',
   targetVersion = '',
   latestVersion = '',
@@ -2187,6 +2270,7 @@ async function triggerSelfUpdate({
       workspaceUris: state.workspaceUris,
     };
     if (confirmEscalation) body.confirmEscalation = true;
+    if (confirmEscalation && approvalKey) body.approvalKey = approvalKey;
     if (resolvedChannel) body.updateChannel = resolvedChannel;
     if (resolvedVersion) body.targetVersion = resolvedVersion;
     if (resolvedRef) body.targetRef = resolvedRef;
@@ -2224,18 +2308,7 @@ async function triggerSelfUpdate({
       state.errorBanner = null;
       startReconnectPolling(res.version || resolvedVersion || '');
     } else {
-      const errMsg = res.error || res.status || t('插件市场自更新未完成', 'Self-update did not complete');
-      setErrorBanner({
-        title: t('AGY Market 自更新失败', 'AGY Market Self-Update Failed'),
-        items: [{ pluginName: 'AGY Market', message: errMsg }],
-        retryAction: {
-          type: 'self-update',
-          updateChannel: resolvedChannel,
-          targetVersion: resolvedVersion,
-          targetRef: resolvedRef,
-        },
-      });
-      showToast(`${t('市场更新失败', 'Self-update failed')}: ${errMsg}`, { tone: 'danger', durationMs: 8000 });
+      throw new Error(res.error || res.status || t('插件市场自更新未完成', 'Self-update did not complete'));
     }
   } catch (err) {
     const errMsg = err?.message || String(err);
@@ -2480,7 +2553,9 @@ async function triggerGithubUrlInstall() {
         url: m.url,
         pluginRoot: m.selectedPluginRoot || pluginInfo.pluginRoot || '.',
         installMode: m.installMode || 'native',
+        ...(m.installMode === 'replace' ? { replacementKey: pf.replacementKey } : {}),
         confirmEscalation: Boolean(m.confirmEscalation),
+        ...(m.confirmEscalation && m.inspectResult?.escalation?.approvalKey ? { approvalKey: m.inspectResult.escalation.approvalKey } : {}),
         workspaceUris: state.workspaceUris,
       },
     });
@@ -2493,6 +2568,7 @@ async function triggerGithubUrlInstall() {
       const nextPf = {
         ...(m.inspectResult?.preflight || {}),
         action: 'conflict-prompt',
+        replacementKey: res.replacementKey,
         conflictItem: res.conflict || m.inspectResult?.preflight?.conflictItem || null,
         canReplace:
           Array.isArray(res.choices) &&
@@ -2581,20 +2657,14 @@ async function triggerGithubUrlInstall() {
     }
 
     const errMsg = res.error || res.status || t('通过 GitHub 链接安装失败', 'Install from GitHub URL failed');
-    setErrorBanner({
-      title: t('GitHub 链接安装失败', 'GitHub URL Install Failed'),
-      items: [{ pluginName: pluginLabel, message: errMsg }],
-    });
-    showToast(`${t('安装失败', 'Install failed')} (${pluginLabel}): ${errMsg}`, {
-      tone: 'danger',
-      durationMs: 8000,
-    });
-    if (state.githubUrlModal) {
-      state.githubUrlModal.phase = 'preview';
-      state.githubUrlModal.error = errMsg;
-    }
+    throw Object.assign(new Error(errMsg), { code: res.errorCode || res.status });
   } catch (err) {
     const errMsg = err?.message || String(err);
+    if (err?.code === 'ERR_INSPECT_TOKEN_EXPIRED' || err?.code === 'ERR_INVALID_INSPECT_TOKEN') {
+      openGithubUrlModal(m.url);
+      state.githubUrlModal.error = errMsg;
+      return;
+    }
     setErrorBanner({
       title: t('GitHub 链接安装失败', 'GitHub URL Install Failed'),
       items: [{ pluginName: pluginLabel, message: errMsg }],
@@ -2625,6 +2695,7 @@ async function triggerDirectPluginUpdate({
   preferUpstream = false,
   forceResync = false,
   confirmEscalation = false,
+  approvalKey = '',
   _internalDelegated = false,
 } = {}) {
   if (!_internalDelegated && isUpdateActionLocked()) return;
@@ -2632,10 +2703,16 @@ async function triggerDirectPluginUpdate({
   const targetId = String(id || cleanDir).trim();
   if (!targetId && !cleanDir) return;
   const label = String(displayName || cleanDir || targetId).trim();
+  const notice = installedUpdateNotice(getGlobalInstalledByDirMap().get(cleanDir) || { dir: cleanDir });
+  if (notice) {
+    showToast(notice);
+    return;
+  }
 
-  if (cleanDir === 'agy-market' || targetId === 'azwosile__agy-market') {
+  if (isSelfTarget(cleanDir, targetId)) {
     await triggerSelfUpdate({
       confirmEscalation,
+      approvalKey,
       updateChannel,
       targetRef,
       _internalDelegated: true,
@@ -2648,9 +2725,11 @@ async function triggerDirectPluginUpdate({
   render();
   try {
     const body = {
+      ...(forceResync ? resyncRequest(getGlobalInstalledByDirMap().get(cleanDir), null) : {}),
       id: targetId,
       dir: cleanDir,
       confirmEscalation: Boolean(confirmEscalation),
+      ...(confirmEscalation && approvalKey ? { approvalKey } : {}),
       workspaceUris: state.workspaceUris,
     };
     if (source) body.source = source;
@@ -2660,7 +2739,6 @@ async function triggerDirectPluginUpdate({
     if (trackBranch) body.trackBranch = trackBranch;
     if (repositoryUrl) body.repositoryUrl = repositoryUrl;
     if (preferUpstream) body.preferUpstream = true;
-    if (forceResync) body.forceResync = true;
 
     const res = await apiFetch('/api/update', {
       method: 'POST',
@@ -2711,6 +2789,7 @@ async function triggerDirectPluginUpdate({
             installedCommitSha: escInstalledCommitSha,
             latestCommitSha: escLatestCommitSha,
             escalation: {
+              approvalKey: res.escalation?.approvalKey,
               addedBadges: normEsc.addedBadges,
               addedRemoteDomains: normEsc.addedDomains,
               addedHookEvents: normEsc.addedHooks,
@@ -2745,7 +2824,7 @@ async function triggerDirectPluginUpdate({
       }
       const loc = getGlobalInstalledByDirMap().get(installedDir) || getInstalledByDirMap().get(installedDir) || null;
       const { byId: catById, byDir: catByDir } = getCatalogMaps();
-      const catEntry = (targetId && catById.get(targetId)) || (installedDir && catByDir.get(installedDir)) || null;
+      const catEntry = loc ? catalogEntryForInstalled(loc, catById, catByDir) : catById.get(targetId);
       const act = resolveActivationInfo(
         res.activation ? { ...(catEntry || loc || {}), activation: res.activation } : catEntry || loc || {},
         catEntry?.capabilities || loc?.capabilities || {},
@@ -2774,29 +2853,7 @@ async function triggerDirectPluginUpdate({
       await checkUpdates(false, { silent: true, allowWhileBusy: true });
       if (state.conflicts.loaded) void loadConflicts({ silent: true });
     } else {
-      const errMsg = res.error || res.status || t('插件更新未能完成', 'Plugin update did not complete');
-      setErrorBanner({
-        title: t('插件更新失败', 'Plugin Update Failed'),
-        items: [{ pluginName: label, message: errMsg }],
-        retryAction: {
-          type: 'update-plugin-direct',
-          id: targetId,
-          dir: cleanDir,
-          displayName: label,
-          source,
-          updateChannel,
-          targetRef,
-          updateKind,
-          trackBranch,
-          repositoryUrl,
-          preferUpstream,
-          forceResync: Boolean(forceResync),
-        },
-      });
-      showToast(`${t('更新失败', 'Update failed')} (${label}): ${errMsg}`, {
-        tone: 'danger',
-        durationMs: 8000,
-      });
+      throw new Error(res.error || res.status || t('插件更新未能完成', 'Plugin update did not complete'));
     }
   } catch (err) {
     const errMsg = err?.message || String(err);
@@ -2838,8 +2895,13 @@ async function triggerSyncInstalledPlugin({ dir = '', id = '', displayName = '' 
   const targetId = String(id || cleanDir).trim();
   if (!cleanDir && !targetId) return;
   const label = String(displayName || cleanDir || targetId).trim();
+  const notice = installedUpdateNotice(getGlobalInstalledByDirMap().get(cleanDir) || { dir: cleanDir });
+  if (notice) {
+    showToast(notice);
+    return;
+  }
 
-  if (cleanDir === 'agy-market' || targetId === 'azwosile__agy-market') {
+  if (isSelfTarget(cleanDir, targetId)) {
     state.busyId = cleanDir || targetId;
     state.errorBanner = null;
     render();
@@ -2854,6 +2916,10 @@ async function triggerSyncInstalledPlugin({ dir = '', id = '', displayName = '' 
         return;
       }
       const su = state.updates.selfUpdate || null;
+      if (!su && state.updates.uncheckedDirs?.includes('agy-market')) {
+        showToast(installedUpdateNotice({ dir: 'agy-market' }), { tone: 'warn' });
+        return;
+      }
       if (!su) {
         markPluginVerifiedLatest('agy-market', 'azwosile__agy-market');
         state.busyId = '';
@@ -2896,6 +2962,11 @@ async function triggerSyncInstalledPlugin({ dir = '', id = '', displayName = '' 
     const { byId: updById, byDir: updByDir } = getUpdateMaps();
     const { byId: catById, byDir: catByDir } = getCatalogMaps();
     const loc = getGlobalInstalledByDirMap().get(cleanDir) || getInstalledByDirMap().get(cleanDir) || null;
+    const checkedNotice = installedUpdateNotice(loc || { dir: cleanDir });
+    if (checkedNotice) {
+      showToast(checkedNotice);
+      return;
+    }
     const freshUpd = loc
       ? findUpdateForLocal(loc, updById, updByDir)
       : (() => {
@@ -2903,12 +2974,7 @@ async function triggerSyncInstalledPlugin({ dir = '', id = '', displayName = '' 
           if (!cand || (cleanDir && cand.dir && cand.dir !== cleanDir)) return null;
           return isUpdateEffectiveForLocal(cand, null) ? cand : null;
         })();
-    const catEntry =
-      (freshUpd?.id && catById.get(freshUpd.id)) ||
-      (targetId && catById.get(targetId)) ||
-      (loc?.receipt?.id && catById.get(loc.receipt.id)) ||
-      (cleanDir && catByDir.get(cleanDir)) ||
-      null;
+    const catEntry = loc ? catalogEntryForInstalled(loc, catById, catByDir) : catById.get(freshUpd?.id || targetId);
 
     if (!freshUpd) {
       markPluginVerifiedLatest(cleanDir || loc?.dir || '', catEntry?.id || targetId);
@@ -2981,7 +3047,7 @@ function startReconnectPolling(targetVersion = '') {
           render();
           await loadState(false);
           await checkUpdates(false, { silent: true });
-          if (!state.updates.selfUpdate && !state.updates.error) {
+          if (!state.updates.selfUpdate && !state.updates.error && !state.updates.uncheckedDirs?.includes('agy-market')) {
             state.verifiedLatestDirs.add('agy-market');
           }
           const versionBehind = Boolean(
@@ -3031,6 +3097,23 @@ function startReconnectPolling(targetVersion = '') {
   reconnectTimer = setTimeout(poll, 700);
 }
 
+function detailQuery(plugin) {
+  const qs = new URLSearchParams();
+  const loc = plugin?._localSelection;
+  if (loc?.scope && (loc.scope !== 'global' || (plugin._localOnly && loc.path))) {
+    qs.set('scope', loc.scope);
+    qs.set('dir', loc.dir);
+    if (loc.path) qs.set('localPath', loc.path);
+    if (loc.scope === 'workspace') for (const uri of state.workspaceUris) qs.append('workspace', uri);
+  }
+  return qs;
+}
+
+function detailSourceKey(plugin) {
+  return JSON.stringify([plugin.id, plugin.repository?.url || '', plugin.repository?.pluginRoot || '.',
+    plugin._feedUrl || '', detailQuery(plugin).toString()]);
+}
+
 async function fetchDetailReadme(plugin) {
   if (!plugin) return;
   const seq = ++readmeRequestSeq;
@@ -3038,9 +3121,10 @@ async function fetchDetailReadme(plugin) {
   const dir = plugin.installStatus?.installedDir || plugin.canonicalName || '';
   state.detailReadmeLoading = true;
   state.detailReadmeLocale = locale;
+  state.detailReadmeError = '';
   render();
   try {
-    const qs = new URLSearchParams();
+    const qs = detailQuery(plugin);
     if (plugin.id) qs.set('id', plugin.id);
     if (dir) qs.set('dir', dir);
     qs.set('locale', locale);
@@ -3048,12 +3132,14 @@ async function fetchDetailReadme(plugin) {
     if (seq !== readmeRequestSeq) return;
     if (state.detailPlugin?.id === plugin.id) {
       state.detailReadme = res.markdown || '';
+      if (res.unavailable || res.ok === false) state.detailReadmeError = t('README 暂时无法加载', 'Could not load the README');
       state.detailReadmeLocale = res.locale || locale;
       state.detailReadmeIsZh = Boolean(res.isTranslatedOrNativeZh || hasCjk(res.markdown || ''));
     }
   } catch {
     if (seq === readmeRequestSeq && state.detailPlugin?.id === plugin.id) {
       state.detailReadme = '';
+      state.detailReadmeError = t('README 暂时无法加载', 'Could not load the README');
       state.detailReadmeIsZh = false;
     }
   } finally {
@@ -3079,16 +3165,20 @@ async function openPluginDetail(plugin, initialTab = 'overview') {
 }
 
 async function loadPluginDiscussions(pluginId, force = false) {
-  if (!pluginId) return;
-  const cached = state.discussionsCache[pluginId];
-  if (!force && cached && (cached.loading || cached.data)) {
-    return;
-  }
-  state.discussionsCache[pluginId] = { loading: true, data: cached?.data || null, error: '' };
+  if (!pluginId || state.detailPlugin?.id !== pluginId || credentialSavesInFlight) return;
+  const qs = detailQuery(state.detailPlugin);
+  const cache = state.discussionsCache;
+  const cacheKey = detailSourceKey(state.detailPlugin);
+  qs.set('id', pluginId);
+  if (force) qs.set('force', '1');
+  const cached = cache[cacheKey];
+  // Another panel can switch credentials. On every visit ask the sidecar for its current session's cached result.
+  if (!force && cached?.loading) return;
+  cache[cacheKey] = { loading: true, data: cached?.data || null, error: '' };
   render();
   try {
-    const res = await apiFetch(`/api/discussions?id=${encodeURIComponent(pluginId)}${force ? '&force=1' : ''}`);
-    state.discussionsCache[pluginId] = {
+    const res = await apiFetch(`/api/discussions?${qs}`);
+    cache[cacheKey] = {
       loading: false,
       data: {
         url: res.url || '',
@@ -3097,11 +3187,13 @@ async function loadPluginDiscussions(pluginId, force = false) {
         disabled: Boolean(res.disabled),
         needsToken: Boolean(res.needsToken),
         rateLimited: Boolean(res.rateLimited),
+        warning: res.warning || '',
+        tokenRejected: Boolean(res.tokenRejected),
       },
       error: res.ok === false ? res.error || '' : '',
     };
   } catch (err) {
-    state.discussionsCache[pluginId] = {
+    cache[cacheKey] = {
       loading: false,
       data: null,
       error: err?.message || String(err),
@@ -3148,8 +3240,17 @@ function syncTrack2PillDom({
   }
 }
 
-async function updatePrefs(patch, successMsg = '') {
+const sourceFieldIds = new Set(['net-mode-select', 'mirror-prefix-input', 'primary-url-input', 'custom-feeds-textarea', 'github-token-input']);
+const sourceDraft = new Map();
+
+async function updatePrefs(patch, successMsg = '', submittedDraft = null) {
   const seq = ++prefsRequestSeq;
+  const tokenChanged = 'githubToken' in patch || 'clearGithubToken' in patch;
+  if (tokenChanged) {
+    credentialSavesInFlight++;
+    state.discussionsCache = {};
+    if (state.detailPlugin && state.detailTab === 'discuss') render();
+  }
   if (state.serverState && !state.serverState.prefs) {
     state.serverState.prefs = {};
   }
@@ -3175,16 +3276,22 @@ async function updatePrefs(patch, successMsg = '') {
 
   let rolledBackAny = false;
   try {
-    const nextState = await apiFetch('/api/prefs', {
+    const nextState = await apiFetch(submittedDraft ? '/api/sources' : '/api/prefs', {
       method: 'POST',
       body: { ...patch, workspaceUris: state.workspaceUris },
     });
     if (seq !== prefsRequestSeq) return;
     applyServerState(nextState);
-    if ('githubToken' in patch || 'clearGithubToken' in patch) {
-      state.discussionsCache = {};
+    if (submittedDraft) {
+      for (const [id, value] of submittedDraft) {
+        if (sourceDraft.get(id) === value) sourceDraft.delete(id);
+      }
     }
-    showToast(successMsg || t('已保存源与网络加速设置', 'Saved catalog & mirror preferences'), { tone: 'ok' });
+    const failed = submittedDraft && nextState.catalog?.failedCustomFeeds?.length;
+    showToast(failed
+      ? t(`设置已保存，${failed} 个自定义源未能加载`, `Settings saved. Could not load ${failed} custom feed(s).`)
+      : nextState.catalog?.warnings?.length ? t('设置已保存，目录同步有提示', 'Settings saved with catalog sync notices')
+      : successMsg || t('已保存源与网络加速设置', 'Saved catalog & mirror preferences'), { tone: failed || nextState.catalog?.warnings?.length ? 'warn' : 'ok' });
     if ('locale' in patch && state.detailPlugin) {
       void fetchDetailReadme(state.detailPlugin);
     }
@@ -3202,8 +3309,15 @@ async function updatePrefs(patch, successMsg = '') {
     }
     showToast(`${t('保存失败', 'Save error')}: ${err?.message || String(err)}`, { tone: 'danger' });
   } finally {
+    if (tokenChanged && --credentialSavesInFlight === 0 && state.detailPlugin && state.detailTab === 'discuss') {
+      void loadPluginDiscussions(state.detailPlugin.id);
+    }
     prefsInFlight = Math.max(0, prefsInFlight - 1);
     state.prefsSaving = prefsInFlight > 0;
+    if (!prefsInFlight && refreshAfterPrefs) {
+      refreshAfterPrefs = false;
+      void loadState(true);
+    }
     syncTrack2PillDom({
       saving: state.prefsSaving,
       enabled: Boolean(state.serverState?.prefs?.enableExperimentalTrack2),
@@ -3399,8 +3513,9 @@ function renderToggleSliderHtml({ dir, enabled, canToggle, toggleDisabledReason 
   if (!dir) return '';
   const reason = String(toggleDisabledReason || '');
   const isSelf = dir === 'agy-market' || reason === 'self';
-  const isLocked = isSelf || canToggle === false;
   const isBusy = state.togglingDir === dir;
+  const waiting = !isBusy && isPluginMutationBusy();
+  const isLocked = isSelf || canToggle === false || waiting;
   const isOn = isSelf ? true : Boolean(enabled);
 
   let tooltip = isOn
@@ -3424,6 +3539,8 @@ function renderToggleSliderHtml({ dir, enabled, canToggle, toggleDisabledReason 
   } else if (reason === 'builtin') {
     tooltip = t('Antigravity 内置插件不可停用', 'Built-in Antigravity plugin');
     labelText = t('内置', 'Built-in');
+  } else if (waiting) {
+    tooltip = t('当前插件操作完成后即可切换', 'Available when the current plugin operation finishes');
   }
 
   return `
@@ -3452,6 +3569,62 @@ function renderToggleSliderHtml({ dir, enabled, canToggle, toggleDisabledReason 
   `;
 }
 
+function catalogSearchText(p) {
+  const cap = p.capabilities || {};
+  const labels = (cap.badges || []).flatMap(id => {
+    const spec = getUiBadgeSpec(id);
+    return [id, spec.zh, spec.en, cleanBadgeText(id, cap)];
+  });
+  const categories = (p.taxonomy?.categories || []).flatMap(id =>
+    [id, CATEGORY_LABELS[id]?.zh, CATEGORY_LABELS[id]?.en]);
+  const servers = (cap.mcpServers || []).map(server => typeof server === 'string' ? server : server?.name);
+  return [p.displayName, p.canonicalName, p.scopedName, p.id, resolveCatalogDescription(p, 'zh'),
+    resolveCatalogDescription(p, 'en'), ...categories, ...(p.taxonomy?.tags || []), ...labels, ...servers,
+    ...(cap.mcpRemoteDomains || [])].filter(Boolean).join(' ').toLowerCase();
+}
+
+function pluginRepositoryUrl(plugin) {
+  return plugin.repository?.url || plugin.repositoryUrl || plugin.receipt?.repositoryUrl || '';
+}
+
+function pluginAuthorName(plugin) {
+  const declared = typeof plugin.author === 'string' ? plugin.author : plugin.author?.name;
+  if (typeof declared === 'string' && declared.trim()) return declared.trim();
+  const owner = plugin.repository?.owner;
+  if (typeof owner === 'string' && owner.trim()) return owner.trim();
+  return /^https?:\/\/[^/]+\/([^/?#]+)/i.exec(pluginRepositoryUrl(plugin))?.[1] ||
+    /^(.+?)__/.exec(plugin.id || plugin.receipt?.id || '')?.[1] || '';
+}
+
+function comparePluginAuthors(a, b, locale) {
+  const aName = pluginAuthorName(a);
+  const bName = pluginAuthorName(b);
+  if (Boolean(aName) !== Boolean(bName)) return aName ? -1 : 1;
+  const root = p => String(p.repository?.pluginRoot || p.receipt?.pluginRoot || '.');
+  return aName.localeCompare(bName, locale, { sensitivity: 'base' }) ||
+    String(pluginRepositoryUrl(a)).localeCompare(String(pluginRepositoryUrl(b)), locale) ||
+    root(a).localeCompare(root(b), locale) ||
+    String(a.id || a.dir || '').localeCompare(String(b.id || b.dir || ''), locale);
+}
+
+// Replace only the slots belonging to a shared title. Explicit stars/date sorts keep their primary keys.
+function orderCatalogNamesakes(ordered, sortBy, locale) {
+  const groups = new Map();
+  for (const [slot, plugin] of ordered.entries()) {
+    const name = String(plugin.displayName || plugin.canonicalName || plugin.id || '').trim().toLowerCase();
+    const priority = sortBy === 'stars' ? Number(plugin.repository?.stars || 0) : sortBy === 'updated' ? plugin.updatedAt || '' : '';
+    const key = JSON.stringify([name, priority]);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(slot);
+  }
+  for (const slots of groups.values()) {
+    if (slots.length < 2) continue;
+    const siblings = slots.map(slot => ordered[slot]).sort((a, b) => comparePluginAuthors(a, b, locale));
+    slots.forEach((slot, i) => { ordered[slot] = siblings[i]; });
+  }
+  return ordered;
+}
+
 function getFilteredPlugins() {
   const list = state.serverState?.catalog?.plugins || [];
   const loc = getLocale();
@@ -3463,15 +3636,10 @@ function getFilteredPlugins() {
       if (!cats.includes(state.category)) return false;
     }
     if (!q) return true;
-    const desc = `${resolveCatalogDescription(p, 'zh')} ${resolveCatalogDescription(p, 'en')}`;
-    const catTerms = (p.taxonomy?.categories || [])
-      .map((c) => `${c} ${CATEGORY_LABELS[c]?.zh || ''} ${CATEGORY_LABELS[c]?.en || ''}`)
-      .join(' ');
-    const hay = `${p.displayName || ''} ${p.canonicalName || ''} ${p.scopedName || ''} ${p.id || ''} ${desc} ${catTerms} ${(p.taxonomy?.tags || []).join(' ')} ${(p.capabilities?.badges || []).join(' ')}`.toLowerCase();
-    return hay.includes(q);
+    return catalogSearchText(p).includes(q);
   });
 
-  return sortCatalogPlugins(filtered, { sortBy: state.sortBy, locale: loc });
+  return orderCatalogNamesakes(sortCatalogPlugins(filtered, { sortBy: state.sortBy, locale: loc }), state.sortBy, loc);
 }
 
 function renderRankingMetaPillsHtml(p) {
@@ -3621,6 +3789,12 @@ function renderRestartBanner() {
           '插件已卸载：建议关闭目标侧边栏或刷新 MCP',
           'Plugin uninstalled: close target Sidebar or refresh MCP',
         );
+  } else if (op === 'disable') {
+    bannerTitle = isHostRestart
+      ? t('插件已停用，请重启反重力', 'Plugin disabled. Restart Antigravity.')
+      : t('插件已停用，请关闭对应侧栏或刷新 MCP', 'Plugin disabled. Close its sidebar or refresh MCP.');
+  } else if (op === 'enable' && hasPatchTargets) {
+    bannerTitle = t('插件已启用，请按插件说明应用补丁并重启', 'Plugin enabled. Follow its patch instructions and restart.');
   } else if (hasPatchTargets) {
     bannerTitle =
       op === 'install'
@@ -3636,9 +3810,9 @@ function renderRestartBanner() {
     bannerTitle = isHostRestart
       ? t('安装已完成：请重启 Antigravity 客户端以生效', 'Installed: restart Antigravity to take effect')
       : t('安装已完成：建议重开目标侧边栏或刷新 MCP 生效', 'Installed: reopen Sidebar or refresh MCP');
-  } else if (op === 'toggle') {
+  } else if (op === 'enable') {
     bannerTitle = isHostRestart
-      ? t('状态已切换：请重启 Antigravity 客户端以彻底释放句柄', 'Status updated: restart Antigravity to release file handles')
+      ? t('插件已启用，请重启反重力以生效', 'Plugin enabled. Restart Antigravity to apply.')
       : t('状态已切换：建议重开目标侧边栏或刷新 MCP 生效', 'Status updated: reopen Sidebar or refresh MCP');
   } else {
     bannerTitle = isHostRestart
@@ -3820,6 +3994,13 @@ function renderAuroraHeroStrip() {
 // Favorites Resolution, Collapsible Pinned Favorites Shelf & Favorites Tab
 // ==========================================================================
 
+function matchesFavoriteSource(key, repositoryUrl, pluginRoot) {
+  const saved = state.serverState?.prefs?.favoriteSources?.[key];
+  if (!saved?.repositoryUrl) return true;
+  const normalize = url => String(url || '').replace(/\/+$/, '').replace(/\.git$/i, '').toLowerCase();
+  return normalize(saved.repositoryUrl) === normalize(repositoryUrl) && (!saved.pluginRoot || saved.pluginRoot === (pluginRoot || '.'));
+}
+
 function resolveFavoriteEntries() {
   const { byId: catById, byDir: catByDir } = getCatalogMaps();
   const installedByDir = getInstalledByDirMap();
@@ -3830,7 +4011,10 @@ function resolveFavoriteEntries() {
     const key = String(rawKey || '').trim();
     if (!key || seen.has(key)) continue;
 
-    if (catById.has(key)) {
+    const savedOnly = key.startsWith('saved:') || key.startsWith('local:');
+    const catalog = catById.get(key);
+    if (!key.startsWith('copy:') && !savedOnly && catalog &&
+        matchesFavoriteSource(key, catalog.repository?.url, catalog.repository?.pluginRoot)) {
       seen.add(key);
       const plugin = catById.get(key);
       const st = plugin.installStatus || {};
@@ -3839,31 +4023,45 @@ function resolveFavoriteEntries() {
       continue;
     }
 
-    if (key.startsWith('local:')) {
-      const dir = key.slice('local:'.length);
-      const loc = installedByDir.get(dir);
-      if (loc) {
-        seen.add(key);
-        const catEntry = (loc.receipt?.id && catById.get(loc.receipt.id)) || catByDir.get(loc.dir) || null;
-        resolved.push({ key, kind: 'local', loc, catEntry });
-      }
-      continue;
-    }
-
-    const fallbackLoc =
-      (state.serverState?.installed || []).find((x) => x.receipt?.id === key || x.dir === key) || null;
+    const installed = state.serverState?.installed || [];
+    const fallbackLoc = key.startsWith('copy:') ? installed.find(x => x.favoriteKey === key)
+      : savedOnly ? null
+      : installed.find(x => x.scope === 'global' && (x.receipt?.id === key || x.dir === key) &&
+        matchesFavoriteSource(key, x.receipt?.repositoryUrl || x.repositoryUrl, x.receipt?.pluginRoot || x.repositoryRoot));
     if (fallbackLoc) {
       seen.add(key);
-      const catEntry = catById.get(key) || catByDir.get(fallbackLoc.dir) || null;
-      if (catEntry) {
+      const catEntry = catalogEntryForInstalled(fallbackLoc, catById, catByDir);
+      if (catEntry && !key.startsWith('copy:')) {
         resolved.push({ key, kind: 'catalog', plugin: catEntry, localItem: fallbackLoc });
       } else {
-        resolved.push({ key, kind: 'local', loc: fallbackLoc, catEntry: null });
+        resolved.push({ key, kind: 'local', loc: fallbackLoc, catEntry });
       }
+    } else {
+      const sources = state.serverState?.prefs?.favoriteSources || {};
+      const source = Object.hasOwn(sources, key) ? sources[key] : {};
+      resolved.push({ key, kind: 'saved', source, displayName: source.displayName || key.replace(/^local:/, '') });
     }
   }
 
   return resolved;
+}
+
+function favoriteDisplayName(entry) {
+  return entry.displayName || entry.plugin?.displayName || entry.plugin?.canonicalName || entry.loc?.displayName || entry.loc?.dir || entry.key;
+}
+
+function renderSavedFavorite(entry) {
+  const { key, source, displayName } = entry;
+  return `<div class="fav-shelf-item saved-favorite">
+    <div class="fav-shelf-copy">
+      <span class="fav-shelf-name">${escapeHtml(displayName)}</span>
+      <span class="fav-shelf-meta">${escapeHtml(source.repositoryUrl || t('当前目录中找不到此插件', 'Unavailable in the current catalog'))}</span>
+    </div>
+    <div class="fav-shelf-item-right">
+      ${source.repositoryUrl ? `<button class="btn btn-sm" data-action="inspect-favorite" data-key="${escapeHtml(key)}">${escapeHtml(t('预检安装', 'Review install'))}</button>` : ''}
+      ${renderFavoriteButtonHtml({ key, displayName, sizeClass: 'is-mini' })}
+    </div>
+  </div>`;
 }
 
 function renderFavoritesShelf() {
@@ -3884,14 +4082,10 @@ function renderFavoritesShelf() {
               ${favEntries
                 .slice(0, 5)
                 .map((entry) => {
-                  const name =
-                    entry.kind === 'catalog'
-                      ? entry.plugin.displayName || entry.plugin.canonicalName
-                      : entry.loc.displayName || entry.loc.dir;
-                  const detailAttr =
-                    entry.kind === 'catalog'
-                      ? `data-action="detail" data-id="${escapeHtml(entry.plugin.id)}"`
-                      : `data-action="detail-local" data-dir="${escapeHtml(entry.loc.dir)}"`;
+                  const name = favoriteDisplayName(entry);
+                  const detailAttr = entry.kind === 'saved' ? 'data-action="tab" data-tab="favorites"'
+                    : entry.kind === 'catalog' ? `data-action="detail" data-id="${escapeHtml(entry.plugin.id)}"`
+                    : localDetailAttrs(entry.loc);
                   return `<button type="button" class="fav-mini-pill" ${detailAttr} title="${escapeHtml(name)}">${escapeHtml(name)}</button>`;
                 })
                 .join('')}
@@ -3927,13 +4121,14 @@ function renderFavoritesShelf() {
       <div class="fav-shelf-grid">
         ${favEntries
           .map((entry) => {
+            if (entry.kind === 'saved') return renderSavedFavorite(entry);
             const isCat = entry.kind === 'catalog';
             const p = isCat ? entry.plugin : entry.catEntry;
             const loc = isCat ? entry.localItem : entry.loc;
             const displayName = (isCat ? p.displayName || p.canonicalName : loc.displayName || loc.dir) || entry.key;
             const version = loc?.version || p?.version || '0.0.0';
             const dir = loc?.dir || p?.installStatus?.installedDir || '';
-            const isSelf = dir === 'agy-market' || p?.id === 'azwosile__agy-market';
+            const isSelf = isSelfPluginIdentity(p, loc);
             const isEnabled = Boolean(loc ? loc.enabled : p?.installStatus?.enabled);
             const sidecarPane = loc?.sidecarPane || p?.installStatus?.sidecarPane || null;
             const upd = loc ? findUpdateForLocal(loc, updById, updByDir) : null;
@@ -3971,7 +4166,7 @@ function renderFavoritesShelf() {
               const targetId = upd?.id || p?.id || loc?.receipt?.id || dir;
               quickActionHtml = `<button type="button" class="btn btn-update-outline btn-sm" data-action="update-plugin-direct" data-id="${escapeHtml(targetId)}" data-dir="${escapeHtml(upd?.dir || dir)}" data-name="${escapeHtml(displayName)}" data-source="${escapeHtml(upd?.source || '')}" data-update-channel="${escapeHtml(upd?.updateChannel || '')}" data-target-ref="${escapeHtml(upd?.targetRef || '')}" data-update-kind="${escapeHtml(upd?.updateKind || '')}" data-track-branch="${escapeHtml(upd?.trackBranch || '')}" data-repo-url="${escapeHtml(upd?.repositoryUrl || repoUrl)}" data-stop-card="1"${lockAttr}>${icon('update', 11)} ${escapeHtml(t('更新', 'Update'))}</button>`;
             } else if (hasUpdate && p) {
-              quickActionHtml = `<button type="button" class="btn btn-update-outline btn-sm" data-action="install" data-id="${escapeHtml(p.id)}" data-stop-card="1"${lockAttr}>${icon('update', 11)} ${escapeHtml(t('更新', 'Update'))}</button>`;
+              quickActionHtml = `<button type="button" class="btn btn-update-outline btn-sm" data-action="install" data-id="${escapeHtml(p.id)}" data-dir="${escapeHtml(upd?.dir || dir)}" data-stop-card="1"${lockAttr}>${icon('update', 11)} ${escapeHtml(t('更新', 'Update'))}</button>`;
             } else if (hasUpdate && loc) {
               const targetId = upd?.id || loc.receipt?.id || loc.dir;
               quickActionHtml = `<button type="button" class="btn btn-update-outline btn-sm" data-action="update-plugin-direct" data-id="${escapeHtml(targetId)}" data-dir="${escapeHtml(loc.dir)}" data-name="${escapeHtml(displayName)}" data-source="${escapeHtml(upd?.source || '')}" data-update-channel="${escapeHtml(upd?.updateChannel || '')}" data-target-ref="${escapeHtml(upd?.targetRef || '')}" data-update-kind="${escapeHtml(upd?.updateKind || '')}" data-track-branch="${escapeHtml(upd?.trackBranch || '')}" data-repo-url="${escapeHtml(upd?.repositoryUrl || repoUrl)}" data-stop-card="1"${lockAttr}>${icon('update', 11)} ${escapeHtml(t('更新', 'Update'))}</button>`;
@@ -3981,7 +4176,7 @@ function renderFavoritesShelf() {
 
             const detailAttrs = isCat
               ? `data-action="detail" data-id="${escapeHtml(p.id)}"`
-              : `data-action="detail-local" data-dir="${escapeHtml(loc.dir)}"`;
+              : localDetailAttrs(loc);
 
             const updateShortLabel =
               upd?.updateKind === 'commit' && upd?.latestCommitSha
@@ -4030,7 +4225,7 @@ function renderPluginCard(p, updateById, installedByDir, updateByDir = null) {
   const desc = resolveCatalogDescription(p, loc);
   const st = p.installStatus || {};
   const localItem = st.installedDir ? installedByDir.get(st.installedDir) || null : null;
-  const isSelf = st.installedDir === 'agy-market' || p.canonicalName === 'agy-market' || p.id === 'azwosile__agy-market';
+  const isSelf = isSelfPluginIdentity(p);
   const resolvedUpdByDir = updateByDir || getUpdateMaps().byDir;
   const effectiveLoc =
     localItem ||
@@ -4066,15 +4261,15 @@ function renderPluginCard(p, updateById, installedByDir, updateByDir = null) {
   const favKey = String(p.id || '');
   const displayName = p.displayName || p.canonicalName;
 
-  let versionChip = `<span class="version-tag">${escapeHtml(formatV(p.version))}</span>`;
+  let versionChip = renderCardVersion(p.version);
   if (upd && st.installed) {
     const fromVer = localItem?.version || upd.installedVersion || st.installedVersion || '?';
     versionChip = isCommitUpdate
-      ? `<span class="version-delta" title="${escapeHtml(t('发现可用更新', 'Update available'))}">${escapeHtml(formatV(fromVer))} (${escapeHtml(upd.installedCommitSha || String(localItem?.receipt?.commitSha || '').slice(0, 7) || 'HEAD')} → ${escapeHtml(upd.latestCommitSha)})</span>`
-      : `<span class="version-delta" title="${escapeHtml(t('发现可用更新', 'Update available'))}">${escapeHtml(formatV(fromVer))} → ${escapeHtml(formatV(upd.latestVersion))}</span>`;
+      ? renderCardVersion(fromVer, '', ` (${upd.installedCommitSha || String(localItem?.receipt?.commitSha || '').slice(0, 7) || 'HEAD'} → ${upd.latestCommitSha})`)
+      : renderCardVersion(fromVer, upd.latestVersion);
   } else if (hasAnyUpdate && st.installed) {
     const fromVer = localItem?.version || st.installedVersion || '?';
-    versionChip = `<span class="version-delta">${escapeHtml(formatV(fromVer))} → ${escapeHtml(formatV(p.version))}</span>`;
+    versionChip = renderCardVersion(fromVer, p.version);
   }
 
   const lockAttr = isUpdateActionLocked() ? ' disabled aria-disabled="true"' : '';
@@ -4091,7 +4286,7 @@ function renderPluginCard(p, updateById, installedByDir, updateByDir = null) {
     } else if (isDirectGhUpdate) {
       actionBtn = `<button type="button" class="btn btn-update-outline btn-sm" data-action="update-plugin-direct" data-id="${escapeHtml(upd.id || p.id)}" data-dir="${escapeHtml(upd.dir || st.installedDir || p.canonicalName)}" data-name="${escapeHtml(displayName)}" data-source="${escapeHtml(upd.source || '')}" data-update-channel="${escapeHtml(upd.updateChannel || '')}" data-target-ref="${escapeHtml(upd.targetRef || '')}" data-update-kind="${escapeHtml(upd.updateKind || '')}" data-track-branch="${escapeHtml(upd.trackBranch || '')}" data-repo-url="${escapeHtml(upd.repositoryUrl || repoUrl)}" data-stop-card="1"${lockAttr}>${icon('update', 12)} ${escapeHtml(updLabel)}</button>`;
     } else {
-      actionBtn = `<button type="button" class="btn btn-update-outline btn-sm" data-action="install" data-id="${escapeHtml(p.id)}" data-stop-card="1"${lockAttr}>${icon('update', 12)} ${escapeHtml(updLabel)}</button>`;
+      actionBtn = `<button type="button" class="btn btn-update-outline btn-sm" data-action="install" data-id="${escapeHtml(p.id)}" data-dir="${escapeHtml(upd?.dir || st.installedDir || '')}" data-stop-card="1"${lockAttr}>${icon('update', 12)} ${escapeHtml(updLabel)}</button>`;
     }
   } else if (st.installed) {
     actionBtn = `<button type="button" class="btn btn-installed btn-sm" data-action="detail" data-id="${escapeHtml(p.id)}">${icon('check', 12)} ${escapeHtml(t('详情', 'Details'))}</button>`;
@@ -4108,7 +4303,7 @@ function renderPluginCard(p, updateById, installedByDir, updateByDir = null) {
       })
     : `
       ${discussUrl ? `<a class="dock-btn" href="${escapeHtml(discussUrl)}" target="_blank" rel="noopener noreferrer" data-stop-card="1" title="${escapeHtml(t('打开 GitHub Discussions 社区讨论', 'Open GitHub Discussions'))}">${icon('message', 12)} <span>${escapeHtml(t('讨论', 'Discuss'))}</span></a>` : ''}
-      ${repoUrl ? `<a class="dock-btn" href="${escapeHtml(repoUrl)}" target="_blank" rel="noopener noreferrer" data-stop-card="1" title="${escapeHtml(t('查看 GitHub 源码仓库', 'View GitHub Repository'))}">${icon('external', 11)} <span>GitHub</span></a>` : ''}
+      ${isSafeHttpUrl(repoUrl) ? `<a class="dock-btn" href="${escapeHtml(repoUrl)}" target="_blank" rel="noopener noreferrer" data-stop-card="1" title="${escapeHtml(t('查看 GitHub 源码仓库', 'View GitHub Repository'))}">${icon('external', 11)} <span>GitHub</span></a>` : ''}
     `;
 
   const paneBtnHtml = st.installed
@@ -4262,14 +4457,13 @@ function setupLoadMoreObserver() {
   if (state.activeTab !== 'discover') return;
   const sentinel = document.getElementById?.('load-more-sentinel');
   if (!sentinel || typeof IntersectionObserver !== 'function') return;
-  const scrollRoot = document.querySelector?.('.main-scroll') || null;
   loadMoreObserver = new IntersectionObserver(
     (entries) => {
       if (entries.some((entry) => entry.isIntersecting)) {
         loadMorePlugins();
       }
     },
-    { root: scrollRoot, rootMargin: '400px 0px' },
+    { root: null, rootMargin: '400px 0px' },
   );
   loadMoreObserver.observe(sentinel);
 }
@@ -4279,9 +4473,12 @@ function syncChipStripOverflow() {
   const strip = document.getElementById?.('discover-chip-strip');
   if (!wrap || !strip || !wrap.classList) return;
   const scrollWidth = Number(strip.scrollWidth || 0);
+  // Reserve both controls only when the categories exceed the whole row.
+  // Using the narrower scrollport here would keep the gutters after resizing.
+  const canScroll = scrollWidth > wrap.clientWidth + 2;
+  wrap.classList.toggle('has-overflow', canScroll);
   const clientWidth = Number(strip.clientWidth || 0);
   const scrollLeft = Number(strip.scrollLeft || 0);
-  const canScroll = scrollWidth > clientWidth + 2;
   const canLeft = canScroll && scrollLeft > 2;
   const canRight = canScroll && scrollLeft + clientWidth < scrollWidth - 2;
   wrap.classList.toggle('can-scroll-left', canLeft);
@@ -4296,10 +4493,11 @@ function setupDiscoverChipStripControls() {
   if (state.activeTab !== 'discover') return;
   const strip = document.getElementById?.('discover-chip-strip');
   if (!strip) return;
+  syncChipStripOverflow();
   if (state.chipStripScrollLeft > 0) {
     strip.scrollLeft = state.chipStripScrollLeft;
+    syncChipStripOverflow();
   }
-  syncChipStripOverflow();
   if (typeof strip.addEventListener === 'function') {
     strip.addEventListener(
       'scroll',
@@ -4410,6 +4608,12 @@ function renderDiscoverView() {
     </div>
 
     <div class="main-scroll">
+      ${renderCatalogWarnings()}
+      ${state.catalogError ? `<div class="empty-state" role="status">
+        <div class="empty-title">${escapeHtml(t('目录加载失败', 'Could not load the catalog'))}</div>
+        <div class="empty-sub">${escapeHtml(state.catalogError)}</div>
+        <button type="button" class="btn btn-sm" data-action="retry-catalog"${state.loading ? ' disabled' : ''}>${escapeHtml(t('重新加载目录', 'Retry catalog'))}</button>
+      </div>` : ''}
       ${renderAuroraHeroStrip()}
 
       ${
@@ -4442,6 +4646,7 @@ function renderDiscoverView() {
           : plugins.length
             ? `<div class="cards-grid" id="discover-grid">${shownPlugins.map((p) => renderPluginCard(p, updById, installedByDir, updByDir)).join('')}</div>${renderLoadMoreHtml(shownPlugins.length, plugins.length)}`
             : (() => {
+                if (state.catalogError) return '';
                 const prefillUrl = extractGithubPrefillUrl(state.search);
                 const prefillAttr = prefillUrl ? ` data-prefill-url="${escapeHtml(prefillUrl)}"` : '';
                 const hasActiveFilter = Boolean(state.search || state.category !== 'all');
@@ -4495,14 +4700,10 @@ function renderFavoritesView() {
 
   let filtered = allFavs.filter((entry) => {
     if (!q) return true;
+    if (entry.kind === 'saved') return [entry.displayName, entry.key, entry.source.repositoryUrl].join(' ').toLowerCase().includes(q);
     if (entry.kind === 'catalog') {
       const p = entry.plugin;
-      const desc = `${resolveCatalogDescription(p, 'zh')} ${resolveCatalogDescription(p, 'en')}`;
-      const catTerms = (p.taxonomy?.categories || [])
-        .map((c) => `${c} ${CATEGORY_LABELS[c]?.zh || ''} ${CATEGORY_LABELS[c]?.en || ''}`)
-        .join(' ');
-      const hay = `${p.displayName || ''} ${p.canonicalName || ''} ${p.scopedName || ''} ${p.id || ''} ${desc} ${catTerms} ${(p.taxonomy?.tags || []).join(' ')} ${(p.capabilities?.badges || []).join(' ')}`.toLowerCase();
-      return hay.includes(q);
+      return catalogSearchText(p).includes(q);
     }
     const l = entry.loc;
     const desc = resolveInstalledDescription(l, entry.catEntry);
@@ -4518,9 +4719,8 @@ function renderFavoritesView() {
     });
   } else if (state.favoritesSortBy === 'name') {
     filtered = [...filtered].sort((a, b) => {
-      const na = a.kind === 'catalog' ? a.plugin.displayName || a.plugin.canonicalName : a.loc.displayName || a.loc.dir;
-      const nb = b.kind === 'catalog' ? b.plugin.displayName || b.plugin.canonicalName : b.loc.displayName || b.loc.dir;
-      return String(na).localeCompare(String(nb), loc);
+      return favoriteDisplayName(a).localeCompare(favoriteDisplayName(b), loc) ||
+        comparePluginAuthors(a.plugin || a.loc || a.source, b.plugin || b.loc || b.source, loc);
     });
   }
 
@@ -4571,7 +4771,7 @@ function renderFavoritesView() {
             : `<div class="cards-grid">
                 ${filtered
                   .map((entry) =>
-                    entry.kind === 'catalog'
+                    entry.kind === 'saved' ? renderSavedFavorite(entry) : entry.kind === 'catalog'
                       ? renderPluginCard(entry.plugin, updById, installedByDir, updByDir)
                       : renderInstalledCard(entry.loc, updById, updByDir, catById, catByDir),
                   )
@@ -4634,7 +4834,7 @@ function renderBatchResultsPanel() {
 
           const dir = r.installedDir || r.dir || '';
           const rLoc = dir ? globalByDir.get(dir) || null : null;
-          const rCat = (r.id && catById.get(r.id)) || (dir && catByDir.get(dir)) || null;
+          const rCat = rLoc ? catalogEntryForInstalled(rLoc, catById, catByDir) : catById.get(r.id);
           const rNeedsPatch = Boolean(
             r.ok &&
               !r.alreadyUpToDate &&
@@ -4670,7 +4870,7 @@ function renderBatchResultsPanel() {
                         : ''
                 }
                 ${openPaneBtn}
-                ${!r.ok && !isEscalated ? `<button type="button" class="btn btn-sm" data-action="retry-batch-one" data-id="${escapeHtml(r.id)}"${updateActionLocked ? ' disabled aria-disabled="true"' : ''}>${escapeHtml(t('重试', 'Retry'))}</button>` : ''}
+                ${!r.ok && !isEscalated ? `<button type="button" class="btn btn-sm" data-action="retry-batch-one" data-id="${escapeHtml(dir || r.id)}"${updateActionLocked ? ' disabled aria-disabled="true"' : ''}>${escapeHtml(t('重试', 'Retry'))}</button>` : ''}
               </div>
             </div>
           `;
@@ -4680,10 +4880,48 @@ function renderBatchResultsPanel() {
   `;
 }
 
+function renderLatestPill(detail = false) {
+  const previous = Boolean(state.updates.error);
+  const label = previous ? t('上次检查为最新', 'Up to date at last check')
+    : detail ? t('已是最新版本', 'Up to Date') : t('最新', 'Latest');
+  const title = previous ? t('本次检查失败，显示上次确认结果', 'This check failed. Showing the last confirmed result.')
+    : t('已检查为最新版本', 'Up to date');
+  return `<span class="state-pill is-latest" title="${escapeHtml(title)}">${icon('check', detail ? 12 : 11)} <span>${escapeHtml(label)}</span></span>`;
+}
+
+function noUpdatesMessage() {
+  return state.updates.uncheckedDirs?.length
+    ? t(`未发现可用更新，另有 ${state.updates.uncheckedDirs.length} 个插件未能完成检查`, `No updates found. Could not check ${state.updates.uncheckedDirs.length} plugin(s).`)
+    : t('全部已安装插件均已是最新版本', 'All installed plugins are already up to date');
+}
+
+function installedUpdateNotice(loc) {
+  if (loc?.successorDir) {
+    return t(`旧副本 · 更新由 ${loc.successorDir} 接管`, `Legacy copy · Updates managed by ${loc.successorDir}`);
+  }
+  if (loc?.inferredRepository && !loc.receipt) {
+    return t('未声明可验证的更新源', 'No verified update source declared');
+  }
+  if (state.updates.unavailableDirs?.includes(loc?.dir)) {
+    return t('暂时无法检查上游版本', 'Upstream version check unavailable');
+  }
+  if (loc?.repositoryRoot === null || (loc?.dir && state.updates.uncheckedDirs?.includes(loc.dir))) {
+    return t('无法确认插件的仓库目录', 'Unable to verify the plugin directory in its repository');
+  }
+  return '';
+}
+
+function renderInstalledUpdateNotice(notice, dir) {
+  if (state.updates.unavailableDirs?.includes(dir)) {
+    return `<button type="button" class="btn btn-sm update-notice" data-action="check-updates" title="${escapeHtml(notice)}"${isUpdateActionLocked() ? ' disabled' : ''}>${escapeHtml(t('检查未完成 · 重试', 'Check incomplete · Retry'))}</button>`;
+  }
+  return `<span class="state-pill is-external update-notice">${escapeHtml(notice)}</span>`;
+}
+
 function renderInstalledCard(loc, updById, updByDir, catById, catByDir) {
   const isSelf = loc.dir === 'agy-market';
   const upd = findUpdateForLocal(loc, updById, updByDir);
-  const catEntry = (upd && catById.get(upd.id)) || (loc.receipt?.id && catById.get(loc.receipt.id)) || catByDir.get(loc.dir) || null;
+  const catEntry = catalogEntryForInstalled(loc, catById, catByDir);
   const isGithubUrlTrack = loc.receipt?.track === 'github-url';
   const isSelfUpdate = Boolean(upd?.isSelf || isSelf);
   const isDirectGhUpdate = Boolean(upd && isDirectGithubUpdateItem(upd));
@@ -4726,7 +4964,10 @@ function renderInstalledCard(loc, updById, updByDir, catById, catByDir) {
   const lockAttr = updateActionLocked ? ' disabled aria-disabled="true"' : '';
 
   let actionHtml = '';
-  if (isBusy) {
+  const notice = installedUpdateNotice(loc);
+  if (notice) {
+    actionHtml = renderInstalledUpdateNotice(notice, loc.dir);
+  } else if (isBusy) {
     const busyLabel = upd || state.batchUpdating ? t('更新中…', 'Updating…') : t('检查中…', 'Checking…');
     actionHtml = `<button type="button" class="btn btn-primary btn-sm" disabled aria-disabled="true">${icon('refresh', 12, 'spin')} ${escapeHtml(busyLabel)}</button>`;
   } else if (isExternalUnmanaged) {
@@ -4751,13 +4992,13 @@ function renderInstalledCard(loc, updById, updByDir, catById, catByDir) {
       const updTargetId = upd.id || catEntry?.id || loc.receipt?.id || loc.dir;
       actionHtml = `<button type="button" class="btn btn-update-outline btn-sm" data-action="update-plugin-direct" data-id="${escapeHtml(updTargetId)}" data-dir="${escapeHtml(upd.dir || loc.dir)}" data-name="${escapeHtml(displayName)}" data-source="${escapeHtml(upd.source || '')}" data-update-channel="${escapeHtml(upd.updateChannel || '')}" data-target-ref="${escapeHtml(upd.targetRef || '')}" data-update-kind="${escapeHtml(upd.updateKind || '')}" data-track-branch="${escapeHtml(upd.trackBranch || '')}" data-repo-url="${escapeHtml(upd.repositoryUrl || repoUrl)}" data-stop-card="1"${lockAttr}>${icon('update', 12)} ${escapeHtml(updLabel)}</button>`;
     } else if (catEntry) {
-      actionHtml = `<button type="button" class="btn btn-update-outline btn-sm" data-action="install" data-id="${escapeHtml(catEntry.id)}" data-stop-card="1"${lockAttr}>${icon('update', 12)} ${escapeHtml(updLabel)}</button>`;
+      actionHtml = `<button type="button" class="btn btn-update-outline btn-sm" data-action="install" data-id="${escapeHtml(catEntry.id)}" data-dir="${escapeHtml(loc.dir)}" data-stop-card="1"${lockAttr}>${icon('update', 12)} ${escapeHtml(updLabel)}</button>`;
     } else {
       const updTargetId = upd.id || loc.receipt?.id || loc.dir;
       actionHtml = `<button type="button" class="btn btn-update-outline btn-sm" data-action="update-plugin-direct" data-id="${escapeHtml(updTargetId)}" data-dir="${escapeHtml(upd.dir || loc.dir)}" data-name="${escapeHtml(displayName)}" data-source="${escapeHtml(upd.source || '')}" data-update-channel="${escapeHtml(upd.updateChannel || '')}" data-target-ref="${escapeHtml(upd.targetRef || '')}" data-update-kind="${escapeHtml(upd.updateKind || '')}" data-track-branch="${escapeHtml(upd.trackBranch || '')}" data-repo-url="${escapeHtml(upd.repositoryUrl || repoUrl)}" data-stop-card="1"${lockAttr}>${icon('update', 12)} ${escapeHtml(updLabel)}</button>`;
     }
   } else if (hasRemoteSource && isConfirmedLatest) {
-    actionHtml = `<span class="state-pill is-latest" title="${escapeHtml(t('已检查为最新版本', 'Up to date'))}">${icon('check', 11)} <span>${escapeHtml(t('最新', 'Latest'))}</span></span>`;
+    actionHtml = renderLatestPill();
   } else if (hasRemoteSource && state.updates.loading) {
     actionHtml = `<button type="button" class="dock-btn is-update" data-action="sync-installed-plugin" data-dir="${escapeHtml(loc.dir)}" data-id="${escapeHtml(catEntry?.id || loc.receipt?.id || loc.dir)}" data-name="${escapeHtml(displayName)}" data-stop-card="1" disabled aria-disabled="true" aria-busy="true" title="${escapeHtml(t('正在检测插件更新，请稍候…', 'Checking for plugin updates…'))}">${icon('refresh', 11, 'spin')} <span>${escapeHtml(t('检测中…', 'Checking…'))}</span></button>`;
   } else if (hasRemoteSource) {
@@ -4784,15 +5025,15 @@ function renderInstalledCard(loc, updById, updByDir, catById, catByDir) {
 
   const versionBadgeHtml = upd
     ? isCommitUpdate
-      ? `<span class="version-delta">${escapeHtml(formatV(loc.version))} (${escapeHtml(upd.installedCommitSha || String(loc.receipt?.commitSha || '').slice(0, 7) || 'HEAD')} → ${escapeHtml(upd.latestCommitSha)})</span>`
-      : `<span class="version-delta">${escapeHtml(formatV(loc.version))} → ${escapeHtml(formatV(upd.latestVersion))}</span>`
+      ? renderCardVersion(loc.version, '', ` (${upd.installedCommitSha || String(loc.receipt?.commitSha || '').slice(0, 7) || 'HEAD'} → ${upd.latestCommitSha})`)
+      : renderCardVersion(loc.version, upd.latestVersion)
     : isUnversionedExternal && (!loc.version || loc.version === '0.0.0' || loc.version === '?')
       ? `<span class="version-tag is-unversioned-tag">${escapeHtml(t('无版本号', 'Unversioned'))}</span>`
-      : `<span class="version-tag">${escapeHtml(formatV(loc.version))}</span>`;
+      : renderCardVersion(loc.version);
 
   return `
     <article class="plugin-card ${upd ? 'has-update' : ''} ${isParked ? 'is-parked' : ''}" style="--card-accent:${accent.a1};--card-accent-2:${accent.a2}">
-      <div class="card-head" data-action="detail-local" data-dir="${escapeHtml(loc.dir)}">
+      <div class="card-head" ${localDetailAttrs(loc)}>
         ${renderLogoHtml(catEntry?.media?.iconUrl, displayName, { isSelf })}
         <div class="card-title-wrap">
           <div class="card-title-row">
@@ -4813,14 +5054,14 @@ function renderInstalledCard(loc, updById, updByDir, catById, catByDir) {
                   : `<span class="state-pill ${loc.enabled ? 'is-enabled' : 'is-disabled'}">${escapeHtml(loc.enabled ? t('已启用', 'Enabled') : t('已停用', 'Disabled'))}</span>`
             }
             ${isGithubUrlTrack ? `<span class="track-tag is-github-url" title="${escapeHtml(t('通过 GitHub 链接安装', 'Installed via GitHub URL'))}">GitHub URL</span>` : ''}
-            ${upd?.changelog ? `<span class="meta-sep">·</span><button type="button" class="notes-link" data-action="detail-local" data-dir="${escapeHtml(loc.dir)}" data-detail-tab="changelog">${escapeHtml(t('更新内容 ›', 'Notes ›'))}</button>` : `<span class="meta-sep">·</span><span class="meta-scope" title="${escapeHtml(scopeInfo.tooltip)}">${escapeHtml(scopeInfo.label)}</span>`}
+            ${upd?.changelog ? `<span class="meta-sep">·</span><button type="button" class="notes-link" ${localDetailAttrs(loc)} data-detail-tab="changelog">${escapeHtml(t('更新内容 ›', 'Notes ›'))}</button>` : `<span class="meta-sep">·</span><span class="meta-scope" title="${escapeHtml(scopeInfo.tooltip)}">${escapeHtml(scopeInfo.label)}</span>`}
           </div>
         </div>
       </div>
 
-      <p class="card-desc" data-action="detail-local" data-dir="${escapeHtml(loc.dir)}">${escapeHtml(localizedDesc)}</p>
+      <p class="card-desc" ${localDetailAttrs(loc)}>${escapeHtml(localizedDesc)}</p>
 
-      <div class="badge-row" data-action="detail-local" data-dir="${escapeHtml(loc.dir)}" data-detail-tab="capabilities">
+      <div class="badge-row" ${localDetailAttrs(loc)} data-detail-tab="capabilities">
         ${badgesObj?.badges?.length ? renderBadgesHtml(badgesObj, { maxCount: 3 }) : ''}
       </div>
 
@@ -4855,13 +5096,17 @@ function renderInstalledView() {
   const disabledCount = installed.filter((x) => !x.enabled).length;
   const updatableCount = installed.filter((loc) => {
     const upd = findUpdateForLocal(loc, updById, updByDir);
-    const catEntry = (upd && catById.get(upd.id)) || (loc.receipt?.id && catById.get(loc.receipt.id)) || catByDir.get(loc.dir) || null;
+    const catEntry = catalogEntryForInstalled(loc, catById, catByDir);
     return Boolean(upd || hasStaleSafeCatalogUpdate(catEntry, loc));
   }).length;
 
-  const checkedLabel = state.updates.checkedAt
-    ? t(`上次检查：${formatRelativeTime(state.updates.checkedAt)}`, `Last checked ${formatRelativeTime(state.updates.checkedAt)}`)
-    : t('正在自动检查远程更新…', 'Checking remote updates…');
+  const checkedLabel = state.updates.loading
+    ? t('正在检查远程更新…', 'Checking remote updates…')
+    : state.updates.error
+      ? t(`更新检查失败：${state.updates.error}`, `Update check failed: ${state.updates.error}`)
+      : state.updates.checkedAt
+        ? t(`上次检查：${formatRelativeTime(state.updates.checkedAt)}`, `Last checked ${formatRelativeTime(state.updates.checkedAt)}`)
+        : t('尚未检查更新', 'Updates have not been checked yet');
 
   // 3-tier automatic ordering: enabled -> updatable -> alphabetical
   const sortedInstalled = [...installed].sort((a, b) => {
@@ -4873,13 +5118,13 @@ function renderInstalledView() {
     const sa = ua ? (ua.installable !== false ? 2 : 1) : 0;
     const sb = ub ? (ub.installable !== false ? 2 : 1) : 0;
     if (sb !== sa) return sb - sa;
-    return String(a.displayName || a.dir).localeCompare(String(b.displayName || b.dir));
+    return String(a.displayName || a.dir).localeCompare(String(b.displayName || b.dir)) || comparePluginAuthors(a, b, getLocale());
   });
 
   const q = state.installedSearch.trim().toLowerCase();
   const filteredInstalled = sortedInstalled.filter((loc) => {
     const upd = findUpdateForLocal(loc, updById, updByDir);
-    const catEntry = (upd && catById.get(upd.id)) || (loc.receipt?.id && catById.get(loc.receipt.id)) || catByDir.get(loc.dir) || null;
+    const catEntry = catalogEntryForInstalled(loc, catById, catByDir);
     const hasUpd = Boolean(upd || hasStaleSafeCatalogUpdate(catEntry, loc));
 
     if (state.installedFilter === 'enabled' && !loc.enabled) return false;
@@ -5081,7 +5326,7 @@ function renderConflictCard(item) {
                   data-fix-type="${escapeHtml(fix.type)}"
                   data-target-dir="${escapeHtml(fix.targetDir || '')}"
                   data-suggested-dir="${escapeHtml(fix.suggestedDir || '')}"
-                  ${isFixing || isIgnoring ? 'disabled' : ''}
+                  ${isPluginMutationBusy() || isIgnoring ? 'disabled' : ''}
                 >
                   ${icon(isFixing ? 'refresh' : 'wrench', 12, isFixing ? 'spin' : '')}
                   <span>${escapeHtml(isFixing ? t('修复中…', 'Fixing…') : fixLabel)}</span>
@@ -5227,7 +5472,7 @@ function renderConflictsView() {
           <h2 class="conflict-hero-title">
             ${
               summary.total === 0
-                ? `${icon('shieldCheck', 16)} ${escapeHtml(t('未检测到插件冲突', 'No plugin conflicts detected'))}`
+                ? `${icon('shieldCheck', 16)} ${escapeHtml(ignoredCount ? t(`已忽略全部 ${ignoredCount} 项冲突`, `All ${ignoredCount} conflicts are ignored`) : t('未检测到插件冲突', 'No plugin conflicts detected'))}`
                 : summary.critical > 0
                   ? `${icon('shieldAlert', 16)} ${escapeHtml(t(`发现 ${summary.critical} 项严重冲突，可能影响插件或 MCP 加载`, `${summary.critical} critical conflict(s) may affect plugin or MCP loading`))}`
                   : `${icon('alertCircle', 16)} ${escapeHtml(t(`发现 ${summary.total} 项警告或提示`, `${summary.total} warning(s) or notice(s) found`))}`
@@ -5294,6 +5539,13 @@ function renderConflictsView() {
 // Sources & Settings View
 // ==========================================================================
 
+function renderCatalogWarnings() {
+  const warnings = state.serverState?.catalog?.warnings;
+  if (!Array.isArray(warnings) || !warnings.length) return '';
+  return `<details class="field-hint feed-warning"><summary>${escapeHtml(t('目录同步提示', 'Catalog sync notices'))} (${warnings.length})</summary>
+    <ul>${warnings.map(text => `<li>${escapeHtml(text)}</li>`).join('')}</ul></details>`;
+}
+
 function renderSourcesView() {
   const prefs = state.serverState?.prefs || {};
   const cat = state.serverState?.catalog || {};
@@ -5314,6 +5566,7 @@ function renderSourcesView() {
               ${escapeHtml(t('立即同步', 'Sync Now'))}
             </button>
           </div>
+          ${renderCatalogWarnings()}
           <div class="telemetry-grid">
             <div class="telemetry-cell">
               <span class="telemetry-k">${escapeHtml(t('当前通道', 'Transport'))}</span>
@@ -5382,6 +5635,9 @@ function renderSourcesView() {
         <div class="field-card">
           <label class="field-label" for="custom-feeds-textarea">${escapeHtml(t('自定义 / 团队私有静态源 (每行一个 index.json URL)', 'Custom / Team Static Feeds (one index.json URL per line)'))}</label>
           <textarea id="custom-feeds-textarea" class="text-input" rows="3" placeholder="https://plugins.internal.example/index.json">${escapeHtml(customLines)}</textarea>
+          ${(cat.failedCustomFeeds || []).map(({ url, status }) =>
+            `<p class="field-hint feed-warning" role="status">${escapeHtml(t('未能加载', 'Could not load'))} ${escapeHtml(url)}${status ? ` (HTTP ${escapeHtml(status)})` : ''}</p>`
+          ).join('')}
         </div>
 
         <div class="settings-actions-row">
@@ -5397,11 +5653,11 @@ function renderSourcesView() {
 // ==========================================================================
 
 function renderDiscussTabContent(plugin) {
-  const entry = state.discussionsCache[plugin.id];
+  const entry = state.discussionsCache[detailSourceKey(plugin)];
   const fallbackUrl = deriveDiscussionsUrl(plugin.repository?.url);
   const data = entry?.data;
-  const openUrl = data?.url || fallbackUrl;
-  const newUrl = data?.newDiscussionUrl || (openUrl ? `${openUrl}/new/choose` : '');
+  const openUrl = isSafeHttpUrl(data?.url) ? data.url : fallbackUrl;
+  const newUrl = isSafeHttpUrl(data?.newDiscussionUrl) ? data.newDiscussionUrl : (openUrl ? `${openUrl}/new/choose` : '');
 
   const topActions = `
     <div class="discuss-header">
@@ -5409,7 +5665,7 @@ function renderDiscussTabContent(plugin) {
         ${icon('message', 14)}
         <span>GitHub Discussions</span>
       </div>
-      <div style="display:flex;align-items:center;gap:6px">
+      <div class="discuss-actions">
         <button type="button" class="btn btn-sm" data-action="refresh-discussions" data-id="${escapeHtml(plugin.id)}" ${entry?.loading ? 'disabled' : ''}>
           ${icon('refresh', 12, entry?.loading ? 'spin' : '')}
         </button>
@@ -5435,7 +5691,7 @@ function renderDiscussTabContent(plugin) {
     `;
   }
 
-  if (entry.error && !data) {
+  if (entry.error && !data?.items?.length) {
     return `
       ${topActions}
       <div class="discuss-info-box">
@@ -5445,31 +5701,38 @@ function renderDiscussTabContent(plugin) {
     `;
   }
 
+  const items = data?.items || [];
+  const warning = entry.error || data?.warning;
+  const warningHtml = warning ? `<div class="discuss-info-box" role="status">
+    <strong>${escapeHtml(data.tokenRejected ? t('GitHub Token 已失效或被拒绝', 'GitHub rejected the saved token')
+      : items.length ? t('刷新失败，正在显示缓存讨论', 'Refresh failed. Showing cached discussions')
+      : t('暂时无法加载讨论', 'Discussions are unavailable'))}</strong>
+    <span>${escapeHtml(warning)}</span>
+    ${data.needsToken ? `<button class="btn btn-sm" data-action="goto-token">${escapeHtml(t('配置 Token', 'Configure token'))}</button>` : ''}
+  </div>` : '';
+  if (warningHtml && !items.length && !data.disabled) return topActions + warningHtml;
+
   if (data?.disabled) {
     return `
       ${topActions}
+      ${warningHtml}
       <div class="discuss-info-box">
         <div style="font-weight:650">${escapeHtml(t('该仓库暂未启用 GitHub Discussions', 'GitHub Discussions is disabled for this repository'))}</div>
         <div class="muted" style="font-size:11.8px">${escapeHtml(t('你可以前往仓库主页或 Issues 提交反馈与建议。', 'You can visit the repository homepage or Issues to report bugs and share feedback.'))}</div>
-        ${plugin.repository?.url ? `<div><a class="btn btn-sm" href="${escapeHtml(plugin.repository.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(t('访问仓库主页', 'Open Repository'))} ${icon('external', 11)}</a></div>` : ''}
+        ${isSafeHttpUrl(plugin.repository?.url) ? `<div><a class="btn btn-sm" href="${escapeHtml(plugin.repository.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(t('访问仓库主页', 'Open Repository'))} ${icon('external', 11)}</a></div>` : ''}
       </div>
     `;
   }
 
-  const items = data?.items || [];
   if (items.length > 0) {
     return `
       ${topActions}
-      ${
-        data?.rateLimited
-          ? `<div class="notice-strip"><span>${icon('alertCircle', 13)} ${escapeHtml(t('GitHub API 当前限流，以下为缓存内容。', 'GitHub API rate-limited; showing cached results.'))}</span></div>`
-          : ''
-      }
+      ${warningHtml}
       <div class="discuss-list">
         ${items
           .map(
             (item) => `
-            <a class="discuss-item" href="${escapeHtml(item.url || openUrl || '#')}" target="_blank" rel="noopener noreferrer">
+            <a class="discuss-item" ${isSafeHttpUrl(item.url) ? `href="${escapeHtml(item.url)}"` : ''} target="_blank" rel="noopener noreferrer">
               <div class="discuss-item-title">
                 <span>${escapeHtml(item.title || t('无标题讨论', 'Untitled discussion'))}</span>
                 ${icon('arrowUpRight', 13)}
@@ -5518,9 +5781,9 @@ function renderDetailDrawer() {
   const { byId: updById, byDir: updByDir } = getUpdateMaps();
   const installedByDir = getInstalledByDirMap();
   const st = p.installStatus || {};
-  const localItem = st.installedDir ? installedByDir.get(st.installedDir) || null : null;
+  const localItem = p._localSelection ? findSelectedLocal(p._localSelection) : st.installedDir ? installedByDir.get(st.installedDir) || null : null;
   const installedDir = st.installedDir || localItem?.dir || '';
-  const isSelf = installedDir === 'agy-market' || p.canonicalName === 'agy-market' || p.id === 'azwosile__agy-market';
+  const isSelf = isSelfPluginIdentity(p, localItem);
   const effectiveLoc =
     localItem ||
     (st.installed && !state.serverState && (!st.scope || st.scope === 'global')
@@ -5590,10 +5853,13 @@ function renderDetailDrawer() {
       ),
   );
   const displayName = p.displayName || p.canonicalName;
-  const favKey = p._localOnly ? getLocalFavoriteKey(localItem || { dir: installedDir, receipt: { id: p.id } }, null) : String(p.id || '');
+  const favKey = p._localSelection ? getLocalFavoriteKey(localItem, p._localOnly ? null : p) : String(p.id || '');
 
   let primaryBtn = '';
-  if (isBusy) {
+  const notice = installedUpdateNotice(localItem);
+  if (notice) {
+    primaryBtn = renderInstalledUpdateNotice(notice, installedDir);
+  } else if (isBusy) {
     primaryBtn = `<button type="button" class="btn btn-primary btn-sm" disabled aria-disabled="true">${icon('refresh', 12, 'spin')} ${escapeHtml(t('处理中…', 'Working…'))}</button>`;
   } else if (hasAnyUpdate) {
     const targetV = upd?.latestVersion || p.version;
@@ -5621,7 +5887,7 @@ function renderDetailDrawer() {
           );
       primaryBtn = `<span class="state-pill is-external ${isGitManaged ? 'is-git-native' : 'is-unversioned'}" title="${escapeHtml(extTip)}">${icon(isGitManaged ? 'lock' : 'info', 11)} <span>${escapeHtml(extLabel)}</span></span>`;
     } else if (isConfirmedLatest) {
-      const latestPillHtml = `<span class="state-pill is-latest" title="${escapeHtml(t('已检查为最新版本', 'Up to date'))}">${icon('check', 12)} ${escapeHtml(t('已是最新版本', 'Up to Date'))}</span>`;
+      const latestPillHtml = renderLatestPill(true);
       if (isSelf) {
         primaryBtn = latestPillHtml;
       } else if (p._localOnly) {
@@ -5717,6 +5983,11 @@ function renderDetailDrawer() {
         })()
       : '';
     const archiveSizeText = formatBytesCompact(p.distribution?.sizeBytes);
+    const installedVersion = localItem?.version || st.installedVersion;
+    const versions = [
+      ...(installedVersion ? [[t('已安装版本', 'Installed version'), installedVersion]] : []),
+      ...(p.version && p.version !== installedVersion ? [[t('目录版本', 'Catalog version'), p.version]] : []),
+    ];
     bodyHtml = `
       <div class="badge-row">
         ${drawerCatTagsHtml}
@@ -5733,12 +6004,19 @@ function renderDetailDrawer() {
                 <div class="skel skel-line" style="width:86%"></div>
                 <div class="skel skel-line" style="width:68%"></div>
               </div>`
-            : renderSafeMarkdown(state.detailReadme, t('暂无 README 文档。', 'No README provided.'))
+            : state.detailReadmeError
+              ? `<p role="status">${escapeHtml(state.detailReadmeError)} <button type="button" class="btn btn-sm" data-action="retry-readme">${escapeHtml(t('重试', 'Retry'))}</button></p>`
+              : renderSafeMarkdown(state.detailReadme, t('暂无 README 文档。', 'No README provided.'))
         }
       </div>
       <div class="meta-kv">
         <span class="muted">ID / Slug</span>
         <span class="mono">${escapeHtml(p.id)} (${escapeHtml(p.forceScopedInstall ? p.scopedName : p.canonicalName)})</span>
+        ${versions.map(([label, version]) => `<span class="muted">${escapeHtml(label)}</span>
+          <span class="meta-kv-val"><span class="mono">${escapeHtml(formatV(version))}</span>
+            <button type="button" class="icon-btn btn-sm" data-action="copy-text" data-copy-key="version-${escapeHtml(version)}"
+              data-copy-val="${escapeHtml(version)}" title="${escapeHtml(t('复制完整版本号', 'Copy full version'))}">${icon(state.copiedKey === 'version-' + version ? 'check' : 'copy', 11)}</button>
+          </span>`).join('')}
         ${
           Array.isArray(p.taxonomy?.categories) && p.taxonomy.categories.length > 0
             ? `<span class="muted">${escapeHtml(t('分类', 'Categories'))}</span>
@@ -5746,7 +6024,7 @@ function renderDetailDrawer() {
             : ''
         }
         ${
-          repoUrl
+          isSafeHttpUrl(repoUrl)
             ? `<span class="muted">Repository</span>
                <span><a class="md-link" href="${escapeHtml(repoUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(repoUrl)}</a></span>`
             : ''
@@ -5802,7 +6080,7 @@ function renderDetailDrawer() {
                   : t('来源：已验证目录（SHA-256 已校验）', 'Source: Verified Catalog (SHA-256 verified)'),
             )}</div>
           </div>
-          ${upd.releaseUrl ? `<a class="btn btn-sm" href="${escapeHtml(upd.releaseUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(isCommitUpdate ? t('查看对比', 'Compare') : 'Release')} ${icon('external', 11)}</a>` : ''}
+          ${isSafeHttpUrl(upd.releaseUrl) ? `<a class="btn btn-sm" href="${escapeHtml(upd.releaseUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(isCommitUpdate ? t('查看对比', 'Compare') : 'Release')} ${icon('external', 11)}</a>` : ''}
         </div>
         <div class="md-body">
           ${renderSafeMarkdown(upd.changelog, t('上游未附带详细的更新日志说明。', 'No release notes were provided for this version.'))}
@@ -5810,9 +6088,9 @@ function renderDetailDrawer() {
       `
       : `<div class="empty-state">
           <div class="empty-icon">${icon('history', 20)}</div>
-          <div class="empty-title">${escapeHtml(t('当前已是最新版本', 'Currently up to date'))}</div>
-          <div class="empty-sub">${escapeHtml(t(`当前版本 ${formatV(localItem?.version || st.installedVersion || p.version)}，暂无待安装的更新日志。`, `Running ${formatV(localItem?.version || st.installedVersion || p.version)} with no pending update changelog.`))}</div>
-          ${repoUrl ? `<a class="btn btn-sm" href="${escapeHtml(repoUrl)}/releases" target="_blank" rel="noopener noreferrer">${escapeHtml(t('查看 GitHub Releases', 'View GitHub Releases'))} ${icon('external', 11)}</a>` : ''}
+          <div class="empty-title">${escapeHtml(notice || (isConfirmedLatest ? t('上次检查为最新', 'Up to date at last check') : t('暂无更新日志', 'No release notes available')))}</div>
+          <div class="empty-sub">${escapeHtml(st.installed ? t(`已安装版本 ${formatV(st.installedVersion || localItem?.version)}`, `Installed version ${formatV(st.installedVersion || localItem?.version)}`) : t(`目录版本 ${formatV(p.version)} · 尚未安装`, `Catalog version ${formatV(p.version)} · Not installed`))}</div>
+          ${isSafeHttpUrl(repoUrl) ? `<a class="btn btn-sm" href="${escapeHtml(repoUrl.replace(/\/+$/, ''))}/releases" target="_blank" rel="noopener noreferrer">${escapeHtml(t('查看 GitHub Releases', 'View GitHub Releases'))} ${icon('external', 11)}</a>` : ''}
         </div>`;
   } else if (state.detailTab === 'capabilities') {
     const cap = p.capabilities || {};
@@ -5897,7 +6175,7 @@ function renderDetailDrawer() {
             ${drawerToggleHtml}
             ${primaryBtn}
             ${drawerPaneBtn}
-            ${repoUrl ? `<a class="btn btn-sm" href="${escapeHtml(repoUrl)}" target="_blank" rel="noopener noreferrer">GitHub ${icon('external', 11)}</a>` : ''}
+            ${isSafeHttpUrl(repoUrl) ? `<a class="btn btn-sm" href="${escapeHtml(repoUrl)}" target="_blank" rel="noopener noreferrer">GitHub ${icon('external', 11)}</a>` : ''}
             ${discussUrl ? `<a class="btn btn-sm" href="${escapeHtml(discussUrl)}" target="_blank" rel="noopener noreferrer">${icon('message', 12)} ${escapeHtml(t('讨论区', 'Discussions'))}</a>` : ''}
             ${
               canUninstall
@@ -6557,7 +6835,7 @@ function renderModals() {
             ${renderSafeMarkdown(su.changelog, t('暂无更新日志详情。', 'No changelog provided.'))}
           </div>
           <div class="modal-footer">
-            ${su.releaseUrl ? `<a class="btn btn-sm" href="${escapeHtml(su.releaseUrl)}" target="_blank" rel="noopener noreferrer">GitHub Release ${icon('external', 11)}</a>` : ''}
+            ${isSafeHttpUrl(su.releaseUrl) ? `<a class="btn btn-sm" href="${escapeHtml(su.releaseUrl)}" target="_blank" rel="noopener noreferrer">GitHub Release ${icon('external', 11)}</a>` : ''}
             <button type="button" class="btn btn-sm" data-action="close-modal">${escapeHtml(t('关闭', 'Close'))}</button>
             <button type="button" class="btn btn-primary btn-sm" data-action="self-update" data-update-channel="${escapeHtml(su.updateChannel || '')}" data-target-version="${escapeHtml(su.latestVersion || '')}" data-target-ref="${escapeHtml(su.targetRef || '')}"${lockAttr}>${icon(state.selfUpdateBusy ? 'refresh' : 'update', 12, state.selfUpdateBusy ? 'spin' : '')} ${escapeHtml(state.selfUpdateBusy ? t('正在更新…', 'Updating…') : t('立即更新市场', 'Update Market'))}</button>
           </div>
@@ -6696,6 +6974,12 @@ function renderModals() {
 // Main Render Loop (Preserves Focus & Scroll Offsets)
 // ==========================================================================
 
+function getMainScroller(root) {
+  const content = root.querySelector('.market-content');
+  return content && window.getComputedStyle?.(content)?.overflowY === 'auto'
+    ? content : root.querySelector('.main-scroll');
+}
+
 function render() {
   const root = document.getElementById('app');
   if (!root) return;
@@ -6704,10 +6988,12 @@ function render() {
   const selStart = document.activeElement?.selectionStart ?? null;
   const selEnd = document.activeElement?.selectionEnd ?? null;
   const selDir = document.activeElement?.selectionDirection ?? null;
-  const prevMainScrollEl = root.querySelector('.main-scroll');
+  const prevMainScrollEl = getMainScroller(root);
   const prevMainScroll = state.activeTab === lastRenderedTab ? prevMainScrollEl?.scrollTop ?? 0 : 0;
   const prevMainScrollLeft = state.activeTab === lastRenderedTab ? prevMainScrollEl?.scrollLeft ?? 0 : 0;
-  const prevDrawerScroll = root.querySelector('#market-drawer-body')?.scrollTop ?? 0;
+  const drawerKey = state.detailPlugin ? JSON.stringify([state.detailPlugin.id, state.detailPlugin._localSelection, state.detailTab]) : '';
+  const prevDrawerScroll = drawerKey === lastDrawerKey ? root.querySelector('#market-drawer-body')?.scrollTop ?? 0 : 0;
+  lastDrawerKey = drawerKey;
 
   const catalogCount = state.serverState?.catalog?.plugins?.length || 0;
   const favCount = resolveFavoriteEntries().length;
@@ -6790,6 +7076,7 @@ function render() {
             type="button"
             class="add-url-btn"
             data-action="open-github-url-modal"
+            aria-label="${escapeHtml(t('链接添加', 'Add URL'))}"
             title="${escapeHtml(t('粘贴任意 GitHub 插件仓库链接进行预检与安装', 'Inspect and install a plugin from any GitHub URL'))}"
           >
             ${icon('link', 12)}
@@ -6797,6 +7084,7 @@ function render() {
           </button>
           <a
             class="submit-plugin-btn"
+            aria-label="${escapeHtml(t('申请收录插件', 'Submit Plugin'))}"
             href="${escapeHtml(SUBMIT_PLUGIN_GUIDE_URL)}"
             target="_blank"
             rel="noopener noreferrer"
@@ -6817,12 +7105,14 @@ function render() {
         </div>
       </header>
 
+      <div class="market-content">
       ${renderErrorAlertBanner()}
       ${renderSelfUpdateBanner()}
       ${renderRestartBanner()}
       ${renderNominationBanner()}
 
       ${viewHtml}
+      </div>
 
       ${renderModals()}
     </div>
@@ -6834,7 +7124,13 @@ function render() {
   setupDiscoverChipStripControls();
   renderToast();
 
-  const mainScrollEl = root.querySelector('.main-scroll');
+  if (state.activeTab === 'sources') {
+    for (const [id, value] of sourceDraft) {
+      const field = document.getElementById(id);
+      if (field) field.value = value;
+    }
+  }
+  const mainScrollEl = getMainScroller(root);
   if (mainScrollEl) {
     if (prevMainScroll > 0) mainScrollEl.scrollTop = prevMainScroll;
     if (prevMainScrollLeft > 0) mainScrollEl.scrollLeft = prevMainScrollLeft;
@@ -7079,10 +7375,14 @@ function handleActionClick(el, e, root) {
     const version = el.getAttribute('data-version') || '';
     const favKey = el.getAttribute('data-fav-key') || '';
     if (dir && dir !== 'agy-market') {
+      const local = getGlobalInstalledByDirMap().get(dir);
+      if (!local) return;
       state.removeConfirmModal = {
         dir,
-        displayName,
-        version,
+        expectedInstall: { parked: Boolean(local.parkedByMarket), name: local.name, id: local.receipt?.id || '',
+          repositoryUrl: local.repositoryUrl || '', key: local.uninstallKey },
+        displayName: local.displayName || local.name || displayName,
+        version: local.version || version,
         isFavorited: isPluginDirFavorited(dir, favKey),
         removeFavorite: false,
       };
@@ -7135,6 +7435,10 @@ function handleActionClick(el, e, root) {
         targetRef: retry.targetRef || '',
       });
     }
+  } else if (action === 'retry-readme') {
+    void fetchDetailReadme(state.detailPlugin);
+  } else if (action === 'retry-catalog') {
+    void loadState(true);
   } else if (action === 'check-updates') {
     if (isUpdateActionLocked()) return;
     void checkUpdates(true, { silent: false });
@@ -7160,6 +7464,14 @@ function handleActionClick(el, e, root) {
       state.detailPlugin = null;
     }
     render();
+  } else if (action === 'inspect-favorite') {
+    const key = el.getAttribute('data-key');
+    const entry = resolveFavoriteEntries().find(item => item.key === key && item.kind === 'saved');
+    if (entry?.source.repositoryUrl) {
+      const { repositoryUrl, pluginRoot, trackBranch } = entry.source;
+      const branchPath = trackBranch ? '/tree/' + trackBranch.split('/').map(encodeURIComponent).join('/') : '';
+      void triggerGithubUrlInspect({ url: repositoryUrl + branchPath, pluginRoot });
+    }
   } else if (action === 'open-github-url-modal') {
     e.stopPropagation();
     const prefill = el.getAttribute('data-prefill-url') || '';
@@ -7258,10 +7570,10 @@ function handleActionClick(el, e, root) {
     e.stopPropagation();
     const dir = el.getAttribute('data-dir');
     const initialTab = el.getAttribute('data-detail-tab') || 'overview';
-    const loc = (state.serverState?.installed || []).find((x) => x.dir === dir);
+    const loc = findSelectedLocal({ dir, scope: el.getAttribute('data-scope'), path: el.getAttribute('data-path') });
     if (loc) {
       const { byId: catById, byDir: catByDir } = getCatalogMaps();
-      const catEntry = (loc.receipt?.id && catById.get(loc.receipt.id)) || catByDir.get(loc.dir) || null;
+      const catEntry = catalogEntryForInstalled(loc, catById, catByDir);
       void openPluginDetail(buildLocalDetailModel(loc, catEntry), initialTab);
     }
   } else if (action === 'detail-tab') {
@@ -7320,7 +7632,9 @@ function handleActionClick(el, e, root) {
   } else if (action === 'resolve-conflict' && state.conflictModal) {
     if (isUpdateActionLocked()) return;
     const strategy = el.getAttribute('data-strategy') || 'isolate';
-    void triggerInstall(state.conflictModal.plugin, { conflictStrategy: strategy });
+    const pending = state.conflictModal;
+    state.conflictModal = null;
+    void triggerInstall(pending.plugin, { ...pending.opts, conflictStrategy: strategy });
   } else if (action === 'confirm-escalation' && state.escalationModal) {
     if (isUpdateActionLocked()) return;
     const em = state.escalationModal;
@@ -7329,6 +7643,9 @@ function handleActionClick(el, e, root) {
       const item = em.items[0];
       void triggerInstall(item.plugin, {
         confirmEscalation: true,
+        approvalKey: item.escalation?.approvalKey,
+        conflictStrategy: item.conflictStrategy,
+        replacementKey: item.replacementKey,
         ...(item.dir ? { dir: item.dir } : {}),
         ...(item.forceResync ? { forceResync: true } : {}),
       });
@@ -7347,18 +7664,21 @@ function handleActionClick(el, e, root) {
         preferUpstream: Boolean(item.preferUpstream),
         forceResync: Boolean(item.forceResync),
         confirmEscalation: true,
+        approvalKey: item.escalation?.approvalKey,
       });
     } else if (em.mode === 'self') {
       const item = em.items[0] || {};
       void triggerSelfUpdate({
         confirmEscalation: true,
+        approvalKey: item.escalation?.approvalKey,
         updateChannel: item.updateChannel || '',
         targetVersion: item.targetVersion && item.targetVersion !== '?' ? item.targetVersion : '',
         targetRef: item.targetRef || '',
       });
     } else {
-      const escalatedIds = em.items.map((x) => x.id).filter(Boolean);
-      void triggerUpdateAll(escalatedIds, { confirmEscalation: true });
+      const escalatedIds = em.items.map((x) => x.dir || x.id).filter(Boolean);
+      const approvalKeys = Object.fromEntries(em.items.map(x => [x.dir || x.id, x.escalation?.approvalKey]));
+      void triggerUpdateAll(escalatedIds, { confirmEscalation: true, approvalKeys });
     }
   } else if (action === 'goto-token') {
     state.detailPlugin = null;
@@ -7367,6 +7687,7 @@ function handleActionClick(el, e, root) {
     render();
   } else if (action === 'clear-github-token') {
     if (isUpdateActionLocked() || state.prefsSaving) return;
+    sourceDraft.delete('github-token-input');
     void updatePrefs({ githubToken: '', clearGithubToken: true }, t('已清除本地 GitHub Token', 'Cleared local GitHub Token'));
   } else if (action === 'copy-text') {
     e.stopPropagation();
@@ -7380,8 +7701,7 @@ function handleActionClick(el, e, root) {
     const id = el.getAttribute('data-id') || '';
     const { byId: catById, byDir: catByDir } = getCatalogMaps();
     const loc = dir ? getInstalledByDirMap().get(dir) || null : null;
-    const catEntry =
-      (id && catById.get(id)) || (loc?.receipt?.id && catById.get(loc.receipt.id)) || (dir && catByDir.get(dir)) || null;
+    const catEntry = loc ? catalogEntryForInstalled(loc, catById, catByDir) : catById.get(id);
     if (catEntry) {
       void openPluginDetail(catEntry, 'overview');
     } else if (loc) {
@@ -7520,6 +7840,7 @@ function bindDelegatedEvents(root) {
   root.addEventListener('input', (e) => {
     const target = e.target;
     const id = target?.id;
+    if (sourceFieldIds.has(id)) sourceDraft.set(id, target.value);
     if (id === 'market-search-input') {
       state.search = target.value;
       state.visibleLimit = DISCOVER_PAGE_SIZE;
@@ -7560,6 +7881,7 @@ function bindDelegatedEvents(root) {
   root.addEventListener('change', (e) => {
     const target = e.target;
     const id = target?.id;
+    if (sourceFieldIds.has(id)) sourceDraft.set(id, target.value);
     if (id === 'track2-checkbox') {
       if (state.prefsSaving) {
         target.checked = Boolean(state.serverState?.prefs?.enableExperimentalTrack2);
@@ -7597,20 +7919,18 @@ function bindDelegatedEvents(root) {
     if (target?.id !== 'sources-form') return;
     e.preventDefault();
     if (isUpdateActionLocked() || state.prefsSaving) return;
-    const networkMode = root.querySelector('#net-mode-select')?.value || 'auto';
-    const githubReleaseMirrorPrefix = root.querySelector('#mirror-prefix-input')?.value?.trim() || '';
-    const primaryCatalogUrl = root.querySelector('#primary-url-input')?.value?.trim() || '';
-    const rawCustom = root.querySelector('#custom-feeds-textarea')?.value || '';
-    const customFeeds = rawCustom
-      .split(/\r?\n/)
-      .map((s) => s.trim())
-      .filter(Boolean);
-    const patch = { networkMode, githubReleaseMirrorPrefix, primaryCatalogUrl, customFeeds };
+    const patch = {};
+    if (sourceDraft.has('net-mode-select')) patch.networkMode = sourceDraft.get('net-mode-select');
+    if (sourceDraft.has('mirror-prefix-input')) patch.githubReleaseMirrorPrefix = sourceDraft.get('mirror-prefix-input').trim();
+    if (sourceDraft.has('primary-url-input')) patch.primaryCatalogUrl = sourceDraft.get('primary-url-input').trim();
+    if (sourceDraft.has('custom-feeds-textarea')) {
+      patch.customFeeds = sourceDraft.get('custom-feeds-textarea').split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+    }
     const tokenVal = root.querySelector('#github-token-input')?.value?.trim() || '';
     if (tokenVal) {
       patch.githubToken = tokenVal;
     }
-    void updatePrefs(patch);
+    void updatePrefs(patch, '', new Map(sourceDraft));
   });
 }
 
@@ -7646,7 +7966,7 @@ window.addEventListener('keydown', (e) => {
       render();
     }
   } else if (e.key === '/' && !e.ctrlKey && !e.metaKey && !e.altKey) {
-    if (state.githubUrlModal || state.conflictModal || state.escalationModal || state.removeConfirmModal) return;
+    if (state.detailPlugin || state.selfChangelogModal || state.reconnecting || state.githubUrlModal || state.conflictModal || state.escalationModal || state.removeConfirmModal) return;
     const tag = (document.activeElement?.tagName || '').toLowerCase();
     if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
     const searchEl =
@@ -7667,6 +7987,49 @@ if (window.sidecar?.onWorkspaceChange) {
   });
 }
 
-// Automatically load state AND check updates (`GET /api/updates?force=0`) on pane open!
-void loadState(false);
-void checkUpdates(false, { silent: true });
+// The host can clip its sidecar iframe when maximized. Keep the scroll areas and
+// their container queries inside the visible slice, including during pinch zoom.
+function fitPanelToViewport() {
+  const app = document.getElementById('app');
+  if (!app?.getBoundingClientRect) return;
+  const viewport = window.visualViewport;
+  let frameClip;
+  function fit() {
+    const box = app.getBoundingClientRect();
+    if (!box.width || !app.offsetWidth) return;
+    const left = Math.max(box.left, frameClip?.left ?? box.left, viewport?.offsetLeft ?? box.left);
+    const right = Math.min(box.right, frameClip?.right ?? box.right,
+      viewport ? viewport.offsetLeft + viewport.width : box.right);
+    if (right <= left) return;
+    const scale = app.offsetWidth / box.width;
+    app.style.paddingLeft = (left - box.left) * scale + 'px';
+    app.style.paddingRight = (box.right - right) * scale + 'px';
+  }
+  if (window.parent !== window && typeof IntersectionObserver === 'function') {
+    const observer = new IntersectionObserver(([entry]) => {
+      frameClip = entry.isIntersecting ? entry.intersectionRect : null;
+      fit();
+    }, { threshold: Array.from({ length: 101 }, (_, i) => i / 100) });
+    // Observe the unchanged outer border box; padding only resizes the inner shell.
+    observer.observe(app);
+    // Resizing a fully visible iframe leaves the intersection ratio at 1.
+    // Request fresh coordinates even when no threshold was crossed.
+    window.addEventListener('resize', () => {
+      observer.unobserve(app);
+      observer.observe(app);
+    });
+  } else {
+    window.addEventListener('resize', fit);
+  }
+  viewport?.addEventListener('resize', fit);
+  viewport?.addEventListener('scroll', fit);
+  fit();
+}
+
+function openMarketPanel() {
+  fitPanelToViewport();
+  panelOpening = 'pending';
+  return loadState(false);
+}
+
+void openMarketPanel();

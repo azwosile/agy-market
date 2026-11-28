@@ -5,17 +5,19 @@
 //   - Aligns `<dir> === plugin.json.name === "<owner-lower>--<slug>"` when scoped isolation is applied.
 //   - Rewrites `customization://` and `sidecar://` links in `.md` files and reports bare-name JS/hook compatibility notes.
 
+import { createHash } from 'node:crypto';
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, posix, resolve } from 'node:path';
 import { classifyActivationRequirement } from '../shared/activation.mjs';
 import { LOCAL_INVENTORY_CACHE_TTL_MS, PLUGIN_ID, SELF_CATALOG_ID, toScopedPluginName } from '../shared/constants.mjs';
 import {
   fileUriToLocalPath,
+  isHostPluginsDir,
   resolveAntigravityConfigDir,
   resolveDisabledPluginsDir,
   resolvePluginsDir,
 } from '../shared/paths.mjs';
-import { parseJsonc, sanitizeNativePluginManifest } from '../shared/schemas.mjs';
+import { normalizePluginRoot, parseJsonc, sanitizeNativePluginManifest } from '../shared/schemas.mjs';
 import { compareSemver, parseSemver } from '../shared/semver.mjs';
 
 const HOOK_META_KEYS = new Set(['$schema', 'version', 'description', 'enabled']);
@@ -97,8 +99,8 @@ export function normalizeRepoUrl(rawRepo) {
     .replace(/^git:\/\/github\.com\//i, 'https://github.com/')
     .replace(/^ssh:\/\/git@github\.com\//i, 'https://github.com/')
     .replace(/^git@github\.com:/i, 'https://github.com/')
-    .replace(/\.git$/i, '')
-    .replace(/\/+$/, '');
+    .replace(/\/+$/, '')
+    .replace(/\.git$/i, '');
   const ghMatch = /^https?:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)(?:\/.*)?$/i.exec(cleaned);
   if (ghMatch) {
     cleaned = `https://github.com/${ghMatch[1].toLowerCase()}/${ghMatch[2].toLowerCase()}`;
@@ -110,31 +112,53 @@ export function normalizeRepoUrl(rawRepo) {
 
 const IGNORED_README_GH_OWNERS = new Set(['features', 'topics', 'settings', 'orgs', 'sponsors', 'marketplace']);
 
-function resolveLocalPluginRepoUrl(fullDir, manifest, receipt) {
+function declaredPluginRoot(repository) {
+  const raw = typeof repository === 'string' ? repository : repository?.url;
+  const url = String(raw || '').trim().replace(/^git\+/, '').replace(/[?#].*$/, '').replace(/\/+$/, '')
+    .replace(/^git@github\.com:/i, 'https://github.com/')
+    .replace(/^(?:git|ssh):\/\/(?:git@)?github\.com\//i, 'https://github.com/');
+  const tree = /^https?:\/\/github\.com\/[^/]+\/[^/]+\/tree\/[^/]+(?:\/(.+))?$/i.exec(url);
+  const hasSuffix = /^https?:\/\/github\.com\/[^/]+\/[^/]+\//i.test(url);
+  function clean(path) {
+    if (typeof path !== 'string' || !path.trim()) return null;
+    if (/^(?:[/\\\\]|[a-z]:)/i.test(path.trim())) return null;
+    const relative = normalizePluginRoot(path);
+    if (relative === '.' || path.trim() === './') return '.';
+    return relative && relative.split('/').every(part => part && part !== '.' && part !== '..' && !/[\\%:?#]/.test(part))
+      ? relative : null;
+  }
+  // A bare URL establishes repository identity but gives no explicit subtree evidence.
+  const fromUrl = tree ? clean(tree[1] || '.') : hasSuffix ? null : undefined;
+  if (typeof repository !== 'object' || !('directory' in repository)) return fromUrl;
+  const directory = clean(repository.directory);
+  return hasSuffix && !(tree && !tree[1]) && directory !== fromUrl ? null : directory;
+}
+
+export function resolveLocalPluginSource(fullDir, manifest, receipt) {
   const fromReceipt = normalizeRepoUrl(receipt?.repositoryUrl);
-  if (receipt?.track === 'github-url' && fromReceipt) return fromReceipt;
-
   const fromRepo = normalizeRepoUrl(manifest?.repository);
-  if (fromRepo) return fromRepo;
-
-  if (fromReceipt) return fromReceipt;
-
-  const fromHomepage = normalizeRepoUrl(manifest?.homepage);
-  if (/^https:\/\/github\.com\/[^/]+\/[^/]+$/.test(fromHomepage)) {
-    return fromHomepage;
+  if (receipt && (fromReceipt || fromRepo)) {
+    return { repositoryUrl: receipt.track === 'github-url' ? fromReceipt || fromRepo : fromRepo || fromReceipt };
   }
 
-  const pkgPath = join(fullDir, 'package.json');
-  if (existsSync(pkgPath)) {
-    try {
-      const pkg = parseJsonc(readFileSync(pkgPath, 'utf8'));
-      const pkgRepo = normalizeRepoUrl(pkg?.repository);
-      if (pkgRepo) return pkgRepo;
-      const pkgHome = normalizeRepoUrl(pkg?.homepage);
-      if (/^https:\/\/github\.com\/[^/]+\/[^/]+$/.test(pkgHome)) return pkgHome;
-    } catch {
-      /* ignore */
-    }
+  let pkg;
+  try { pkg = parseJsonc(readFileSync(join(fullDir, 'package.json'), 'utf8')); } catch { /* optional metadata */ }
+  const pkgRepo = normalizeRepoUrl(pkg?.repository);
+  const homepages = [manifest?.homepage, pkg?.homepage].filter(link => typeof link === 'string');
+  const homepage = homepages.find(link => /^https:\/\/github\.com\/[^/]+\/[^/]+$/.test(normalizeRepoUrl(link)));
+  const declaredUrl = fromRepo || pkgRepo;
+  const repositoryUrl = declaredUrl || normalizeRepoUrl(homepage);
+  if (repositoryUrl) {
+    const sources = [manifest?.repository, pkg?.repository,
+      ...homepages.filter(link => !declaredUrl || /\/tree\//i.test(link))];
+    const roots = new Set(sources.filter(source => normalizeRepoUrl(source) === repositoryUrl)
+      .map(declaredPluginRoot).filter(root => root !== undefined));
+    const repositoryRoot = roots.has(null) || roots.size > 1 ? null : [...roots][0] || '.';
+    return {
+      repositoryUrl, repositoryRoot,
+      ...(declaredUrl && roots.size === 0 ? { implicitRepositoryRoot: true } : {}),
+      ...(!declaredUrl ? { inferredRepository: true } : {}),
+    };
   }
 
   if (!receipt) {
@@ -148,7 +172,7 @@ function resolveLocalPluginRepoUrl(fullDir, manifest, receipt) {
           const owner = m[1].toLowerCase();
           const repo = m[2].replace(/\.git$/i, '').toLowerCase();
           if (IGNORED_README_GH_OWNERS.has(owner) || !repo) continue;
-          return `https://github.com/${owner}/${repo}`;
+          return { repositoryUrl: `https://github.com/${owner}/${repo}`, inferredRepository: true };
         }
       } catch {
         /* ignore */
@@ -156,7 +180,25 @@ function resolveLocalPluginRepoUrl(fullDir, manifest, receipt) {
     }
   }
 
-  return '';
+  return { repositoryUrl: '' };
+}
+
+function localCopyFavoriteKey(scope, dir, fullDir, name, source, receipt) {
+  // The global copy can move to the disabled vault. Workspace copies need their full path.
+  const path = scope === 'global' ? dir : resolve(fullDir);
+  const location = process.platform === 'win32' ? path.toLowerCase() : path;
+  return 'copy:' + createHash('sha256').update(JSON.stringify([
+    scope, location, name, normalizeRepoUrl(receipt?.repositoryUrl || source.repositoryUrl),
+    receipt?.pluginRoot || source.repositoryRoot || '', receipt?.id || '',
+  ])).digest('hex');
+}
+
+export function matchLegacyLocalFavorite(key, installed, source = null) {
+  if (!key.startsWith('local:')) return null;
+  const matches = installed.filter(loc => loc.dir === key.slice(6) &&
+    (!source?.repositoryUrl || (normalizeRepoUrl(loc.receipt?.repositoryUrl || loc.repositoryUrl) === normalizeRepoUrl(source.repositoryUrl) &&
+      (!source.pluginRoot || normalizePluginRoot(loc.receipt?.pluginRoot || loc.repositoryRoot) === source.pluginRoot))));
+  return matches.length === 1 ? matches[0] : null;
 }
 
 function normalizeAuthorDisplay(rawAuthor) {
@@ -290,7 +332,7 @@ function detectLocalHostEnhancementKinds(fullDir, dirName, manifestName, receipt
   }
 
   // Never self-flag agy-market's own source code
-  if (dirName === PLUGIN_ID || manifestName === PLUGIN_ID) {
+  if (samePluginName(dirName, PLUGIN_ID) || samePluginName(manifestName, PLUGIN_ID)) {
     return [...kinds].sort();
   }
 
@@ -625,6 +667,14 @@ export function scanLocalPluginComponents(fullDir, dirName, manifestName, receip
   };
 }
 
+export function localUninstallKey(path, manifest, receipt) {
+  const st = lstatSync(path, { bigint: true, throwIfNoEntry: false });
+  if (!st) return '';
+  return createHash('sha256').update(JSON.stringify([
+    path, String(st.dev), String(st.ino), String(st.birthtimeNs), manifest, receipt,
+  ])).digest('hex');
+}
+
 function scanSinglePluginFolder(
   parentDir,
   dirName,
@@ -645,7 +695,9 @@ function scanSinglePluginFolder(
 
   let manifest = { name: dirName };
   try {
-    manifest = parseJsonc(readFileSync(manifestPath, 'utf8'));
+    const parsed = parseJsonc(readFileSync(manifestPath, 'utf8'));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    manifest = parsed;
   } catch {
     manifest = { name: dirName };
   }
@@ -672,7 +724,7 @@ function scanSinglePluginFolder(
   const enabled = parkedByMarket ? false : explicitEnabled !== undefined ? explicitEnabled : manifest.disabled !== true;
 
   let toggleDisabledReason = '';
-  if (dirName === PLUGIN_ID) {
+  if (samePluginName(dirName, PLUGIN_ID)) {
     toggleDisabledReason = 'self';
   } else if (scope === 'workspace') {
     toggleDisabledReason = 'workspace';
@@ -681,17 +733,17 @@ function scanSinglePluginFolder(
   } else if (hostDisabled) {
     toggleDisabledReason = 'host-disabled';
   }
-  const canToggle = scope === 'global' && dirName !== PLUGIN_ID && !hostDisabled;
+  const canToggle = scope === 'global' && !samePluginName(dirName, PLUGIN_ID) && !hostDisabled;
 
   const uninstallDisabledReason =
-    dirName === PLUGIN_ID
+    samePluginName(dirName, PLUGIN_ID)
       ? 'self'
       : scope === 'workspace'
         ? 'workspace'
         : scope === 'builtin'
           ? 'builtin'
           : '';
-  const canUninstall = scope === 'global' && dirName !== PLUGIN_ID;
+  const canUninstall = scope === 'global' && !samePluginName(dirName, PLUGIN_ID);
 
   const activation = classifyActivationRequirement(components.capabilities);
 
@@ -703,17 +755,27 @@ function scanSinglePluginFolder(
   const declaredVersion = manifestVersion;
   const hasDeclaredVersion = Boolean(receiptVersion || declaredVersion);
   const unmanagedReason = isGitManaged ? 'git-clone' : !receipt && !hasDeclaredVersion ? 'no-version' : null;
-  const resolvedVersion =
-    receiptVersion &&
-    manifestVersion &&
-    parseSemver(manifestVersion) &&
-    parseSemver(receiptVersion) &&
-    compareSemver(manifestVersion, receiptVersion) > 0
-      ? manifestVersion
-      : String(receipt?.installedVersion || manifest.version || '0.0.0');
-
+  const localSource = resolveLocalPluginSource(fullDir, manifest, receipt);
+  const favoriteKey = localCopyFavoriteKey(scope, dirName, fullDir, manifestName, localSource, receipt);
+  // Complete old receipts from declared metadata without changing their saved bookmark key.
+  if (receipt && !receipt.pluginRoot && localSource.repositoryUrl && localSource.repositoryRoot === undefined) {
+    const declared = resolveLocalPluginSource(fullDir, manifest, null);
+    if (!declared.inferredRepository && declared.repositoryUrl === normalizeRepoUrl(receipt.repositoryUrl || localSource.repositoryUrl)) {
+      localSource.repositoryRoot = declared.repositoryRoot;
+    }
+  }
+  // Older GitHub installs recorded the repository tag as the component version.
+  const githubChild = (receipt?.githubSource || receipt?.track === 'github-url') &&
+    normalizePluginRoot(receipt.pluginRoot || localSource.repositoryRoot) !== '.';
+  const legacyRepoTagVersion = Boolean(githubChild && parseSemver(receipt?.gitTag) && parseSemver(manifestVersion) &&
+    compareSemver(receipt.gitTag, receiptVersion) === 0 && compareSemver(receiptVersion, manifestVersion) > 0);
+  const useManifest = legacyRepoTagVersion || (parseSemver(manifestVersion) && parseSemver(receiptVersion) &&
+    compareSemver(manifestVersion, receiptVersion) > 0);
+  const resolvedVersion = useManifest ? manifestVersion : String(receipt?.installedVersion || manifest.version || '0.0.0');
   return {
     dir: dirName,
+    favoriteKey,
+    ...(canUninstall ? { uninstallKey: localUninstallKey(fullDir, manifest, receipt) } : {}),
     path: fullDir,
     ...(isSymlink ? { realPath } : {}),
     scope, // 'global' | 'workspace' | 'builtin'
@@ -725,9 +787,10 @@ function scanSinglePluginFolder(
     displayName,
     description: String(manifest.description || ''),
     version: resolvedVersion,
+    ...(legacyRepoTagVersion ? { legacyRepoTagVersion: true } : {}),
     author: normalizeAuthorDisplay(manifest.author),
     logo: typeof manifest.logo === 'string' ? manifest.logo.trim().replace(/\\/g, '/').replace(/^\.\/+/, '') : '',
-    repositoryUrl: resolveLocalPluginRepoUrl(fullDir, manifest, receipt),
+    ...localSource,
     enabled,
     parkedByMarket: Boolean(parkedByMarket),
     hostDisabled,
@@ -790,6 +853,7 @@ function appendRootInventorySignature(parts, rootDir, label) {
       d,
       statSignature(full, true),
       statSignature(join(full, 'plugin.json')),
+      statSignature(join(full, 'package.json')),
       statSignature(join(full, '.agy-market-receipt.json')),
       statSignature(join(full, 'hooks.json')),
       statSignature(join(full, 'hooks', 'hooks.json')),
@@ -829,10 +893,11 @@ export function scanLocalPluginInventory({
   builtinPluginsDir = '',
   linkInfoOverride = null,
   bypassCache = false,
+  catalogPlugins = [],
 } = {}) {
   const resolvedConfigDir = resolve(configDir);
   const globalPluginsDir = pluginsDir ? resolve(pluginsDir) : resolvePluginsDir(resolvedConfigDir);
-  const disabledPluginsDir = dataDir ? resolveDisabledPluginsDir(dataDir) : '';
+  const disabledPluginsDir = dataDir && isHostPluginsDir(globalPluginsDir, resolvedConfigDir) ? resolveDisabledPluginsDir(dataDir) : '';
   const resolvedBuiltinDir = builtinPluginsDir ? resolve(builtinPluginsDir) : '';
   const workspaceRoots = [];
   for (const uri of workspaceUris || []) {
@@ -858,7 +923,7 @@ export function scanLocalPluginInventory({
     if (hit && nowMs - hit.cachedAtMs < LOCAL_INVENTORY_CACHE_TTL_MS && hit.signature === currentSig) {
       return {
         ...hit.value,
-        installed: [...hit.value.installed],
+        installed: hit.value.installed.map(loc => resolveCatalogPluginRoot(loc, catalogPlugins)),
         userMcpServerNames: new Set(hit.value.userMcpServerNames),
       };
     }
@@ -945,16 +1010,91 @@ export function scanLocalPluginInventory({
     });
   }
 
-  return result;
+  return catalogPlugins.length ? { ...result, installed: installed.map(loc => resolveCatalogPluginRoot(loc, catalogPlugins)) } : result;
+}
+
+// Old manual root installs used the repository slug as both directory and manifest name.
+// Require the root entry's full catalog identity; sharing a repository URL is not enough.
+function isLegacyRepoRoot(loc, repoUrl, id, root) {
+  if (!loc || loc.scope !== 'global' || loc.receipt || loc.isGitManaged || loc.isSymlink ||
+      loc.repositoryRoot !== '.' || loc.inferredRepository || samePluginName(loc.dir, PLUGIN_ID) || loc.dir !== loc.name || !repoUrl || loc.repositoryUrl !== repoUrl ||
+      normalizePluginRoot(root) !== '.') return false;
+  const match = /^https:\/\/github\.com\/([^/]+)\/([^/]+)$/.exec(repoUrl);
+  return Boolean(match && loc.name.toLowerCase() === match[2] && id === `${match[1]}__${match[2]}`);
+}
+
+// Only fill an omitted path. Explicit local paths, conflicting metadata and receipts take precedence.
+export function resolveCatalogPluginRoot(loc, catalogPlugins) {
+  if (!loc?.implicitRepositoryRoot || !catalogPlugins.length) return loc;
+  const roots = new Set();
+  for (const plugin of catalogPlugins) {
+    if (normalizeRepoUrl(plugin.repository?.url) !== loc.repositoryUrl) continue;
+    const root = normalizePluginRoot(plugin.repository?.pluginRoot);
+    if (samePluginName(plugin.canonicalName, loc.name) || isLegacyRepoRoot(loc, loc.repositoryUrl, plugin.id, root)) roots.add(root);
+  }
+  if (!roots.size) return loc;
+  return { ...loc, repositoryRoot: roots.size === 1 ? [...roots][0] : null, implicitRepositoryRoot: false };
+}
+
+export function samePluginName(a, b) {
+  return typeof a === 'string' && typeof b === 'string' &&
+    ((process.platform === 'win32' || (process.platform === 'darwin' && a.toLowerCase() === PLUGIN_ID && b.toLowerCase() === PLUGIN_ID)) ? a.toLowerCase() === b.toLowerCase() : a === b);
+}
+
+export function matchesInstalledSource(loc, plugin, installed = [], allowLegacyRename = true) {
+  const repo = plugin?.repository;
+  if (!loc || !plugin) return false;
+  if ((samePluginName(loc.dir, PLUGIN_ID) || samePluginName(loc.name, PLUGIN_ID)) && plugin.id !== SELF_CATALOG_ID) return false;
+  const root = normalizePluginRoot(repo?.pluginRoot);
+  if (loc.receipt) {
+    const rec = loc.receipt;
+    const installedRoot = rec.pluginRoot || loc.repositoryRoot;
+    if (installedRoot === null || normalizePluginRoot(installedRoot) !== root) return false;
+    const localId = Number(rec.repositoryId);
+    const catalogId = Number(repo?.repositoryId);
+    // Track 2 derives its entry ID from owner/repo, which can change on transfer.
+    if (rec.id !== plugin.id) {
+      return rec.track === 'unverified' && plugin._track === 'unverified' &&
+        rec.id !== SELF_CATALOG_ID && plugin.id !== SELF_CATALOG_ID &&
+        Number.isSafeInteger(localId) && localId > 0 && localId === catalogId;
+    }
+    if (localId > 0 && catalogId > 0) return localId === catalogId;
+    const installedUrl = normalizeRepoUrl(rec.repositoryUrl || (!loc.inferredRepository && loc.repositoryUrl));
+    return Boolean(installedUrl && installedUrl === normalizeRepoUrl(repo?.url));
+  }
+  // README references and homepages can point to a dependency or an upstream
+  // example. They are display hints, not evidence that this directory is owned.
+  if (loc.inferredRepository) return false;
+  const url = normalizeRepoUrl(repo?.url);
+  if (!url || loc.repositoryUrl !== url || (loc.repositoryRoot !== undefined && loc.repositoryRoot !== root)) return false;
+  if (samePluginName(loc.name, plugin.canonicalName)) return true;
+  return allowLegacyRename && !samePluginName(plugin.canonicalName, PLUGIN_ID) && isLegacyRepoRoot(loc, url, plugin.id, root) &&
+    !installed.some(other => other !== loc && (samePluginName(other.name, plugin.canonicalName) || samePluginName(other.dir, plugin.canonicalName)));
+}
+
+export function findCatalogEntryForLocal(loc, plugins = [], installed = []) {
+  if (!loc) return null;
+  return plugins.find(plugin => matchesInstalledSource(loc, plugin, installed)) ||
+    ((samePluginName(loc.dir, PLUGIN_ID) || samePluginName(loc.name, PLUGIN_ID)) && plugins.find(plugin => plugin.id === SELF_CATALOG_ID)) || null;
+}
+
+export function legacyDuplicateResult(dir, successorDir) {
+  return { ok: false, status: 'LEGACY_DUPLICATE', errorCode: 'ERR_LEGACY_DUPLICATE', dir, successorDir,
+    error: `请核对旧目录 ${dir}，市场托管副本为 ${successorDir}。` };
+}
+
+export function findManagedSuccessor(loc, installed) {
+  if (!loc || loc.receipt || loc.scope !== 'global') return null;
+  return installed.find(other => other.scope === 'global' && other.dir !== loc.dir &&
+    other.receipt?.scopedRewriteApplied && other.receipt.repositoryUrl &&
+    isLegacyRepoRoot(loc, normalizeRepoUrl(other.receipt.repositoryUrl), other.receipt.id, other.receipt.pluginRoot)) || null;
 }
 
 /**
  * Resolves exact install target & collision strategy for `plugin` against `inventory`.
  * `conflictStrategy`: `'prompt'` (default) | `'isolate'` | `'replace'`
  */
-export function resolveInstallPreflight(plugin, inventory, { conflictStrategy = 'prompt', preferredDir = '' } = {}) {
-  const repoId = Number(plugin?.repository?.repositoryId || 0);
-  const repoUrlNorm = normalizeRepoUrl(plugin?.repository?.url);
+export function resolveInstallPreflight(plugin, inventory, { conflictStrategy = 'prompt', preferredDir = '', requireExistingDir = false, allowLegacyRename = true } = {}) {
   const canonicalName = String(plugin.canonicalName || '').trim();
   if (
     !canonicalName ||
@@ -973,32 +1113,41 @@ export function resolveInstallPreflight(plugin, inventory, { conflictStrategy = 
   const scopedName = plugin.scopedName || toScopedPluginName(ownerFromId, canonicalName);
 
   // 1. Check if SAME plugin is already installed locally (active OR parked in `disabled-plugins/<dir>`)
-  const sameSourceMatches = (inventory.installed || []).filter((loc) => {
-    if (loc.scope !== 'global') return false;
-    if (loc.receipt) {
-      if (repoId > 0 && Number(loc.receipt.repositoryId || 0) > 0) {
-        return loc.receipt.repositoryId === repoId && loc.receipt.id === plugin.id;
-      }
-      return loc.receipt.id === plugin.id;
-    }
-    if (repoUrlNorm && loc.repositoryUrl && loc.repositoryUrl === repoUrlNorm && loc.name === canonicalName) {
-      return true;
-    }
-    return false;
-  });
+  const sameSourceMatches = (inventory.installed || []).filter(loc =>
+    loc.scope === 'global' && matchesInstalledSource(loc, plugin, inventory.installed, allowLegacyRename));
   const normPreferredDir = String(preferredDir || '').trim();
+  if (requireExistingDir && normPreferredDir) {
+    const requested = inventory.installed.find(loc => loc.scope === 'global' && samePluginName(loc.dir, normPreferredDir));
+    if (!requested) throw new Error(`ERR_UPDATE_TARGET_MISMATCH: Installed directory "${normPreferredDir}" was not found.`);
+    if ((samePluginName(requested.dir, PLUGIN_ID) || samePluginName(requested.name, PLUGIN_ID)) && plugin.id !== SELF_CATALOG_ID) {
+      throw new Error(`ERR_CANNOT_REPLACE_SELF: Foreign plugin "${plugin.id}" cannot overwrite "${PLUGIN_ID}".`);
+    }
+    const successor = findManagedSuccessor(requested, inventory.installed);
+    if (successor) {
+      const result = legacyDuplicateResult(requested.dir, successor.dir);
+      throw Object.assign(new Error(result.errorCode + ' ' + result.error), { result });
+    }
+    if (!sameSourceMatches.includes(requested)) {
+      throw new Error(`ERR_UPDATE_TARGET_MISMATCH: Cannot safely update "${normPreferredDir}" in place.`);
+    }
+  }
+  if (requireExistingDir && !sameSourceMatches.length) {
+    throw new Error(`ERR_UPDATE_TARGET_MISMATCH: No installed directory matches "${plugin.id}".`);
+  }
   const sameSource =
-    (normPreferredDir && sameSourceMatches.find((loc) => loc.dir === normPreferredDir)) ||
+    (normPreferredDir && sameSourceMatches.find((loc) => samePluginName(loc.dir, normPreferredDir))) ||
+    sameSourceMatches.find(loc => loc.receipt?.id === plugin.id) ||
+    sameSourceMatches.find(loc => loc.receipt) ||
     sameSourceMatches[0] ||
     null;
 
   if (sameSource) {
-    const isScoped = Boolean(sameSource.receipt?.scopedRewriteApplied) || sameSource.dir === scopedName;
+    const isScoped = Boolean(sameSource.receipt?.scopedRewriteApplied) || samePluginName(sameSource.dir, scopedName);
     const effectiveScopedName = sameSource.receipt?.effectivePluginName || sameSource.dir || scopedName;
     return {
       action: 'update',
       targetDir: sameSource.dir,
-      effectivePluginName: isScoped ? effectiveScopedName : sameSource.name,
+      effectivePluginName: isScoped ? effectiveScopedName : canonicalName,
       applyScopedRewrite: isScoped,
       existingInstall: {
         ...sameSource,
@@ -1008,22 +1157,30 @@ export function resolveInstallPreflight(plugin, inventory, { conflictStrategy = 
     };
   }
 
-  // 2. Track-2 Experimental plugins ALWAYS enforce Layer-2 `<owner>--<slug>` scoped isolation
-  if (plugin.forceScopedInstall) {
+  function planScopedInstall(conflict = null) {
+    const occupied = (inventory.installed || []).find(loc =>
+      samePluginName(loc.dir, scopedName) || samePluginName(loc.name, scopedName));
     return {
-      action: 'install-scoped',
+      action: occupied ? 'scoped-target-occupied' : 'install-scoped',
       targetDir: scopedName,
       effectivePluginName: scopedName,
       applyScopedRewrite: true,
       existingInstall: null,
-      conflict: null,
+      conflict: occupied || conflict,
     };
   }
 
+  if (plugin.forceScopedInstall) return planScopedInstall();
+
   // 3. Check for collision on `dir === canonicalName` OR `manifest.name === canonicalName` across global/workspace/builtin
-  const conflicting = (inventory.installed || []).find(
-    (loc) => loc.dir === canonicalName || loc.name === canonicalName,
+  let conflicting = (inventory.installed || []).find(
+    loc => samePluginName(loc.dir, canonicalName) || samePluginName(loc.name, canonicalName),
   );
+  if (!conflicting && [inventory.globalPluginsDir, inventory.disabledPluginsDir].some(
+    root => root && lstatSync(join(root, canonicalName), { throwIfNoEntry: false }),
+  )) {
+    conflicting = { scope: 'global', dir: canonicalName, name: canonicalName, displayName: canonicalName, unidentified: true };
+  }
 
   if (!conflicting) {
     return {
@@ -1037,25 +1194,19 @@ export function resolveInstallPreflight(plugin, inventory, { conflictStrategy = 
   }
 
   const isForeignSelfCollision =
-    (conflicting.dir === PLUGIN_ID || conflicting.name === PLUGIN_ID) && plugin.id !== SELF_CATALOG_ID;
+    (samePluginName(conflicting.dir, PLUGIN_ID) || samePluginName(conflicting.name, PLUGIN_ID)) && plugin.id !== SELF_CATALOG_ID;
 
   // 4. Foreign local/builtin collision detected!
-  if (conflictStrategy === 'isolate') {
-    return {
-      action: 'install-scoped',
-      targetDir: scopedName,
-      effectivePluginName: scopedName,
-      applyScopedRewrite: true,
-      existingInstall: null,
-      conflict: conflicting,
-    };
-  }
+  if (conflictStrategy === 'isolate') return planScopedInstall(conflicting);
 
   if (conflictStrategy === 'replace') {
     if (isForeignSelfCollision) {
       throw new Error(
         `ERR_CANNOT_REPLACE_SELF: Foreign plugin "${plugin.id}" cannot overwrite "${PLUGIN_ID}"; choose isolated install (${scopedName}) instead`,
       );
+    }
+    if (conflicting.unidentified) {
+      throw new Error(`ERR_TARGET_DIR_EXISTS: Cannot replace unidentified local directory "${canonicalName}".`);
     }
     if (conflicting.scope !== 'global') {
       throw new Error(
@@ -1076,7 +1227,7 @@ export function resolveInstallPreflight(plugin, inventory, { conflictStrategy = 
   }
 
   const choices = ['isolate'];
-  if (conflicting.scope === 'global' && !isForeignSelfCollision) choices.push('replace');
+  if (conflicting.scope === 'global' && !isForeignSelfCollision && !conflicting.unidentified) choices.push('replace');
 
   return {
     action: 'conflict-prompt',
@@ -1100,9 +1251,10 @@ function escapeRegExp(str) {
  *   - Rewrites `customization://<old>` and `sidecar://<old>/` protocol links in `.md` files.
  *   - Scans `.js`/`.mjs`/`.cjs`/`hooks.json` for hardcoded bare references and emits non-blocking compatibility notes.
  */
-export function applyScopedIsolationRewrite(stagingBundleDir, { canonicalName, scopedName, fallbackDisplayName = '' }) {
+export function applyScopedIsolationRewrite(stagingBundleDir, { canonicalName, scopedName, fallbackDisplayName = '', writeText = writeFileSync }) {
   const absRoot = resolve(stagingBundleDir);
   const manifestPath = join(absRoot, 'plugin.json');
+  if (!lstatSync(manifestPath).isFile()) throw new Error('ERR_MANIFEST_INVALID: Expected a regular plugin.json');
   const rawManifest = parseJsonc(readFileSync(manifestPath, 'utf8'));
   const oldName = String(rawManifest.name || canonicalName || '').trim();
 
@@ -1114,16 +1266,17 @@ export function applyScopedIsolationRewrite(stagingBundleDir, { canonicalName, s
   // Never inject `"disabled": true` — preserve one-click immediate activation!
   delete nextManifest.disabled;
 
-  writeFileSync(manifestPath, `${JSON.stringify(nextManifest, null, 2)}\n`, 'utf8');
+  writeText(manifestPath, `${JSON.stringify(nextManifest, null, 2)}\n`, 'utf8');
 
   const compatibilityNotes = [];
   const oldTokens = [...new Set([oldName, canonicalName].filter(Boolean))];
 
   function walk(dir, relPrefix = '') {
-    for (const entry of readdirSync(dir)) {
+    for (const st of readdirSync(dir, { withFileTypes: true })) {
+      const entry = st.name;
+      if (st.isSymbolicLink() || entry === 'node_modules' || entry === '.git') continue;
       const full = join(dir, entry);
       const rel = relPrefix ? posix.join(relPrefix, entry) : entry;
-      const st = statSync(full);
       if (st.isDirectory()) {
         walk(full, rel);
         continue;
@@ -1142,7 +1295,7 @@ export function applyScopedIsolationRewrite(stagingBundleDir, { canonicalName, s
             changed = true;
           }
         }
-        if (changed) writeFileSync(full, md, 'utf8');
+        if (changed) writeText(full, md, 'utf8');
       } else if (/\.(?:js|mjs|cjs)$/i.test(entry) || rel === 'hooks.json') {
         const src = readFileSync(full, 'utf8');
         for (const tok of oldTokens) {

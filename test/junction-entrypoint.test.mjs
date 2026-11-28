@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import test from 'node:test';
@@ -8,9 +8,31 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { isMainEntry } from '../sidecars/market_pane/main.mjs';
 import { isMainModule } from '../src/shared/paths.mjs';
+import { installLocalAgyMarket } from '../scripts/install-local.mjs';
 
 const __testDir = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__testDir, '..');
+
+test('bootstrap materializes a legacy official junction and preserves its Git worktree', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'agy-bootstrap-link-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const checkout = join(root, 'development', 'agy-market');
+  const dataDir = join(root, 'data');
+  mkdirSync(join(checkout, '.git'), { recursive: true });
+  const manifest = JSON.stringify({ name: 'agy-market', repository: 'https://github.com/azwosile/agy-market' });
+  writeFileSync(join(checkout, 'plugin.json'), manifest);
+  writeFileSync(join(checkout, 'notes.txt'), 'draft');
+  await assert.rejects(installLocalAgyMarket({ destPluginsDir: dirname(checkout), dataDir }), /ERR_BOOTSTRAP_CONFLICT/);
+  const plugins = join(root, 'plugins');
+  mkdirSync(plugins);
+  symlinkSync(checkout, join(plugins, 'agy-market'), process.platform === 'win32' ? 'junction' : 'dir');
+  await installLocalAgyMarket({ destPluginsDir: plugins, dataDir });
+  assert.equal(lstatSync(join(plugins, 'agy-market')).isSymbolicLink(), false);
+  assert.ok(existsSync(join(plugins, 'agy-market', '.agy-market-receipt.json')));
+  assert.equal(existsSync(join(checkout, '.agy-market-receipt.json')), false);
+  assert.equal(readFileSync(join(checkout, 'notes.txt'), 'utf8'), 'draft');
+  assert.equal(readFileSync(join(checkout, 'plugin.json'), 'utf8'), manifest);
+});
 
 test('isMainModule handles direct paths, Windows NTFS cross-drive junctions, drive casing, and non-matching scripts', () => {
   const realMain = join(REPO_ROOT, 'sidecars', 'market_pane', 'main.mjs');
@@ -25,10 +47,11 @@ test('isMainModule handles direct paths, Windows NTFS cross-drive junctions, dri
   assert.equal(isMainEntry(join(REPO_ROOT, 'bin', 'agy-market.mjs')), false);
 
   // 3. Simulated Windows NTFS cross-drive directory junction (C:\Users\longyi\.gemini -> D:\Antigravity\.gemini)
-  const realWinPath = '/D:/Antigravity/.gemini/config/plugins/agy-market/sidecars/market_pane/main.mjs';
-  const junctionWinPath = '/C:/Users/longyi/.gemini/config/plugins/agy-market/sidecars/market_pane/main.mjs';
+  const drivePrefix = process.platform === 'win32' ? '' : '/';
+  const realWinPath = resolve(drivePrefix + 'D:/Antigravity/.gemini/config/plugins/agy-market/sidecars/market_pane/main.mjs');
+  const junctionWinPath = resolve(drivePrefix + 'C:/Users/longyi/.gemini/config/plugins/agy-market/sidecars/market_pane/main.mjs');
   const realWinUrl = pathToFileURL(realWinPath).href;
-  const fakeRealpath = (p) => (p.includes('Users/longyi') ? realWinPath : p);
+  const fakeRealpath = (p) => (p === junctionWinPath ? realWinPath : p);
   fakeRealpath.native = fakeRealpath;
 
   assert.equal(
@@ -37,13 +60,8 @@ test('isMainModule handles direct paths, Windows NTFS cross-drive junctions, dri
   );
 
   // 4. Simulated Windows case-insensitive drive letter / folder casing difference
-  const lowerCaseRealpath = (p) => p.replace('/D:/Antigravity/', '/d:/antigravity/');
-  lowerCaseRealpath.native = lowerCaseRealpath;
   assert.equal(
-    isMainModule(realWinUrl, realWinPath.replace('/D:/Antigravity/', '/d:/antigravity/'), {
-      realpathFn: lowerCaseRealpath,
-      platform: 'win32',
-    }),
+    isMainModule(realWinUrl, realWinPath.toLowerCase(), { realpathFn: fakeRealpath, platform: 'win32' }),
     true,
   );
 });
@@ -62,9 +80,10 @@ test('sidecars/market_pane/main.mjs and bin/agy-market.mjs boot properly when la
     mkdirSync(dataDir, { recursive: true });
 
     // Simulate C:\Users\<user>\.gemini -> D:\Antigravity\.gemini directory junction
-    symlinkSync(realTargetGemini, linkedGemini, 'dir');
+    const linkType = process.platform === 'win32' ? 'junction' : 'dir';
+    symlinkSync(realTargetGemini, linkedGemini, linkType);
     // Link repo into real D:\Antigravity\.gemini\config\plugins\agy-market
-    symlinkSync(REPO_ROOT, join(realPluginsDir, 'agy-market'), 'dir');
+    symlinkSync(REPO_ROOT, join(realPluginsDir, 'agy-market'), linkType);
 
     const linkedMain = join(linkedGemini, 'config', 'plugins', 'agy-market', 'sidecars', 'market_pane', 'main.mjs');
     const linkedCli = join(linkedGemini, 'config', 'plugins', 'agy-market', 'bin', 'agy-market.mjs');

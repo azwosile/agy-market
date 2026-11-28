@@ -97,7 +97,7 @@ function jsonResp(obj, status = 200, headers = {}) {
 
 function createInteractiveUiHarness() {
   const bundled = bundleZeroDepEsm(join(REPO_ROOT, 'src', 'ui', 'app.mjs'));
-  const bootMarker = 'void loadState(false);\nvoid checkUpdates(false, { silent: true });';
+  const bootMarker = 'void openMarketPanel();';
   assert.ok(bundled.includes(bootMarker), 'Bundled app.mjs must contain auto-boot marker');
 
   const instrumented = bundled.replace(
@@ -405,7 +405,7 @@ function createInteractiveUiHarness() {
 }
 
 test('v1.7.1 Track 2 timeout & fallback: index.json OK + unverified timeout falls back to alternate URL then local cache with warnings and >4 plugins', async () => {
-  assert.equal(PLUGIN_VERSION, '1.7.2');
+  assert.equal(PLUGIN_VERSION, '2.0.0');
   assert.equal(PRIMARY_FETCH_TIMEOUT_MS, 3500);
   assert.equal(UNVERIFIED_FETCH_TIMEOUT_MS, 20000);
   assert.equal(LOCAL_INVENTORY_CACHE_TTL_MS, 30000);
@@ -525,6 +525,35 @@ test('v1.7.1 Track 2 timeout & fallback: index.json OK + unverified timeout fall
     assert.ok(chinaRes.warnings.some((w) => /Track 2/.test(w)));
   } finally {
     ws.cleanup();
+  }
+});
+
+test('Track 2 remains available when both verified indexes fail, including a verified-only mirror fallback', async t => {
+  const primaryPlugin = makeCatalogPlugin(31, { track: 'unverified' });
+  const mirrorVerified = makeCatalogPlugin(32);
+  const mirrorTrack2 = makeCatalogPlugin(33, { track: 'unverified' });
+  const mirror = 'https://mirror.example';
+  const tgz = createDeterministicTarGz({
+    'package/dist/index.json': JSON.stringify({ plugins: [mirrorVerified] }),
+    'package/dist/unverified-index.json': JSON.stringify({ plugins: [mirrorTrack2] }),
+  });
+  for (const networkMode of ['direct', 'auto']) {
+    await t.test(networkMode, async t => {
+      const ws = makeTempWorkspace();
+      t.after(() => ws.cleanup());
+      const fetchImpl = async url => {
+        if (url === PRIMARY_CATALOG_BASE_URL + '/unverified-index.json') return Response.json({ plugins: [primaryPlugin] });
+        if (url === mirror + '/catalog.tgz') return new Response(tgz);
+        if (url.startsWith(mirror + '/')) return Response.json({ dist: { tarball: mirror + '/catalog.tgz' } });
+        return new Response('{}', { status: 503 });
+      };
+      const result = await resolveMarketCatalog({ dataDir: ws.dataDir, prefs: { networkMode, enableExperimentalTrack2: true },
+        mirrors: [mirror], fetchImpl });
+      assert.deepEqual(result.plugins.filter(p => p._track === 'unverified').map(p => p.id), [primaryPlugin.id]);
+      const cache = JSON.parse(readFileSync(join(ws.dataDir, 'cache', 'unverified-index.json')));
+      assert.equal(cache.plugins[0].id, primaryPlugin.id);
+      if (networkMode === 'auto') assert.equal(result.plugins[0].id, mirrorVerified.id);
+    });
   }
 });
 

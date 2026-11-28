@@ -16,7 +16,6 @@ import { dirname } from 'node:path';
 import { CHINA_NPM_MIRRORS, MAX_TARBALL_BYTES } from '../shared/constants.mjs';
 import { fileUriToLocalPath } from '../shared/paths.mjs';
 import { defaultProxyFetch } from '../shared/proxy-fetch.mjs';
-import { inspectTarGzStream } from './tar-extract.mjs';
 
 function resolveEffectiveFetch(fetchImpl) {
   return !fetchImpl || fetchImpl === fetch ? defaultProxyFetch : fetchImpl;
@@ -172,7 +171,7 @@ const FULL_SHA256_RE = /^[0-9a-f]{64}$/i;
 export function isOfficialGithubTokenHost(rawUrl) {
   try {
     const u = new URL(String(rawUrl || ''));
-    if (u.protocol !== 'https:' && u.protocol !== 'http:') return false;
+    if (u.protocol !== 'https:') return false;
     return OFFICIAL_GITHUB_TOKEN_HOSTS.has(u.hostname.toLowerCase());
   } catch {
     return false;
@@ -570,46 +569,11 @@ export async function fetchVerifiedPluginTarball({
           extraHeaders: fallbackHeaders,
         });
 
-        const rawExpectedCommitFallbackSha = String(plugin?.distribution?.commitFallbackSha256 || '')
-          .trim()
-          .toLowerCase();
-        if (rawExpectedCommitFallbackSha) {
-          if (
-            !FULL_SHA256_RE.test(rawExpectedCommitFallbackSha) ||
-            sha256.toLowerCase() !== rawExpectedCommitFallbackSha
-          ) {
-            rmSync(stagingArchivePath, { force: true });
-            throw new Error(
-              `INTEGRITY_SHA256_MISMATCH: Expected commitFallbackSha256 ${rawExpectedCommitFallbackSha}, got ${sha256} from github-commit-fallback (${commitFallbackUrl})`,
-            );
-          }
-        } else {
-          const expectedCommitSha = String(plugin?.commitSha || '').trim().toLowerCase();
-          let meta;
-          try {
-            meta = await inspectTarGzStream(stagingArchivePath, {
-              maxUncompressedBytes: maxBytes,
-              stripSingleTopDir: true,
-              pluginRoot: plugin?.repository?.pluginRoot || '.',
-              shouldBufferFile: () => false,
-            });
-          } catch (parseErr) {
-            rmSync(stagingArchivePath, { force: true });
-            const parseMsg = parseErr?.message || String(parseErr);
-            if (parseMsg.includes('ERR_TAR_SYMLINK_FORBIDDEN')) {
-              throw parseErr;
-            }
-            throw new Error(
-              `INTEGRITY_SHA256_MISMATCH: Failed to verify commit-fallback archive PAX header (${parseMsg})`,
-            );
-          }
-          const paxComment = String(meta?.globalPax?.comment || '').trim().toLowerCase();
-          if (!FULL_COMMIT_SHA_RE.test(paxComment) || paxComment !== expectedCommitSha) {
-            rmSync(stagingArchivePath, { force: true });
-            throw new Error(
-              `INTEGRITY_SHA256_MISMATCH: Commit fallback archive PAX comment "${paxComment || 'missing'}" does not match locked commitSha ${expectedCommitSha}`,
-            );
-          }
+        // Older catalogs may only pin the main archive. Accept identical bytes
+        // from the commit URL, or a second digest explicitly pinned by the feed.
+        const fallbackDigest = String(plugin.distribution.commitFallbackSha256 || expectedSha256).trim().toLowerCase();
+        if (!FULL_SHA256_RE.test(fallbackDigest) || sha256 !== fallbackDigest) {
+          throw new Error(`INTEGRITY_SHA256_MISMATCH: Expected commitFallbackSha256 ${fallbackDigest}, got ${sha256} from github-commit-fallback (${commitFallbackUrl})`);
         }
 
         return {

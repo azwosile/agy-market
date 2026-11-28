@@ -187,19 +187,9 @@ export function parseWindowsInternetSettingsOutput(stdout = '') {
   };
 }
 
-function hasAnyEnvProxy(env = process.env) {
-  if (!env || typeof env !== 'object') return false;
-  return Boolean(
-    String(
-      env.HTTPS_PROXY ||
-        env.https_proxy ||
-        env.HTTP_PROXY ||
-        env.http_proxy ||
-        env.ALL_PROXY ||
-        env.all_proxy ||
-        '',
-    ).trim(),
-  );
+function envProxyForProtocol(protocol, env) {
+  const perProtocol = protocol === 'https:' ? env.HTTPS_PROXY || env.https_proxy : env.HTTP_PROXY || env.http_proxy;
+  return normalizeHttpProxyUrl(perProtocol) || normalizeHttpProxyUrl(env.ALL_PROXY || env.all_proxy);
 }
 
 /**
@@ -221,22 +211,16 @@ export function resolveProxyUrlForTarget(targetUrl, { env = process.env, winProx
   }
 
   const envObj = env && typeof env === 'object' ? env : {};
-  const envProxyPresent = hasAnyEnvProxy(envObj);
+  const envProxy = envProxyForProtocol(urlObj.protocol, envObj);
   const rawEnvNoProxy = String(envObj.NO_PROXY || envObj.no_proxy || '').trim();
-  const rawWinNoProxy = !envProxyPresent && winProxyConfig?.enabled ? String(winProxyConfig.proxyOverride || '').trim() : '';
+  const rawWinNoProxy = !envProxy && winProxyConfig?.enabled ? String(winProxyConfig.proxyOverride || '').trim() : '';
   const combinedNoProxy = [rawEnvNoProxy, rawWinNoProxy].filter(Boolean).join(',');
 
   if (combinedNoProxy && matchesNoProxy(urlObj, parseNoProxy(combinedNoProxy))) {
     return null;
   }
 
-  if (envProxyPresent) {
-    const rawProxy =
-      urlObj.protocol === 'https:'
-        ? envObj.HTTPS_PROXY || envObj.https_proxy || envObj.ALL_PROXY || envObj.all_proxy || ''
-        : envObj.HTTP_PROXY || envObj.http_proxy || envObj.ALL_PROXY || envObj.all_proxy || '';
-    return normalizeHttpProxyUrl(rawProxy);
-  }
+  if (envProxy) return envProxy;
 
   if (winProxyConfig?.enabled && winProxyConfig.proxyServer) {
     return parseWindowsProxyServer(winProxyConfig.proxyServer, urlObj.protocol);
@@ -589,9 +573,11 @@ export function createProxyAwareFetch({
   let winProxyCache = null; // { expiresAtMs, config }
   let winProxyInFlight = null;
 
-  async function getWinProxyConfig() {
+  async function getWinProxyConfig(target) {
     if (!readWinSystemProxy || platform !== 'win32') return null;
-    if (hasAnyEnvProxy(env)) return null;
+    let url;
+    try { url = new URL(target); } catch { return null; }
+    if (!['https:', 'http:'].includes(url.protocol) || isLoopbackHost(url.hostname) || envProxyForProtocol(url.protocol, env)) return null;
 
     const now = nowFn();
     if (winProxyCache && now < winProxyCache.expiresAtMs) {
@@ -633,7 +619,7 @@ export function createProxyAwareFetch({
   return async function proxyAwareFetch(input, init = undefined) {
     const isRequestObj = typeof Request !== 'undefined' && input instanceof Request;
     const rawUrl = isRequestObj ? input.url : String(input instanceof URL ? input.toString() : input || '');
-    const winProxyCfg = await getWinProxyConfig();
+    const winProxyCfg = await getWinProxyConfig(rawUrl);
     const initialProxy = resolveProxyUrlForTarget(rawUrl, { env, winProxyConfig: winProxyCfg });
 
     if (!initialProxy) {
@@ -690,7 +676,7 @@ export function createProxyAwareFetch({
             delete currentHeaders['content-type'];
           }
           currentUrl = nextUrl;
-          const cfg = await getWinProxyConfig();
+          const cfg = await getWinProxyConfig(currentUrl);
           currentProxy = resolveProxyUrlForTarget(currentUrl, { env, winProxyConfig: cfg });
           continue;
         }
@@ -737,7 +723,7 @@ export function createProxyAwareFetch({
           delete currentHeaders['content-type'];
         }
         currentUrl = nextUrl;
-        const cfg = await getWinProxyConfig();
+        const cfg = await getWinProxyConfig(currentUrl);
         currentProxy = resolveProxyUrlForTarget(currentUrl, { env, winProxyConfig: cfg });
         continue;
       }

@@ -2,9 +2,25 @@
 
 import { existsSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { PLUGIN_ID, SIDECAR_ID } from './constants.mjs';
+
+export function assertSafePluginDir(rawDir, errPrefix = 'ERR_INVALID_PLUGIN_DIR') {
+  const safeDir = String(rawDir || '').trim();
+  if (
+    !safeDir ||
+    safeDir === '.' ||
+    safeDir === '..' ||
+    safeDir.includes('/') ||
+    safeDir.includes('\\') ||
+    safeDir.includes('..') ||
+    /[\x00-\x1f<>:"|?*]/.test(safeDir)
+  ) {
+    throw new Error(`${errPrefix}: Invalid plugin directory name "${rawDir}"`);
+  }
+  return safeDir;
+}
 
 export function resolveAntigravityConfigDir(explicitConfigDir = '') {
   if (explicitConfigDir) return resolve(explicitConfigDir);
@@ -14,6 +30,12 @@ export function resolveAntigravityConfigDir(explicitConfigDir = '') {
 
 export function resolvePluginsDir(explicitConfigDir = '') {
   return join(resolveAntigravityConfigDir(explicitConfigDir), 'plugins');
+}
+
+export function isHostPluginsDir(pluginsDir, configDir) {
+  const host = resolvePluginsDir(configDir);
+  return relative(pluginsDir, host) === '' || (existsSync(pluginsDir) && existsSync(host) &&
+    relative(realpathSync.native(pluginsDir), realpathSync.native(host)) === '');
 }
 
 export function resolveMarketDataDir(explicitDataDir = '') {

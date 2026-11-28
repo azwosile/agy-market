@@ -9,13 +9,17 @@
 //     out-of-root `@[...](...)` exfiltration, and >24,000-byte rules.
 //   - Exempts zero-dependency dynamic HTTP Sidecars (e.g. `view.path: "/"` backed by existing `server.mjs`/`main.mjs`).
 
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { BUILTIN_AGENT_NAMES, BUILTIN_SKILL_NAMES, GENERIC_MCP_SERVER_KEYS } from '../preflight/conflicts.mjs';
 import {
   normalizeRepoUrl,
   resolveInstallPreflight,
+  samePluginName,
+  findCatalogEntryForLocal,
+  matchesInstalledSource,
+  resolveCatalogPluginRoot,
   scanLocalPluginComponents,
   scanLocalPluginInventory,
 } from '../preflight/index.mjs';
@@ -31,7 +35,7 @@ import {
 import { resolveAntigravityConfigDir, resolveMarketDataDir } from '../shared/paths.mjs';
 import { defaultProxyFetch } from '../shared/proxy-fetch.mjs';
 import {
-  computeCapabilityEscalation,
+  normalizePluginRoot as normalizeStoredPluginRoot,
   parseJsonc,
   sanitizeNativePluginManifest,
   sanitizePrefs,
@@ -40,13 +44,16 @@ import { compareSemver, parseSemver } from '../shared/semver.mjs';
 import {
   computeRateLimitResetMs,
   getGithubCacheDir,
+  readRateLimitState,
+  writeRateLimitState,
+  isRateLimitBackoffActive,
   isRateLimitResponse,
   probeGithubGitRefs,
   probeGithubLatestReleaseRedirect,
   redactSecret,
 } from '../updates/index.mjs';
 import { isOfficialGithubTokenHost, streamUrlToFileAndHash } from './fetch-tarball.mjs';
-import { installOrUpdateCatalogPlugin } from './index.mjs';
+import { getReplacementKey, getUpdateEscalation, installOrUpdateCatalogPlugin } from './index.mjs';
 import { safeRemoveDirBestEffort } from './sync-dir.mjs';
 import { assertNoScopedSymlinks, inspectTarGzStream, validateSafeRelPath } from './tar-extract.mjs';
 
@@ -323,7 +330,7 @@ function assertLocalStaticSafety(scopedFiles, scopedFileSizes = null) {
         );
       }
       checkRulesExfiltration(relPath, text);
-    } else if (/^skills\/[^/]+\/SKILL\.md$/.test(relPath) || /^agents\/[^/]+\.md$/i.test(relPath)) {
+    } else if (/^skills\/[^/]+\/SKILL\.md$/i.test(relPath) || /^agents\/[^/]+\.md$/i.test(relPath)) {
       if (actualBytes > 0 && buf.length === 0) {
         throw new Error(
           `ERR_INVISIBLE_PROMPT_INJECTION: "${relPath}" (${actualBytes} bytes) exceeded text inspection buffer ceiling (${MAX_INSPECT_TEXT_BYTES} bytes)`,
@@ -547,13 +554,17 @@ export function parseGithubPluginUrl(rawUrl) {
     throw new Error('ERR_INVALID_GITHUB_REPO_URL: 链接缺少 <owner>/<repo> 仓库路径。');
   }
 
-  const owner = decodeURIComponent(segments[0]);
+  const decodeSegment = segment => {
+    try { return decodeURIComponent(segment); }
+    catch { throw new Error('ERR_INVALID_URL: Invalid URL encoding'); }
+  };
+  const owner = decodeSegment(segments[0]);
   const ownerLower = owner.toLowerCase();
   if (!OWNER_RE.test(owner) || RESERVED_GITHUB_OWNERS.has(ownerLower)) {
     throw new Error(`ERR_INVALID_GITHUB_OWNER: 非法或保留的 GitHub 仓库所有者路径 "${owner}"。`);
   }
 
-  const repoRaw = decodeURIComponent(segments[1]);
+  const repoRaw = decodeSegment(segments[1]);
   const repo = repoRaw.replace(/\.git$/i, '');
   const repoLower = repo.toLowerCase();
   if (!repo || repo === '.' || repo === '..' || !REPO_RE.test(repo)) {
@@ -571,7 +582,7 @@ export function parseGithubPluginUrl(rawUrl) {
     if (fmt !== 'tar.gz' && fmt !== 'legacy.tar.gz' && fmt !== 'zip') {
       throw new Error(`ERR_UNSUPPORTED_ARCHIVE_FORMAT: codeload 归档类型 "${segments[2]}" 不受支持。`);
     }
-    const refSegments = segments.slice(3).map((s) => decodeURIComponent(s));
+    const refSegments = segments.slice(3).map((s) => decodeSegment(s));
     const refRaw = refSegments.join('/');
     const cleanRef = refRaw.replace(/^refs\/(?:heads|tags)\//i, '');
     const refType = refRaw.startsWith('refs/tags/')
@@ -643,7 +654,7 @@ export function parseGithubPluginUrl(rawUrl) {
       };
     }
     if (segments[3].toLowerCase() === 'tag' && segments.length >= 5) {
-      const tag = segments.slice(4).map((s) => decodeURIComponent(s)).join('/');
+      const tag = segments.slice(4).map((s) => decodeSegment(s)).join('/');
       return {
         inputUrl,
         normalizedRepoUrl,
@@ -662,8 +673,8 @@ export function parseGithubPluginUrl(rawUrl) {
       };
     }
     if (segments[3].toLowerCase() === 'download' && segments.length >= 6) {
-      const tag = decodeURIComponent(segments[4]);
-      const assetSegs = segments.slice(5).map((s) => decodeURIComponent(s));
+      const tag = decodeSegment(segments[4]);
+      const assetSegs = segments.slice(5).map((s) => decodeSegment(s));
       const assetName = assetSegs.join('/');
       if (/\.zip$/i.test(assetName)) {
         throw new Error(
@@ -698,7 +709,7 @@ export function parseGithubPluginUrl(rawUrl) {
 
   // 4. Tree: `/tree/<ref>[/<subpath...>]`
   if (section === 'tree' && segments.length >= 4) {
-    const rawRestSegments = segments.slice(3).map((s) => decodeURIComponent(s));
+    const rawRestSegments = segments.slice(3).map((s) => decodeSegment(s));
     const ref = rawRestSegments[0];
     const subParts = rawRestSegments.slice(1);
     const pluginRoot = subParts.length > 0 ? normalizePluginRoot(subParts.join('/')) : '.';
@@ -722,7 +733,7 @@ export function parseGithubPluginUrl(rawUrl) {
 
   // 5. Blob manifest link: `/blob/<ref>/[<subpath>/]plugin.json` (also `.antigravity-plugin/plugin.json`)
   if (section === 'blob' && segments.length >= 5) {
-    const rest = segments.slice(3).map((s) => decodeURIComponent(s));
+    const rest = segments.slice(3).map((s) => decodeSegment(s));
     const lastSeg = rest[rest.length - 1];
     if (lastSeg.toLowerCase() !== 'plugin.json') {
       throw new Error(
@@ -777,7 +788,7 @@ export function parseGithubPluginUrl(rawUrl) {
 
   // 7. Archive link: `/archive/...tar.gz` (or `/archive/...zip` auto-rewritten to `.tar.gz`)
   if (section === 'archive' && segments.length >= 4) {
-    const rawArchiveRest = segments.slice(3).map((s) => decodeURIComponent(s)).join('/');
+    const rawArchiveRest = segments.slice(3).map((s) => decodeSegment(s)).join('/');
     let archiveRest = rawArchiveRest;
     let rewrittenFromZip = false;
     if (/\.zip$/i.test(archiveRest)) {
@@ -820,45 +831,13 @@ export function parseGithubPluginUrl(rawUrl) {
   );
 }
 
-function readRateLimitFile(dataDir) {
-  if (!dataDir) return null;
-  const p = join(getGithubCacheDir(dataDir), '_ratelimit.json');
-  if (!existsSync(p)) return null;
-  try {
-    return JSON.parse(readFileSync(p, 'utf8'));
-  } catch {
-    return null;
-  }
-}
-
-function writeRateLimitFile(dataDir, { resetAtMs, authenticated, nowMs }) {
+function writeRateLimitFile(dataDir, options) {
   if (!dataDir) return;
   try {
-    const p = join(getGithubCacheDir(dataDir), '_ratelimit.json');
-    writeFileSync(
-      p,
-      `${JSON.stringify(
-        {
-          schemaVersion: 1,
-          resetAtMs,
-          authenticated: Boolean(authenticated),
-          recordedAt: new Date(nowMs).toISOString(),
-        },
-        null,
-        2,
-      )}\n`,
-      'utf8',
-    );
+    writeRateLimitState(getGithubCacheDir(dataDir), options);
   } catch {
-    /* non-fatal */
+    /* Installation can proceed without a writable rate-limit cache. */
   }
-}
-
-function isRateLimitCooldownActive(dataDir, { nowMs, authenticated }) {
-  const state = readRateLimitFile(dataDir);
-  if (!state || !Number.isFinite(state.resetAtMs)) return false;
-  if (!state.authenticated && authenticated) return false;
-  return nowMs < state.resetAtMs;
 }
 
 function buildGithubApiHeaders(token = '') {
@@ -881,43 +860,28 @@ function pickReleaseTarballAsset(releaseJson) {
   );
   if (tarAssets.length === 0) return null;
 
-  const platformTokens = [
-    'darwin',
-    'macos',
-    'osx',
-    'apple',
-    'linux',
-    'win32',
-    'windows',
-    'mingw',
-    'msvc',
-    'amd64',
-    'x86_64',
-    'x64',
-    'arm64',
-    'aarch64',
-  ];
-  const isPlatformSpecific = (name) => {
-    const lower = String(name || '').toLowerCase();
-    return platformTokens.some((tok) => new RegExp(`(?:^|[^a-z0-9])${tok}(?:$|[^a-z0-9])`).test(lower));
+  const osLabels = {
+    darwin: ['darwin', 'macos', 'osx', 'apple'], linux: ['linux'],
+    win32: ['win', 'win32', 'win64', 'windows', 'mingw', 'msvc'], freebsd: ['freebsd'],
   };
-
-  // Prefer platform-agnostic `.tar.gz` plugin bundle first
-  const universal = tarAssets.find((a) => !isPlatformSpecific(a.name));
-  if (universal) return universal;
-
-  // Otherwise match current host OS/arch only (never silently download macOS binary on Windows)
-  const osPattern =
-    process.platform === 'win32'
-      ? /(?:win32|windows|msvc|mingw)/i
-      : process.platform === 'darwin'
-        ? /(?:darwin|macos|osx|apple)/i
-        : /linux/i;
-  const archPattern = process.arch === 'arm64' ? /(?:arm64|aarch64)/i : /(?:x64|x86_64|amd64)/i;
-  const exactPlatform = tarAssets.find((a) => osPattern.test(a.name) && archPattern.test(a.name));
-  if (exactPlatform) return exactPlatform;
-  const osOnly = tarAssets.find((a) => osPattern.test(a.name));
-  return osOnly || null;
+  const archLabels = {
+    x64: ['x64', 'amd64', 'x86_64'], arm64: ['arm64', 'aarch64'],
+    ia32: ['ia32', 'i386', 'i686', 'x86'], arm: ['arm', 'armhf', 'armv7', 'armv7l'],
+    ppc64: ['ppc64', 'ppc64le'], riscv64: ['riscv64'], s390x: ['s390x'], loong64: ['loong64', 'loongarch64'],
+  };
+  let best = null;
+  let bestRank = Infinity;
+  for (const asset of tarAssets) {
+    const name = asset.name || asset.browser_download_url.split('/').pop();
+    const labels = name.toLowerCase().replaceAll('x86_64', 'amd64').split(/[^a-z0-9]+/);
+    const matches = aliases => aliases.some(alias => labels.includes(alias));
+    const os = Object.entries(osLabels).find(([, aliases]) => matches(aliases))?.[0];
+    const arch = Object.entries(archLabels).find(([, aliases]) => matches(aliases))?.[0];
+    if ((os && os !== process.platform) || (arch && arch !== process.arch)) continue;
+    const rank = !os && !arch ? 0 : os && arch ? 1 : 2;
+    if (rank < bestRank) { best = asset; bestRank = rank; }
+  }
+  return best;
 }
 
 function appendMirroredAndDirect(list, rawGithubUrl, { mirrorPrefix = '', directChannel = 'direct', codeloadUrl = '' } = {}) {
@@ -1144,7 +1108,7 @@ export async function resolveGithubArchiveCandidates(
     return { meta, attempts };
   }
 
-  const inCooldown = isRateLimitCooldownActive(dataDir, { nowMs, authenticated });
+  const inCooldown = dataDir && isRateLimitBackoffActive(readRateLimitState(getGithubCacheDir(dataDir)), { nowMs, authenticated });
 
   // Tier 2: Release Tag URL
   if (parsed.kind === 'release-tag') {
@@ -1398,8 +1362,10 @@ function inferBranchFromArchiveMeta({ repo, strippedTopDir = '', contentDisposit
 
   const cdMatch = /filename\*?=(?:UTF-8'')?["']?([^"';\r\n]+)["']?/i.exec(contentDisposition);
   if (cdMatch && cdMatch[1]) {
-    const fromCd = extractSuffix(decodeURIComponent(cdMatch[1]));
-    if (fromCd) return fromCd;
+    try {
+      const fromCd = extractSuffix(decodeURIComponent(cdMatch[1]));
+      if (fromCd) return fromCd;
+    } catch { /* Malformed optional filename. Use the archive directory instead. */ }
   }
   return extractSuffix(strippedTopDir);
 }
@@ -1484,7 +1450,7 @@ function summarizeCandidateComponents(scopedFiles) {
   let hasHooks = false;
 
   for (const rel of scopedFiles.keys()) {
-    if (/^skills\/[^/]+\/SKILL\.md$/.test(rel)) hasSkills = true;
+    if (/^skills\/[^/]+\/SKILL\.md$/i.test(rel)) hasSkills = true;
     else if (/^agents\/[^/]+\.md$/i.test(rel)) hasAgents = true;
     else if (/^rules\/[^/]+\.md$/i.test(rel)) hasRules = true;
     else if (/^sidecars\/[^/]+\/sidecar\.json$/.test(rel) || rel === 'sidecars.json') hasSidecar = true;
@@ -1831,7 +1797,6 @@ function buildSyntheticPluginRecord({
   preserveRepositoryId = 0,
   preserveForceScopedInstall = false,
   preservePaths: extraPreservePaths = [],
-  includeGithubSource = true,
 }) {
   const { plugin, resolution, parsed } = inspectData;
   const forceScopedInstall = Boolean(preserveForceScopedInstall) || installMode === 'isolate';
@@ -1884,18 +1849,14 @@ function buildSyntheticPluginRecord({
       preservePaths: mergedPreservePaths,
     },
     capabilities: plugin.capabilities,
-    ...(includeGithubSource
-      ? {
-          githubSource: {
-            inputUrl: parsed?.inputUrl || plugin.repoUrl,
-            kind: parsed?.kind || 'repo',
-            ref: effectiveRef,
-            refType: effectiveRefType,
-            ...(trackBranch ? { trackBranch } : {}),
-            tarballUrl: plugin.tarballUrl,
-          },
-        }
-      : {}),
+    githubSource: {
+      inputUrl: parsed?.inputUrl || plugin.repoUrl,
+      kind: parsed?.kind || 'repo',
+      ref: effectiveRef,
+      refType: effectiveRefType,
+      ...(trackBranch ? { trackBranch } : {}),
+      tarballUrl: plugin.tarballUrl,
+    },
   };
 }
 
@@ -1908,6 +1869,7 @@ function buildSyntheticPluginRecord({
 export async function inspectGithubPluginUrl({
   url = '',
   inspectToken = '',
+  requireStagedInspect = false,
   pluginRoot = '',
   prefs = {},
   configDir = resolveAntigravityConfigDir(),
@@ -1933,9 +1895,17 @@ export async function inspectGithubPluginUrl({
   let stageMeta = null;
   let parsed = null;
   let explicitRootFromRequest = pluginRoot ? normalizePluginRoot(pluginRoot) : '';
+  let tarParsed;
+  const inspectArchive = () => inspectTarGzStream(archivePath, {
+    stripSingleTopDir: true, allowDeferredSymlinkCheck: true,
+    maxUncompressedBytes: MAX_TARBALL_BYTES, shouldBufferFile: shouldBufferInspectFile,
+  });
 
   // Fast path: reuse staged archive for zero-redownload Monorepo subpath switch
   const existingStaged = inspectToken ? loadValidStagedInspect(dataDir, inspectToken, nowMs) : null;
+  if (requireStagedInspect && !existingStaged) {
+    throw new Error('ERR_INSPECT_TOKEN_EXPIRED: 预检暂存已过期，请重新预检并确认安装内容。');
+  }
   if (existingStaged) {
     activeToken = inspectToken;
     stagingRootDir = existingStaged.stagingRootDir;
@@ -1976,6 +1946,21 @@ export async function inspectGithubPluginUrl({
             extraHeaders,
             requireGzipMagic: true,
           });
+          // A release may package a standalone CLI or omit the requested repository subdirectory.
+          if (parsed.kind !== 'release-asset' && cand.canonicalUrl?.includes('/releases/download/')) {
+            let archive;
+            try {
+              archive = await inspectArchive();
+            } catch (err) {
+              const blocked = classifySecurityError(err, resolved.meta.repoUrl);
+              if (!blocked) throw err;
+              safeRemoveDirBestEffort(stagingRootDir);
+              return blocked;
+            }
+            const manifests = discoverPluginManifests(archive.files);
+            if (!manifests.some(c => !explicitRootFromRequest || c.pluginRoot === explicitRootFromRequest)) continue;
+            tarParsed = archive;
+          }
           winningAttempt = attempt;
           winningCandidate = cand;
           break outer;
@@ -2028,14 +2013,8 @@ export async function inspectGithubPluginUrl({
 
   // Parse archive safely via streaming gunzip + tar parser (O(MB) RAM even for 200MB–2GB+ archives;
   // enforces Zip-Slip & typeFlag gates; defers symlink scope check until `selectedRoot` is known)
-  let tarParsed;
   try {
-    tarParsed = await inspectTarGzStream(archivePath, {
-      stripSingleTopDir: true,
-      allowDeferredSymlinkCheck: true,
-      maxUncompressedBytes: MAX_TARBALL_BYTES,
-      shouldBufferFile: shouldBufferInspectFile,
-    });
+    tarParsed ??= await inspectArchive();
   } catch (err) {
     safeRemoveDirBestEffort(stagingRootDir);
     const secBlock = classifySecurityError(err, stageMeta.resolution.repoUrl);
@@ -2183,7 +2162,8 @@ export async function inspectGithubPluginUrl({
   const manifestSem = parseSemver(cleanManifest.version);
   const tagSem = parseSemver(effectiveResolution.gitTag);
   const stableTagSem = tagSem && tagSem.prerelease.length === 0 ? tagSem : null;
-  const version =
+  // A repository tag may describe another component in a multi-plugin repository.
+  const version = selectedRoot !== '.' ? manifestSem?.version || String(cleanManifest.version || '0.0.0') :
     (stableTagSem && (!manifestSem || compareSemver(stableTagSem.version, manifestSem.version) > 0)
       ? stableTagSem.version
       : manifestSem?.version) ||
@@ -2211,9 +2191,10 @@ export async function inspectGithubPluginUrl({
     dataDir,
     workspaceUris,
     builtinPluginsDir,
+    catalogPlugins,
   });
 
-  const isForeignSelfRepo = canonicalName === PLUGIN_ID && syntheticId !== SELF_CATALOG_ID;
+  const isForeignSelfRepo = samePluginName(canonicalName, PLUGIN_ID) && syntheticId !== SELF_CATALOG_ID;
   const probePlugin = {
     id: syntheticId,
     canonicalName,
@@ -2228,21 +2209,32 @@ export async function inspectGithubPluginUrl({
       repositoryId: Number(effectiveResolution.repositoryId || 0),
       pluginRoot: selectedRoot,
     },
+    distribution: { sha256: stageMeta.sha256 },
     capabilities: components.capabilities,
   };
 
-  const preflight = resolveInstallPreflight(probePlugin, inventory, { conflictStrategy: 'prompt' });
+  const allowLegacyRename = catalogPlugins.some(p => p.id === syntheticId &&
+    normalizeRepoUrl(p.repository?.url) === normalizeRepoUrl(probePlugin.repository.url) &&
+    normalizeStoredPluginRoot(p.repository?.pluginRoot) === selectedRoot);
+  const preflight = resolveInstallPreflight(probePlugin, inventory, { conflictStrategy: 'prompt', allowLegacyRename });
   const isForeignSelfCollision =
     isForeignSelfRepo ||
     Boolean(
       preflight.conflict &&
-        (preflight.conflict.dir === PLUGIN_ID || preflight.conflict.name === PLUGIN_ID) &&
+        (samePluginName(preflight.conflict.dir, PLUGIN_ID) || samePluginName(preflight.conflict.name, PLUGIN_ID)) &&
         syntheticId !== SELF_CATALOG_ID,
     );
   const canReplace =
-    Boolean(preflight.conflict) && preflight.conflict.scope === 'global' && !isForeignSelfCollision;
+    Boolean(preflight.choices?.includes('replace')) && !isForeignSelfCollision;
+  const replacementKey = canReplace ? getReplacementKey(probePlugin, preflight.conflict) : '';
+  const previewKeyPath = join(stagingRootDir, 'replacement-' + createHash('sha256').update(selectedRoot).digest('hex'));
+  if (replacementKey && !requireStagedInspect) {
+    // Token-only clients may confirm the original preview for this subtree.
+    try { writeFileSync(previewKeyPath, replacementKey, { flag: 'wx' }); }
+    catch (err) { if (err.code !== 'EEXIST') throw err; }
+  }
 
-  const esc = computeCapabilityEscalation(preflight.existingInstall?.receipt || null, probePlugin);
+  const esc = getUpdateEscalation(probePlugin, preflight);
   const componentWarnings = collectComponentWarnings(components, canonicalName, inventory);
 
   // Cross-check active catalog for gentle notice if already listed
@@ -2368,10 +2360,12 @@ export async function inspectGithubPluginUrl({
           }
         : null,
       canReplace,
+      replacementKey,
       isForeignSelfCollision,
       choices: preflight.choices || (canReplace ? ['isolate', 'replace'] : ['isolate']),
     },
     escalation: {
+      ...(esc.approvalKey ? { approvalKey: esc.approvalKey } : {}),
       hasEscalation: Boolean(esc.escalated),
       escalated: Boolean(esc.escalated),
       addedBadges: esc.addedBadges || [],
@@ -2388,23 +2382,29 @@ export async function inspectGithubPluginUrl({
     _internal: {
       stagingRootDir,
       archivePath,
+      previewKeyPath,
       resolution: effectiveResolution,
       parsed: stageMeta.parsed,
+      allowLegacyRename,
     },
   };
 }
 
 /**
  * Step 2: Installs a GitHub URL plugin by consuming a staged `inspectToken` (with zero redundant
- * network download via `preverifiedArchivePath`), or automatically re-inspecting if expired and `url` is supplied.
+ * network download via `preverifiedArchivePath`). A URL-only caller starts a new inspection.
  */
 export async function installGithubPlugin({
   inspectToken = '',
   url = '',
   pluginRoot = '',
   installMode = '', // '' | 'native' | 'isolate' | 'replace'
+  replacementKey = '',
   preferredDir = '',
   confirmEscalation = false,
+  approvalKey = '',
+  rejectDowngrade = false,
+  resyncVersion = '',
   prefs = {},
   configDir = resolveAntigravityConfigDir(),
   pluginsDir = '',
@@ -2422,17 +2422,10 @@ export async function installGithubPlugin({
   _preserveTrackBranch = '',
 } = {}) {
   const activeFetch = resolveEffectiveFetch(fetchImpl);
-  let activeToken = inspectToken;
-  const staged = inspectToken ? loadValidStagedInspect(dataDir, inspectToken, nowMs) : null;
-
-  if (!staged && !url) {
-    throw new Error('ERR_INSPECT_TOKEN_EXPIRED: 预检暂存已过期，请重新粘贴 GitHub 链接执行预检。');
-  }
-
-  // Re-evaluate staged archive locally (0 network calls if `staged` is valid; downloads once if expired & `url` provided)
   const inspectRes = await inspectGithubPluginUrl({
     url,
-    inspectToken: staged ? activeToken : '',
+    inspectToken,
+    requireStagedInspect: Boolean(inspectToken) || !url,
     pluginRoot,
     prefs,
     configDir,
@@ -2451,13 +2444,18 @@ export async function installGithubPlugin({
     return inspectRes;
   }
 
-  activeToken = inspectRes.inspectToken;
+  const activeToken = inspectRes.inspectToken;
   const { stagingRootDir, archivePath, resolution, parsed } = inspectRes._internal;
   const normalizedMode = ['native', 'isolate', 'replace'].includes(installMode) ? installMode : '';
+  if (normalizedMode === 'replace' && inspectToken && !replacementKey) {
+    try { replacementKey = readFileSync(inspectRes._internal.previewKeyPath, 'utf8'); }
+    catch (err) { if (err.code !== 'ENOENT') throw err; }
+  }
 
   // Hard guard: never allow foreign GitHub repo to overwrite `agy-market` itself
   if (inspectRes.preflight.isForeignSelfCollision) {
     if (normalizedMode === 'replace') {
+      if (!inspectToken) safeRemoveDirBestEffort(stagingRootDir);
       throw new Error(
         `ERR_CANNOT_REPLACE_SELF: 禁止使用外部 GitHub 仓库覆盖 "${PLUGIN_ID}" 本体，请选择隔离安装 (${inspectRes.plugin.scopedName})。`,
       );
@@ -2492,16 +2490,22 @@ export async function installGithubPlugin({
     preserveRepositoryId: effectivePreserveRepoId,
     preserveForceScopedInstall: effectiveForceScopedInstall,
     preservePaths: extraPreservePaths,
-    includeGithubSource: effectiveTrack === 'github-url',
   });
 
   const installRes = await installOrUpdateCatalogPlugin({
-    plugin: syntheticPlugin,
+    plugin: { ...syntheticPlugin, _track: effectiveTrack },
+    catalogPlugins,
     track: effectiveTrack,
     prefs,
     conflictStrategy,
+    replacementKey,
     preferredDir,
+    requireExistingDir: Boolean(preferredDir),
+    allowLegacyRename: inspectRes._internal.allowLegacyRename,
     confirmEscalation: Boolean(confirmEscalation),
+    approvalKey,
+    rejectDowngrade,
+    resyncVersion,
     configDir,
     pluginsDir,
     dataDir,
@@ -2510,6 +2514,9 @@ export async function installGithubPlugin({
     fetchImpl: activeFetch,
     preverifiedArchivePath: archivePath,
     writeOverride,
+  }).catch(err => {
+    if (!inspectToken) safeRemoveDirBestEffort(stagingRootDir);
+    throw err;
   });
 
   if (installRes.ok && installRes.status === 'INSTALLED') {
@@ -2537,39 +2544,6 @@ export async function installGithubPlugin({
   };
 }
 
-function findMatchingCatalogForLocalUpdate(loc, catalogPlugins = [], isSelf = false) {
-  const list = Array.isArray(catalogPlugins) ? catalogPlugins : [];
-  if (list.length === 0) return null;
-  const receipt = loc?.receipt || null;
-  if (receipt?.id) {
-    const recRepoId = Number(receipt.repositoryId || 0);
-    const byReceipt = list.find((p) => {
-      const pRepoId = Number(p?.repository?.repositoryId || 0);
-      if (recRepoId > 0 && pRepoId > 0) {
-        return pRepoId === recRepoId && p.id === receipt.id;
-      }
-      return p.id === receipt.id;
-    });
-    if (byReceipt) return byReceipt;
-  }
-  const locRepo = normalizeRepoUrl(receipt?.repositoryUrl || loc?.repositoryUrl || '');
-  if (locRepo) {
-    const locRoot = normalizePluginRoot(receipt?.pluginRoot || '.');
-    const byRepo = list.find((p) => {
-      const pRepo = normalizeRepoUrl(p?.repository?.url);
-      if (!pRepo || pRepo !== locRepo) return false;
-      const pRoot = normalizePluginRoot(p?.repository?.pluginRoot || '.');
-      if (receipt?.pluginRoot && pRoot !== locRoot) return false;
-      return p.canonicalName === loc?.name || p.canonicalName === loc?.dir || p.scopedName === loc?.dir;
-    });
-    if (byRepo) return byRepo;
-  }
-  if (isSelf) {
-    return list.find((p) => p.id === SELF_CATALOG_ID || p.canonicalName === PLUGIN_ID) || null;
-  }
-  return null;
-}
-
 /**
  * Resolves, stages, and updates any globally installed plugin with a valid GitHub repository URL
  * directly from upstream GitHub (Release tarball -> highest SemVer Tag -> default/tracked branch archive),
@@ -2581,6 +2555,8 @@ export async function resolveAndStageGithubUpdate({
   catPlugin = null,
   updateHint = null,
   confirmEscalation = false,
+  approvalKey = '',
+  resyncVersion = '',
   prefs = {},
   configDir = resolveAntigravityConfigDir(),
   pluginsDir = '',
@@ -2601,14 +2577,25 @@ export async function resolveAndStageGithubUpdate({
     );
   }
 
+  loc = resolveCatalogPluginRoot(loc, catalogPlugins);
   const receipt = loc?.receipt || null;
+  if (!receipt && loc?.inferredRepository) {
+    throw new Error('ERR_UNVERIFIED_UPDATE_SOURCE: The installed plugin does not declare a repository for updates.');
+  }
   const isSelf = Boolean(
-    loc?.dir === PLUGIN_ID || loc?.name === PLUGIN_ID || receipt?.id === SELF_CATALOG_ID || catPlugin?.id === SELF_CATALOG_ID,
+    samePluginName(loc?.dir, PLUGIN_ID) || samePluginName(loc?.name, PLUGIN_ID) || receipt?.id === SELF_CATALOG_ID || catPlugin?.id === SELF_CATALOG_ID,
   );
-  const matchedCatPlugin = catPlugin || findMatchingCatalogForLocalUpdate(loc, catalogPlugins, isSelf);
+  const matchedCatPlugin = catPlugin || findCatalogEntryForLocal(loc, catalogPlugins);
+  const installedUrl = normalizeRepoUrl(receipt?.repositoryUrl || loc?.repositoryUrl);
+  const catalogUrl = normalizeRepoUrl(matchedCatPlugin?.repository?.url);
+  const recordedId = Number(receipt?.repositoryId);
+  const moved = installedUrl && catalogUrl && installedUrl !== catalogUrl &&
+    Number.isSafeInteger(recordedId) && recordedId > 0 && recordedId === Number(matchedCatPlugin.repository.repositoryId) &&
+    matchesInstalledSource(loc, matchedCatPlugin);
 
   const repoUrl = normalizeRepoUrl(
     updateHint?.repositoryUrl ||
+      (moved && catalogUrl) ||
       receipt?.repositoryUrl ||
       matchedCatPlugin?.repository?.url ||
       loc?.repositoryUrl ||
@@ -2628,8 +2615,24 @@ export async function resolveAndStageGithubUpdate({
   }
 
   const pluginRoot = normalizePluginRoot(
-    updateHint?.pluginRoot || receipt?.pluginRoot || matchedCatPlugin?.repository?.pluginRoot || '.',
+    updateHint?.pluginRoot || receipt?.pluginRoot || matchedCatPlugin?.repository?.pluginRoot || loc?.repositoryRoot || '.',
   );
+  const installedRoot = receipt?.pluginRoot || loc?.repositoryRoot;
+  if ((installedUrl && repoUrl !== (moved ? catalogUrl : installedUrl)) ||
+      (installedRoot === null || (installedRoot !== undefined && normalizeStoredPluginRoot(installedRoot) !== pluginRoot))) {
+    throw new Error('ERR_UPDATE_TARGET_MISMATCH: Selected repository or path differs from the installed source.');
+  }
+  if (moved) {
+    // A feed may be stale after another rename. Confirm ownership before downloading from the new address.
+    const slug = new URL(catalogUrl).pathname;
+    const response = await activeFetch(`${githubApiBaseUrl.replace(/\/+$/, '')}/repos${slug}`, {
+      headers: buildGithubApiHeaders(prefs.githubToken),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!response.ok || (await response.json()).id !== recordedId) {
+      throw new Error('ERR_UPDATE_TARGET_MISMATCH: GitHub could not confirm the installed repository ID at its new address.');
+    }
+  }
   const ghSource = receipt?.githubSource || {};
   const preserveTrackBranch =
     updateHint?.trackBranch ||
@@ -2643,7 +2646,7 @@ export async function resolveAndStageGithubUpdate({
   const preservedTrack = validTracks.has(receipt?.track)
     ? receipt.track
     : catalogTrack || (isSelf ? 'verified' : 'github-url');
-  const preservedId = String(receipt?.id || matchedCatPlugin?.id || (isSelf ? SELF_CATALOG_ID : '')).trim();
+  const preservedId = String((moved && matchedCatPlugin.id) || receipt?.id || matchedCatPlugin?.id || (isSelf ? SELF_CATALOG_ID : '')).trim();
   const preservedRepoId = Number(receipt?.repositoryId || matchedCatPlugin?.repository?.repositoryId || 0);
   const preservedForceScoped = Boolean(
     receipt?.scopedRewriteApplied || (!receipt && matchedCatPlugin?.forceScopedInstall),
@@ -2668,11 +2671,8 @@ export async function resolveAndStageGithubUpdate({
     } else {
       targetUrl = `${repoUrl}/releases/tag/${encodePathSegments(updateHint.targetRef)}`;
     }
-  } else if (receipt?.track === 'github-url' && ghSource.kind === 'tree' && preserveTrackBranch) {
-    targetUrl =
-      pluginRoot !== '.'
-        ? `${repoUrl}/tree/${encodePathSegments(preserveTrackBranch)}/${encodePathSegments(pluginRoot)}`
-        : `${repoUrl}/tree/${encodePathSegments(preserveTrackBranch)}`;
+  } else if (receipt?.track === 'github-url' && preserveTrackBranch && preserveTrackBranch !== 'HEAD') {
+    targetUrl = `${repoUrl}/archive/refs/heads/${encodePathSegments(preserveTrackBranch)}.tar.gz`;
   }
 
   const installMode = isSelf ? 'replace' : preservedForceScoped ? 'isolate' : 'native';
@@ -2683,6 +2683,9 @@ export async function resolveAndStageGithubUpdate({
     installMode,
     preferredDir: loc?.dir || '',
     confirmEscalation: Boolean(confirmEscalation),
+    approvalKey,
+    rejectDowngrade: true,
+    resyncVersion,
     prefs,
     configDir,
     pluginsDir,
@@ -2710,6 +2713,7 @@ export async function resolveAndStageGithubUpdate({
     throw new Error(`ERR_GITHUB_UPDATE_BLOCKED: ${result.reasonEn || result.reasonZh || result.status}`);
   }
   if (result.status === 'SUBPATH_SELECTION_REQUIRED') {
+    if (result.inspectToken) safeRemoveDirBestEffort(getInspectStagingDir(dataDir, result.inspectToken));
     throw new Error(`ERR_GITHUB_UPDATE_SUBPATH_MISSING: Subpath "${pluginRoot}" no longer contains plugin.json`);
   }
 

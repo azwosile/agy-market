@@ -21,8 +21,10 @@ import tls from 'node:tls';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import vm from 'node:vm';
 import { createGzip, gzipSync } from 'node:zlib';
+import { makeUiSandbox } from './helpers/ui-sandbox.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+
 const REPO_ROOT = resolve(__dirname, '..');
 
 const { bundleZeroDepEsm } = await import(pathToFileURL(join(REPO_ROOT, 'scripts', 'build.mjs')).href);
@@ -372,9 +374,9 @@ function buildTarGzWithSymlink(filesObj, { topDir = 'sym-plugin', links = [] } =
   return gzipSync(Buffer.concat(chunks), { level: 6 });
 }
 
-function createUiVmHarness() {
+function createUiVmHarness(mockFetchFn = async () => jsonResp({ ok: true })) {
   const bundled = bundleZeroDepEsm(join(REPO_ROOT, 'src', 'ui', 'app.mjs'));
-  const bootMarker = 'void loadState(false);\nvoid checkUpdates(false, { silent: true });';
+  const bootMarker = 'void openMarketPanel();';
   assert.ok(bundled.includes(bootMarker), 'Bundled app.mjs must contain auto-boot marker');
 
   const instrumented = bundled.replace(
@@ -390,6 +392,9 @@ function createUiVmHarness() {
       '  isUpdateEffectiveForLocal,',
       '  renderInstalledCard,',
       '  renderDetailDrawer,',
+      '  renderPluginCard, renderDiscoverView, renderFavoritesView, renderModals, getInstalledByDirMap, handleActionClick, applyServerState,',
+      '  getFilteredPlugins, fitPanelToViewport, openMarketPanel, loadState, updatePrefs, renderDiscussTabContent,',
+      '  triggerInstall, triggerUpdateAll, triggerSelfUpdate, triggerDirectPluginUpdate, triggerGithubUrlInstall,',
       '  getUpdateMaps,',
       '  getCatalogMaps,',
       '};',
@@ -397,7 +402,6 @@ function createUiVmHarness() {
   );
 
   const storageMap = new Map();
-  const mockFetchFn = async () => jsonResp({ ok: true });
   const mockWindow = {
     localStorage: {
       getItem: (k) => (storageMap.has(k) ? storageMap.get(k) : null),
@@ -411,36 +415,432 @@ function createUiVmHarness() {
     sidecar: null,
     fetch: mockFetchFn,
   };
-  const mockDocument = {
-    getElementById: () => null,
-    querySelector: () => null,
-    querySelectorAll: () => [],
-    activeElement: null,
-    documentElement: { setAttribute: () => {}, classList: { toggle: () => {} } },
-    body: { classList: { toggle: () => {} } },
-    addEventListener: () => {},
+  const sandbox = makeUiSandbox(mockWindow, mockFetchFn);
+  vm.runInNewContext(instrumented, sandbox, { filename: 'agy-market-v17-ui-test.js' });
+  return { ui: sandbox.__V17_UI__, bundled, mockWindow, sandbox };
+}
+
+function clickUiAction(ui, action, attrs = {}) {
+  ui.handleActionClick({ getAttribute: key => key === 'data-action' ? action : attrs[key] }, { stopPropagation() {} });
+}
+
+test('panel fits the intersection of the host frame and zoomed viewport, then regains its full width', () => {
+  const { ui, mockWindow, sandbox } = createUiVmHarness();
+  const app = { style: {}, offsetWidth: 1000, getBoundingClientRect() {
+    const width = this.offsetWidth * 1.25;
+    return { left: 0, right: width, width };
+  } };
+  sandbox.document.getElementById = () => app;
+  let onIntersection;
+  let observing = false;
+  sandbox.IntersectionObserver = class {
+    constructor(callback) { onIntersection = callback; }
+    observe(target) {
+      if (!observing) onIntersection([{ isIntersecting: true, intersectionRect: target.getBoundingClientRect() }]);
+      observing = true;
+    }
+    unobserve() { observing = false; }
   };
-  const sandbox = {
-    window: mockWindow,
-    document: mockDocument,
-    fetch: mockFetchFn,
-    URL,
-    URLSearchParams,
-    Headers,
-    Response,
-    console,
-    setTimeout: () => 1,
-    clearTimeout: () => {},
-    requestAnimationFrame: (cb) => {
-      cb();
-      return 1;
+  let resizeFrame;
+  mockWindow.addEventListener = (type, listener) => { if (type === 'resize') resizeFrame = listener; };
+  const events = {};
+  const viewport = mockWindow.visualViewport = {
+    width: 1250, offsetLeft: 0, addEventListener(type, callback) { events[type] = callback; },
+  };
+  ui.fitPanelToViewport();
+  const clip = (left, right) => onIntersection([{ isIntersecting: true, intersectionRect: { left, right } }]);
+  clip(10, 1200);
+  assert.deepEqual(app.style, { paddingLeft: '8px', paddingRight: '40px' });
+  viewport.width = 900;
+  viewport.offsetLeft = 50;
+  events.scroll();
+  assert.deepEqual(app.style, { paddingLeft: '40px', paddingRight: '240px' });
+  viewport.width = 1250;
+  viewport.offsetLeft = 0;
+  events.resize();
+  clip(0, 1250);
+  assert.deepEqual(app.style, { paddingLeft: '0px', paddingRight: '0px' });
+  app.offsetWidth = 1600;
+  viewport.width = 2000;
+  resizeFrame();
+  events.resize();
+  assert.equal(app.style.paddingRight, '0px');
+});
+
+test('a null catalog description renders and remains searchable in the pane and static showcase', async () => {
+  const plugin = { id: 'acme__reader', canonicalName: 'reader', displayName: 'Reader', version: '1.0.0', description: null };
+  const { ui } = createUiVmHarness();
+  ui.state.loading = false;
+  ui.applyServerState({ prefs: { locale: 'en' }, installed: [], catalog: { plugins: [plugin] } });
+  for (const search of ['', 'reader']) {
+    ui.state.search = search;
+    assert.match(ui.renderDiscoverView(), /data-id="acme__reader"/);
+  }
+  const elements = new Map();
+  const document = {
+    querySelectorAll: () => [],
+    getElementById(id) {
+      if (!elements.has(id)) elements.set(id, { value: '', options: [], handlers: {},
+        addEventListener(event, fn) { this.handlers[event] = fn; } });
+      return elements.get(id);
     },
   };
-  sandbox.globalThis = sandbox;
-  sandbox.self = mockWindow;
-  vm.runInNewContext(instrumented, sandbox, { filename: 'agy-market-v17-ui-test.js' });
-  return { ui: sandbox.__V17_UI__, bundled };
-}
+  document.getElementById('site-category').value = 'all';
+  const sandbox = { document, fetch: async () => Response.json({ plugins: [null, plugin, { taxonomy: { categories: 7 } }] }) };
+  const source = readFileSync(join(REPO_ROOT, 'site', 'app.js'), 'utf8');
+  vm.runInNewContext(source.replace('void fetchCatalog();', 'globalThis.ready = fetchCatalog();'), sandbox);
+  await sandbox.ready;
+  assert.equal(document.getElementById('stat-total').textContent, '1 款');
+  const search = document.getElementById('site-search');
+  for (const term of ['', 'reader']) {
+    search.value = term;
+    search.handlers.input();
+    assert.match(document.getElementById('site-grid').innerHTML, /Reader/);
+  }
+});
+
+test('the opening update check waits for workspace and catalog revalidation and runs once', async () => {
+  const requests = [];
+  let finishOpening;
+  const { ui, mockWindow } = createUiVmHarness(async url => {
+    requests.push(new URL(url, 'http://localhost'));
+    if (url.includes('panelOpen=1')) await new Promise(resolve => { finishOpening = resolve; });
+    return jsonResp({ catalog: { plugins: [] }, installed: [] });
+  });
+  let resolveWorkspace;
+  mockWindow.sidecar = { getWorkspaceUris: () => new Promise(resolve => { resolveWorkspace = resolve; }) };
+  const opening = ui.openMarketPanel();
+  assert.equal(requests.length, 0);
+  resolveWorkspace(['file:///workspace A']);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(requests.map(url => url.pathname), ['/api/state']);
+  finishOpening();
+  await opening;
+  mockWindow.sidecar = null;
+  await ui.loadState(false);
+  assert.deepEqual(requests.map(url => url.pathname), ['/api/state', '/api/updates', '/api/state']);
+  const snapshots = requests.filter(url => url.pathname === '/api/state');
+  assert.deepEqual(snapshots.map(url => url.searchParams.get('panelOpen')), ['1', null]);
+  assert.ok(snapshots.every(url => url.searchParams.get('workspaceUris') === 'file:///workspace A'));
+});
+
+test('namesakes occupy their existing slots in author order without overriding explicit star order', () => {
+  const { ui } = createUiVmHarness();
+  const entry = (id, displayName, stars, author) => ({
+    id, displayName, author, repository: { url: 'https://github.com/' + id.split('__')[0] + '/tools', stars },
+  });
+  const z = entry('acme__z', 'Reader', 90, { name: 'Zoe' });
+  const other = entry('acme__x', 'Unrelated', 75);
+  const a = entry('bob__reader', 'Reader', 50);
+  ui.applyServerState({ prefs: { locale: 'en' }, installed: [], catalog: { plugins: [z, other, a] } });
+  const order = () => Array.from(ui.getFilteredPlugins(), p => p.id);
+  ui.state.sortBy = 'recommended';
+  assert.deepEqual(order(), [a.id, other.id, z.id]);
+  ui.state.sortBy = 'stars';
+  assert.deepEqual(order(), [z.id, other.id, a.id]);
+  ui.state.sortBy = 'name';
+  assert.deepEqual(order(), [a.id, z.id, other.id]);
+  a.author = 'Zoe';
+  a.repository = { ...z.repository, pluginRoot: 'b' };
+  z.repository.pluginRoot = 'a';
+  assert.deepEqual(order(), [z.id, a.id, other.id]);
+});
+
+test('saving new credentials hides old discussions immediately and drops late replies', async () => {
+  const plugin = { id: 'team__reader', canonicalName: 'reader', repository: { url: 'https://github.com/team/reader' } };
+  const snapshot = { prefs: { locale: 'en' }, installed: [], catalog: { plugins: [plugin] } };
+  const oldReply = Promise.withResolvers();
+  const prefsSave = Promise.withResolvers();
+  let fetchCount = 0;
+  const { ui } = createUiVmHarness(async url => {
+    if (url === '/api/prefs') { await prefsSave.promise; return jsonResp(snapshot); }
+    if (url.startsWith('/api/discussions?')) {
+      fetchCount++;
+      const title = fetchCount <= 2 ? 'Private title from A' : fetchCount === 3 ? 'Visible to B' : 'Visible after another panel switched';
+      if (fetchCount === 2) await oldReply.promise;
+      return jsonResp({ items: [{ title, url: plugin.repository.url + '/discussions/1' }] });
+    }
+    return jsonResp({ ok: true });
+  });
+  const settle = () => new Promise(resolve => setImmediate(resolve));
+  const view = () => ui.renderDiscussTabContent(ui.state.detailPlugin);
+  ui.applyServerState(snapshot);
+  clickUiAction(ui, 'detail', { 'data-id': plugin.id, 'data-detail-tab': 'discuss' });
+  await settle();
+  assert.match(view(), /Private title from A/);
+  clickUiAction(ui, 'refresh-discussions', { 'data-id': plugin.id });
+  const save = ui.updatePrefs({ githubToken: 'fixture-account-B' });
+  assert.doesNotMatch(view(), /Private title from A/);
+  prefsSave.resolve();
+  await save;
+  await settle();
+  oldReply.resolve();
+  await settle();
+  assert.equal(fetchCount, 3);
+  assert.match(view(), /Visible to B/);
+  assert.doesNotMatch(view(), /Private title from A/);
+  clickUiAction(ui, 'close-modal');
+  clickUiAction(ui, 'detail', { 'data-id': plugin.id, 'data-detail-tab': 'discuss' });
+  await settle();
+  assert.equal(fetchCount, 4);
+  assert.match(view(), /Visible after another panel switched/);
+  assert.doesNotMatch(view(), /Visible to B/);
+});
+
+test('switching catalog source with a reused ID refreshes the open detail and its discussion links', async () => {
+  const plugin = repo => ({ id: 'team__reader', canonicalName: 'reader', displayName: repo,
+    repository: { url: 'https://github.com/team/' + repo } });
+  let current = plugin('original');
+  const snapshot = () => ({ prefs: { locale: 'en' }, installed: [], catalog: { plugins: [current] } });
+  let releaseOld;
+  let discussions = 0;
+  const { ui } = createUiVmHarness(async url => {
+    if (url === '/api/sources') return jsonResp(snapshot());
+    if (url.startsWith('/api/readme?')) return jsonResp({ markdown: 'README ' + current.displayName });
+    if (url.startsWith('/api/discussions?')) {
+      discussions++;
+      const target = current.repository.url + '/discussions';
+      if (current.displayName === 'original') await new Promise(resolve => { releaseOld = resolve; });
+      return jsonResp({ url: target, newDiscussionUrl: target + '/new/choose', items: [] });
+    }
+    throw new Error('Unexpected URL ' + url);
+  });
+  ui.applyServerState(snapshot());
+  clickUiAction(ui, 'detail', { 'data-id': current.id, 'data-detail-tab': 'discuss' });
+  current = plugin('replacement');
+  await ui.updatePrefs({ customFeeds: ['https://catalog.example/index.json'] }, '', new Map());
+  releaseOld();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(discussions, 2);
+  assert.equal(ui.state.detailReadme, 'README replacement');
+  const discussion = ui.renderDiscussTabContent(ui.state.detailPlugin);
+  assert.match(discussion, /replacement\/discussions\/new\/choose/);
+  assert.doesNotMatch(discussion, /original\/discussions/);
+  clickUiAction(ui, 'close-modal');
+  clickUiAction(ui, 'detail', { 'data-id': current.id, 'data-detail-tab': 'discuss' });
+  assert.equal(discussions, 3);
+});
+
+test('snapshot versions are compact on cards and retain the full version in details and copy actions', () => {
+  const { ui } = createUiVmHarness();
+  const version = '1.0.0-git.20261123131750.d0f0741';
+  const plugin = { id: 'demo__reader', displayName: 'Reader', canonicalName: 'reader', version };
+  const loc = { scope: 'global', dir: 'reader', name: 'reader', version };
+  ui.applyServerState({ prefs: { locale: 'en' }, installed: [loc], catalog: { plugins: [plugin] } });
+  for (const card of [ui.renderPluginCard(plugin, new Map(), new Map()), ui.renderInstalledCard(loc, new Map(), new Map(), new Map(), new Map())]) {
+    assert.ok(card.includes(`title="v${version}">v1.0.0 · git</span>`));
+  }
+  assert.match(ui.renderPluginCard({ ...plugin, version: '2.1.0-beta.2' }, new Map(), new Map()), />v2\.1\.0-beta\.2<\/span>/);
+  ui.state.detailPlugin = plugin;
+  const drawer = ui.renderDetailDrawer();
+  assert.ok(drawer.includes(`data-copy-val="${version}"`));
+  assert.ok(drawer.includes(`>v${version}</span>`));
+});
+
+test('a catalog favorite remains a bookmark when its id points to another repository', () => {
+  const { ui } = createUiVmHarness();
+  const key = 'demo__reader';
+  const original = { displayName: 'Original Reader', repositoryUrl: 'https://github.com/demo/original', pluginRoot: 'plugin' };
+  ui.applyServerState({ prefs: { locale: 'en', favorites: [key], favoriteSources: { [key]: original } }, installed: [],
+    catalog: { plugins: [{ id: key, displayName: 'Different Reader', canonicalName: 'reader', version: '1.0.0',
+      repository: { url: 'https://github.com/demo/different', pluginRoot: 'plugin' } }] } });
+  const view = ui.renderFavoritesView();
+  assert.match(view, /Original Reader/);
+  assert.doesNotMatch(view, /Different Reader|data-action="install"/);
+});
+
+test('the workspace favorite card retains its selected copy without exposing global mutations', () => {
+  const { ui } = createUiVmHarness();
+  const global = { scope: 'global', dir: 'reader', name: 'reader', path: '/global/reader', favoriteKey: 'copy:global',
+    version: '1.0.0', displayName: 'Global Reader', enabled: true };
+  const workspace = { ...global, scope: 'workspace', path: '/workspace/reader', displayName: 'Workspace Reader',
+    favoriteKey: 'copy:workspace', canToggle: false, canUninstall: false };
+  ui.applyServerState({ prefs: { favorites: [workspace.favoriteKey] }, catalog: { plugins: [] }, installed: [global, workspace] });
+  const view = ui.renderFavoritesView();
+  assert.match(view, /Workspace Reader/);
+  assert.match(view, /data-scope="workspace" data-path="\/workspace\/reader"/);
+  assert.doesNotMatch(view, /Global Reader|data-action="prompt-uninstall"/);
+  assert.match(view, /data-action="toggle-plugin"[^>]+disabled/);
+});
+
+test('inferred repositories have no update action before the first check', () => {
+  const { ui } = createUiVmHarness();
+  const local = { scope: 'global', name: 'reader', dir: 'reader', path: '/global/reader', version: '1.0.0',
+    repositoryUrl: 'https://github.com/team/reader', inferredRepository: true };
+  ui.applyServerState({ prefs: { locale: 'en' }, installed: [local], catalog: { plugins: [] } });
+  const card = ui.renderInstalledCard(local, new Map(), new Map(), new Map(), new Map());
+  clickUiAction(ui, 'detail-local', { 'data-dir': local.dir, 'data-scope': local.scope, 'data-path': local.path });
+  for (const html of [card, ui.renderDetailDrawer()]) {
+    assert.match(html, /No verified update source declared/);
+    assert.doesNotMatch(html, /data-action="(?:sync-installed-plugin|update-plugin-direct|install)"/);
+  }
+});
+
+test('local detail and uninstall keep a manual plugin separate from an unrelated catalog slug', async () => {
+  const requests = [];
+  const { ui } = createUiVmHarness(async (url, opts) => {
+    requests.push({ url, body: opts.body && JSON.parse(opts.body) });
+    return jsonResp({ ok: true });
+  });
+  const local = { scope: 'global', dir: 'notes', name: 'notes', path: '/fixture/plugins/notes', displayName: 'My Notes',
+    version: '2.0.0', repositoryUrl: 'https://github.com/me/notes' };
+  const other = { id: 'other__notes', canonicalName: 'notes', displayName: 'Other Notes',
+    repository: { url: 'https://github.com/other/notes' }, installStatus: { installed: false, conflictDetected: true } };
+  const snapshot = { prefs: { locale: 'en' }, installed: [local], catalog: { plugins: [other] } };
+  ui.state.loading = false;
+  ui.applyServerState(snapshot);
+  clickUiAction(ui, 'detail-local', { 'data-dir': local.dir, 'data-scope': local.scope, 'data-path': local.path });
+  ui.applyServerState(snapshot);
+  const drawer = ui.renderDetailDrawer();
+  assert.match(drawer, /data-action="prompt-uninstall" data-dir="notes" data-name="My Notes"/);
+  assert.doesNotMatch(drawer, /Other Notes|github\.com\/other\/notes/);
+  assert.equal(new URL(requests[0].url, 'http://localhost').searchParams.get('scope'), 'global');
+  clickUiAction(ui, 'prompt-uninstall', { 'data-dir': 'notes', 'data-name': 'stale display label' });
+  assert.match(ui.renderModals(), /permanently uninstalls.*My Notes/);
+  clickUiAction(ui, 'confirm-uninstall', { 'data-dir': local.dir });
+  assert.deepEqual(requests.find(req => req.url === '/api/uninstall').body.expectedInstall,
+    { parked: false, name: 'notes', id: '', repositoryUrl: local.repositoryUrl });
+  // A catalog ID reused by a different source must not override the server's identity match.
+  local.receipt = { id: other.id, repositoryId: 11 };
+  local.catalogId = null;
+  clickUiAction(ui, 'detail-local', { 'data-dir': local.dir, 'data-scope': local.scope, 'data-path': local.path });
+  assert.equal(ui.state.detailPlugin.displayName, 'My Notes');
+  assert.equal(ui.state.detailPlugin._localOnly, true);
+});
+
+test('an isolated agy-market fork gets its own update button in Discover and Details', () => {
+  const { ui } = createUiVmHarness();
+  const dir = 'demo--agy-market';
+  const id = 'demo__agy-market';
+  const loc = { scope: 'global', dir, name: dir, version: '1.0.0', receipt: { id } };
+  const plugin = { id, canonicalName: 'agy-market', scopedName: dir, displayName: 'Demo Market',
+    version: '1.1.0', installStatus: { installed: true, installedDir: dir, installedVersion: '1.0.0' } };
+  ui.state.serverState = { installed: [loc], catalog: { plugins: [plugin] } };
+  ui.state.updates.items = [{ id, dir, isSelf: false, source: 'catalog', installedVersion: '1.0.0', latestVersion: '1.1.0' }];
+  ui.state.detailPlugin = plugin;
+  const updates = ui.getUpdateMaps();
+  for (const html of [ui.renderPluginCard(plugin, updates.byId, ui.getInstalledByDirMap(), updates.byDir), ui.renderDetailDrawer()]) {
+    assert.match(html, /data-action="install" data-id="demo__agy-market" data-dir="demo--agy-market"/);
+    assert.doesNotMatch(html, /data-action="self-update"/);
+  }
+});
+
+test('Re-sync selects the installed source, version and revision across catalog and GitHub channels', async () => {
+  const posts = [];
+  const { ui } = createUiVmHarness(async (url, opts) => {
+    if (opts.method === 'POST') posts.push(JSON.parse(opts.body));
+    return jsonResp({ ok: true, alreadyUpToDate: true });
+  });
+  const dir = 'notes', id = 'demo__notes';
+  const receipt = { id, installedVersion: '2.0.0', gitTag: 'release-2', commitSha: 'a'.repeat(40), track: 'verified' };
+  const loc = { scope: 'global', dir, name: dir, version: '2.0.0', receipt };
+  const plugin = { id, version: '1.0.0', installStatus: { installed: true, installedDir: dir } };
+  ui.state.loading = false;
+  ui.state.serverState = { installed: [loc], catalog: { plugins: [plugin] } };
+  await ui.triggerInstall(plugin, { dir, forceResync: true });
+  assert.equal(posts[0].updateChannel, 'github-upstream');
+  assert.equal(posts[0].targetVersion, loc.version);
+  assert.equal(posts[0].targetRef, 'release-2');
+  plugin.version = loc.version;
+  await ui.triggerInstall(plugin, { dir, forceResync: true });
+  assert.equal(posts[1].updateChannel, 'catalog');
+  assert.equal(posts[1].targetVersion, loc.version);
+  receipt.track = 'github-url';
+  receipt.githubSource = { refType: 'branch', trackBranch: 'beta' };
+  await ui.triggerDirectPluginUpdate({ id, dir, forceResync: true });
+  assert.equal(posts[2].updateChannel, 'github-url');
+  assert.equal(posts[2].targetRef, receipt.commitSha);
+  assert.equal(posts[2].trackBranch, 'beta');
+  loc.version = '3.0.0';
+  await ui.triggerInstall(plugin, { dir, forceResync: true });
+  assert.equal(posts[3].targetVersion, '3.0.0');
+  assert.equal(posts[3].targetRef, undefined);
+  loc.version = '1.0.0';
+  loc.legacyRepoTagVersion = true;
+  receipt.githubSource = { refType: 'tag' };
+  receipt.gitTag = 'v2.0.0';
+  await ui.triggerInstall(plugin, { dir, forceResync: true });
+  assert.equal(posts[4].targetVersion, loc.version);
+  assert.equal(posts[4].targetRef, receipt.gitTag);
+});
+
+test('capability confirmation resends the displayed approval key for each update entry point', async () => {
+  const escalation = { hasEscalation: true, addedBadges: ['mcp-stdio'], approvalKey: 'reviewed-key' };
+  const prompt = { ok: false, status: 'CAPABILITY_ESCALATION_CONFIRM_REQUIRED', escalation };
+  for (const mode of ['catalog', 'direct', 'self', 'batch']) {
+    const posts = [];
+    const { ui } = createUiVmHarness(async (url, opts) => {
+      if (opts.method !== 'POST') return jsonResp({ ok: true });
+      posts.push(JSON.parse(opts.body));
+      return jsonResp(mode === 'batch' ? { ok: false, results: [
+        { ...prompt, id: 'a__notes', dir: 'notes' },
+        { ...prompt, id: 'a__notes', dir: 'other-copy', escalation: { ...escalation, approvalKey: 'second-key' } },
+      ] } : prompt);
+    });
+    ui.state.loading = false;
+    if (mode === 'catalog') await ui.triggerInstall({ id: 'a__notes', installStatus: { installed: true, installedDir: 'notes' } });
+    if (mode === 'direct') await ui.triggerDirectPluginUpdate({ id: 'a__notes', dir: 'notes' });
+    if (mode === 'self') await ui.triggerSelfUpdate();
+    if (mode === 'batch') await ui.triggerUpdateAll(['notes', 'other-copy']);
+    assert.ok(!posts[0].approvalKey && !posts[0].approvalKeys);
+    clickUiAction(ui, 'confirm-escalation');
+    assert.equal(posts[1].confirmEscalation, true, mode);
+    if (mode === 'batch') assert.deepEqual(posts[1].approvalKeys, { notes: 'reviewed-key', 'other-copy': 'second-key' });
+    else assert.equal(posts[1].approvalKey, 'reviewed-key', mode);
+  }
+});
+
+test('an expired GitHub preview clears its token, replace choice, and capability approval before reinspection', async () => {
+  const posts = [];
+  const { ui } = createUiVmHarness(async (url, opts) => {
+    posts.push({ url, body: JSON.parse(opts.body) });
+    return jsonResp({ ok: false, error: 'ERR_INSPECT_TOKEN_EXPIRED: Preview expired' }, 400);
+  });
+  const url = 'https://github.com/demo/notes';
+  ui.state.loading = false;
+  ui.state.githubUrlModal = { phase: 'preview', url, inspectToken: 'old-preview', installMode: 'replace',
+    confirmEscalation: true, inspectResult: { escalation: { hasEscalation: true, approvalKey: 'old-key' } } };
+  await ui.triggerGithubUrlInstall();
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].body.approvalKey, 'old-key');
+  const modal = ui.state.githubUrlModal;
+  assert.equal(modal.phase, 'input');
+  assert.equal(modal.url, url);
+  assert.equal(modal.inspectToken, '');
+  assert.equal(modal.confirmEscalation, false);
+  assert.equal(modal.installMode, 'native');
+  assert.equal(modal.inspectResult, null);
+  assert.ok(modal.error);
+});
+
+test('a GitHub preview reopens for staged capability changes and sends the displayed grant on confirmation', async () => {
+  const posts = [];
+  const { ui } = createUiVmHarness(async (url, opts) => {
+    if (url !== '/api/github/install') return jsonResp({ ok: true, items: [] });
+    posts.push(JSON.parse(opts.body));
+    return jsonResp(posts.length === 1 ? { ok: false, status: 'CAPABILITY_ESCALATION_CONFIRM_REQUIRED',
+      escalation: { escalated: true, addedBadges: ['mcp-remote'], addedRemoteDomains: ['fixture.example'],
+        addedHookEvents: ['OnStart'], approvalKey: 'staged-grant' } }
+      : { ok: true, status: 'INSTALLED', installedDir: 'reader', version: '2.0.0' });
+  });
+  ui.state.loading = false;
+  ui.state.githubUrlModal = { phase: 'preview', inspectToken: 'preview-token', url: 'https://github.com/demo/reader',
+    installMode: 'native', inspectResult: { plugin: { canonicalName: 'reader', version: '2.0.0' },
+      preflight: { action: 'update' }, escalation: { hasEscalation: false } } };
+  await ui.triggerGithubUrlInstall();
+  const html = ui.renderModals();
+  assert.match(html, /fixture\.example/);
+  assert.match(html, /OnStart/);
+  assert.match(html, /id="gh-confirm-escalation"/);
+  assert.match(html, /data-action="install-github-url" disabled/);
+  await ui.triggerGithubUrlInstall();
+  assert.equal(posts.length, 1);
+  ui.state.githubUrlModal.confirmEscalation = true;
+  await ui.triggerGithubUrlInstall();
+  assert.equal(posts[1].approvalKey, 'staged-grant');
+  assert.equal(posts[1].inspectToken, 'preview-token');
+  assert.equal(posts[1].confirmEscalation, true);
+});
 
 test('Issue #2A: createProxyAwareFetch routes external HTTP/HTTPS through proxy (incl. CONNECT+TLS) while bypassing 127.0.0.1/localhost/NO_PROXY & honoring Windows registry cache', async () => {
   const ws = makeTempWorkspace('agy-v17-proxy-');
@@ -575,6 +975,12 @@ test('Issue #2A: createProxyAwareFetch routes external HTTP/HTTPS through proxy 
         env: { HTTPS_PROXY: proxyUrl, NO_PROXY: 'localhost,.internal.corp' },
       })?.startsWith('http://alice:s3cr3t@127.0.0.1:'),
     );
+
+    for (const env of [{ ALL_PROXY: 'socks5://proxy.example:1080' }, { HTTP_PROXY: proxyUrl }]) {
+      assert.equal(resolveProxyUrlForTarget('https://example.com', {
+        env, winProxyConfig: { enabled: true, proxyServer: 'https=127.0.0.1:7891' },
+      }), 'http://127.0.0.1:7891/');
+    }
 
     const noProxyParsed = parseNoProxy('localhost, 127.0.0.1, <local>, *.corp.local');
     assert.equal(noProxyParsed.length, 4);
@@ -1227,12 +1633,31 @@ test('Issue #3C: install-local.mjs succeeds when repo lives under _npx/.../node_
     mkdirSync(join(stagedRepo, 'src', 'node_modules', 'nested-dep'), { recursive: true });
     writeFileSync(join(stagedRepo, 'src', 'node_modules', 'nested-dep', 'x.js'), 'export default 1;\n', 'utf8');
 
+    const installedRoot = join(destPluginsDir, 'agy-market');
+    const retiredSkill = 'skills/retired/SKILL.md';
+    mkdirSync(join(installedRoot, 'skills/retired'), { recursive: true });
+    writeFileSync(join(installedRoot, retiredSkill), 'old');
+    writeFileSync(join(installedRoot, 'notes.txt'), 'user file');
+    const receiptPath = join(installedRoot, '.agy-market-receipt.json');
+    writeFileSync(receiptPath, JSON.stringify({ id: 'team__market', managedFiles: ['notes.txt'] }));
+    assert.throws(() => execFileSync(process.execPath, [join(stagedRepo, 'scripts', 'install-local.mjs'), '--dest', destPluginsDir], {
+      env: { ...process.env, AGY_MARKET_DATA_DIR: ws.dataDir }, stdio: 'pipe',
+    }), /ERR_BOOTSTRAP_CONFLICT/);
+    assert.equal(readFileSync(join(installedRoot, 'notes.txt'), 'utf8'), 'user file');
+    assert.equal(existsSync(join(installedRoot, 'plugin.json')), false);
+    writeFileSync(join(installedRoot, '.agy-market-receipt.json'), JSON.stringify({
+      id: 'azwosile__agy-market', managedFiles: [retiredSkill],
+    }));
     execFileSync(process.execPath, [join(stagedRepo, 'scripts', 'install-local.mjs'), '--dest', destPluginsDir], {
       cwd: stagedRepo,
+      env: { ...process.env, AGY_MARKET_DATA_DIR: ws.dataDir },
       stdio: 'pipe',
     });
 
-    const installedRoot = join(destPluginsDir, 'agy-market');
+    assert.equal(existsSync(join(installedRoot, retiredSkill)), false);
+    assert.equal(readFileSync(join(installedRoot, 'notes.txt'), 'utf8'), 'user file');
+    const receipt = JSON.parse(readFileSync(join(installedRoot, '.agy-market-receipt.json')));
+    assert.ok(receipt.managedFiles.includes('skills/agy-market/SKILL.md'));
     assert.equal(existsSync(join(installedRoot, 'plugin.json')), true);
     assert.equal(existsSync(join(installedRoot, 'assets', 'logo.png')), true);
     assert.equal(existsSync(join(installedRoot, 'bin', 'agy-market.mjs')), true);

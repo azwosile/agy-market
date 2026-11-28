@@ -20,7 +20,12 @@ Sidebar Panel UI · Lock-Safe One-Click Uninstall · Direct In-Sidebar Upstream 
 
 ---
 
-## ✨ Highlights (v1.7.1)
+## ✨ Highlights (v2.0.0)
+
+### What's new in v2.0.0
+
+- Installing from a GitHub repository link now checks the tagged source if the release asset contains only a CLI. When a Track 2 repository changes owners, updating the plugin preserves its install directory and moves its bookmark.
+- For plugins with the same name, the details panel matches local documentation by repository and plugin directory. A custom feed that returns HTTP 410 stays withdrawn when the market reopens offline.
 
 ### 0. What's New in v1.7.1
 - **Faster, Smoother Track 2 Rendering at Scale**: Discover now renders incrementally in pages of 48 cards (`IntersectionObserver` sentinel auto-append plus a visible Load More button), pairs `.plugin-card` with CSS `content-visibility: auto`, removes per-card `backdrop-filter` / `filter: blur` layers in favor of clean semi-opaque surfaces, uses root event delegation, 150ms debounced search across Discover/Favorites/Installed, and `requestAnimationFrame`-throttled card spotlight tracking.
