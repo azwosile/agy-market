@@ -1,9 +1,16 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="dark">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta name="color-scheme" content="dark" />
+  <meta name="color-scheme" content="dark light" />
+  <script>
+    try {
+      document.documentElement.dataset.theme = localStorage.getItem('agy-site-theme') === 'light' ? 'light' : 'dark';
+    } catch {
+      // Storage can be unavailable in private or embedded contexts.
+    }
+  </script>
   <title>AGY Market · 反重力插件市场</title>
   <link rel="icon" href="./assets/logo.png" />
   <link rel="stylesheet" href="./styles.css" />
@@ -107,6 +114,10 @@
         <div class="topbar-actions">
           <button type="button" class="quiet-button topbar-search" data-open-palette aria-label="快速搜索">
             <svg class="icon" viewBox="0 0 20 20" aria-hidden="true"><use href="#icon-search"/></svg><kbd aria-label="Command K"><svg class="icon" viewBox="0 0 20 20" aria-hidden="true"><use href="#icon-command"/></svg>K</kbd>
+          </button>
+          <button type="button" id="site-theme-toggle" class="icon-button" aria-label="切换到日间模式" aria-pressed="false">
+            <svg class="icon theme-sun" viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="3.5"/><path d="M10 2v2m0 12v2M2 10h2m12 0h2M4.34 4.34l1.41 1.41m8.5 8.5 1.41 1.41m0-11.32-1.41 1.41m-8.5 8.5-1.41 1.41"/></svg>
+            <svg class="icon theme-moon" viewBox="0 0 20 20" aria-hidden="true"><path d="M17 12.2A7.3 7.3 0 1 1 7.8 3a6.2 6.2 0 0 0 9.2 9.2Z"/></svg>
           </button>
           <div class="catalog-actions">
             <div id="site-view-switch" class="segments" role="group" aria-label="插件视图">

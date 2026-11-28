@@ -1,6 +1,6 @@
 /* ==========================================================================
    AGY Market — Sidebar Panel Stylesheet (`src/ui/styles.css`)
-   Dark monochrome surfaces with the host font stack.
+   Monochrome surfaces with the host font stack.
    ========================================================================== */
 
 :root {
@@ -85,6 +85,46 @@
   --m-toggle-off-bd: var(--m-hairline-strong);
   --m-toggle-thumb: var(--m-text);
   color-scheme: dark;
+}
+
+/* Apply the host class at the root so derived tokens use the light palette too. */
+:root[data-theme="light"],
+:root:not([data-theme="dark"]):has(> body.vscode-light) {
+  color-scheme: light;
+  --m-bg-raw: #ffffff;
+  --m-surface-raw: #f7f7f5;
+  --m-text: #191919;
+  --m-text-2: #37352f;
+  --m-muted: #5a5a57;
+  --m-faint: #9b9a97;
+  --m-card-bg-hover: #efefef;
+  --m-inset-bg: #f1f1ef;
+  --m-ctl-bg: #efefef;
+  --m-ctl-hover: #e5e5e2;
+  --m-hairline: rgba(0, 0, 0, 0.08);
+  --m-hairline-strong: rgba(0, 0, 0, 0.14);
+  --m-backdrop: rgba(0, 0, 0, 0.28);
+  --m-accent-hover: var(--m-text-2);
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    color-scheme: light;
+    --m-bg-raw: #ffffff;
+    --m-surface-raw: #f7f7f5;
+    --m-text: #191919;
+    --m-text-2: #37352f;
+    --m-muted: #5a5a57;
+    --m-faint: #9b9a97;
+    --m-card-bg-hover: #efefef;
+    --m-inset-bg: #f1f1ef;
+    --m-ctl-bg: #efefef;
+    --m-ctl-hover: #e5e5e2;
+    --m-hairline: rgba(0, 0, 0, 0.08);
+    --m-hairline-strong: rgba(0, 0, 0, 0.14);
+    --m-backdrop: rgba(0, 0, 0, 0.28);
+    --m-accent-hover: var(--m-text-2);
+  }
 }
 
 *,

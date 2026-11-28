@@ -113,6 +113,7 @@
   const mobile = matchMedia('(max-width: 760px)');
   const sidebar = byId('site-sidebar');
   const sidebarToggle = byId('sidebar-toggle');
+  const themeToggle = byId('site-theme-toggle');
   const canvas = document.querySelector('.canvas');
   const grid = byId('site-grid');
   const pagination = byId('site-pagination');
@@ -848,6 +849,24 @@
     byId('copy-status').textContent = copied ? '已复制命令' : '复制失败，可手动选中命令';
     copyTimers.set(button, setTimeout(() => updateCopyLabel(button, '复制命令', false), 1600));
   }
+
+  function syncThemeToggle() {
+    const light = document.documentElement.dataset.theme === 'light';
+    themeToggle.setAttribute('aria-pressed', String(light));
+    themeToggle.setAttribute('aria-label', light ? '切换到夜间模式' : '切换到日间模式');
+  }
+
+  themeToggle.addEventListener('click', () => {
+    const root = document.documentElement;
+    root.dataset.theme = root.dataset.theme === 'light' ? 'dark' : 'light';
+    syncThemeToggle();
+    try {
+      localStorage.setItem('agy-site-theme', root.dataset.theme);
+    } catch {
+      // The toggle still works for the current page.
+    }
+  });
+  syncThemeToggle();
 
   sidebarToggle.addEventListener('click', () => {
     workspace.classList.toggle(mobile.matches ? 'mobile-open' : 'collapsed');
