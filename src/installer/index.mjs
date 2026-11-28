@@ -2,6 +2,7 @@
 
 import { randomUUID } from 'node:crypto';
 import {
+  copyFileSync,
   cpSync,
   existsSync,
   lstatSync,
@@ -45,7 +46,15 @@ import {
 import { parseGithubRepoSlug, safeGithubCacheKey } from '../updates/index.mjs';
 import { fetchVerifiedPluginTarball } from './fetch-tarball.mjs';
 import { clearPendingJournal, writePendingJournal } from './journal.mjs';
-import { recordRetiredBinaries, sweepRetiredBinaries, syncDirectoryLockSafe } from './sync-dir.mjs';
+import {
+  listAllRelFiles,
+  recordRetiredBinaries,
+  removeSymlinkOrJunctionOnly,
+  safeRemoveDirBestEffort,
+  sweepRetiredBinaries,
+  syncDirectoryLockSafe,
+  withLockRetrySync,
+} from './sync-dir.mjs';
 import { extractTarGzStreamToDir } from './tar-extract.mjs';
 
 function resolveEffectiveFetch(fetchImpl) {
@@ -115,16 +124,114 @@ function stripDisabledFlagFromManifest(pluginDir) {
   return false;
 }
 
-function removeSymlinkOrJunctionOnly(linkPath) {
+function annotateLockError(err, stage, relPath = '') {
+  if (!err || !LOCK_ERROR_CODES.has(err.code)) return err;
+  const tag = `[${stage}]`;
+  const msg = String(err.message || err);
+  if (msg.includes(tag)) return err;
+  const cleanRel = relPath ? String(relPath).replace(/\\/g, '/') : '';
+  const prefix = cleanRel && !cleanRel.startsWith('..') ? `${tag} (${cleanRel}) ` : `${tag} `;
   try {
-    unlinkSync(linkPath);
-  } catch (err) {
-    if (err?.code === 'EPERM' || err?.code === 'EISDIR') {
-      rmdirSync(linkPath);
+    err.message = `${prefix}${msg}`;
+    return err;
+  } catch {
+    const wrapped = new Error(`${prefix}${msg}`);
+    wrapped.code = err.code;
+    wrapped.errno = err.errno;
+    wrapped.syscall = err.syscall;
+    wrapped.path = err.path;
+    wrapped.cause = err;
+    return wrapped;
+  }
+}
+
+/**
+ * Safely snapshots an existing plugin directory to `dstDir` without dereferencing symlinks/junctions.
+ * Skips `node_modules`, `.git`, and retired `*.old.<ts>` binaries, retries transient lock errors 3x,
+ * and skips persistently locked entries with a warning so updates are never blocked.
+ */
+function snapshotBackupSafe(srcDir, dstDir, { onWarning = null } = {}) {
+  const warn = (relPath, err) => {
+    const msg = `[backup] Skipping locked item "${relPath || '.'}": ${err?.code || ''} ${err?.message || err}`.trim();
+    if (typeof onWarning === 'function') {
+      onWarning(msg);
     } else {
+      console.warn(msg);
+    }
+  };
+
+  let rootLst;
+  try {
+    if (!existsSync(srcDir)) return false;
+    rootLst = withLockRetrySync(() => lstatSync(srcDir));
+  } catch (err) {
+    if (LOCK_ERROR_CODES.has(err?.code) || err?.code === 'ENOENT') {
+      warn('.', err);
+      return false;
+    }
+    throw err;
+  }
+  if (rootLst.isSymbolicLink() || !rootLst.isDirectory()) {
+    return false;
+  }
+
+  mkdirSync(dstDir, { recursive: true });
+
+  function walk(curSrc, curDst, relPrefix) {
+    let entries;
+    try {
+      entries = withLockRetrySync(() => readdirSync(curSrc));
+    } catch (err) {
+      if (LOCK_ERROR_CODES.has(err?.code) || err?.code === 'ENOENT') {
+        warn(relPrefix, err);
+        return;
+      }
       throw err;
     }
+
+    for (const name of entries) {
+      if (name === 'node_modules' || name === '.git' || RETIRED_BINARY_RE.test(name)) {
+        continue;
+      }
+      const srcItem = join(curSrc, name);
+      const dstItem = join(curDst, name);
+      const rel = relPrefix ? `${relPrefix}/${name}` : name;
+
+      let lst;
+      try {
+        lst = withLockRetrySync(() => lstatSync(srcItem));
+      } catch (err) {
+        if (LOCK_ERROR_CODES.has(err?.code) || err?.code === 'ENOENT') {
+          warn(rel, err);
+          continue;
+        }
+        throw err;
+      }
+
+      if (lst.isSymbolicLink()) {
+        continue;
+      }
+
+      if (lst.isDirectory()) {
+        mkdirSync(dstItem, { recursive: true });
+        walk(srcItem, dstItem, rel);
+      } else if (lst.isFile()) {
+        try {
+          mkdirSync(curDst, { recursive: true });
+          withLockRetrySync(() => copyFileSync(srcItem, dstItem));
+        } catch (err) {
+          if (LOCK_ERROR_CODES.has(err?.code) || err?.code === 'ENOENT') {
+            warn(rel, err);
+            continue;
+          }
+          throw err;
+        }
+      }
+    }
   }
+
+  walk(srcDir, dstDir, '');
+  return true;
 }
 
 /**
@@ -612,10 +719,10 @@ export function fixLocalConflict({
       } catch (err) {
         if (!MOVE_FALLBACK_CODES.has(err?.code)) throw err;
         cpSync(tmpStage, srcPath, { recursive: true, dereference: true });
-        rmSync(tmpStage, { recursive: true, force: true });
+        safeRemoveDirBestEffort(tmpStage);
       }
     } catch (err) {
-      rmSync(tmpStage, { recursive: true, force: true });
+      safeRemoveDirBestEffort(tmpStage);
       throw err;
     }
 
@@ -727,6 +834,9 @@ export async function installOrUpdateCatalogPlugin({
   const backupDir = join(dataDir, 'staging', `${opId}-backup`);
   mkdirSync(stagingRootDir, { recursive: true });
 
+  let installStage = 'staging';
+  let targetPluginDirForErr = '';
+
   try {
     // Download & verify mandatory SHA-256 BEFORE unpacking a single byte
     const dlInfo = await fetchVerifiedPluginTarball({
@@ -776,21 +886,22 @@ export async function installOrUpdateCatalogPlugin({
     const targetDir = preflight.targetDir;
     const targetRootDir = isUpdatingParked ? disabledDir : pluginsDir;
     const targetPluginDir = join(targetRootDir, targetDir);
+    targetPluginDirForErr = targetPluginDir;
     const preservePaths = [
       ...new Set([
         ...(Array.isArray(existingReceipt?.preservePaths) ? existingReceipt.preservePaths : []),
         ...(Array.isArray(plugin.distribution?.preservePaths) ? plugin.distribution.preservePaths : []),
       ]),
     ];
+    const previousManagedFiles = Array.isArray(existingReceipt?.managedFiles) ? existingReceipt.managedFiles : null;
 
-    // Snapshot lightweight rollback backup if updating/replacing an existing directory
-    if (existsSync(targetPluginDir) && !lstatSync(targetPluginDir).isSymbolicLink()) {
-      cpSync(targetPluginDir, backupDir, {
-        recursive: true,
-        dereference: true,
-        filter: (p) => !hasNodeModulesSegment(targetPluginDir, p) && !RETIRED_BINARY_RE.test(p),
-      });
-    }
+    // Snapshot lightweight lock-safe rollback backup if updating/replacing an existing directory
+    installStage = 'backup';
+    snapshotBackupSafe(targetPluginDir, backupDir);
+
+    const incomingManagedFiles = listAllRelFiles(stagingBundleDir, { tolerateLockErrors: false })
+      .filter((rel) => rel !== '.agy-market-receipt.json')
+      .sort();
 
     const receipt = buildInstallReceipt({
       plugin,
@@ -801,6 +912,7 @@ export async function installOrUpdateCatalogPlugin({
       previousInstalledAt: existingReceipt?.installedAt || null,
       actualSha256: dlInfo.sha256,
       preservePaths,
+      managedFiles: incomingManagedFiles,
     });
 
     // Write crash-recovery journal BEFORE touching target plugin directory
@@ -814,24 +926,34 @@ export async function installOrUpdateCatalogPlugin({
       stagingBundleDir,
       backupDir: existsSync(backupDir) ? backupDir : null,
       preservePaths,
+      previousManagedFiles,
       receipt,
       startedAt: new Date().toISOString(),
     });
 
+    installStage = 'sync';
     const syncStats = syncDirectoryLockSafe({
       stagingBundleDir,
       targetPluginDir,
       dataDir,
       preservePaths,
+      previousManagedFiles,
       writeOverride,
     });
 
+    const verifiedManagedFiles = Array.isArray(syncStats.managedFiles)
+      ? [...new Set(syncStats.managedFiles.filter((rel) => rel !== '.agy-market-receipt.json'))].sort()
+      : incomingManagedFiles;
+    if (JSON.stringify(verifiedManagedFiles) !== JSON.stringify(receipt.managedFiles || [])) {
+      receipt.managedFiles = verifiedManagedFiles;
+    }
+
     writeFileSync(join(targetPluginDir, '.agy-market-receipt.json'), `${JSON.stringify(receipt, null, 2)}\n`, 'utf8');
 
-    // Clear journal & temporary staging artifacts
+    // Clear journal & temporary staging artifacts (best-effort so brief Windows Defender locks never fail a finished update)
     clearPendingJournal(dataDir);
-    rmSync(stagingRootDir, { recursive: true, force: true });
-    rmSync(backupDir, { recursive: true, force: true });
+    safeRemoveDirBestEffort(stagingRootDir);
+    safeRemoveDirBestEffort(backupDir);
 
     // Check if an already-enabled MCP plugin needs server reload (skip if parked/disabled)
     const enabledByDir = readHostEnabledMapReadOnly(configDir);
@@ -879,10 +1001,16 @@ export async function installOrUpdateCatalogPlugin({
       receipt,
     };
   } catch (err) {
-    rmSync(stagingRootDir, { recursive: true, force: true });
-    rmSync(backupDir, { recursive: true, force: true });
-    clearPendingJournal(dataDir);
-    throw err;
+    safeRemoveDirBestEffort(stagingRootDir);
+    safeRemoveDirBestEffort(backupDir);
+    try {
+      clearPendingJournal(dataDir);
+    } catch {
+      /* never mask original error */
+    }
+    const relPath =
+      targetPluginDirForErr && err?.path ? relative(targetPluginDirForErr, String(err.path)) : '';
+    throw annotateLockError(err, installStage, relPath);
   }
 }
 

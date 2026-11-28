@@ -3,7 +3,7 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { resolveDisabledPluginsDir } from '../shared/paths.mjs';
-import { syncDirectoryLockSafe } from './sync-dir.mjs';
+import { safeRemoveDirBestEffort, syncDirectoryLockSafe } from './sync-dir.mjs';
 
 export function getJournalPath(dataDir) {
   return join(dataDir, 'pending-journal.json');
@@ -44,6 +44,7 @@ export function recoverInterruptedJournal({ dataDir, pluginsDir }) {
         targetPluginDir,
         dataDir,
         preservePaths: journal.preservePaths || [],
+        previousManagedFiles: journal.previousManagedFiles ?? null,
       });
       if (journal.receipt) {
         writeFileSync(
@@ -53,7 +54,10 @@ export function recoverInterruptedJournal({ dataDir, pluginsDir }) {
         );
       }
       if (journal.stagingRootDir) {
-        rmSync(journal.stagingRootDir, { recursive: true, force: true });
+        safeRemoveDirBestEffort(journal.stagingRootDir);
+      }
+      if (journal.backupDir) {
+        safeRemoveDirBestEffort(journal.backupDir);
       }
       clearPendingJournal(dataDir);
       return { recovered: true, action: 'completed-forward', dir: journal.dir };
@@ -65,8 +69,9 @@ export function recoverInterruptedJournal({ dataDir, pluginsDir }) {
         targetPluginDir,
         dataDir,
         preservePaths: journal.preservePaths || [],
+        previousManagedFiles: journal.previousManagedFiles ?? null,
       });
-      rmSync(journal.backupDir, { recursive: true, force: true });
+      safeRemoveDirBestEffort(journal.backupDir);
       clearPendingJournal(dataDir);
       return { recovered: true, action: 'rolled-back', dir: journal.dir };
     }

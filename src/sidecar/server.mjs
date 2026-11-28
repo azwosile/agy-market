@@ -35,6 +35,7 @@ import {
   CUSTOMIZATION_URI,
   GZIP_MIN_BYTES,
   MAX_FAVORITES,
+  MAX_IGNORED_CONFLICTS,
   PLUGIN_DISPLAY_NAME,
   PLUGIN_ID,
   PLUGIN_VERSION,
@@ -53,6 +54,7 @@ import {
   computeCapabilityEscalation,
   loadPrefsFromDisk,
   sanitizeFavorites,
+  sanitizeIgnoredConflictIds,
   sanitizePrefs,
   savePrefsToDisk,
   toPublicPrefs,
@@ -608,6 +610,46 @@ export async function createMarketSidecarServer(options = {}) {
     return serverMatch || validExplicit || null;
   }
 
+function applyIgnoredConflictsFilter(report, ignoredIds = []) {
+  const base = report && typeof report === 'object' ? report : {};
+  const rawItems = Array.isArray(base.items) ? base.items : [];
+  const ignoredSet = new Set(sanitizeIgnoredConflictIds(ignoredIds));
+  const items = rawItems.map((item) => ({
+    ...item,
+    ignored: Boolean(item?.id && ignoredSet.has(item.id)),
+  }));
+
+  let total = 0;
+  let critical = 0;
+  let warning = 0;
+  let info = 0;
+  let ignoredCount = 0;
+
+  for (const item of items) {
+    if (item.ignored) {
+      ignoredCount += 1;
+      continue;
+    }
+    total += 1;
+    if (item.severity === 'critical') critical += 1;
+    else if (item.severity === 'warning') warning += 1;
+    else if (item.severity === 'info') info += 1;
+  }
+
+  return {
+    ...base,
+    summary: {
+      total,
+      critical,
+      warning,
+      info,
+      ignoredCount,
+      healthyCount: Number(base.summary?.healthyCount || 0),
+    },
+    items,
+  };
+}
+
   async function buildEnrichedState({ forceCatalogRefresh = false, workspaceUris = [] } = {}) {
     const loadedCatalog = await ensureCatalogLoaded({ forceCatalogRefresh, includeReadmes: false });
     const activeCatalog =
@@ -649,13 +691,16 @@ export async function createMarketSidecarServer(options = {}) {
     });
 
     const enrichedInventory = { ...inventory, installed: enrichedInstalled };
-    const conflictsReport = scanLocalConflicts({
-      inventory: enrichedInventory,
-      configDir,
-      dataDir,
-      workspaceUris,
-      catalogPlugins,
-    });
+    const conflictsReport = applyIgnoredConflictsFilter(
+      scanLocalConflicts({
+        inventory: enrichedInventory,
+        configDir,
+        dataDir,
+        workspaceUris,
+        catalogPlugins,
+      }),
+      prefs.ignoredConflictIds,
+    );
 
     const enrichedCatalogPlugins = catalogPlugins.map((p) => {
       const preflight = resolveInstallPreflight(p, enrichedInventory, { conflictStrategy: 'prompt' });
@@ -842,13 +887,16 @@ export async function createMarketSidecarServer(options = {}) {
         await ensureCatalogLoaded({ forceCatalogRefresh: false, includeReadmes: false }).catch(() => null);
       }
       const inventory = scanLocalPluginInventory({ configDir, dataDir, workspaceUris, builtinPluginsDir, linkInfoOverride });
-      const report = scanLocalConflicts({
-        inventory,
-        configDir,
-        dataDir,
-        workspaceUris,
-        catalogPlugins: lastCatalog?.plugins || [],
-      });
+      const report = applyIgnoredConflictsFilter(
+        scanLocalConflicts({
+          inventory,
+          configDir,
+          dataDir,
+          workspaceUris,
+          catalogPlugins: lastCatalog?.plugins || [],
+        }),
+        prefs.ignoredConflictIds,
+      );
       sendJson(res, 200, report);
       return;
     }
@@ -1173,6 +1221,9 @@ export async function createMarketSidecarServer(options = {}) {
           if (!Object.prototype.hasOwnProperty.call(body, 'favorites')) {
             merged.favorites = Array.isArray(prefs.favorites) ? [...prefs.favorites] : [];
           }
+          if (!Object.prototype.hasOwnProperty.call(body, 'ignoredConflictIds')) {
+            merged.ignoredConflictIds = Array.isArray(prefs.ignoredConflictIds) ? [...prefs.ignoredConflictIds] : [];
+          }
           prefs = savePrefsToDisk(dataDir, merged);
           const nextCatalogKey = getCatalogPrefsKey(prefs);
           const track2SwitchedOn = !prevPrefs.enableExperimentalTrack2 && Boolean(prefs.enableExperimentalTrack2);
@@ -1219,6 +1270,72 @@ export async function createMarketSidecarServer(options = {}) {
           isFavorite: persisted.includes(key),
           favorites: persisted,
         });
+        return;
+      }
+
+      if (pathname === '/api/conflicts/ignore') {
+        const id = typeof body.id === 'string' ? body.id.trim() : '';
+        if (!id || id.length > 200) {
+          sendJson(res, 400, {
+            ok: false,
+            error: 'ERR_INVALID_CONFLICT_ID: Non-empty string "id" (<=200 chars) is required',
+          });
+          return;
+        }
+        if (typeof body.ignored !== 'boolean') {
+          sendJson(res, 400, {
+            ok: false,
+            error: 'ERR_INVALID_IGNORED_FLAG: Boolean "ignored" is required',
+          });
+          return;
+        }
+        const workspaceUris = parseWorkspaceUrisInput(body.workspaceUris);
+        const result = await enqueueCatalogConfigOp(async () => {
+          const current = sanitizeIgnoredConflictIds(prefs.ignoredConflictIds);
+          const exists = current.includes(id);
+          let nextIgnoredIds;
+          if (body.ignored) {
+            if (exists) {
+              nextIgnoredIds = current;
+            } else {
+              const trimmed =
+                current.length >= MAX_IGNORED_CONFLICTS ? current.slice(-(MAX_IGNORED_CONFLICTS - 1)) : current;
+              nextIgnoredIds = [...trimmed, id];
+            }
+          } else {
+            nextIgnoredIds = current.filter((item) => item !== id);
+          }
+          prefs = savePrefsToDisk(dataDir, { ...prefs, ignoredConflictIds: nextIgnoredIds });
+          invalidateUpdateCheckState();
+          const state = await buildEnrichedState({ forceCatalogRefresh: false, workspaceUris });
+          const freshInv = scanLocalPluginInventory({
+            configDir,
+            dataDir,
+            workspaceUris,
+            builtinPluginsDir,
+            linkInfoOverride,
+          });
+          const conflicts = applyIgnoredConflictsFilter(
+            scanLocalConflicts({
+              inventory: { ...freshInv, installed: state.installed },
+              configDir,
+              dataDir,
+              workspaceUris,
+              catalogPlugins: lastCatalog?.plugins || [],
+            }),
+            prefs.ignoredConflictIds,
+          );
+          return {
+            ok: true,
+            id,
+            ignored: Boolean(body.ignored),
+            ignoredConflictIds: [...(prefs.ignoredConflictIds || [])],
+            conflicts,
+            conflictsSummary: conflicts.summary,
+            state,
+          };
+        });
+        sendJson(res, 200, result);
         return;
       }
 
@@ -1316,13 +1433,16 @@ export async function createMarketSidecarServer(options = {}) {
         invalidateUpdateCheckState();
         const state = await buildEnrichedState({ forceCatalogRefresh: false, workspaceUris });
         const freshInv = scanLocalPluginInventory({ configDir, dataDir, workspaceUris, linkInfoOverride });
-        const conflicts = scanLocalConflicts({
-          inventory: { ...freshInv, installed: state.installed },
-          configDir,
-          dataDir,
-          workspaceUris,
-          catalogPlugins: lastCatalog?.plugins || [],
-        });
+        const conflicts = applyIgnoredConflictsFilter(
+          scanLocalConflicts({
+            inventory: { ...freshInv, installed: state.installed },
+            configDir,
+            dataDir,
+            workspaceUris,
+            catalogPlugins: lastCatalog?.plugins || [],
+          }),
+          prefs.ignoredConflictIds,
+        );
         sendJson(res, 200, {
           ...fixRes,
           conflicts,

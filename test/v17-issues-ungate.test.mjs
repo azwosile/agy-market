@@ -1234,7 +1234,7 @@ test('Issue #3C: install-local.mjs succeeds when repo lives under _npx/.../node_
 
     const installedRoot = join(destPluginsDir, 'agy-market');
     assert.equal(existsSync(join(installedRoot, 'plugin.json')), true);
-    assert.equal(existsSync(join(installedRoot, 'assets', 'logo.svg')), true);
+    assert.equal(existsSync(join(installedRoot, 'assets', 'logo.png')), true);
     assert.equal(existsSync(join(installedRoot, 'bin', 'agy-market.mjs')), true);
     assert.equal(existsSync(join(installedRoot, 'sidecars', 'market_pane', 'index.html')), true);
     assert.equal(existsSync(join(installedRoot, 'src', 'sidecar', 'server.mjs')), true);

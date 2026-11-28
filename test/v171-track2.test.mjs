@@ -405,7 +405,7 @@ function createInteractiveUiHarness() {
 }
 
 test('v1.7.1 Track 2 timeout & fallback: index.json OK + unverified timeout falls back to alternate URL then local cache with warnings and >4 plugins', async () => {
-  assert.equal(PLUGIN_VERSION, '1.7.1');
+  assert.equal(PLUGIN_VERSION, '1.7.2');
   assert.equal(PRIMARY_FETCH_TIMEOUT_MS, 3500);
   assert.equal(UNVERIFIED_FETCH_TIMEOUT_MS, 20000);
   assert.equal(LOCAL_INVENTORY_CACHE_TTL_MS, 30000);
@@ -578,6 +578,13 @@ test('v1.7.1 POST /api/prefs does not force-refresh when cache fresh, and B3 gen
       }
       return jsonResp({ message: 'Not Found' }, 404);
     };
+
+    // Seed Track 2 = false explicitly so this test exercises the Track-2-off -> Track-2-on transition
+    writeFileSync(
+      join(ws.dataDir, 'prefs.json'),
+      `${JSON.stringify({ schemaVersion: 1, enableExperimentalTrack2: false }, null, 2)}\n`,
+      'utf8',
+    );
 
     const srv = await createMarketSidecarServer({
       listen: false,
@@ -827,6 +834,7 @@ test('v1.7.1 gzip compression for >64KB JSON responses (inject + TCP loopback) a
   const ws = makeTempWorkspace('agy-v171-gzip-');
   try {
     const manyPlugins = Array.from({ length: 180 }, (_, i) => makeCatalogPlugin(i + 1));
+
     const srv = await createMarketSidecarServer({
       listen: true,
       configDir: ws.configDir,

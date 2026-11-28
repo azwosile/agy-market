@@ -8,13 +8,14 @@ export const SUBMIT_PLUGIN_GUIDE_URL =
 export const NOMINATE_PLUGIN_ISSUE_BASE_URL =
   'https://github.com/azwosile/agy-market-catalog/issues/new';
 export const PLUGIN_DISPLAY_NAME = 'AGY Market · 反重力插件市场';
-export const PLUGIN_VERSION = '1.7.1';
+export const PLUGIN_VERSION = '1.7.2';
 export const SIDECAR_ID = 'market_pane';
 export const SIDECAR_URI = 'sidecar://agy-market/market_pane/';
 export const CUSTOMIZATION_URI = 'customization://agy-market';
 
 export const MAX_TARBALL_BYTES = 0; // 0 = unlimited
 export const MAX_FAVORITES = 500;
+export const MAX_IGNORED_CONFLICTS = 500;
 export const PRIMARY_CATALOG_BASE_URL = 'https://azwosile.github.io/agy-market-catalog';
 export const RAW_GH_PAGES_CATALOG_BASE_URL = 'https://raw.githubusercontent.com/azwosile/agy-market-catalog/gh-pages';
 export const PRIMARY_FETCH_TIMEOUT_MS = 3500;
@@ -148,13 +149,14 @@ export const CATEGORY_LABELS = Object.freeze({
 export const DEFAULT_PREFS = Object.freeze({
   schemaVersion: 1,
   locale: 'zh',
-  enableExperimentalTrack2: false,
+  enableExperimentalTrack2: true,
   networkMode: 'auto', // 'auto' | 'china-mirror' | 'direct'
   primaryCatalogUrl: PRIMARY_CATALOG_BASE_URL,
   githubReleaseMirrorPrefix: '',
   githubToken: '',
   customFeeds: [],
   favorites: [],
+  ignoredConflictIds: [],
 });
 
 export function formatBadgeLabel(badgeId, capabilities = {}, locale = 'zh') {

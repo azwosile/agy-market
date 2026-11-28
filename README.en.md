@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/logo.svg" alt="AGY Market Logo" width="84" />
+<img src="assets/logo.png" alt="AGY Market Logo" width="84" />
 
 # AGY Market (`agy-market`)
 

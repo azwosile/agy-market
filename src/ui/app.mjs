@@ -27,6 +27,7 @@ function formatV(ver) {
 const SELF_OFFER_DISMISSED_KEY = 'agy-market-self-offer-dismissed';
 const HERO_COLLAPSED_KEY = 'agy-market-hero-collapsed';
 const FAVS_SHELF_COLLAPSED_KEY = 'agy-market-favs-shelf-collapsed';
+const SHOW_IGNORED_CONFLICTS_KEY = 'agy-market-show-ignored-conflicts';
 const SUBMIT_PLUGIN_GUIDE_URL =
   'https://github.com/azwosile/agy-market-catalog/blob/main/docs/SUBMISSION_GUIDE.md';
 const ASAR_LABEL = ['app', 'asar'].join('.');
@@ -172,6 +173,9 @@ const state = {
     data: null, // { ok, checkedAt, summary, items }
     error: '',
   },
+  showIgnoredConflicts: readStorage(SHOW_IGNORED_CONFLICTS_KEY, '0') === '1',
+  ignoringConflictId: '',
+  chipStripScrollLeft: 0,
 
   // Dismissible Smart Restart / Reload Banner (shown ONLY after a completed install/update/uninstall/toggle)
   restartBanner: null, // null | { level: 'host-restart'|'reload-pane', operation: 'install'|'update'|'uninstall'|'toggle', plugins: string[], reasons: string[] }
@@ -186,6 +190,7 @@ const state = {
   batchUpdating: false,
   batchTargetIds: [],
   batchResults: null,
+  batchResultsAutoClose: null, // null | { active: boolean, paused: boolean, delayMs: number }
 
   // Reconnect overlay after `POST /api/self-update`
   reconnecting: null,
@@ -213,8 +218,10 @@ const state = {
 };
 
 const DISCOVER_PAGE_SIZE = 48;
+const BATCH_RESULTS_AUTO_CLOSE_MS = 8000;
 
 let toastTimer = null;
+let batchResultsAutoCloseTimer = null;
 let reconnectTimer = null;
 let updatesRequestSeq = 0;
 let readmeRequestSeq = 0;
@@ -225,6 +232,7 @@ let prefsInFlight = 0;
 const prefsLastSeq = Object.create(null);
 let lastForcedUpdatesAt = 0;
 let loadMoreObserver = null;
+let chipStripResizeObserver = null;
 let lastFiltered = { key: '', pluginsRef: null, totalLen: 0, plugins: null };
 let searchDebounceTimer = null;
 let isComposingSearch = false;
@@ -298,6 +306,49 @@ function t(zh, en) {
   return getLocale() === 'en' ? en : zh;
 }
 
+function getScopeDisplay(scope) {
+  const raw = String(scope || 'global').trim().toLowerCase() || 'global';
+  if (raw === 'workspace') {
+    return {
+      raw: 'workspace',
+      label: t('工作区', 'Workspace'),
+      tooltip: t(
+        '工作区插件：安装于当前工作区 .agents/plugins/，仅对当前项目生效',
+        'Workspace plugin: installed in .agents/plugins/ for the current workspace only',
+      ),
+      searchTerms: 'workspace 工作区',
+    };
+  }
+  if (raw === 'builtin') {
+    return {
+      raw: 'builtin',
+      label: t('内置', 'Built-in'),
+      tooltip: t(
+        '内置插件：由 Antigravity 宿主自带并统一维护',
+        'Built-in plugin: bundled and maintained by Antigravity host',
+      ),
+      searchTerms: 'builtin built-in 内置',
+    };
+  }
+  if (raw === 'global') {
+    return {
+      raw: 'global',
+      label: t('全局', 'Global'),
+      tooltip: t(
+        '全局插件：安装于 ~/.gemini/config/plugins/，对所有工作区生效',
+        'Global plugin: installed in ~/.gemini/config/plugins/ for all workspaces',
+      ),
+      searchTerms: 'global 全局',
+    };
+  }
+  return {
+    raw,
+    label: raw,
+    tooltip: '',
+    searchTerms: raw,
+  };
+}
+
 function hasCjk(str) {
   return /[\u4e00-\u9fff]/.test(String(str || ''));
 }
@@ -356,6 +407,54 @@ function renderToast() {
   if (!host) return false;
   host.innerHTML = renderToastHtml();
   return true;
+}
+
+function clearBatchResultsAutoCloseTimer() {
+  if (batchResultsAutoCloseTimer !== null && typeof clearTimeout === 'function') {
+    clearTimeout(batchResultsAutoCloseTimer);
+  }
+  batchResultsAutoCloseTimer = null;
+}
+
+function dismissBatchResults() {
+  clearBatchResultsAutoCloseTimer();
+  state.batchResults = null;
+  state.batchResultsAutoClose = null;
+}
+
+function scheduleBatchResultsAutoClose(delayMs = BATCH_RESULTS_AUTO_CLOSE_MS) {
+  clearBatchResultsAutoCloseTimer();
+  if (!Array.isArray(state.batchResults) || state.batchResults.length === 0) {
+    state.batchResultsAutoClose = null;
+    return;
+  }
+  const allSucceeded = state.batchResults.every((r) => Boolean(r && r.ok));
+  if (!allSucceeded) {
+    state.batchResultsAutoClose = null;
+    return;
+  }
+  state.batchResultsAutoClose = { active: true, paused: false, delayMs };
+  if (typeof setTimeout === 'function') {
+    batchResultsAutoCloseTimer = setTimeout(() => {
+      batchResultsAutoCloseTimer = null;
+      if (state.batchResultsAutoClose && !state.batchResultsAutoClose.paused) {
+        state.batchResults = null;
+        state.batchResultsAutoClose = null;
+        render();
+      }
+    }, delayMs);
+  }
+}
+
+function pauseBatchResultsAutoClose() {
+  if (!state.batchResultsAutoClose || state.batchResultsAutoClose.paused) return;
+  clearBatchResultsAutoCloseTimer();
+  state.batchResultsAutoClose = { ...state.batchResultsAutoClose, active: false, paused: true };
+  const hintEl = document.querySelector?.('.batch-results-hint');
+  if (hintEl) {
+    hintEl.textContent = t('已暂停自动关闭', 'Auto-close paused');
+    hintEl.classList?.add?.('is-paused');
+  }
 }
 
 function showToast(message, { subtext = '', tone = 'info', durationMs = 5000 } = {}) {
@@ -1087,9 +1186,10 @@ function getConflictsSummary() {
       warning: Number(s.warning || 0),
       info: Number(s.info || 0),
       healthyCount: Number(s.healthyCount ?? Math.max(0, installedCount - Number(s.critical || 0))),
+      ignoredCount: Number(s.ignoredCount || 0),
     };
   }
-  return { total: 0, critical: 0, warning: 0, info: 0, healthyCount: installedCount };
+  return { total: 0, critical: 0, warning: 0, info: 0, healthyCount: installedCount, ignoredCount: 0 };
 }
 
 function buildLocalDetailModel(loc, catEntry) {
@@ -1337,6 +1437,58 @@ async function triggerFixConflict({ type, targetDir, suggestedDir = '' }) {
     showToast(`${t('冲突修复失败', 'Conflict fix failed')}: ${err?.message || String(err)}`, { tone: 'danger' });
   } finally {
     state.fixingKey = '';
+    render();
+  }
+}
+
+async function triggerIgnoreConflict(conflictId, ignored) {
+  const id = String(conflictId || '').trim();
+  if (!id) return;
+  state.ignoringConflictId = id;
+  render();
+  try {
+    const res = await apiFetch('/api/conflicts/ignore', {
+      method: 'POST',
+      body: {
+        id,
+        ignored: Boolean(ignored),
+        workspaceUris: state.workspaceUris,
+      },
+    });
+    if (res.state) {
+      applyServerState(res.state);
+    }
+    if (res.conflicts) {
+      state.conflicts = {
+        loading: false,
+        loaded: true,
+        data: res.conflicts,
+        error: '',
+      };
+    } else if (state.conflicts.data?.items) {
+      const nextItems = state.conflicts.data.items.map((it) =>
+        it?.id === id ? { ...it, ignored: Boolean(ignored) } : it,
+      );
+      state.conflicts.data = {
+        ...state.conflicts.data,
+        items: nextItems,
+        summary: res.conflictsSummary || state.conflicts.data.summary,
+      };
+    }
+    if (state.serverState && (res.conflictsSummary || res.conflicts?.summary)) {
+      state.serverState.conflictsSummary = res.conflictsSummary || res.conflicts.summary;
+    }
+    showToast(
+      ignored ? t('已忽略该冲突提示', 'Conflict ignored') : t('已恢复显示该冲突提示', 'Conflict restored'),
+      { tone: 'ok' },
+    );
+  } catch (err) {
+    showToast(
+      `${ignored ? t('忽略冲突失败', 'Failed to ignore conflict') : t('取消忽略失败', 'Failed to unignore conflict')}: ${err?.message || String(err)}`,
+      { tone: 'danger' },
+    );
+  } finally {
+    state.ignoringConflictId = '';
     render();
   }
 }
@@ -1809,6 +1961,8 @@ async function triggerUpdateAll(ids = null, { confirmEscalation = false, _intern
   let didLiveCheck = false;
 
   if (!targetIds.length && (!Array.isArray(ids) || ids.length === 0)) {
+    clearBatchResultsAutoCloseTimer();
+    state.batchResultsAutoClose = null;
     state.batchUpdating = true;
     state.batchTargetIds = [];
     state.errorBanner = null;
@@ -1841,6 +1995,8 @@ async function triggerUpdateAll(ids = null, { confirmEscalation = false, _intern
     return;
   }
 
+  clearBatchResultsAutoCloseTimer();
+  state.batchResultsAutoClose = null;
   state.batchUpdating = true;
   state.batchTargetIds = targetIds;
   state.errorBanner = null;
@@ -1987,7 +2143,15 @@ async function triggerUpdateAll(ids = null, { confirmEscalation = false, _intern
 
     await checkUpdates(false, { silent: true, allowWhileBusy: true });
     if (state.conflicts.loaded) void loadConflicts({ silent: true });
+    if (failCount === 0 && escalated.length === 0 && res.ok !== false) {
+      scheduleBatchResultsAutoClose(BATCH_RESULTS_AUTO_CLOSE_MS);
+    } else {
+      clearBatchResultsAutoCloseTimer();
+      state.batchResultsAutoClose = null;
+    }
   } catch (err) {
+    clearBatchResultsAutoCloseTimer();
+    state.batchResultsAutoClose = null;
     const errMsg = err?.message || String(err);
     setErrorBanner({
       title: t('批量更新失败', 'Batch Update Failed'),
@@ -4110,6 +4274,50 @@ function setupLoadMoreObserver() {
   loadMoreObserver.observe(sentinel);
 }
 
+function syncChipStripOverflow() {
+  const wrap = document.getElementById?.('discover-chip-wrap');
+  const strip = document.getElementById?.('discover-chip-strip');
+  if (!wrap || !strip || !wrap.classList) return;
+  const scrollWidth = Number(strip.scrollWidth || 0);
+  const clientWidth = Number(strip.clientWidth || 0);
+  const scrollLeft = Number(strip.scrollLeft || 0);
+  const canScroll = scrollWidth > clientWidth + 2;
+  const canLeft = canScroll && scrollLeft > 2;
+  const canRight = canScroll && scrollLeft + clientWidth < scrollWidth - 2;
+  wrap.classList.toggle('can-scroll-left', canLeft);
+  wrap.classList.toggle('can-scroll-right', canRight);
+}
+
+function setupDiscoverChipStripControls() {
+  if (chipStripResizeObserver) {
+    chipStripResizeObserver.disconnect();
+    chipStripResizeObserver = null;
+  }
+  if (state.activeTab !== 'discover') return;
+  const strip = document.getElementById?.('discover-chip-strip');
+  if (!strip) return;
+  if (state.chipStripScrollLeft > 0) {
+    strip.scrollLeft = state.chipStripScrollLeft;
+  }
+  syncChipStripOverflow();
+  if (typeof strip.addEventListener === 'function') {
+    strip.addEventListener(
+      'scroll',
+      () => {
+        state.chipStripScrollLeft = strip.scrollLeft || 0;
+        syncChipStripOverflow();
+      },
+      { passive: true },
+    );
+  }
+  if (typeof ResizeObserver === 'function') {
+    chipStripResizeObserver = new ResizeObserver(() => {
+      syncChipStripOverflow();
+    });
+    chipStripResizeObserver.observe(strip);
+  }
+}
+
 function renderDiscoverView() {
   const prefs = state.serverState?.prefs || {};
   const loc = getLocale();
@@ -4186,14 +4394,18 @@ function renderDiscoverView() {
         </label>
       </div>
 
-      <div class="chip-strip" role="tablist" aria-label="${escapeHtml(t('插件分类', 'Categories'))}">
-        ${chipKeys
-          .map((key) => {
-            const label = CATEGORY_LABELS[key]?.[loc] || CATEGORY_LABELS[key]?.zh || key;
-            const n = catCounts[key] || 0;
-            return `<button type="button" class="cat-chip ${state.category === key ? 'active' : ''}" data-action="category" data-category="${escapeHtml(key)}">${escapeHtml(label)}${n > 0 ? `<span class="cat-chip-n">${n}</span>` : ''}</button>`;
-          })
-          .join('')}
+      <div class="chip-strip-wrap" id="discover-chip-wrap">
+        <button type="button" class="chip-scroll-btn is-prev" data-action="scroll-chips" data-dir="-1" aria-label="${escapeHtml(t('向左滚动标签', 'Scroll categories left'))}">${icon('chevronLeft', 14)}</button>
+        <div class="chip-strip" id="discover-chip-strip" role="tablist" aria-label="${escapeHtml(t('插件分类', 'Categories'))}">
+          ${chipKeys
+            .map((key) => {
+              const label = CATEGORY_LABELS[key]?.[loc] || CATEGORY_LABELS[key]?.zh || key;
+              const n = catCounts[key] || 0;
+              return `<button type="button" class="cat-chip ${state.category === key ? 'active' : ''}" data-action="category" data-category="${escapeHtml(key)}">${escapeHtml(label)}${n > 0 ? `<span class="cat-chip-n">${n}</span>` : ''}</button>`;
+            })
+            .join('')}
+        </div>
+        <button type="button" class="chip-scroll-btn is-next" data-action="scroll-chips" data-dir="1" aria-label="${escapeHtml(t('向右滚动标签', 'Scroll categories right'))}">${icon('chevronRight', 14)}</button>
       </div>
     </div>
 
@@ -4379,11 +4591,29 @@ function renderBatchResultsPanel() {
   const updateActionLocked = isUpdateActionLocked();
   const { byId: catById, byDir: catByDir } = getCatalogMaps();
   const globalByDir = getGlobalInstalledByDirMap();
+  const autoClose = state.batchResultsAutoClose;
+  const allSucceeded = state.batchResults.every((r) => Boolean(r && r.ok));
+  let hintHtml = '';
+  if (allSucceeded && autoClose?.paused) {
+    hintHtml = `<span class="batch-results-hint is-paused">${escapeHtml(t('已暂停自动关闭', 'Auto-close paused'))}</span>`;
+  } else if (allSucceeded && autoClose?.active) {
+    const secs = Math.max(1, Math.round((autoClose.delayMs || BATCH_RESULTS_AUTO_CLOSE_MS) / 1000));
+    hintHtml = `<span class="batch-results-hint">${escapeHtml(t(`已全部更新 · ${secs} 秒后自动关闭`, `All updated · auto-closes in ${secs}s`))}</span>`;
+  }
   return `
-    <div class="batch-results">
+    <div class="batch-results" role="region" aria-label="${escapeHtml(t('本次批量更新结果', 'Batch Update Results'))}">
       <div class="batch-results-head">
-        <span>${escapeHtml(t('本次批量更新结果', 'Batch Update Results'))}</span>
-        <button type="button" class="ghost-link" data-action="clear-batch-results">${escapeHtml(t('收起', 'Dismiss'))}</button>
+        <div class="batch-results-title-wrap">
+          <span class="batch-results-title">${escapeHtml(t('本次批量更新结果', 'Batch Update Results'))}</span>
+          ${hintHtml}
+        </div>
+        <button
+          type="button"
+          class="batch-close-btn"
+          data-action="clear-batch-results"
+          title="${escapeHtml(t('关闭批量更新结果', 'Close batch update results'))}"
+          aria-label="${escapeHtml(t('关闭', 'Close'))}"
+        >${icon('close', 12)} <span>${escapeHtml(t('关闭', 'Close'))}</span></button>
       </div>
       ${state.batchResults
         .map((r) => {
@@ -4473,6 +4703,7 @@ function renderInstalledCard(loc, updById, updByDir, catById, catByDir) {
   const isParked = !loc.enabled;
   const displayName = loc.displayName || catEntry?.displayName || loc.dir;
   const favKey = getLocalFavoriteKey(loc, catEntry);
+  const scopeInfo = getScopeDisplay(loc.scope);
 
   const canToggle =
     loc.canToggle !== undefined
@@ -4582,7 +4813,7 @@ function renderInstalledCard(loc, updById, updByDir, catById, catByDir) {
                   : `<span class="state-pill ${loc.enabled ? 'is-enabled' : 'is-disabled'}">${escapeHtml(loc.enabled ? t('已启用', 'Enabled') : t('已停用', 'Disabled'))}</span>`
             }
             ${isGithubUrlTrack ? `<span class="track-tag is-github-url" title="${escapeHtml(t('通过 GitHub 链接安装', 'Installed via GitHub URL'))}">GitHub URL</span>` : ''}
-            ${upd?.changelog ? `<span class="meta-sep">·</span><button type="button" class="notes-link" data-action="detail-local" data-dir="${escapeHtml(loc.dir)}" data-detail-tab="changelog">${escapeHtml(t('更新内容 ›', 'Notes ›'))}</button>` : `<span class="meta-sep">·</span><span>${escapeHtml(loc.scope || 'global')}</span>`}
+            ${upd?.changelog ? `<span class="meta-sep">·</span><button type="button" class="notes-link" data-action="detail-local" data-dir="${escapeHtml(loc.dir)}" data-detail-tab="changelog">${escapeHtml(t('更新内容 ›', 'Notes ›'))}</button>` : `<span class="meta-sep">·</span><span class="meta-scope" title="${escapeHtml(scopeInfo.tooltip)}">${escapeHtml(scopeInfo.label)}</span>`}
           </div>
         </div>
       </div>
@@ -4660,7 +4891,8 @@ function renderInstalledView() {
     const catDescObj = catEntry && typeof catEntry.description === 'object' ? catEntry.description : null;
     const badges = (catEntry?.capabilities?.badges || loc.capabilities?.badges || loc.receipt?.grantedCapabilities?.badges || []).join(' ');
     const trackHint = loc.receipt?.track === 'github-url' ? 'github url' : loc.receipt?.track || '';
-    const hay = `${loc.displayName || ''} ${catEntry?.displayName || ''} ${loc.name || ''} ${loc.dir || ''} ${localizedDesc} ${loc.description || ''} ${catDescObj?.zh || ''} ${catDescObj?.en || ''} ${loc.scope || ''} ${trackHint} ${loc.receipt?.pluginRoot || ''} ${badges}`.toLowerCase();
+    const scopeSearchTerms = getScopeDisplay(loc.scope).searchTerms;
+    const hay = `${loc.displayName || ''} ${catEntry?.displayName || ''} ${loc.name || ''} ${loc.dir || ''} ${localizedDesc} ${loc.description || ''} ${catDescObj?.zh || ''} ${catDescObj?.en || ''} ${loc.scope || ''} ${scopeSearchTerms} ${trackHint} ${loc.receipt?.pluginRoot || ''} ${badges}`.toLowerCase();
     return hay.includes(q);
   });
 
@@ -4820,8 +5052,11 @@ function renderConflictCard(item) {
       : t('隔离重命名修复', 'Isolate & Rename');
   const fixLabel = (loc === 'en' ? fix?.labelEn : fix?.labelZh) || defaultFixLabel;
 
+  const isIgnored = Boolean(item?.ignored);
+  const isIgnoring = Boolean(item?.id && state.ignoringConflictId === item.id);
+
   return `
-    <article class="conflict-card sev-${sev}">
+    <article class="conflict-card sev-${sev}${isIgnored ? ' is-ignored' : ''}">
       <div class="conflict-card-head">
         <div class="conflict-card-title-group">
           <div class="conflict-card-badges">
@@ -4831,24 +5066,54 @@ function renderConflictCard(item) {
             </span>
             <span class="layer-tag">${escapeHtml(loc === 'en' ? layerMeta.en : layerMeta.zh)}</span>
           </div>
-          <h3 class="conflict-card-title">${escapeHtml(title)}</h3>
+          <div class="conflict-card-title-line">
+            <h3 class="conflict-card-title">${escapeHtml(title)}</h3>
+            ${isIgnored ? `<span class="ignored-badge">${escapeHtml(t('已忽略', 'Ignored'))}</span>` : ''}
+          </div>
         </div>
-        ${
-          fix
-            ? `<button
-                type="button"
-                class="btn btn-fix btn-sm"
-                data-action="fix-conflict"
-                data-fix-type="${escapeHtml(fix.type)}"
-                data-target-dir="${escapeHtml(fix.targetDir || '')}"
-                data-suggested-dir="${escapeHtml(fix.suggestedDir || '')}"
-                ${isFixing ? 'disabled' : ''}
-              >
-                ${icon(isFixing ? 'refresh' : 'wrench', 12, isFixing ? 'spin' : '')}
-                <span>${escapeHtml(isFixing ? t('修复中…', 'Fixing…') : fixLabel)}</span>
-              </button>`
-            : ''
-        }
+        <div class="conflict-card-actions">
+          ${
+            !isIgnored && fix
+              ? `<button
+                  type="button"
+                  class="btn btn-fix btn-sm"
+                  data-action="fix-conflict"
+                  data-fix-type="${escapeHtml(fix.type)}"
+                  data-target-dir="${escapeHtml(fix.targetDir || '')}"
+                  data-suggested-dir="${escapeHtml(fix.suggestedDir || '')}"
+                  ${isFixing || isIgnoring ? 'disabled' : ''}
+                >
+                  ${icon(isFixing ? 'refresh' : 'wrench', 12, isFixing ? 'spin' : '')}
+                  <span>${escapeHtml(isFixing ? t('修复中…', 'Fixing…') : fixLabel)}</span>
+                </button>`
+              : ''
+          }
+          ${
+            item.id
+              ? isIgnored
+                ? `<button
+                    type="button"
+                    class="btn btn-sm btn-unignore-conflict"
+                    data-action="unignore-conflict"
+                    data-conflict-id="${escapeHtml(item.id)}"
+                    ${isIgnoring ? 'disabled' : ''}
+                  >
+                    ${isIgnoring ? icon('refresh', 12, 'spin') : ''}
+                    <span>${escapeHtml(isIgnoring ? t('处理中…', 'Saving…') : t('取消忽略', 'Unignore'))}</span>
+                  </button>`
+                : `<button
+                    type="button"
+                    class="btn btn-sm btn-ignore-conflict"
+                    data-action="ignore-conflict"
+                    data-conflict-id="${escapeHtml(item.id)}"
+                    ${isFixing || isIgnoring ? 'disabled' : ''}
+                  >
+                    ${isIgnoring ? icon('refresh', 12, 'spin') : ''}
+                    <span>${escapeHtml(isIgnoring ? t('处理中…', 'Saving…') : t('忽略', 'Ignore'))}</span>
+                  </button>`
+              : ''
+          }
+        </div>
       </div>
 
       ${summary ? `<p class="conflict-card-desc">${escapeHtml(summary)}</p>` : ''}
@@ -4863,7 +5128,14 @@ function renderConflictCard(item) {
                       <span class="conflict-box-label">${icon('checkCircle', 12)} ${escapeHtml(t('优先加载', 'Active'))}</span>
                       <div class="conflict-path-line">
                         <strong>${escapeHtml(item.winner.dir || item.winner.name || '')}</strong>
-                        ${item.winner.scope ? `<span class="scope-chip">${escapeHtml(item.winner.scope)}</span>` : ''}
+                        ${
+                          item.winner.scope
+                            ? (() => {
+                                const sc = getScopeDisplay(item.winner.scope);
+                                return `<span class="scope-chip" title="${escapeHtml(sc.tooltip)}">${escapeHtml(sc.label)}</span>`;
+                              })()
+                            : ''
+                        }
                       </div>
                       ${item.winner.path ? `<div class="conflict-path-line muted">${escapeHtml(item.winner.path)}</div>` : ''}
                     </div>`
@@ -4878,7 +5150,14 @@ function renderConflictCard(item) {
                           (s) => `
                           <div class="conflict-path-line">
                             <strong>${escapeHtml(s.dir || s.name || '')}</strong>
-                            ${s.scope ? `<span class="scope-chip">${escapeHtml(s.scope)}</span>` : ''}
+                            ${
+                              s.scope
+                                ? (() => {
+                                    const sc = getScopeDisplay(s.scope);
+                                    return `<span class="scope-chip" title="${escapeHtml(sc.tooltip)}">${escapeHtml(sc.label)}</span>`;
+                                  })()
+                                : ''
+                            }
                             ${s.path ? `<span class="muted">${escapeHtml(s.path)}</span>` : ''}
                           </div>
                         `,
@@ -4896,7 +5175,14 @@ function renderConflictCard(item) {
                           (ap) => `
                           <div class="conflict-path-line">
                             <strong>${escapeHtml(ap.dir || ap.name || '')}</strong>
-                            ${ap.scope ? `<span class="scope-chip">${escapeHtml(ap.scope)}</span>` : ''}
+                            ${
+                              ap.scope
+                                ? (() => {
+                                    const sc = getScopeDisplay(ap.scope);
+                                    return `<span class="scope-chip" title="${escapeHtml(sc.tooltip)}">${escapeHtml(sc.label)}</span>`;
+                                  })()
+                                : ''
+                            }
                             ${ap.path ? `<span class="muted">${escapeHtml(ap.path)}</span>` : ''}
                           </div>
                         `,
@@ -4924,6 +5210,11 @@ function renderConflictsView() {
   const report = state.conflicts.data;
   const items = Array.isArray(report?.items) ? report.items : [];
   const summary = getConflictsSummary();
+  const activeItems = items.filter((it) => !it?.ignored);
+  const ignoredItems = items.filter((it) => Boolean(it?.ignored));
+  const ignoredCount = Math.max(0, Number(summary.ignoredCount || ignoredItems.length || 0));
+  const visibleItems = state.showIgnoredConflicts ? [...activeItems, ...ignoredItems] : activeItems;
+  const allIgnored = items.length > 0 && activeItems.length === 0 && !state.showIgnoredConflicts;
   const heroToneCls = summary.critical > 0 ? 'has-critical' : summary.total > 0 ? 'has-warnings' : '';
   const checkedText = report?.checkedAt
     ? t(`上次扫描：${formatRelativeTime(report.checkedAt)}`, `Scanned ${formatRelativeTime(report.checkedAt)}`)
@@ -4951,10 +5242,24 @@ function renderConflictsView() {
         </div>
 
         <div class="conflict-hero-actions">
-          <button type="button" class="btn btn-primary btn-sm" data-action="refresh-conflicts" ${state.conflicts.loading ? 'disabled' : ''}>
-            ${icon('refresh', 12, state.conflicts.loading ? 'spin' : '')}
-            <span>${escapeHtml(state.conflicts.loading ? t('扫描中…', 'Scanning…') : t('重新扫描', 'Rescan'))}</span>
-          </button>
+          <div class="conflict-hero-action-row">
+            <label
+              class="ignored-toggle-pill ${state.showIgnoredConflicts ? 'enabled' : ''} ${ignoredCount > 0 ? 'has-ignored' : 'is-empty'}"
+              title="${escapeHtml(
+                ignoredCount > 0
+                  ? t(`切换显示 ${ignoredCount} 项已忽略的冲突`, `Toggle visibility of ${ignoredCount} ignored conflict(s)`)
+                  : t('暂无已忽略项；可在下方冲突卡片点击「忽略」隐藏暂不处理的提示', 'No ignored conflicts yet; click Ignore on a conflict card below to hide it'),
+              )}"
+            >
+              <input id="show-ignored-conflicts-checkbox" type="checkbox" ${state.showIgnoredConflicts ? 'checked' : ''} />
+              <span class="switch-track" aria-hidden="true"></span>
+              <span class="ignored-toggle-label">${escapeHtml(t('显示已忽略', 'Show Ignored'))} <span class="ignored-toggle-count">(${ignoredCount})</span></span>
+            </label>
+            <button type="button" class="btn btn-primary btn-sm" data-action="refresh-conflicts" ${state.conflicts.loading ? 'disabled' : ''}>
+              ${icon('refresh', 12, state.conflicts.loading ? 'spin' : '')}
+              <span>${escapeHtml(state.conflicts.loading ? t('扫描中…', 'Scanning…') : t('重新扫描', 'Rescan'))}</span>
+            </button>
+          </div>
           <span class="muted" style="font-size:11px">${escapeHtml(checkedText)}</span>
         </div>
       </section>
@@ -4967,13 +5272,19 @@ function renderConflictsView() {
                 <span>${icon('alertCircle', 13)} ${escapeHtml(state.conflicts.error)}</span>
                 <button type="button" class="btn btn-sm" data-action="refresh-conflicts">${escapeHtml(t('重试', 'Retry'))}</button>
               </div>`
-            : items.length > 0
-              ? `<div class="conflict-list">${items.map((it) => renderConflictCard(it)).join('')}</div>`
-              : `<div class="empty-state" style="border-color:var(--m-ok-border)">
-                   <div class="empty-icon" style="background:var(--m-ok-soft);border-color:var(--m-ok-border);color:var(--m-ok)">${icon('shieldCheck', 22)}</div>
-                   <div class="empty-title">${escapeHtml(t('未检测到插件冲突', 'No plugin conflicts detected'))}</div>
-                   <div class="empty-sub">${escapeHtml(t('当前未发现同名插件、符号链接、MCP 服务名或技能重名冲突。', 'No duplicate plugin names, symlinks, MCP collisions, or duplicate skills found.'))}</div>
-                 </div>`
+            : visibleItems.length > 0
+              ? `<div class="conflict-list">${visibleItems.map((it) => renderConflictCard(it)).join('')}</div>`
+              : allIgnored
+                ? `<div class="empty-state" style="border-color:var(--m-ok-border)">
+                     <div class="empty-icon" style="background:var(--m-ok-soft);border-color:var(--m-ok-border);color:var(--m-ok)">${icon('shieldCheck', 22)}</div>
+                     <div class="empty-title">${escapeHtml(t(`所有 ${ignoredItems.length} 项检测到的冲突均已忽略`, `All ${ignoredItems.length} detected conflict(s) are ignored`))}</div>
+                     <div class="empty-sub">${escapeHtml(t('所有检测到的冲突均已忽略，可开启上方「显示已忽略」控件查看或恢复。', 'All detected conflicts are currently ignored. Enable "Show Ignored" above to view or restore them.'))}</div>
+                   </div>`
+                : `<div class="empty-state" style="border-color:var(--m-ok-border)">
+                     <div class="empty-icon" style="background:var(--m-ok-soft);border-color:var(--m-ok-border);color:var(--m-ok)">${icon('shieldCheck', 22)}</div>
+                     <div class="empty-title">${escapeHtml(t('未检测到插件冲突', 'No plugin conflicts detected'))}</div>
+                     <div class="empty-sub">${escapeHtml(t('当前未发现同名插件、符号链接、MCP 服务名或技能重名冲突。', 'No duplicate plugin names, symlinks, MCP collisions, or duplicate skills found.'))}</div>
+                   </div>`
       }
     </div>
   `;
@@ -4995,7 +5306,7 @@ function renderSourcesView() {
   return `
     <div class="main-scroll">
       <form id="sources-form" class="settings-panel">
-        <div class="field-card">
+        <div class="field-card field-card-wide">
           <div class="field-head">
             <div class="field-label">${icon('globe', 14)} ${escapeHtml(t('目录源与同步状态', 'Catalog Source & Sync Status'))}</div>
             <button type="button" class="btn btn-sm" data-action="refresh"${lockAttr}>
@@ -5073,7 +5384,7 @@ function renderSourcesView() {
           <textarea id="custom-feeds-textarea" class="text-input" rows="3" placeholder="https://plugins.internal.example/index.json">${escapeHtml(customLines)}</textarea>
         </div>
 
-        <div style="display:flex;align-items:center;gap:8px">
+        <div class="settings-actions-row">
           <button type="submit" class="btn btn-primary"${saveLockAttr}>${icon('check', 13)} ${escapeHtml(t('保存并重新同步目录', 'Save & Revalidate Catalog'))}</button>
         </div>
       </form>
@@ -6520,6 +6831,7 @@ function render() {
   lastRenderedTab = state.activeTab;
   bindDomEvents(root);
   setupLoadMoreObserver();
+  setupDiscoverChipStripControls();
   renderToast();
 
   const mainScrollEl = root.querySelector('.main-scroll');
@@ -6617,7 +6929,13 @@ function handleActionClick(el, e, root) {
     const nextTab = el.getAttribute('data-tab') || 'discover';
     const changed = nextTab !== state.activeTab;
     state.activeTab = nextTab;
-    if (changed) state.scrolledStuck = false;
+    if (changed) {
+      state.scrolledStuck = false;
+      clearBatchResultsAutoCloseTimer();
+      if (state.batchResultsAutoClose?.active) {
+        state.batchResultsAutoClose = { ...state.batchResultsAutoClose, active: false, paused: true };
+      }
+    }
     render();
     if (nextTab === 'installed' && Date.now() - lastForcedUpdatesAt > 10_000 && !isUpdateActionLocked()) {
       void checkUpdates(true, { silent: true });
@@ -6686,6 +7004,19 @@ function handleActionClick(el, e, root) {
       checkUpdates(true, { silent: false }),
       state.activeTab === 'conflicts' || state.conflicts.loaded ? loadConflicts({ silent: true }) : Promise.resolve(),
     ]);
+  } else if (action === 'scroll-chips') {
+    e.stopPropagation();
+    const strip = document.getElementById?.('discover-chip-strip');
+    if (!strip) return;
+    const dir = Number(el.getAttribute('data-dir') || 1) < 0 ? -1 : 1;
+    const step = Math.max(180, Math.round((strip.clientWidth || 280) * 0.65));
+    if (typeof strip.scrollBy === 'function') {
+      strip.scrollBy({ left: dir * step, behavior: 'smooth' });
+    } else {
+      strip.scrollLeft = (strip.scrollLeft || 0) + dir * step;
+    }
+    state.chipStripScrollLeft = strip.scrollLeft || 0;
+    syncChipStripOverflow();
   } else if (action === 'refresh-conflicts') {
     void loadConflicts({ silent: false });
   } else if (action === 'fix-conflict') {
@@ -6695,6 +7026,18 @@ function handleActionClick(el, e, root) {
     const suggestedDir = el.getAttribute('data-suggested-dir') || '';
     if (type && targetDir) {
       void triggerFixConflict({ type, targetDir, suggestedDir });
+    }
+  } else if (action === 'ignore-conflict') {
+    e.stopPropagation();
+    const conflictId = el.getAttribute('data-conflict-id') || '';
+    if (conflictId) {
+      void triggerIgnoreConflict(conflictId, true);
+    }
+  } else if (action === 'unignore-conflict') {
+    e.stopPropagation();
+    const conflictId = el.getAttribute('data-conflict-id') || '';
+    if (conflictId) {
+      void triggerIgnoreConflict(conflictId, false);
     }
   } else if (action === 'toggle-plugin') {
     e.stopPropagation();
@@ -6948,7 +7291,7 @@ function handleActionClick(el, e, root) {
     const id = el.getAttribute('data-id');
     if (id) void triggerUpdateAll([id], { confirmEscalation: false });
   } else if (action === 'clear-batch-results') {
-    state.batchResults = null;
+    dismissBatchResults();
     render();
   } else if (action === 'self-update') {
     e.stopPropagation();
@@ -7089,6 +7432,18 @@ function bindDelegatedEvents(root) {
     );
   }
 
+  root.addEventListener('mouseover', (e) => {
+    if (state.batchResultsAutoClose?.active && e.target?.closest?.('.batch-results')) {
+      pauseBatchResultsAutoClose();
+    }
+  });
+
+  root.addEventListener('focusin', (e) => {
+    if (state.batchResultsAutoClose?.active && e.target?.closest?.('.batch-results')) {
+      pauseBatchResultsAutoClose();
+    }
+  });
+
   root.addEventListener('click', (e) => {
     const path = [];
     for (let n = e.target; n && n !== root.parentNode; n = n.parentNode) {
@@ -7121,6 +7476,22 @@ function bindDelegatedEvents(root) {
       }
     }
   });
+
+  root.addEventListener(
+    'wheel',
+    (e) => {
+      const strip = e.target?.closest?.('#discover-chip-strip');
+      if (!strip) return;
+      if ((strip.scrollWidth || 0) <= (strip.clientWidth || 0) + 2) return;
+      if (Math.abs(e.deltaY || 0) > Math.abs(e.deltaX || 0)) {
+        e.preventDefault?.();
+        strip.scrollLeft = (strip.scrollLeft || 0) + e.deltaY;
+        state.chipStripScrollLeft = strip.scrollLeft || 0;
+        syncChipStripOverflow();
+      }
+    },
+    { passive: false },
+  );
 
   root.addEventListener('compositionstart', (e) => {
     const id = e.target?.id;
@@ -7214,6 +7585,10 @@ function bindDelegatedEvents(root) {
     } else if (id === 'uninstall-remove-favorite') {
       if (!state.removeConfirmModal) return;
       state.removeConfirmModal.removeFavorite = Boolean(target.checked);
+    } else if (id === 'show-ignored-conflicts-checkbox') {
+      state.showIgnoredConflicts = Boolean(target.checked);
+      writeStorage(SHOW_IGNORED_CONFLICTS_KEY, state.showIgnoredConflicts ? '1' : '0');
+      render();
     }
   });
 

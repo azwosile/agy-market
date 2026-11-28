@@ -121,7 +121,7 @@ try {
   }
 
   $Manifest = Get-Content -Path (Join-Path $TargetDir "plugin.json") -Raw -Encoding UTF8 | ConvertFrom-Json
-  $Ver = if ($Manifest.version) { [string]$Manifest.version } else { "1.7.1" }
+  $Ver = if ($Manifest.version) { [string]$Manifest.version } else { "1.7.2" }
   $NowIso = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
   $Receipt = [ordered]@{
     schemaVersion = 1

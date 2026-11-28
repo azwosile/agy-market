@@ -47,6 +47,7 @@ import {
 } from '../updates/index.mjs';
 import { isOfficialGithubTokenHost, streamUrlToFileAndHash } from './fetch-tarball.mjs';
 import { installOrUpdateCatalogPlugin } from './index.mjs';
+import { safeRemoveDirBestEffort } from './sync-dir.mjs';
 import { assertNoScopedSymlinks, inspectTarGzStream, validateSafeRelPath } from './tar-extract.mjs';
 
 function resolveEffectiveFetch(fetchImpl) {
@@ -1765,8 +1766,9 @@ export function sweepExpiredInspectStaging(dataDir, nowMs = Date.now(), { preser
         }
       }
       if (expired) {
-        rmSync(fullDir, { recursive: true, force: true });
-        removed += 1;
+        if (safeRemoveDirBestEffort(fullDir)) {
+          removed += 1;
+        }
       }
     } catch {
       /* ignore locked/in-use dir */
@@ -1777,7 +1779,7 @@ export function sweepExpiredInspectStaging(dataDir, nowMs = Date.now(), { preser
 }
 
 function writePreviewFilesToDisk(previewDir, scopedFiles, selectedCandidate, cleanManifest, scopedFileSizes = null) {
-  rmSync(previewDir, { recursive: true, force: true });
+  safeRemoveDirBestEffort(previewDir);
   mkdirSync(previewDir, { recursive: true });
   const absPreview = resolve(previewDir);
 
@@ -1812,7 +1814,7 @@ function loadValidStagedInspect(dataDir, inspectToken, nowMs = Date.now()) {
   try {
     const meta = JSON.parse(readFileSync(metaPath, 'utf8'));
     if (!Number.isFinite(meta?.expiresAtMs) || nowMs > meta.expiresAtMs) {
-      rmSync(stagingRootDir, { recursive: true, force: true });
+      safeRemoveDirBestEffort(stagingRootDir);
       return null;
     }
     return { stagingRootDir, archivePath, metaPath, meta };
@@ -1985,7 +1987,7 @@ export async function inspectGithubPluginUrl({
     }
 
     if (!dlResult || !winningAttempt || !winningCandidate) {
-      rmSync(stagingRootDir, { recursive: true, force: true });
+      safeRemoveDirBestEffort(stagingRootDir);
       throw new Error(
         redactSecret(
           `ERR_GITHUB_DOWNLOAD_FAILED: 无法下载 ${parsed.owner}/${parsed.repo} 归档（${attemptErrors.slice(0, 3).join(' | ')}）`,
@@ -2035,7 +2037,7 @@ export async function inspectGithubPluginUrl({
       shouldBufferFile: shouldBufferInspectFile,
     });
   } catch (err) {
-    rmSync(stagingRootDir, { recursive: true, force: true });
+    safeRemoveDirBestEffort(stagingRootDir);
     const secBlock = classifySecurityError(err, stageMeta.resolution.repoUrl);
     if (secBlock) return secBlock;
     throw err;
@@ -2078,7 +2080,7 @@ export async function inspectGithubPluginUrl({
 
   // Case 3: No `plugin.json` anywhere -> NOT_A_PLUGIN_REPO + immediate staging cleanup!
   if (candidates.length === 0) {
-    rmSync(stagingRootDir, { recursive: true, force: true });
+    safeRemoveDirBestEffort(stagingRootDir);
     return buildNotPluginRepoDiagnostic(allFiles, effectiveResolution.repoUrl);
   }
 
@@ -2161,7 +2163,7 @@ export async function inspectGithubPluginUrl({
     assertNoScopedSymlinks(tarParsed.symlinks, selectedRoot, tarParsed.strippedTopDir);
     assertLocalStaticSafety(scopedFiles, scopedFileSizes);
   } catch (err) {
-    rmSync(stagingRootDir, { recursive: true, force: true });
+    safeRemoveDirBestEffort(stagingRootDir);
     const secBlock = classifySecurityError(err, effectiveResolution.repoUrl);
     if (secBlock) return secBlock;
     throw err;
@@ -2199,7 +2201,7 @@ export async function inspectGithubPluginUrl({
     writePreviewFilesToDisk(previewDir, scopedFiles, selectedCandidate, cleanManifest, scopedFileSizes);
     components = scanLocalPluginComponents(previewDir, canonicalName, cleanManifest.name, null);
   } finally {
-    rmSync(previewDir, { recursive: true, force: true });
+    safeRemoveDirBestEffort(previewDir);
   }
 
   // Cross-check local inventory & preflight collision
@@ -2511,7 +2513,7 @@ export async function installGithubPlugin({
   });
 
   if (installRes.ok && installRes.status === 'INSTALLED') {
-    rmSync(stagingRootDir, { recursive: true, force: true });
+    safeRemoveDirBestEffort(stagingRootDir);
     return {
       ...installRes,
       inspectToken: activeToken,

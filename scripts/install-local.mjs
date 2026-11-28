@@ -63,7 +63,7 @@ export async function installLocalAgyMarket({ destPluginsDir = '' } = {}) {
 
   const requiredFiles = [
     'plugin.json',
-    join('assets', 'logo.svg'),
+    join('assets', 'logo.png'),
     join('bin', 'agy-market.mjs'),
     join('skills', 'agy-market', 'SKILL.md'),
     join('sidecars', 'market_pane', 'sidecar.json'),

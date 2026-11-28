@@ -132,11 +132,19 @@ test('Dual-channel registry: ETag 304 cache hit + automatic @agy-market/catalog 
       return new Response('{}', { status: 404 });
     };
 
-    const firstLoad = await resolveMarketCatalog({ dataDir: ws.dataDir, fetchImpl: primaryFetchMock });
+    const firstLoad = await resolveMarketCatalog({
+      dataDir: ws.dataDir,
+      prefs: { enableExperimentalTrack2: false },
+      fetchImpl: primaryFetchMock,
+    });
     assert.equal(firstLoad.channelUsed, 'github-pages');
     assert.equal(firstLoad.plugins.length, 1);
 
-    const secondLoad = await resolveMarketCatalog({ dataDir: ws.dataDir, fetchImpl: primaryFetchMock });
+    const secondLoad = await resolveMarketCatalog({
+      dataDir: ws.dataDir,
+      prefs: { enableExperimentalTrack2: false },
+      fetchImpl: primaryFetchMock,
+    });
     assert.equal(etagSawIfNoneMatch, true);
     assert.equal(secondLoad.channelUsed, 'github-pages-304');
     assert.equal(secondLoad.plugins.length, 1);
@@ -160,6 +168,7 @@ test('Dual-channel registry: ETag 304 cache hit + automatic @agy-market/catalog 
 
       const rawLoad = await resolveMarketCatalog({
         dataDir: wsRawFallback.dataDir,
+        prefs: { enableExperimentalTrack2: false },
         fetchImpl: rawFallbackMock,
       });
       assert.equal(rawLoad.channelUsed, 'github-raw-gh-pages');

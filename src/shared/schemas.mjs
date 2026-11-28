@@ -2,7 +2,13 @@
 
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { DEFAULT_PREFS, MAX_FAVORITES, PLUGIN_JSON_ALLOWED_KEYS, PRIVILEGE_ESCALATION_BADGES } from './constants.mjs';
+import {
+  DEFAULT_PREFS,
+  MAX_FAVORITES,
+  MAX_IGNORED_CONFLICTS,
+  PLUGIN_JSON_ALLOWED_KEYS,
+  PRIVILEGE_ESCALATION_BADGES,
+} from './constants.mjs';
 
 export function parseJsonc(rawText) {
   const src = String(rawText || '').replace(/^\uFEFF/, '');
@@ -90,19 +96,27 @@ export function sanitizeNativePluginManifest(rawManifest) {
   return clean;
 }
 
-export function sanitizeFavorites(rawFavorites) {
-  if (!Array.isArray(rawFavorites)) return [];
+function sanitizeStringIdList(rawList, maxItems) {
+  if (!Array.isArray(rawList)) return [];
   const seen = new Set();
   const out = [];
-  for (const entry of rawFavorites) {
+  for (const entry of rawList) {
     if (typeof entry !== 'string') continue;
     const key = entry.trim();
     if (!key || key.length > 200 || seen.has(key)) continue;
     seen.add(key);
     out.push(key);
-    if (out.length >= MAX_FAVORITES) break;
+    if (out.length >= maxItems) break;
   }
   return out;
+}
+
+export function sanitizeFavorites(rawFavorites) {
+  return sanitizeStringIdList(rawFavorites, MAX_FAVORITES);
+}
+
+export function sanitizeIgnoredConflictIds(rawIds) {
+  return sanitizeStringIdList(rawIds, MAX_IGNORED_CONFLICTS);
 }
 
 export function sanitizePrefs(input = {}) {
@@ -120,17 +134,22 @@ export function sanitizePrefs(input = {}) {
     ? [...new Set(src.customFeeds.map((u) => String(u || '').trim()).filter((u) => /^https?:\/\/|^file:\/\//i.test(u)))]
     : [];
   const favorites = sanitizeFavorites(src.favorites);
+  const ignoredConflictIds = sanitizeIgnoredConflictIds(src.ignoredConflictIds);
 
   return {
     schemaVersion: 1,
     locale,
-    enableExperimentalTrack2: Boolean(src.enableExperimentalTrack2),
+    enableExperimentalTrack2:
+      typeof src.enableExperimentalTrack2 === 'boolean'
+        ? src.enableExperimentalTrack2
+        : DEFAULT_PREFS.enableExperimentalTrack2,
     networkMode,
     primaryCatalogUrl,
     githubReleaseMirrorPrefix,
     githubToken,
     customFeeds,
     favorites,
+    ignoredConflictIds,
   };
 }
 
@@ -222,6 +241,7 @@ export function buildInstallReceipt({
   previousInstalledAt = null,
   actualSha256 = '',
   preservePaths = null,
+  managedFiles = null,
   nowIso = new Date().toISOString(),
 }) {
   const cap = plugin?.capabilities || {};
@@ -265,6 +285,17 @@ export function buildInstallReceipt({
       : Array.isArray(plugin.distribution?.preservePaths)
         ? [...plugin.distribution.preservePaths]
         : [],
+    ...(Array.isArray(managedFiles)
+      ? {
+          managedFiles: [
+            ...new Set(
+              managedFiles
+                .filter((f) => typeof f === 'string' && f.trim())
+                .map((f) => f.trim().replace(/\\/g, '/')),
+            ),
+          ].sort(),
+        }
+      : {}),
     grantedCapabilities: {
       badges: Array.isArray(cap.badges) ? [...cap.badges] : [],
       mcpRemoteDomains: Array.isArray(cap.mcpRemoteDomains) ? [...cap.mcpRemoteDomains] : [],

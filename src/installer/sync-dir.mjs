@@ -25,6 +25,73 @@ import { PLUGIN_ID } from '../shared/constants.mjs';
 
 const LOCK_ERROR_CODES = new Set(['EBUSY', 'EPERM', 'EACCES']);
 const RETIRED_BINARY_RE = /\.old\.\d{10,}$/;
+const LOCK_RETRY_DELAYS_MS = [30, 80, 150];
+const SLEEP_BUF = new Int32Array(new SharedArrayBuffer(4));
+
+function sleepSync(ms) {
+  if (ms > 0) {
+    Atomics.wait(SLEEP_BUF, 0, 0, ms);
+  }
+}
+
+/**
+ * Retries a synchronous filesystem operation on transient Windows lock errors (`EBUSY`/`EPERM`/`EACCES`).
+ */
+export function withLockRetrySync(fn, retryDelays = LOCK_RETRY_DELAYS_MS) {
+  let lastErr;
+  for (let attempt = 0; attempt <= retryDelays.length; attempt++) {
+    try {
+      return fn();
+    } catch (err) {
+      lastErr = err;
+      if (!LOCK_ERROR_CODES.has(err?.code) || attempt >= retryDelays.length) {
+        throw err;
+      }
+      sleepSync(retryDelays[attempt]);
+    }
+  }
+  throw lastErr;
+}
+
+/**
+ * Removes a symlink or NTFS junction without traversing into its target directory.
+ */
+export function removeSymlinkOrJunctionOnly(linkPath) {
+  try {
+    unlinkSync(linkPath);
+  } catch (err) {
+    if (err?.code === 'EPERM' || err?.code === 'EISDIR') {
+      rmdirSync(linkPath);
+    } else {
+      throw err;
+    }
+  }
+}
+
+/**
+ * Best-effort recursive directory removal that retries transient Windows locks and never throws.
+ */
+export function safeRemoveDirBestEffort(dirPath, { retries = 3, delayMs = 80 } = {}) {
+  if (!dirPath) return false;
+  try {
+    if (existsSync(dirPath)) {
+      const lst = lstatSync(dirPath);
+      if (lst.isSymbolicLink()) {
+        removeSymlinkOrJunctionOnly(dirPath);
+        return true;
+      }
+    }
+    rmSync(dirPath, {
+      recursive: true,
+      force: true,
+      maxRetries: retries,
+      retryDelay: delayMs,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 function globToRegExp(globPattern) {
   const norm = String(globPattern || '')
@@ -259,18 +326,68 @@ export function sweepRetiredBinaries(dataDir, { pluginsDir = '' } = {}) {
   return { removed, remaining: remaining.length, removedDirs };
 }
 
-function listAllRelFiles(rootDir) {
+/**
+ * Lists all regular files under `rootDir` as POSIX relative paths while safely removing stray symlinks/junctions.
+ * When `tolerateLockErrors` is true, retries transient Windows locks on `readdirSync` and skips locked subdirs.
+ */
+export function listAllRelFiles(rootDir, { tolerateLockErrors = false, onWarning = null } = {}) {
   const out = [];
   if (!existsSync(rootDir)) return out;
 
+  const warnLock = (relPath, err) => {
+    const msg = `[sync-dir] Skipping locked path "${relPath || '.'}": ${err?.code || ''} ${err?.message || err}`.trim();
+    if (typeof onWarning === 'function') {
+      onWarning(msg);
+    } else {
+      console.warn(msg);
+    }
+  };
+
   function walk(curAbs, relPrefix) {
-    for (const name of readdirSync(curAbs)) {
+    let entries;
+    if (tolerateLockErrors) {
+      try {
+        entries = withLockRetrySync(() => readdirSync(curAbs));
+      } catch (err) {
+        if (LOCK_ERROR_CODES.has(err?.code) || err?.code === 'ENOENT') {
+          warnLock(relPrefix, err);
+          return;
+        }
+        throw err;
+      }
+    } else {
+      entries = readdirSync(curAbs);
+    }
+
+    for (const name of entries) {
       const full = join(curAbs, name);
       const rel = relPrefix ? posix.join(relPrefix, name) : name;
-      const lst = lstatSync(full);
+      let lst;
+      if (tolerateLockErrors) {
+        try {
+          lst = withLockRetrySync(() => lstatSync(full));
+        } catch (err) {
+          if (LOCK_ERROR_CODES.has(err?.code) || err?.code === 'ENOENT') {
+            warnLock(rel, err);
+            continue;
+          }
+          throw err;
+        }
+      } else {
+        lst = lstatSync(full);
+      }
+
       if (lst.isSymbolicLink()) {
-        // Remove any stray symlink inside target
-        rmSync(full, { recursive: true, force: true });
+        // Remove any stray symlink/junction inside target without calling recursive opendir
+        if (tolerateLockErrors) {
+          try {
+            removeSymlinkOrJunctionOnly(full);
+          } catch (err) {
+            warnLock(rel, err);
+          }
+        } else {
+          removeSymlinkOrJunctionOnly(full);
+        }
         continue;
       }
       if (lst.isDirectory()) {
@@ -293,22 +410,24 @@ export function syncDirectoryLockSafe({
   targetPluginDir,
   dataDir,
   preservePaths = [],
+  previousManagedFiles = null,
   nowMs = Date.now(),
   writeOverride = null,
+  onWarning = null,
 }) {
   const absSrc = resolve(stagingBundleDir);
   const absDst = resolve(targetPluginDir);
 
   // If a symlink/junction ever sat at absDst, remove link before creating real directory
   if (existsSync(absDst) && lstatSync(absDst).isSymbolicLink()) {
-    rmSync(absDst, { recursive: true, force: true });
+    removeSymlinkOrJunctionOnly(absDst);
   }
   mkdirSync(absDst, { recursive: true });
 
   const isPreserved = createPreserveMatcher(preservePaths);
-  const incomingFiles = listAllRelFiles(absSrc);
+  const incomingFiles = listAllRelFiles(absSrc, { tolerateLockErrors: false });
   const incomingSet = new Set(incomingFiles);
-  const existingFiles = listAllRelFiles(absDst);
+  const existingFiles = listAllRelFiles(absDst, { tolerateLockErrors: true, onWarning });
 
   const retiredPaths = readRetiredBinariesList(dataDir);
   const newlyRetired = [];
@@ -333,34 +452,69 @@ export function syncDirectoryLockSafe({
       if (LOCK_ERROR_CODES.has(err?.code) && existsSync(dstFile)) {
         // Rename locked binary aside in the same directory (`<file>.old.<timestamp>`)
         const retiredFile = `${dstFile}.old.${nowMs}`;
-        renameSync(dstFile, retiredFile);
-        copyFileSync(srcFile, dstFile);
-        newlyRetired.push(retiredFile);
+        try {
+          renameSync(dstFile, retiredFile);
+          copyFileSync(srcFile, dstFile);
+          newlyRetired.push(retiredFile);
+        } catch (retryErr) {
+          if (LOCK_ERROR_CODES.has(retryErr?.code) && retryErr?.message && !String(retryErr.message).includes('[sync]')) {
+            try {
+              retryErr.message = `[sync] (${rel}) ${retryErr.message}`;
+            } catch {
+              /* read-only message */
+            }
+          }
+          throw retryErr;
+        }
       } else {
+        if (LOCK_ERROR_CODES.has(err?.code) && err?.message && !String(err.message).includes('[sync]')) {
+          try {
+            err.message = `[sync] (${rel}) ${err.message}`;
+          } catch {
+            /* read-only message */
+          }
+        }
         throw err;
       }
     }
   }
 
-  // 2. Remove stale files no longer present in the new release (except preserved globs & retired `*.old.<ts>`)
+  // 2. Remove stale files no longer present in the new release:
+  //    - When `previousManagedFiles` is provided, only delete files that were previously managed by the package.
+  //    - When `previousManagedFiles === null` (legacy pre-v1.7.2 receipt):
+  //        * if `preservePaths.length === 0`, skip stale deletion to protect user-created files on first upgrade;
+  //        * if `preservePaths.length > 0`, preserve legacy preservePaths-based cleanup for compatibility.
   let removedStale = 0;
-  for (const rel of existingFiles) {
-    if (incomingSet.has(rel)) continue;
-    if (isPreserved(rel)) continue;
-    if (RETIRED_BINARY_RE.test(rel)) continue;
+  const hasPrevManaged = Array.isArray(previousManagedFiles);
+  const prevManagedSet = hasPrevManaged
+    ? new Set(
+        previousManagedFiles
+          .filter((f) => typeof f === 'string' && f.trim())
+          .map((f) => f.trim().replace(/\\/g, '/')),
+      )
+    : null;
+  const shouldCleanStale = hasPrevManaged || preservePaths.length > 0;
 
-    const staleFile = join(absDst, rel);
-    try {
-      unlinkSync(staleFile);
-      removedStale++;
-    } catch (err) {
-      if (LOCK_ERROR_CODES.has(err?.code) && existsSync(staleFile)) {
-        const retiredFile = `${staleFile}.old.${nowMs}`;
-        try {
-          renameSync(staleFile, retiredFile);
-          newlyRetired.push(retiredFile);
-        } catch {
-          /* leave for next sweep */
+  if (shouldCleanStale) {
+    for (const rel of existingFiles) {
+      if (hasPrevManaged && !prevManagedSet.has(rel)) continue;
+      if (incomingSet.has(rel)) continue;
+      if (isPreserved(rel)) continue;
+      if (RETIRED_BINARY_RE.test(rel)) continue;
+
+      const staleFile = join(absDst, rel);
+      try {
+        unlinkSync(staleFile);
+        removedStale++;
+      } catch (err) {
+        if (LOCK_ERROR_CODES.has(err?.code) && existsSync(staleFile)) {
+          const retiredFile = `${staleFile}.old.${nowMs}`;
+          try {
+            renameSync(staleFile, retiredFile);
+            newlyRetired.push(retiredFile);
+          } catch {
+            /* leave for next sweep */
+          }
         }
       }
     }
@@ -370,16 +524,23 @@ export function syncDirectoryLockSafe({
     writeRetiredBinariesList(dataDir, [...retiredPaths, ...newlyRetired]);
   }
 
-  // Clean up empty non-root subdirectories inside absDst
+  // Clean up empty non-root subdirectories inside absDst without traversing junctions
   function pruneEmptyDirs(curDir) {
     if (!existsSync(curDir)) return;
-    for (const entry of readdirSync(curDir)) {
+    let entries;
+    try {
+      entries = readdirSync(curDir);
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
       const sub = join(curDir, entry);
       try {
-        if (statSync(sub).isDirectory()) {
+        const lst = lstatSync(sub);
+        if (!lst.isSymbolicLink() && lst.isDirectory()) {
           pruneEmptyDirs(sub);
           if (readdirSync(sub).length === 0) {
-            rmSync(sub, { recursive: true, force: true });
+            rmdirSync(sub);
           }
         }
       } catch {
@@ -393,5 +554,6 @@ export function syncDirectoryLockSafe({
     syncedFiles: incomingFiles.length,
     removedStale,
     retiredBinaries: newlyRetired,
+    managedFiles: [...incomingFiles].sort(),
   };
 }

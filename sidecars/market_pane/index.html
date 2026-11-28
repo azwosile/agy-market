@@ -625,6 +625,14 @@ body,
   display: block;
 }
 
+.brand-mark .brand-logo-img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+  background: transparent;
+}
+
 .brand-copy {
   display: flex;
   align-items: center;
@@ -1227,13 +1235,14 @@ body,
   align-items: center;
   gap: 4px;
   font-family: var(--m-mono);
-  font-size: 10.5px;
-  font-weight: 650;
-  padding: 2px 7.5px;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 3px 9px;
   border-radius: var(--m-r-pill);
   background: var(--m-sky-soft);
   color: var(--m-sky);
   border: 1px solid var(--m-sky-border);
+  line-height: 1.25;
   white-space: nowrap;
   flex-shrink: 0;
 }
@@ -1719,6 +1728,13 @@ body,
 }
 
 /* Category horizontal chip strip */
+.chip-strip-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
 .chip-strip {
   display: flex;
   align-items: center;
@@ -1730,6 +1746,90 @@ body,
 
 .chip-strip::-webkit-scrollbar {
   display: none;
+}
+
+.chip-strip-wrap .chip-strip {
+  flex: 1 1 auto;
+  min-width: 0;
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+  padding-bottom: 4px;
+  margin-bottom: -3px;
+}
+
+.chip-strip-wrap:hover .chip-strip,
+.chip-strip-wrap:focus-within .chip-strip {
+  scrollbar-color: color-mix(in srgb, var(--m-accent) 45%, var(--m-hairline-strong)) transparent;
+}
+
+.chip-strip-wrap .chip-strip::-webkit-scrollbar {
+  display: block;
+  height: 4px;
+}
+
+.chip-strip-wrap .chip-strip::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.chip-strip-wrap .chip-strip::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 999px;
+}
+
+.chip-strip-wrap:hover .chip-strip::-webkit-scrollbar-thumb,
+.chip-strip-wrap:focus-within .chip-strip::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--m-accent) 45%, var(--m-hairline-strong));
+}
+
+.chip-scroll-btn {
+  position: absolute;
+  top: calc(50% - 1px);
+  transform: translateY(-50%);
+  z-index: 3;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border-radius: 999px;
+  border: 1px solid var(--m-hairline-strong);
+  background: color-mix(in srgb, var(--m-surface-raw) 88%, transparent);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  color: var(--m-text);
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.28), inset 0 1px 0 var(--m-specular);
+  display: inline-grid;
+  place-items: center;
+  cursor: pointer;
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    opacity var(--m-dur-fast) var(--m-ease-out),
+    background var(--m-dur-fast) var(--m-ease-out),
+    border-color var(--m-dur-fast) var(--m-ease-out),
+    transform var(--m-dur-fast) var(--m-ease-out);
+}
+
+.chip-scroll-btn.is-prev {
+  left: 2px;
+}
+
+.chip-scroll-btn.is-next {
+  right: 2px;
+}
+
+.chip-strip-wrap.can-scroll-left .chip-scroll-btn.is-prev,
+.chip-strip-wrap.can-scroll-right .chip-scroll-btn.is-next {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.chip-scroll-btn:hover {
+  background: var(--m-ctl-hover);
+  border-color: var(--m-accent-border);
+  color: var(--m-accent-bright);
+}
+
+.chip-scroll-btn:active {
+  transform: translateY(-50%) scale(0.94);
 }
 
 .cat-chip {
@@ -1958,6 +2058,17 @@ body,
   height: 100%;
   object-fit: cover;
   background: var(--m-surface-raw);
+}
+
+.fav-mini-logo .brand-logo-img {
+  position: static;
+  box-sizing: border-box;
+  width: 100%;
+  height: 100%;
+  padding: 2px;
+  object-fit: contain;
+  display: block;
+  background: transparent;
 }
 
 .fav-mini-logo svg {
@@ -2245,9 +2356,74 @@ html[data-theme="light"] .fav-btn.is-favorited {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
   font-size: 11.5px;
   font-weight: 600;
   color: var(--m-muted);
+}
+
+.batch-results-title-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.batch-results-title {
+  font-size: 11.5px;
+  font-weight: 650;
+  color: var(--m-text-2);
+}
+
+.batch-results-hint {
+  font-size: 10.6px;
+  font-weight: 560;
+  color: var(--m-ok);
+  background: var(--m-ok-soft);
+  border: 1px solid var(--m-ok-border);
+  border-radius: var(--m-r-pill);
+  padding: 1.5px 8px;
+  white-space: nowrap;
+}
+
+.batch-results-hint.is-paused {
+  color: var(--m-muted);
+  background: var(--b-subtle-bg);
+  border-color: var(--m-hairline);
+}
+
+.batch-close-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3.5px 9px;
+  border-radius: 8px;
+  border: 1px solid var(--m-hairline-strong);
+  background: var(--m-ctl-bg);
+  color: var(--m-text-2);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
+  transition:
+    background var(--m-dur-fast) var(--m-ease-out),
+    border-color var(--m-dur-fast) var(--m-ease-out),
+    color var(--m-dur-fast) var(--m-ease-out);
+}
+
+.batch-close-btn:hover {
+  background: var(--m-ctl-hover);
+  border-color: var(--m-accent-border);
+  color: var(--m-text);
+}
+
+.batch-close-btn:focus-visible {
+  outline: 2px solid var(--m-accent);
+  outline-offset: 2px;
 }
 
 .batch-row {
@@ -2519,6 +2695,17 @@ html[data-theme="light"] .fav-btn.is-favorited {
   background: var(--m-surface-raw);
 }
 
+.plugin-logo .brand-logo-img {
+  position: static;
+  box-sizing: border-box;
+  width: 100%;
+  height: 100%;
+  padding: 2px;
+  object-fit: contain;
+  display: block;
+  background: transparent;
+}
+
 .plugin-logo svg {
   width: 100%;
   height: 100%;
@@ -2599,13 +2786,14 @@ html[data-theme="light"] .fav-btn.is-favorited {
 
 .version-tag {
   font-family: var(--m-mono);
-  font-size: 10.5px;
-  font-weight: 650;
-  color: var(--m-muted);
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--m-text-2);
   background: var(--m-inset-bg);
-  padding: 2px 7px;
-  border-radius: 7px;
+  padding: 3px 9px;
+  border-radius: 8px;
   border: 1px solid var(--m-hairline);
+  line-height: 1.25;
   white-space: nowrap;
   flex-shrink: 0;
   margin-top: 1px;
@@ -2633,6 +2821,12 @@ html[data-theme="light"] .fav-btn.is-favorited {
 .meta-sep {
   opacity: 0.42;
   flex-shrink: 0;
+}
+
+.meta-scope {
+  white-space: nowrap;
+  flex-shrink: 0;
+  cursor: help;
 }
 
 .meta-star {
@@ -2945,9 +3139,10 @@ html[data-theme="light"] .fav-btn.is-favorited {
 
 .card-dock {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: 8px 10px;
   margin-top: auto;
   padding: 7.5px 9.5px;
   border-radius: 12px;
@@ -2962,7 +3157,8 @@ html[data-theme="light"] .fav-btn.is-favorited {
   display: flex;
   align-items: center;
   gap: 6px;
-  min-width: 0;
+  flex: 0 0 auto;
+  max-width: 100%;
   flex-wrap: wrap;
 }
 
@@ -2972,7 +3168,9 @@ html[data-theme="light"] .fav-btn.is-favorited {
   justify-content: flex-end;
   flex-wrap: wrap;
   gap: 5px;
-  flex-shrink: 0;
+  flex: 0 0 auto;
+  max-width: 100%;
+  margin-left: auto;
 }
 
 /* Luxurious iOS / Linear-grade Animated Toggle Slider */
@@ -2987,10 +3185,21 @@ html[data-theme="light"] .fav-btn.is-favorited {
   font-family: inherit;
   font-size: 11.2px;
   font-weight: 650;
+  white-space: nowrap;
+  flex-shrink: 0;
+  max-width: 100%;
   cursor: pointer;
   border-radius: var(--m-r-pill);
   user-select: none;
   transition: opacity var(--m-dur-fast) var(--m-ease-out), color var(--m-dur-fast) var(--m-ease-out);
+}
+
+.prism-toggle-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .prism-toggle:hover:not(:disabled) {
@@ -3102,6 +3311,11 @@ html[data-theme="light"] .fav-btn.is-favorited {
     color var(--m-dur-fast) var(--m-ease-out),
     border-color var(--m-dur-fast) var(--m-ease-out);
   white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.card-dock .btn {
+  flex-shrink: 0;
 }
 
 .dock-btn:hover:not(:disabled) {
@@ -3490,6 +3704,67 @@ html[data-theme="light"] .fav-btn.is-favorited {
   flex-shrink: 0;
 }
 
+.conflict-hero-action-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.ignored-toggle-pill {
+  position: relative;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px;
+  border-radius: 9px;
+  border: 1px solid var(--m-hairline);
+  background: var(--m-ctl-bg);
+  color: var(--m-muted);
+  font-size: 11.2px;
+  font-weight: 600;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+  transition: all var(--m-dur-fast) var(--m-ease-out);
+}
+
+.ignored-toggle-pill:hover {
+  border-color: var(--m-hairline-strong);
+  color: var(--m-text);
+}
+
+.ignored-toggle-pill input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.ignored-toggle-pill.is-empty {
+  opacity: 0.72;
+}
+
+.ignored-toggle-pill.has-ignored .ignored-toggle-count {
+  color: var(--m-accent-bright);
+  font-weight: 700;
+}
+
+.ignored-toggle-pill.enabled {
+  border-color: var(--m-accent-border);
+  background: var(--m-accent-soft);
+  color: var(--m-text);
+}
+
+.ignored-toggle-pill.enabled .switch-track {
+  background: var(--m-accent);
+}
+
+.ignored-toggle-pill.enabled .switch-track::after {
+  transform: translateX(10px);
+}
+
 .conflict-list {
   display: flex;
   flex-direction: column;
@@ -3547,6 +3822,52 @@ html[data-theme="light"] .fav-btn.is-favorited {
   align-items: flex-start;
   justify-content: space-between;
   gap: 8px 12px;
+}
+
+.conflict-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  flex-shrink: 0;
+}
+
+.conflict-card-title-line {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px;
+  min-width: 0;
+}
+
+.ignored-badge {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1.5px 7px;
+  border-radius: var(--m-r-pill);
+  background: var(--m-inset-bg);
+  color: var(--m-muted);
+  border: 1px dashed var(--m-hairline-strong);
+  white-space: nowrap;
+}
+
+.conflict-card.is-ignored {
+  opacity: 0.68;
+  border-style: dashed;
+}
+
+.conflict-card.is-ignored:hover {
+  opacity: 0.92;
+}
+
+.btn-ignore-conflict {
+  color: var(--m-muted);
+}
+
+.btn-unignore-conflict {
+  border-color: var(--m-accent-border);
+  color: var(--m-accent-bright);
+  background: var(--m-accent-soft);
 }
 
 .conflict-card-title-group {
@@ -4158,13 +4479,24 @@ html[data-theme="light"] .fav-btn.is-favorited {
    ========================================================================== */
 
 .settings-panel {
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 12px;
-  max-width: 720px;
+  width: 100%;
+  max-width: none;
+}
+
+.settings-actions-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 .field-card {
+  min-width: 0;
+  width: 100%;
+  box-sizing: border-box;
   background: var(--m-sheen), var(--m-card-bg);
   border: 1px solid var(--m-hairline);
   border-radius: var(--m-r-lg);
@@ -4175,10 +4507,20 @@ html[data-theme="light"] .fav-btn.is-favorited {
   box-shadow: inset 0 1px 0 var(--m-specular), var(--m-shadow-card);
 }
 
+.field-card .text-input,
+.field-card .select-input,
+.field-card textarea {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+
 .field-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: 8px;
 }
 
@@ -4188,6 +4530,8 @@ html[data-theme="light"] .fav-btn.is-favorited {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  min-width: 0;
+  word-break: break-word;
 }
 
 .field-hint {
@@ -4199,11 +4543,12 @@ html[data-theme="light"] .fav-btn.is-favorited {
 
 .telemetry-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 8px;
 }
 
 .telemetry-cell {
+  min-width: 0;
   padding: 8.5px 10.5px;
   border-radius: var(--m-r-sm);
   background: var(--m-inset-bg);
@@ -5331,6 +5676,70 @@ html[data-theme="light"] .fav-btn.is-favorited {
     align-items: center;
     justify-content: space-between;
   }
+
+  .conflict-hero-action-row {
+    flex: 1 1 auto;
+    justify-content: flex-start;
+  }
+
+  .card-title-right {
+    max-width: 60%;
+    min-width: 0;
+  }
+
+  .card-title-right .version-tag,
+  .card-title-right .version-delta {
+    display: inline-block;
+    min-width: 0;
+    max-width: calc(100% - 31px);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    vertical-align: middle;
+  }
+
+  .version-delta {
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .telemetry-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .token-row {
+    flex-wrap: wrap;
+  }
+
+  .token-row .text-input {
+    flex: 1 1 180px;
+  }
+
+  .field-card {
+    padding: 12px 13px;
+  }
+}
+
+@container market (max-width: 360px) {
+  .telemetry-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@container market (min-width: 960px) {
+  .settings-panel {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    align-items: start;
+  }
+
+  .field-card-wide,
+  .settings-actions-row {
+    grid-column: 1 / -1;
+  }
+
+  .telemetry-grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
 }
 
 @container market (min-width: 1020px) {
@@ -5372,12 +5781,13 @@ const SUBMIT_PLUGIN_GUIDE_URL =
 const NOMINATE_PLUGIN_ISSUE_BASE_URL =
   'https://github.com/azwosile/agy-market-catalog/issues/new';
 const PLUGIN_DISPLAY_NAME = 'AGY Market · 反重力插件市场';
-const PLUGIN_VERSION = '1.7.1';
+const PLUGIN_VERSION = '1.7.2';
 const SIDECAR_ID = 'market_pane';
 const SIDECAR_URI = 'sidecar://agy-market/market_pane/';
 const CUSTOMIZATION_URI = 'customization://agy-market';
 const MAX_TARBALL_BYTES = 0; // 0 = unlimited
 const MAX_FAVORITES = 500;
+const MAX_IGNORED_CONFLICTS = 500;
 const PRIMARY_CATALOG_BASE_URL = 'https://azwosile.github.io/agy-market-catalog';
 const RAW_GH_PAGES_CATALOG_BASE_URL = 'https://raw.githubusercontent.com/azwosile/agy-market-catalog/gh-pages';
 const PRIMARY_FETCH_TIMEOUT_MS = 3500;
@@ -5504,13 +5914,14 @@ const CATEGORY_LABELS = Object.freeze({
 const DEFAULT_PREFS = Object.freeze({
   schemaVersion: 1,
   locale: 'zh',
-  enableExperimentalTrack2: false,
+  enableExperimentalTrack2: true,
   networkMode: 'auto', // 'auto' | 'china-mirror' | 'direct'
   primaryCatalogUrl: PRIMARY_CATALOG_BASE_URL,
   githubReleaseMirrorPrefix: '',
   githubToken: '',
   customFeeds: [],
   favorites: [],
+  ignoredConflictIds: [],
 });
 function formatBadgeLabel(badgeId, capabilities = {}, locale = 'zh') {
   const spec = CAPABILITY_BADGE_SPECS[badgeId];
@@ -5542,7 +5953,7 @@ function scrubChildProcessEnv(baseEnv = process.env) {
   return clean;
 }
 
-return { formatBadgeLabel: formatBadgeLabel, toScopedPluginName: toScopedPluginName, scrubChildProcessEnv: scrubChildProcessEnv, PLUGIN_ID: PLUGIN_ID, SELF_CATALOG_ID: SELF_CATALOG_ID, SELF_REPO_URL: SELF_REPO_URL, SUBMIT_PLUGIN_GUIDE_URL: SUBMIT_PLUGIN_GUIDE_URL, NOMINATE_PLUGIN_ISSUE_BASE_URL: NOMINATE_PLUGIN_ISSUE_BASE_URL, PLUGIN_DISPLAY_NAME: PLUGIN_DISPLAY_NAME, PLUGIN_VERSION: PLUGIN_VERSION, SIDECAR_ID: SIDECAR_ID, SIDECAR_URI: SIDECAR_URI, CUSTOMIZATION_URI: CUSTOMIZATION_URI, MAX_TARBALL_BYTES: MAX_TARBALL_BYTES, MAX_FAVORITES: MAX_FAVORITES, PRIMARY_CATALOG_BASE_URL: PRIMARY_CATALOG_BASE_URL, RAW_GH_PAGES_CATALOG_BASE_URL: RAW_GH_PAGES_CATALOG_BASE_URL, PRIMARY_FETCH_TIMEOUT_MS: PRIMARY_FETCH_TIMEOUT_MS, UNVERIFIED_FETCH_TIMEOUT_MS: UNVERIFIED_FETCH_TIMEOUT_MS, LOCAL_INVENTORY_CACHE_TTL_MS: LOCAL_INVENTORY_CACHE_TTL_MS, GZIP_MIN_BYTES: GZIP_MIN_BYTES, GITHUB_API_BASE_URL: GITHUB_API_BASE_URL, UPDATE_CHECK_CACHE_TTL_MS: UPDATE_CHECK_CACHE_TTL_MS, DISCUSSIONS_CACHE_TTL_MS: DISCUSSIONS_CACHE_TTL_MS, CHINA_NPM_MIRRORS: CHINA_NPM_MIRRORS, CATALOG_NPM_PACKAGE: CATALOG_NPM_PACKAGE, PLUGIN_JSON_ALLOWED_KEYS: PLUGIN_JSON_ALLOWED_KEYS, PRIVILEGE_ESCALATION_BADGES: PRIVILEGE_ESCALATION_BADGES, CAPABILITY_BADGE_SPECS: CAPABILITY_BADGE_SPECS, CATEGORY_LABELS: CATEGORY_LABELS, DEFAULT_PREFS: DEFAULT_PREFS };
+return { formatBadgeLabel: formatBadgeLabel, toScopedPluginName: toScopedPluginName, scrubChildProcessEnv: scrubChildProcessEnv, PLUGIN_ID: PLUGIN_ID, SELF_CATALOG_ID: SELF_CATALOG_ID, SELF_REPO_URL: SELF_REPO_URL, SUBMIT_PLUGIN_GUIDE_URL: SUBMIT_PLUGIN_GUIDE_URL, NOMINATE_PLUGIN_ISSUE_BASE_URL: NOMINATE_PLUGIN_ISSUE_BASE_URL, PLUGIN_DISPLAY_NAME: PLUGIN_DISPLAY_NAME, PLUGIN_VERSION: PLUGIN_VERSION, SIDECAR_ID: SIDECAR_ID, SIDECAR_URI: SIDECAR_URI, CUSTOMIZATION_URI: CUSTOMIZATION_URI, MAX_TARBALL_BYTES: MAX_TARBALL_BYTES, MAX_FAVORITES: MAX_FAVORITES, MAX_IGNORED_CONFLICTS: MAX_IGNORED_CONFLICTS, PRIMARY_CATALOG_BASE_URL: PRIMARY_CATALOG_BASE_URL, RAW_GH_PAGES_CATALOG_BASE_URL: RAW_GH_PAGES_CATALOG_BASE_URL, PRIMARY_FETCH_TIMEOUT_MS: PRIMARY_FETCH_TIMEOUT_MS, UNVERIFIED_FETCH_TIMEOUT_MS: UNVERIFIED_FETCH_TIMEOUT_MS, LOCAL_INVENTORY_CACHE_TTL_MS: LOCAL_INVENTORY_CACHE_TTL_MS, GZIP_MIN_BYTES: GZIP_MIN_BYTES, GITHUB_API_BASE_URL: GITHUB_API_BASE_URL, UPDATE_CHECK_CACHE_TTL_MS: UPDATE_CHECK_CACHE_TTL_MS, DISCUSSIONS_CACHE_TTL_MS: DISCUSSIONS_CACHE_TTL_MS, CHINA_NPM_MIRRORS: CHINA_NPM_MIRRORS, CATALOG_NPM_PACKAGE: CATALOG_NPM_PACKAGE, PLUGIN_JSON_ALLOWED_KEYS: PLUGIN_JSON_ALLOWED_KEYS, PRIVILEGE_ESCALATION_BADGES: PRIVILEGE_ESCALATION_BADGES, CAPABILITY_BADGE_SPECS: CAPABILITY_BADGE_SPECS, CATEGORY_LABELS: CATEGORY_LABELS, DEFAULT_PREFS: DEFAULT_PREFS };
 })();
 
 const __market_mod_3 = (function() {
@@ -5750,24 +6161,7 @@ return { parseSemver: parseSemver, compareSemver: compareSemver, isNewerVersion:
 const __market_mod_5 = (function() {
 // Crisp zero-dependency inline SVG icons for AGY Market Sidebar UI (`src/ui/icons.mjs`).
 // Keeps all iconography sharp at every DPI across Dark, Light, and Wallpaper Prism glass surfaces.
-const BRAND_LOGO_SVG = `<svg viewBox="0 0 256 256" fill="none" aria-hidden="true">
-  <defs>
-    <linearGradient id="agym-bg" x1="24" y1="24" x2="232" y2="232" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#4F46E5"/>
-      <stop offset="52%" stop-color="#7C3AED"/>
-      <stop offset="100%" stop-color="#06B6D4"/>
-    </linearGradient>
-    <linearGradient id="agym-gem" x1="72" y1="68" x2="188" y2="192" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#FFFFFF"/>
-      <stop offset="100%" stop-color="#E0E7FF"/>
-    </linearGradient>
-  </defs>
-  <rect x="20" y="20" width="216" height="216" rx="54" fill="url(#agym-bg)"/>
-  <rect x="23" y="23" width="210" height="210" rx="51" stroke="#FFFFFF" stroke-opacity="0.32" stroke-width="4"/>
-  <path d="M74 96L90 68H166L182 96C182 106 174 114 164 114C154 114 146 106 146 96C146 106 138 114 128 114C118 114 110 106 110 96C110 106 102 114 92 114C82 114 74 106 74 96Z" fill="url(#agym-gem)"/>
-  <path d="M84 126H172V178C172 186.837 164.837 194 156 194H100C91.163 194 84 186.837 84 178V126Z" fill="#FFFFFF" fill-opacity="0.2" stroke="#FFFFFF" stroke-width="8" stroke-linejoin="round"/>
-  <path d="M128 136L146 158L128 180L110 158L128 136Z" fill="#38BDF8" stroke="#FFFFFF" stroke-width="5" stroke-linejoin="round"/>
-</svg>`;
+const BRAND_LOGO_SVG = `<img class="brand-logo-img" src="data:image/png;base64,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" alt="" aria-hidden="true" />`;
 
 const PATHS = {
   search: '<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>',
@@ -5796,6 +6190,7 @@ const PATHS = {
   globe: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a14 14 0 0 1 0 18"/><path d="M12 3a14 14 0 0 0 0 18"/>',
   sparkle: '<path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3Z"/><path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8L19 15Z"/>',
   close: '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
+  chevronLeft: '<path d="m15 6-6 6 6 6"/>',
   chevronRight: '<path d="m9 6 6 6-6 6"/>',
   chevronDown: '<path d="m6 9 6 6 6-6"/>',
   chevronUp: '<path d="m18 15-6-6-6 6"/>',
@@ -6073,6 +6468,7 @@ function formatV(ver) {
 const SELF_OFFER_DISMISSED_KEY = 'agy-market-self-offer-dismissed';
 const HERO_COLLAPSED_KEY = 'agy-market-hero-collapsed';
 const FAVS_SHELF_COLLAPSED_KEY = 'agy-market-favs-shelf-collapsed';
+const SHOW_IGNORED_CONFLICTS_KEY = 'agy-market-show-ignored-conflicts';
 const SUBMIT_PLUGIN_GUIDE_URL =
   'https://github.com/azwosile/agy-market-catalog/blob/main/docs/SUBMISSION_GUIDE.md';
 const ASAR_LABEL = ['app', 'asar'].join('.');
@@ -6218,6 +6614,9 @@ const state = {
     data: null, // { ok, checkedAt, summary, items }
     error: '',
   },
+  showIgnoredConflicts: readStorage(SHOW_IGNORED_CONFLICTS_KEY, '0') === '1',
+  ignoringConflictId: '',
+  chipStripScrollLeft: 0,
 
   // Dismissible Smart Restart / Reload Banner (shown ONLY after a completed install/update/uninstall/toggle)
   restartBanner: null, // null | { level: 'host-restart'|'reload-pane', operation: 'install'|'update'|'uninstall'|'toggle', plugins: string[], reasons: string[] }
@@ -6232,6 +6631,7 @@ const state = {
   batchUpdating: false,
   batchTargetIds: [],
   batchResults: null,
+  batchResultsAutoClose: null, // null | { active: boolean, paused: boolean, delayMs: number }
 
   // Reconnect overlay after `POST /api/self-update`
   reconnecting: null,
@@ -6259,8 +6659,10 @@ const state = {
 };
 
 const DISCOVER_PAGE_SIZE = 48;
+const BATCH_RESULTS_AUTO_CLOSE_MS = 8000;
 
 let toastTimer = null;
+let batchResultsAutoCloseTimer = null;
 let reconnectTimer = null;
 let updatesRequestSeq = 0;
 let readmeRequestSeq = 0;
@@ -6271,6 +6673,7 @@ let prefsInFlight = 0;
 const prefsLastSeq = Object.create(null);
 let lastForcedUpdatesAt = 0;
 let loadMoreObserver = null;
+let chipStripResizeObserver = null;
 let lastFiltered = { key: '', pluginsRef: null, totalLen: 0, plugins: null };
 let searchDebounceTimer = null;
 let isComposingSearch = false;
@@ -6344,6 +6747,49 @@ function t(zh, en) {
   return getLocale() === 'en' ? en : zh;
 }
 
+function getScopeDisplay(scope) {
+  const raw = String(scope || 'global').trim().toLowerCase() || 'global';
+  if (raw === 'workspace') {
+    return {
+      raw: 'workspace',
+      label: t('工作区', 'Workspace'),
+      tooltip: t(
+        '工作区插件：安装于当前工作区 .agents/plugins/，仅对当前项目生效',
+        'Workspace plugin: installed in .agents/plugins/ for the current workspace only',
+      ),
+      searchTerms: 'workspace 工作区',
+    };
+  }
+  if (raw === 'builtin') {
+    return {
+      raw: 'builtin',
+      label: t('内置', 'Built-in'),
+      tooltip: t(
+        '内置插件：由 Antigravity 宿主自带并统一维护',
+        'Built-in plugin: bundled and maintained by Antigravity host',
+      ),
+      searchTerms: 'builtin built-in 内置',
+    };
+  }
+  if (raw === 'global') {
+    return {
+      raw: 'global',
+      label: t('全局', 'Global'),
+      tooltip: t(
+        '全局插件：安装于 ~/.gemini/config/plugins/，对所有工作区生效',
+        'Global plugin: installed in ~/.gemini/config/plugins/ for all workspaces',
+      ),
+      searchTerms: 'global 全局',
+    };
+  }
+  return {
+    raw,
+    label: raw,
+    tooltip: '',
+    searchTerms: raw,
+  };
+}
+
 function hasCjk(str) {
   return /[\u4e00-\u9fff]/.test(String(str || ''));
 }
@@ -6402,6 +6848,54 @@ function renderToast() {
   if (!host) return false;
   host.innerHTML = renderToastHtml();
   return true;
+}
+
+function clearBatchResultsAutoCloseTimer() {
+  if (batchResultsAutoCloseTimer !== null && typeof clearTimeout === 'function') {
+    clearTimeout(batchResultsAutoCloseTimer);
+  }
+  batchResultsAutoCloseTimer = null;
+}
+
+function dismissBatchResults() {
+  clearBatchResultsAutoCloseTimer();
+  state.batchResults = null;
+  state.batchResultsAutoClose = null;
+}
+
+function scheduleBatchResultsAutoClose(delayMs = BATCH_RESULTS_AUTO_CLOSE_MS) {
+  clearBatchResultsAutoCloseTimer();
+  if (!Array.isArray(state.batchResults) || state.batchResults.length === 0) {
+    state.batchResultsAutoClose = null;
+    return;
+  }
+  const allSucceeded = state.batchResults.every((r) => Boolean(r && r.ok));
+  if (!allSucceeded) {
+    state.batchResultsAutoClose = null;
+    return;
+  }
+  state.batchResultsAutoClose = { active: true, paused: false, delayMs };
+  if (typeof setTimeout === 'function') {
+    batchResultsAutoCloseTimer = setTimeout(() => {
+      batchResultsAutoCloseTimer = null;
+      if (state.batchResultsAutoClose && !state.batchResultsAutoClose.paused) {
+        state.batchResults = null;
+        state.batchResultsAutoClose = null;
+        render();
+      }
+    }, delayMs);
+  }
+}
+
+function pauseBatchResultsAutoClose() {
+  if (!state.batchResultsAutoClose || state.batchResultsAutoClose.paused) return;
+  clearBatchResultsAutoCloseTimer();
+  state.batchResultsAutoClose = { ...state.batchResultsAutoClose, active: false, paused: true };
+  const hintEl = document.querySelector?.('.batch-results-hint');
+  if (hintEl) {
+    hintEl.textContent = t('已暂停自动关闭', 'Auto-close paused');
+    hintEl.classList?.add?.('is-paused');
+  }
 }
 
 function showToast(message, { subtext = '', tone = 'info', durationMs = 5000 } = {}) {
@@ -7133,9 +7627,10 @@ function getConflictsSummary() {
       warning: Number(s.warning || 0),
       info: Number(s.info || 0),
       healthyCount: Number(s.healthyCount ?? Math.max(0, installedCount - Number(s.critical || 0))),
+      ignoredCount: Number(s.ignoredCount || 0),
     };
   }
-  return { total: 0, critical: 0, warning: 0, info: 0, healthyCount: installedCount };
+  return { total: 0, critical: 0, warning: 0, info: 0, healthyCount: installedCount, ignoredCount: 0 };
 }
 
 function buildLocalDetailModel(loc, catEntry) {
@@ -7383,6 +7878,58 @@ async function triggerFixConflict({ type, targetDir, suggestedDir = '' }) {
     showToast(`${t('冲突修复失败', 'Conflict fix failed')}: ${err?.message || String(err)}`, { tone: 'danger' });
   } finally {
     state.fixingKey = '';
+    render();
+  }
+}
+
+async function triggerIgnoreConflict(conflictId, ignored) {
+  const id = String(conflictId || '').trim();
+  if (!id) return;
+  state.ignoringConflictId = id;
+  render();
+  try {
+    const res = await apiFetch('/api/conflicts/ignore', {
+      method: 'POST',
+      body: {
+        id,
+        ignored: Boolean(ignored),
+        workspaceUris: state.workspaceUris,
+      },
+    });
+    if (res.state) {
+      applyServerState(res.state);
+    }
+    if (res.conflicts) {
+      state.conflicts = {
+        loading: false,
+        loaded: true,
+        data: res.conflicts,
+        error: '',
+      };
+    } else if (state.conflicts.data?.items) {
+      const nextItems = state.conflicts.data.items.map((it) =>
+        it?.id === id ? { ...it, ignored: Boolean(ignored) } : it,
+      );
+      state.conflicts.data = {
+        ...state.conflicts.data,
+        items: nextItems,
+        summary: res.conflictsSummary || state.conflicts.data.summary,
+      };
+    }
+    if (state.serverState && (res.conflictsSummary || res.conflicts?.summary)) {
+      state.serverState.conflictsSummary = res.conflictsSummary || res.conflicts.summary;
+    }
+    showToast(
+      ignored ? t('已忽略该冲突提示', 'Conflict ignored') : t('已恢复显示该冲突提示', 'Conflict restored'),
+      { tone: 'ok' },
+    );
+  } catch (err) {
+    showToast(
+      `${ignored ? t('忽略冲突失败', 'Failed to ignore conflict') : t('取消忽略失败', 'Failed to unignore conflict')}: ${err?.message || String(err)}`,
+      { tone: 'danger' },
+    );
+  } finally {
+    state.ignoringConflictId = '';
     render();
   }
 }
@@ -7855,6 +8402,8 @@ async function triggerUpdateAll(ids = null, { confirmEscalation = false, _intern
   let didLiveCheck = false;
 
   if (!targetIds.length && (!Array.isArray(ids) || ids.length === 0)) {
+    clearBatchResultsAutoCloseTimer();
+    state.batchResultsAutoClose = null;
     state.batchUpdating = true;
     state.batchTargetIds = [];
     state.errorBanner = null;
@@ -7887,6 +8436,8 @@ async function triggerUpdateAll(ids = null, { confirmEscalation = false, _intern
     return;
   }
 
+  clearBatchResultsAutoCloseTimer();
+  state.batchResultsAutoClose = null;
   state.batchUpdating = true;
   state.batchTargetIds = targetIds;
   state.errorBanner = null;
@@ -8033,7 +8584,15 @@ async function triggerUpdateAll(ids = null, { confirmEscalation = false, _intern
 
     await checkUpdates(false, { silent: true, allowWhileBusy: true });
     if (state.conflicts.loaded) void loadConflicts({ silent: true });
+    if (failCount === 0 && escalated.length === 0 && res.ok !== false) {
+      scheduleBatchResultsAutoClose(BATCH_RESULTS_AUTO_CLOSE_MS);
+    } else {
+      clearBatchResultsAutoCloseTimer();
+      state.batchResultsAutoClose = null;
+    }
   } catch (err) {
+    clearBatchResultsAutoCloseTimer();
+    state.batchResultsAutoClose = null;
     const errMsg = err?.message || String(err);
     setErrorBanner({
       title: t('批量更新失败', 'Batch Update Failed'),
@@ -10156,6 +10715,50 @@ function setupLoadMoreObserver() {
   loadMoreObserver.observe(sentinel);
 }
 
+function syncChipStripOverflow() {
+  const wrap = document.getElementById?.('discover-chip-wrap');
+  const strip = document.getElementById?.('discover-chip-strip');
+  if (!wrap || !strip || !wrap.classList) return;
+  const scrollWidth = Number(strip.scrollWidth || 0);
+  const clientWidth = Number(strip.clientWidth || 0);
+  const scrollLeft = Number(strip.scrollLeft || 0);
+  const canScroll = scrollWidth > clientWidth + 2;
+  const canLeft = canScroll && scrollLeft > 2;
+  const canRight = canScroll && scrollLeft + clientWidth < scrollWidth - 2;
+  wrap.classList.toggle('can-scroll-left', canLeft);
+  wrap.classList.toggle('can-scroll-right', canRight);
+}
+
+function setupDiscoverChipStripControls() {
+  if (chipStripResizeObserver) {
+    chipStripResizeObserver.disconnect();
+    chipStripResizeObserver = null;
+  }
+  if (state.activeTab !== 'discover') return;
+  const strip = document.getElementById?.('discover-chip-strip');
+  if (!strip) return;
+  if (state.chipStripScrollLeft > 0) {
+    strip.scrollLeft = state.chipStripScrollLeft;
+  }
+  syncChipStripOverflow();
+  if (typeof strip.addEventListener === 'function') {
+    strip.addEventListener(
+      'scroll',
+      () => {
+        state.chipStripScrollLeft = strip.scrollLeft || 0;
+        syncChipStripOverflow();
+      },
+      { passive: true },
+    );
+  }
+  if (typeof ResizeObserver === 'function') {
+    chipStripResizeObserver = new ResizeObserver(() => {
+      syncChipStripOverflow();
+    });
+    chipStripResizeObserver.observe(strip);
+  }
+}
+
 function renderDiscoverView() {
   const prefs = state.serverState?.prefs || {};
   const loc = getLocale();
@@ -10232,14 +10835,18 @@ function renderDiscoverView() {
         </label>
       </div>
 
-      <div class="chip-strip" role="tablist" aria-label="${escapeHtml(t('插件分类', 'Categories'))}">
-        ${chipKeys
-          .map((key) => {
-            const label = CATEGORY_LABELS[key]?.[loc] || CATEGORY_LABELS[key]?.zh || key;
-            const n = catCounts[key] || 0;
-            return `<button type="button" class="cat-chip ${state.category === key ? 'active' : ''}" data-action="category" data-category="${escapeHtml(key)}">${escapeHtml(label)}${n > 0 ? `<span class="cat-chip-n">${n}</span>` : ''}</button>`;
-          })
-          .join('')}
+      <div class="chip-strip-wrap" id="discover-chip-wrap">
+        <button type="button" class="chip-scroll-btn is-prev" data-action="scroll-chips" data-dir="-1" aria-label="${escapeHtml(t('向左滚动标签', 'Scroll categories left'))}">${icon('chevronLeft', 14)}</button>
+        <div class="chip-strip" id="discover-chip-strip" role="tablist" aria-label="${escapeHtml(t('插件分类', 'Categories'))}">
+          ${chipKeys
+            .map((key) => {
+              const label = CATEGORY_LABELS[key]?.[loc] || CATEGORY_LABELS[key]?.zh || key;
+              const n = catCounts[key] || 0;
+              return `<button type="button" class="cat-chip ${state.category === key ? 'active' : ''}" data-action="category" data-category="${escapeHtml(key)}">${escapeHtml(label)}${n > 0 ? `<span class="cat-chip-n">${n}</span>` : ''}</button>`;
+            })
+            .join('')}
+        </div>
+        <button type="button" class="chip-scroll-btn is-next" data-action="scroll-chips" data-dir="1" aria-label="${escapeHtml(t('向右滚动标签', 'Scroll categories right'))}">${icon('chevronRight', 14)}</button>
       </div>
     </div>
 
@@ -10425,11 +11032,29 @@ function renderBatchResultsPanel() {
   const updateActionLocked = isUpdateActionLocked();
   const { byId: catById, byDir: catByDir } = getCatalogMaps();
   const globalByDir = getGlobalInstalledByDirMap();
+  const autoClose = state.batchResultsAutoClose;
+  const allSucceeded = state.batchResults.every((r) => Boolean(r && r.ok));
+  let hintHtml = '';
+  if (allSucceeded && autoClose?.paused) {
+    hintHtml = `<span class="batch-results-hint is-paused">${escapeHtml(t('已暂停自动关闭', 'Auto-close paused'))}</span>`;
+  } else if (allSucceeded && autoClose?.active) {
+    const secs = Math.max(1, Math.round((autoClose.delayMs || BATCH_RESULTS_AUTO_CLOSE_MS) / 1000));
+    hintHtml = `<span class="batch-results-hint">${escapeHtml(t(`已全部更新 · ${secs} 秒后自动关闭`, `All updated · auto-closes in ${secs}s`))}</span>`;
+  }
   return `
-    <div class="batch-results">
+    <div class="batch-results" role="region" aria-label="${escapeHtml(t('本次批量更新结果', 'Batch Update Results'))}">
       <div class="batch-results-head">
-        <span>${escapeHtml(t('本次批量更新结果', 'Batch Update Results'))}</span>
-        <button type="button" class="ghost-link" data-action="clear-batch-results">${escapeHtml(t('收起', 'Dismiss'))}</button>
+        <div class="batch-results-title-wrap">
+          <span class="batch-results-title">${escapeHtml(t('本次批量更新结果', 'Batch Update Results'))}</span>
+          ${hintHtml}
+        </div>
+        <button
+          type="button"
+          class="batch-close-btn"
+          data-action="clear-batch-results"
+          title="${escapeHtml(t('关闭批量更新结果', 'Close batch update results'))}"
+          aria-label="${escapeHtml(t('关闭', 'Close'))}"
+        >${icon('close', 12)} <span>${escapeHtml(t('关闭', 'Close'))}</span></button>
       </div>
       ${state.batchResults
         .map((r) => {
@@ -10519,6 +11144,7 @@ function renderInstalledCard(loc, updById, updByDir, catById, catByDir) {
   const isParked = !loc.enabled;
   const displayName = loc.displayName || catEntry?.displayName || loc.dir;
   const favKey = getLocalFavoriteKey(loc, catEntry);
+  const scopeInfo = getScopeDisplay(loc.scope);
 
   const canToggle =
     loc.canToggle !== undefined
@@ -10628,7 +11254,7 @@ function renderInstalledCard(loc, updById, updByDir, catById, catByDir) {
                   : `<span class="state-pill ${loc.enabled ? 'is-enabled' : 'is-disabled'}">${escapeHtml(loc.enabled ? t('已启用', 'Enabled') : t('已停用', 'Disabled'))}</span>`
             }
             ${isGithubUrlTrack ? `<span class="track-tag is-github-url" title="${escapeHtml(t('通过 GitHub 链接安装', 'Installed via GitHub URL'))}">GitHub URL</span>` : ''}
-            ${upd?.changelog ? `<span class="meta-sep">·</span><button type="button" class="notes-link" data-action="detail-local" data-dir="${escapeHtml(loc.dir)}" data-detail-tab="changelog">${escapeHtml(t('更新内容 ›', 'Notes ›'))}</button>` : `<span class="meta-sep">·</span><span>${escapeHtml(loc.scope || 'global')}</span>`}
+            ${upd?.changelog ? `<span class="meta-sep">·</span><button type="button" class="notes-link" data-action="detail-local" data-dir="${escapeHtml(loc.dir)}" data-detail-tab="changelog">${escapeHtml(t('更新内容 ›', 'Notes ›'))}</button>` : `<span class="meta-sep">·</span><span class="meta-scope" title="${escapeHtml(scopeInfo.tooltip)}">${escapeHtml(scopeInfo.label)}</span>`}
           </div>
         </div>
       </div>
@@ -10706,7 +11332,8 @@ function renderInstalledView() {
     const catDescObj = catEntry && typeof catEntry.description === 'object' ? catEntry.description : null;
     const badges = (catEntry?.capabilities?.badges || loc.capabilities?.badges || loc.receipt?.grantedCapabilities?.badges || []).join(' ');
     const trackHint = loc.receipt?.track === 'github-url' ? 'github url' : loc.receipt?.track || '';
-    const hay = `${loc.displayName || ''} ${catEntry?.displayName || ''} ${loc.name || ''} ${loc.dir || ''} ${localizedDesc} ${loc.description || ''} ${catDescObj?.zh || ''} ${catDescObj?.en || ''} ${loc.scope || ''} ${trackHint} ${loc.receipt?.pluginRoot || ''} ${badges}`.toLowerCase();
+    const scopeSearchTerms = getScopeDisplay(loc.scope).searchTerms;
+    const hay = `${loc.displayName || ''} ${catEntry?.displayName || ''} ${loc.name || ''} ${loc.dir || ''} ${localizedDesc} ${loc.description || ''} ${catDescObj?.zh || ''} ${catDescObj?.en || ''} ${loc.scope || ''} ${scopeSearchTerms} ${trackHint} ${loc.receipt?.pluginRoot || ''} ${badges}`.toLowerCase();
     return hay.includes(q);
   });
 
@@ -10866,8 +11493,11 @@ function renderConflictCard(item) {
       : t('隔离重命名修复', 'Isolate & Rename');
   const fixLabel = (loc === 'en' ? fix?.labelEn : fix?.labelZh) || defaultFixLabel;
 
+  const isIgnored = Boolean(item?.ignored);
+  const isIgnoring = Boolean(item?.id && state.ignoringConflictId === item.id);
+
   return `
-    <article class="conflict-card sev-${sev}">
+    <article class="conflict-card sev-${sev}${isIgnored ? ' is-ignored' : ''}">
       <div class="conflict-card-head">
         <div class="conflict-card-title-group">
           <div class="conflict-card-badges">
@@ -10877,24 +11507,54 @@ function renderConflictCard(item) {
             </span>
             <span class="layer-tag">${escapeHtml(loc === 'en' ? layerMeta.en : layerMeta.zh)}</span>
           </div>
-          <h3 class="conflict-card-title">${escapeHtml(title)}</h3>
+          <div class="conflict-card-title-line">
+            <h3 class="conflict-card-title">${escapeHtml(title)}</h3>
+            ${isIgnored ? `<span class="ignored-badge">${escapeHtml(t('已忽略', 'Ignored'))}</span>` : ''}
+          </div>
         </div>
-        ${
-          fix
-            ? `<button
-                type="button"
-                class="btn btn-fix btn-sm"
-                data-action="fix-conflict"
-                data-fix-type="${escapeHtml(fix.type)}"
-                data-target-dir="${escapeHtml(fix.targetDir || '')}"
-                data-suggested-dir="${escapeHtml(fix.suggestedDir || '')}"
-                ${isFixing ? 'disabled' : ''}
-              >
-                ${icon(isFixing ? 'refresh' : 'wrench', 12, isFixing ? 'spin' : '')}
-                <span>${escapeHtml(isFixing ? t('修复中…', 'Fixing…') : fixLabel)}</span>
-              </button>`
-            : ''
-        }
+        <div class="conflict-card-actions">
+          ${
+            !isIgnored && fix
+              ? `<button
+                  type="button"
+                  class="btn btn-fix btn-sm"
+                  data-action="fix-conflict"
+                  data-fix-type="${escapeHtml(fix.type)}"
+                  data-target-dir="${escapeHtml(fix.targetDir || '')}"
+                  data-suggested-dir="${escapeHtml(fix.suggestedDir || '')}"
+                  ${isFixing || isIgnoring ? 'disabled' : ''}
+                >
+                  ${icon(isFixing ? 'refresh' : 'wrench', 12, isFixing ? 'spin' : '')}
+                  <span>${escapeHtml(isFixing ? t('修复中…', 'Fixing…') : fixLabel)}</span>
+                </button>`
+              : ''
+          }
+          ${
+            item.id
+              ? isIgnored
+                ? `<button
+                    type="button"
+                    class="btn btn-sm btn-unignore-conflict"
+                    data-action="unignore-conflict"
+                    data-conflict-id="${escapeHtml(item.id)}"
+                    ${isIgnoring ? 'disabled' : ''}
+                  >
+                    ${isIgnoring ? icon('refresh', 12, 'spin') : ''}
+                    <span>${escapeHtml(isIgnoring ? t('处理中…', 'Saving…') : t('取消忽略', 'Unignore'))}</span>
+                  </button>`
+                : `<button
+                    type="button"
+                    class="btn btn-sm btn-ignore-conflict"
+                    data-action="ignore-conflict"
+                    data-conflict-id="${escapeHtml(item.id)}"
+                    ${isFixing || isIgnoring ? 'disabled' : ''}
+                  >
+                    ${isIgnoring ? icon('refresh', 12, 'spin') : ''}
+                    <span>${escapeHtml(isIgnoring ? t('处理中…', 'Saving…') : t('忽略', 'Ignore'))}</span>
+                  </button>`
+              : ''
+          }
+        </div>
       </div>
 
       ${summary ? `<p class="conflict-card-desc">${escapeHtml(summary)}</p>` : ''}
@@ -10909,7 +11569,14 @@ function renderConflictCard(item) {
                       <span class="conflict-box-label">${icon('checkCircle', 12)} ${escapeHtml(t('优先加载', 'Active'))}</span>
                       <div class="conflict-path-line">
                         <strong>${escapeHtml(item.winner.dir || item.winner.name || '')}</strong>
-                        ${item.winner.scope ? `<span class="scope-chip">${escapeHtml(item.winner.scope)}</span>` : ''}
+                        ${
+                          item.winner.scope
+                            ? (() => {
+                                const sc = getScopeDisplay(item.winner.scope);
+                                return `<span class="scope-chip" title="${escapeHtml(sc.tooltip)}">${escapeHtml(sc.label)}</span>`;
+                              })()
+                            : ''
+                        }
                       </div>
                       ${item.winner.path ? `<div class="conflict-path-line muted">${escapeHtml(item.winner.path)}</div>` : ''}
                     </div>`
@@ -10924,7 +11591,14 @@ function renderConflictCard(item) {
                           (s) => `
                           <div class="conflict-path-line">
                             <strong>${escapeHtml(s.dir || s.name || '')}</strong>
-                            ${s.scope ? `<span class="scope-chip">${escapeHtml(s.scope)}</span>` : ''}
+                            ${
+                              s.scope
+                                ? (() => {
+                                    const sc = getScopeDisplay(s.scope);
+                                    return `<span class="scope-chip" title="${escapeHtml(sc.tooltip)}">${escapeHtml(sc.label)}</span>`;
+                                  })()
+                                : ''
+                            }
                             ${s.path ? `<span class="muted">${escapeHtml(s.path)}</span>` : ''}
                           </div>
                         `,
@@ -10942,7 +11616,14 @@ function renderConflictCard(item) {
                           (ap) => `
                           <div class="conflict-path-line">
                             <strong>${escapeHtml(ap.dir || ap.name || '')}</strong>
-                            ${ap.scope ? `<span class="scope-chip">${escapeHtml(ap.scope)}</span>` : ''}
+                            ${
+                              ap.scope
+                                ? (() => {
+                                    const sc = getScopeDisplay(ap.scope);
+                                    return `<span class="scope-chip" title="${escapeHtml(sc.tooltip)}">${escapeHtml(sc.label)}</span>`;
+                                  })()
+                                : ''
+                            }
                             ${ap.path ? `<span class="muted">${escapeHtml(ap.path)}</span>` : ''}
                           </div>
                         `,
@@ -10970,6 +11651,11 @@ function renderConflictsView() {
   const report = state.conflicts.data;
   const items = Array.isArray(report?.items) ? report.items : [];
   const summary = getConflictsSummary();
+  const activeItems = items.filter((it) => !it?.ignored);
+  const ignoredItems = items.filter((it) => Boolean(it?.ignored));
+  const ignoredCount = Math.max(0, Number(summary.ignoredCount || ignoredItems.length || 0));
+  const visibleItems = state.showIgnoredConflicts ? [...activeItems, ...ignoredItems] : activeItems;
+  const allIgnored = items.length > 0 && activeItems.length === 0 && !state.showIgnoredConflicts;
   const heroToneCls = summary.critical > 0 ? 'has-critical' : summary.total > 0 ? 'has-warnings' : '';
   const checkedText = report?.checkedAt
     ? t(`上次扫描：${formatRelativeTime(report.checkedAt)}`, `Scanned ${formatRelativeTime(report.checkedAt)}`)
@@ -10997,10 +11683,24 @@ function renderConflictsView() {
         </div>
 
         <div class="conflict-hero-actions">
-          <button type="button" class="btn btn-primary btn-sm" data-action="refresh-conflicts" ${state.conflicts.loading ? 'disabled' : ''}>
-            ${icon('refresh', 12, state.conflicts.loading ? 'spin' : '')}
-            <span>${escapeHtml(state.conflicts.loading ? t('扫描中…', 'Scanning…') : t('重新扫描', 'Rescan'))}</span>
-          </button>
+          <div class="conflict-hero-action-row">
+            <label
+              class="ignored-toggle-pill ${state.showIgnoredConflicts ? 'enabled' : ''} ${ignoredCount > 0 ? 'has-ignored' : 'is-empty'}"
+              title="${escapeHtml(
+                ignoredCount > 0
+                  ? t(`切换显示 ${ignoredCount} 项已忽略的冲突`, `Toggle visibility of ${ignoredCount} ignored conflict(s)`)
+                  : t('暂无已忽略项；可在下方冲突卡片点击「忽略」隐藏暂不处理的提示', 'No ignored conflicts yet; click Ignore on a conflict card below to hide it'),
+              )}"
+            >
+              <input id="show-ignored-conflicts-checkbox" type="checkbox" ${state.showIgnoredConflicts ? 'checked' : ''} />
+              <span class="switch-track" aria-hidden="true"></span>
+              <span class="ignored-toggle-label">${escapeHtml(t('显示已忽略', 'Show Ignored'))} <span class="ignored-toggle-count">(${ignoredCount})</span></span>
+            </label>
+            <button type="button" class="btn btn-primary btn-sm" data-action="refresh-conflicts" ${state.conflicts.loading ? 'disabled' : ''}>
+              ${icon('refresh', 12, state.conflicts.loading ? 'spin' : '')}
+              <span>${escapeHtml(state.conflicts.loading ? t('扫描中…', 'Scanning…') : t('重新扫描', 'Rescan'))}</span>
+            </button>
+          </div>
           <span class="muted" style="font-size:11px">${escapeHtml(checkedText)}</span>
         </div>
       </section>
@@ -11013,13 +11713,19 @@ function renderConflictsView() {
                 <span>${icon('alertCircle', 13)} ${escapeHtml(state.conflicts.error)}</span>
                 <button type="button" class="btn btn-sm" data-action="refresh-conflicts">${escapeHtml(t('重试', 'Retry'))}</button>
               </div>`
-            : items.length > 0
-              ? `<div class="conflict-list">${items.map((it) => renderConflictCard(it)).join('')}</div>`
-              : `<div class="empty-state" style="border-color:var(--m-ok-border)">
-                   <div class="empty-icon" style="background:var(--m-ok-soft);border-color:var(--m-ok-border);color:var(--m-ok)">${icon('shieldCheck', 22)}</div>
-                   <div class="empty-title">${escapeHtml(t('未检测到插件冲突', 'No plugin conflicts detected'))}</div>
-                   <div class="empty-sub">${escapeHtml(t('当前未发现同名插件、符号链接、MCP 服务名或技能重名冲突。', 'No duplicate plugin names, symlinks, MCP collisions, or duplicate skills found.'))}</div>
-                 </div>`
+            : visibleItems.length > 0
+              ? `<div class="conflict-list">${visibleItems.map((it) => renderConflictCard(it)).join('')}</div>`
+              : allIgnored
+                ? `<div class="empty-state" style="border-color:var(--m-ok-border)">
+                     <div class="empty-icon" style="background:var(--m-ok-soft);border-color:var(--m-ok-border);color:var(--m-ok)">${icon('shieldCheck', 22)}</div>
+                     <div class="empty-title">${escapeHtml(t(`所有 ${ignoredItems.length} 项检测到的冲突均已忽略`, `All ${ignoredItems.length} detected conflict(s) are ignored`))}</div>
+                     <div class="empty-sub">${escapeHtml(t('所有检测到的冲突均已忽略，可开启上方「显示已忽略」控件查看或恢复。', 'All detected conflicts are currently ignored. Enable "Show Ignored" above to view or restore them.'))}</div>
+                   </div>`
+                : `<div class="empty-state" style="border-color:var(--m-ok-border)">
+                     <div class="empty-icon" style="background:var(--m-ok-soft);border-color:var(--m-ok-border);color:var(--m-ok)">${icon('shieldCheck', 22)}</div>
+                     <div class="empty-title">${escapeHtml(t('未检测到插件冲突', 'No plugin conflicts detected'))}</div>
+                     <div class="empty-sub">${escapeHtml(t('当前未发现同名插件、符号链接、MCP 服务名或技能重名冲突。', 'No duplicate plugin names, symlinks, MCP collisions, or duplicate skills found.'))}</div>
+                   </div>`
       }
     </div>
   `;
@@ -11041,7 +11747,7 @@ function renderSourcesView() {
   return `
     <div class="main-scroll">
       <form id="sources-form" class="settings-panel">
-        <div class="field-card">
+        <div class="field-card field-card-wide">
           <div class="field-head">
             <div class="field-label">${icon('globe', 14)} ${escapeHtml(t('目录源与同步状态', 'Catalog Source & Sync Status'))}</div>
             <button type="button" class="btn btn-sm" data-action="refresh"${lockAttr}>
@@ -11119,7 +11825,7 @@ function renderSourcesView() {
           <textarea id="custom-feeds-textarea" class="text-input" rows="3" placeholder="https://plugins.internal.example/index.json">${escapeHtml(customLines)}</textarea>
         </div>
 
-        <div style="display:flex;align-items:center;gap:8px">
+        <div class="settings-actions-row">
           <button type="submit" class="btn btn-primary"${saveLockAttr}>${icon('check', 13)} ${escapeHtml(t('保存并重新同步目录', 'Save & Revalidate Catalog'))}</button>
         </div>
       </form>
@@ -12566,6 +13272,7 @@ function render() {
   lastRenderedTab = state.activeTab;
   bindDomEvents(root);
   setupLoadMoreObserver();
+  setupDiscoverChipStripControls();
   renderToast();
 
   const mainScrollEl = root.querySelector('.main-scroll');
@@ -12663,7 +13370,13 @@ function handleActionClick(el, e, root) {
     const nextTab = el.getAttribute('data-tab') || 'discover';
     const changed = nextTab !== state.activeTab;
     state.activeTab = nextTab;
-    if (changed) state.scrolledStuck = false;
+    if (changed) {
+      state.scrolledStuck = false;
+      clearBatchResultsAutoCloseTimer();
+      if (state.batchResultsAutoClose?.active) {
+        state.batchResultsAutoClose = { ...state.batchResultsAutoClose, active: false, paused: true };
+      }
+    }
     render();
     if (nextTab === 'installed' && Date.now() - lastForcedUpdatesAt > 10_000 && !isUpdateActionLocked()) {
       void checkUpdates(true, { silent: true });
@@ -12732,6 +13445,19 @@ function handleActionClick(el, e, root) {
       checkUpdates(true, { silent: false }),
       state.activeTab === 'conflicts' || state.conflicts.loaded ? loadConflicts({ silent: true }) : Promise.resolve(),
     ]);
+  } else if (action === 'scroll-chips') {
+    e.stopPropagation();
+    const strip = document.getElementById?.('discover-chip-strip');
+    if (!strip) return;
+    const dir = Number(el.getAttribute('data-dir') || 1) < 0 ? -1 : 1;
+    const step = Math.max(180, Math.round((strip.clientWidth || 280) * 0.65));
+    if (typeof strip.scrollBy === 'function') {
+      strip.scrollBy({ left: dir * step, behavior: 'smooth' });
+    } else {
+      strip.scrollLeft = (strip.scrollLeft || 0) + dir * step;
+    }
+    state.chipStripScrollLeft = strip.scrollLeft || 0;
+    syncChipStripOverflow();
   } else if (action === 'refresh-conflicts') {
     void loadConflicts({ silent: false });
   } else if (action === 'fix-conflict') {
@@ -12741,6 +13467,18 @@ function handleActionClick(el, e, root) {
     const suggestedDir = el.getAttribute('data-suggested-dir') || '';
     if (type && targetDir) {
       void triggerFixConflict({ type, targetDir, suggestedDir });
+    }
+  } else if (action === 'ignore-conflict') {
+    e.stopPropagation();
+    const conflictId = el.getAttribute('data-conflict-id') || '';
+    if (conflictId) {
+      void triggerIgnoreConflict(conflictId, true);
+    }
+  } else if (action === 'unignore-conflict') {
+    e.stopPropagation();
+    const conflictId = el.getAttribute('data-conflict-id') || '';
+    if (conflictId) {
+      void triggerIgnoreConflict(conflictId, false);
     }
   } else if (action === 'toggle-plugin') {
     e.stopPropagation();
@@ -12994,7 +13732,7 @@ function handleActionClick(el, e, root) {
     const id = el.getAttribute('data-id');
     if (id) void triggerUpdateAll([id], { confirmEscalation: false });
   } else if (action === 'clear-batch-results') {
-    state.batchResults = null;
+    dismissBatchResults();
     render();
   } else if (action === 'self-update') {
     e.stopPropagation();
@@ -13135,6 +13873,18 @@ function bindDelegatedEvents(root) {
     );
   }
 
+  root.addEventListener('mouseover', (e) => {
+    if (state.batchResultsAutoClose?.active && e.target?.closest?.('.batch-results')) {
+      pauseBatchResultsAutoClose();
+    }
+  });
+
+  root.addEventListener('focusin', (e) => {
+    if (state.batchResultsAutoClose?.active && e.target?.closest?.('.batch-results')) {
+      pauseBatchResultsAutoClose();
+    }
+  });
+
   root.addEventListener('click', (e) => {
     const path = [];
     for (let n = e.target; n && n !== root.parentNode; n = n.parentNode) {
@@ -13167,6 +13917,22 @@ function bindDelegatedEvents(root) {
       }
     }
   });
+
+  root.addEventListener(
+    'wheel',
+    (e) => {
+      const strip = e.target?.closest?.('#discover-chip-strip');
+      if (!strip) return;
+      if ((strip.scrollWidth || 0) <= (strip.clientWidth || 0) + 2) return;
+      if (Math.abs(e.deltaY || 0) > Math.abs(e.deltaX || 0)) {
+        e.preventDefault?.();
+        strip.scrollLeft = (strip.scrollLeft || 0) + e.deltaY;
+        state.chipStripScrollLeft = strip.scrollLeft || 0;
+        syncChipStripOverflow();
+      }
+    },
+    { passive: false },
+  );
 
   root.addEventListener('compositionstart', (e) => {
     const id = e.target?.id;
@@ -13260,6 +14026,10 @@ function bindDelegatedEvents(root) {
     } else if (id === 'uninstall-remove-favorite') {
       if (!state.removeConfirmModal) return;
       state.removeConfirmModal.removeFavorite = Boolean(target.checked);
+    } else if (id === 'show-ignored-conflicts-checkbox') {
+      state.showIgnoredConflicts = Boolean(target.checked);
+      writeStorage(SHOW_IGNORED_CONFLICTS_KEY, state.showIgnoredConflicts ? '1' : '0');
+      render();
     }
   });
 
