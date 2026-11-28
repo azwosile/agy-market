@@ -452,11 +452,10 @@
     byId('site-breadcrumb').textContent = hasCategory ? labelForCategory(category.value) : pages.find((item) => item.id === page).label;
     byId('catalog-title').textContent = hasCategory ? labelForCategory(category.value) : '全部插件';
     document.querySelector('.catalog-actions').hidden = !isCatalog;
+    document.querySelector('.hero-grid').hidden = page === 'settings';
     byId('catalog-heading').hidden = !isCatalog;
-    byId('site-stats').hidden = !isCatalog;
-    document.querySelector('.features-toggle').hidden = !isCatalog;
+    document.querySelector('.overview-meta-bar').hidden = !isCatalog;
     byId('catalog-page').hidden = !isCatalog;
-    byId('quick-install').hidden = page === 'settings';
     byId('settings-page').hidden = page !== 'settings';
     for (const item of pages) {
       if (item.id === page && !hasCategory) item.button.setAttribute('aria-current', 'page');
