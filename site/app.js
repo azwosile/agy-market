@@ -2,13 +2,23 @@
   'use strict';
 
   const BADGE_LABELS = {
-    'declarative-only': '纯声明式技能',
-    'global-rules': '常驻规则',
-    'sidecar-ui': 'Sidebar 侧边栏',
-    'mcp-stdio': '本地 MCP 进程',
-    'mcp-remote': '远程 MCP 服务',
-    'lifecycle-hooks': '生命周期钩子',
-    'host-enhancement': '宿主界面增强',
+    'declarative-only': '轻量技能包',
+    'global-rules': '全局规则',
+    'sidecar-ui': '独立面板',
+    'mcp-stdio': '本地工具',
+    'mcp-remote': '云端连接',
+    'lifecycle-hooks': '自动触发',
+    'host-enhancement': '外观增强',
+  };
+
+  const BADGE_TITLES = {
+    'declarative-only': '仅含提示词与工作流，无后台程序',
+    'global-rules': '对话时自动生效的规则指令',
+    'sidecar-ui': '在右侧边栏提供可视化界面',
+    'mcp-stdio': '在本地运行扩展工具供 AI 调用',
+    'mcp-remote': '连接远程在线服务或 API',
+    'lifecycle-hooks': '在特定操作时自动运行脚本',
+    'host-enhancement': '美化或增强编辑器界面',
   };
 
   const BADGE_ICONS = {
@@ -39,6 +49,65 @@
     other: '其他扩展',
   };
 
+  const CATEGORY_PURPOSES = {
+    'monitoring-quota': ['监控与用量', '帮助你查看 AI 的使用情况。'],
+    'context-cache': ['缓存与提速', '帮助 AI 管理对话内容，减少重复处理。'],
+    'ui-themes': ['界面美化', '调整编辑器的外观或显示方式。'],
+    'agents-reasoning': ['AI 协作', '调整 AI 助手处理任务的方式。'],
+    'developer-tools': ['代码工具', '辅助日常编写、检查或管理代码。'],
+    'mcp-integrations': ['连接外部软件', '让 AI 助手使用编辑器以外的工具。'],
+    'skills-workflows': ['效率工作流', '为 AI 提供可重复使用的任务步骤。'],
+    productivity: ['常用扩展', '简化编辑器里的日常操作。'],
+    'writing-knowledge': ['写作整理', '辅助写作、整理或查找资料。'],
+    automation: ['自动任务', '把重复操作交给工具自动完成。'],
+    security: ['安全检查', '帮助检查安全风险或管理权限。'],
+    'creative-media': ['多媒体设计', '辅助制作或编辑设计和多媒体素材。'],
+    'data-science': ['数据分析', '辅助整理、计算或分析数据。'],
+    'cloud-devops': ['云端部署', '辅助发布应用或管理运行环境。'],
+    other: ['常用扩展', '可在插件仓库查看具体用途。'],
+  };
+
+  // Match concrete features before falling back to the broader catalog category.
+  const PURPOSE_KEYWORDS = [
+    [/KaTeX|LaTeX.*(?:cop|复制)|数学公式/i, '让数学公式显示得更整齐，方便复制公式。'],
+    [/documentation lookup|version-specific documentation|最新(?:版本)?文档/i, '让 AI 查阅与你使用的版本相符的文档和代码示例。'],
+    [/KV[- ]?Cache.{0,12}(?:保护|protect)|低延迟加速/i, '保护 AI 对话中已处理的内容，减少重复计算，让回复更快。'],
+    [/RTL\/BiDi|Arabic.*(?:render|text)|阿拉伯语/i, '修正阿拉伯语和英语混排时的对齐与显示。'],
+    [/(?:ollama|deepseek|openai).{0,40}(?:task router|fallback)|外部大模型协同调度/i, '把不同的工作分配给多个 AI 模型处理。'],
+    [/model selector|原生模型下拉菜单/i, '把外部 AI 模型加入编辑器的模型列表，方便切换使用。'],
+    [/reasoning language|思考与推理语言/i, '切换 AI 思考时使用的语言，例如简体中文或英文。'],
+    [/convert designs to React|convert designs? into React/i, '把设计稿转换成可用于网页的 React 组件。'],
+    [/generate screens from text|convert code to designs/i, '用文字或代码生成界面设计稿。'],
+    [/extract static HTML|generate DESIGN\.md specs/i, '整理设计规范，并导出网页或素材。'],
+    [/remove AI writing patterns|AI-isms/i, '找出文字里常见的 AI 写作腔，并帮助改写。'],
+    [/skill vault|(?:search|install).{0,25}(?:update|install).{0,25}skills/i, '查找、安装和更新 AI 技能。'],
+    [/tabbed browser|built-in browser.*shared/i, '在编辑器侧栏打开网页，并与 AI 共用浏览器。'],
+    [/control desktop apps on Windows|Windows desktop apps/i, '让 AI 帮你操作 Windows 桌面软件。'],
+    [/animated desktop companion|desktop pet/i, '在桌面显示会动的宠物陪伴。'],
+    [/native multi-model fusion|unified orchestration across coding agents/i, '让多个 AI 编程助手一起处理任务。'],
+    [/batched search|用更少的回合找代码/i, '让 AI 更快地查找代码、读取和修改文件。'],
+    [/context window protection|context-window guard/i, '控制 AI 每次需要读取的内容，避免对话过长。'],
+    [/skill usage tracking|技能使用(?:统计|记录)/i, '查看 AI 使用了哪些技能，以及它们消耗了多少用量。'],
+    [/quota reset|usage.*reset|配额重置/i, '查看 AI 用了多少额度，以及额度何时恢复。'],
+    [/quota (?:view|track|monitor)|usage quotas?|token (?:usage monitor|breakdown|throughput)|配额(?:查询|监控)|用量监控/i, '查看 AI 的用量和剩余额度。'],
+    [/context (?:window|usage|estimate)|上下文(?:水位|占用)/i, '查看 AI 对话还剩多少空间可用。'],
+    [/wallpaper|壁纸/i, '为编辑器更换壁纸和外观。'],
+    [/marketplace sidebar|社区插件市场侧边栏/i, '从编辑器侧栏查找、安装和更新社区插件。'],
+    [/Bilateral Category Wheel|双侧分类轮盘/i, '用侧栏快捷切换分类、浏览文件层级并预览内容。'],
+    [/全文搜索.*(?:归档|续聊)|full.text search.*(?:session|archive)/i, '搜索、整理已有对话，并在不同项目中继续聊。'],
+    [/full.text search|全文(?:搜索|检索)/i, '按内容搜索已经保存的记录或资料。'],
+    [/browser automation|desktop and web automation|桌面与网页操控/i, '让 AI 帮你在网页或桌面软件中执行操作。'],
+    [/\bOCR\b|text recognition|文字识别/i, '从图片或扫描文件中识别文字。'],
+    [/\bschedul(?:e|ed|er|ing)\b|\bcron\b|定时(?:执行|任务)/i, '让指定任务按设定时间自动运行。'],
+    [/security audit|vulnerability scan|漏洞扫描/i, '检查项目中可能存在的安全问题。'],
+    [/auto.permission|permission classifier|自动授权/i, '帮助判断什么时候允许 AI 使用工具。'],
+    [/\blint(?:er|ing)?\b|code review|代码审查/i, '检查代码并指出可以修正的问题。'],
+    [/\b(?:git|github)\b.{0,24}\b(?:commit|branch|pull request)|版本管理/i, '辅助提交或管理代码改动。'],
+    [/marketing analytics|ad spend|广告投放分析/i, '查看广告花费、转化等投放数据。'],
+    [/image generation|generate images|生成图片/i, '帮助你用 AI 生成图片。'],
+    [/deploy(?:ment|s|ing)? (?:to |your |an )|部署到/i, '帮助你把应用发布到运行环境。'],
+  ];
+
   const byId = (id) => document.getElementById(id);
   const workspace = document.querySelector('.workspace');
   const mobile = matchMedia('(max-width: 760px)');
@@ -46,6 +115,12 @@
   const sidebarToggle = byId('sidebar-toggle');
   const canvas = document.querySelector('.canvas');
   const grid = byId('site-grid');
+  const pagination = byId('site-pagination');
+  const pageNumbers = byId('site-page-numbers');
+  const pageSizeSelect = byId('site-page-size');
+  const previousPage = byId('site-page-prev');
+  const nextPage = byId('site-page-next');
+  const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)');
   const search = byId('site-search');
   const category = byId('site-category');
   const discovery = byId('site-discovery-toggle');
@@ -66,6 +141,9 @@
   let activeFeedUrl;
   let plugins = [];
   let visiblePlugins = [];
+  let pagePlugins = [];
+  let pageSize = Number(pageSizeSelect.value);
+  let currentPage = 1;
   let paletteItems = [];
   let activeResult = -1;
   let view = 'grid';
@@ -183,6 +261,109 @@
     return Array.isArray(plugin.capabilities?.badges) ? plugin.capabilities.badges : [];
   }
 
+  function getPlainPurpose(plugin) {
+    const id = categoriesOf(plugin).find((key) => Object.hasOwn(CATEGORY_PURPOSES, key) && key !== 'other') || 'other';
+    const [label, fallback] = CATEGORY_PURPOSES[id];
+    const description = descriptionOf(plugin, true);
+    const authored = typeof plugin.description === 'object' && plugin.description
+      ? [plugin.description.zh, plugin.description.en]
+      : [description];
+    const chinese = authored.find((value) => typeof value === 'string' && /\p{Script=Han}{2}/u.test(value));
+    // Prefer a specific keyword match for English or technical descriptions.
+    const feature = PURPOSE_KEYWORDS.find(([pattern]) => pattern.test(description));
+    const simplified = chinese?.trim().replace(/\s+/g, ' ')
+      .replace(/^[^：:]{2,30}[：:]\s*/, '')
+      .replace(/\bAgent\b/gi, 'AI 助手')
+      .replace(/\bSidecar\b/gi, '侧边面板')
+      .replace(/\bTokens?\b(?:\s*用量)?/gi, '文字用量')
+      .replace(/对话上下文/g, '对话内容')
+      .replace(/上下文窗口/g, '对话容量')
+      .replace(/大模型/g, 'AI 模型')
+      .split(/[。！？；]/, 1)[0].trim().replace(/[.!?]+$/, '');
+    const shortChinese = simplified?.length > 64
+      ? simplified.slice(0, 65).match(/^.{8,63}(?=[，,、])/u)?.[0]
+      : simplified;
+    const capability = badgesOf(plugin).find((badge) => Object.hasOwn(BADGE_TITLES, badge));
+    const summary = feature?.[1] || (shortChinese && `${shortChinese}。`) ||
+      (id === 'other' && capability ? `${BADGE_TITLES[capability]}。` : fallback);
+    return { id, label, summary };
+  }
+
+  function renderPurpose(purpose) {
+    return `<span class="plugin-purpose"><span class="purpose-pill" title="用途">${purpose.label}</span><span class="purpose-summary">${escapeHtml(purpose.summary)}</span></span>`;
+  }
+
+  const PURPOSE_SCENES = {
+    'monitoring-quota': `
+      <rect class="scene-frame" x="15" y="14" width="150" height="42" rx="6"/>
+      <path class="scene-guide" d="M24 35h79m9-15v30"/>
+      <path class="scene-action" style="--scene-y:-3px" d="M24 36h16l6-7 7 16 10-23 8 14h27"/>
+      <g class="scene-action" style="--scene-scale-y:1.3;--scene-origin:bottom"><rect x="123" y="39" width="7" height="9" rx="1"/><rect x="135" y="32" width="7" height="16" rx="1"/><rect x="147" y="27" width="7" height="21" rx="1"/></g>
+      <circle class="scene-signal" cx="98" cy="36" r="2"/>`,
+    'context-cache': `
+      <path class="scene-guide" d="M59 20l27 11m-27 4h27m-27 15 27-11"/>
+      <g class="scene-action" style="--scene-x:9px;--scene-scale-y:.68"><rect x="23" y="15" width="32" height="10" rx="2"/><rect x="23" y="30" width="32" height="10" rx="2"/><rect x="23" y="45" width="32" height="10" rx="2"/></g>
+      <path d="M87 35h15m-4-4 4 4-4 4"/>
+      <rect class="scene-frame" x="110" y="19" width="48" height="32" rx="4"/><path d="M120 29h28m-28 6h28m-28 6h28"/>`,
+    'ui-themes': `
+      <rect class="scene-frame scene-action" style="--scene-x:5px;--scene-y:-3px" x="60" y="13" width="84" height="37" rx="4"/>
+      <rect class="scene-panel" x="36" y="23" width="84" height="35" rx="4"/>
+      <path d="M36 33h84m-66 0v25m9-16h32m-32 7h44"/><path class="scene-guide" d="M43 28h2m4 0h2m4 0h2"/>`,
+    'agents-reasoning': `
+      <path class="scene-guide" d="M41 35h38m20-4 27-11M99 39l27 11"/>
+      <circle class="scene-frame" cx="31" cy="35" r="9"/><circle class="scene-frame" cx="138" cy="17" r="9"/><circle class="scene-frame" cx="138" cy="53" r="9"/>
+      <circle class="scene-action" style="--scene-scale-x:1.28;--scene-scale-y:1.28" cx="90" cy="35" r="10"/>
+      <circle cx="31" cy="35" r="2"/><circle cx="90" cy="35" r="2"/><circle cx="138" cy="17" r="2"/><circle cx="138" cy="53" r="2"/>`,
+    'developer-tools': `
+      <path d="M32 22v26m0-6c20 0 22-4 22-20"/><circle cx="32" cy="17" r="4"/><circle cx="32" cy="53" r="4"/><circle cx="54" cy="17" r="4"/>
+      <rect class="scene-frame" x="77" y="15" width="79" height="40" rx="5"/>
+      <path class="scene-action" style="--scene-x:-4px" d="m105 29-7 6 7 6"/><path d="m120 27-7 16"/><path class="scene-action" style="--scene-x:4px" d="m128 29 7 6-7 6"/>`,
+    'mcp-integrations': `
+      <rect class="scene-frame" x="14" y="22" width="43" height="26" rx="4"/><path d="M23 31h19m-19 8h25m9-4h19"/>
+      <rect class="scene-frame" x="122" y="22" width="44" height="26" rx="4"/><path d="M122 30h44m-64 5h20"/>
+      <path class="scene-action" style="--scene-x:5px" d="M76 29h8a6 6 0 0 1 0 12h-8zM90 32h8m-8 6h8"/>
+      <path d="M102 28v14"/>`,
+    'skills-workflows': `
+      <path class="scene-guide" d="M55 35h21m28 0h21m-54-4 4 4-4 4m49-8 4 4-4 4"/>
+      <rect class="scene-frame" x="28" y="23" width="26" height="24" rx="4"/><rect class="scene-frame scene-action" style="--scene-y:-5px" x="77" y="23" width="26" height="24" rx="4"/><rect class="scene-frame" x="126" y="23" width="26" height="24" rx="4"/>
+      <path d="M37 35h8m89 0 4 4 7-8"/><path class="scene-action" style="--scene-y:-5px" d="M86 32h8m-8 6h8"/>`,
+    'writing-knowledge': `
+      <rect class="scene-frame" x="53" y="11" width="74" height="48" rx="4"/>
+      <path d="M63 25h34m-34 8h29m-29 8h50m-50 8h44"/>
+      <path class="scene-action" style="--scene-y:5px" d="M105 11v21l6-4 6 4V11"/>`,
+    automation: `
+      <path d="M55 42a36 22 0 0 1 66-15m-10-1 11 3 2-9m1 8a36 22 0 0 1-66 15m10 1-11-3-2 9"/>
+      <circle class="scene-frame" cx="90" cy="35" r="15"/>
+      <path d="M90 35V24"/><path class="scene-action" style="--scene-rotation:55deg;--scene-origin:90px 35px" d="M90 35h8"/>`,
+    security: `
+      <path class="scene-frame" d="M90 11c8 5 17 7 24 8v11c0 13-9 23-24 29-15-6-24-16-24-29V19c7-1 16-3 24-8Z"/>
+      <path d="m82 34 6 6 11-12"/><path class="scene-guide scene-action" style="--scene-y:18px" d="M56 25h68"/>`,
+    'creative-media': `
+      <rect class="scene-frame" x="29" y="15" width="122" height="40" rx="5"/>
+      <circle cx="61" cy="27" r="4"/><path class="scene-guide" d="m40 48 26-13 20 13"/>
+      <path class="scene-action" style="--scene-y:-4px;--scene-scale-y:1.18" d="M39 44c11 4 20 1 31-2s23-12 34-8 21 12 37 8"/>`,
+    'data-science': `
+      <path class="scene-guide" d="M31 15v41h118M44 41h99M44 27h99"/>
+      <g class="scene-action" style="--scene-scale-y:1.24;--scene-origin:bottom"><rect x="50" y="44" width="12" height="12" rx="1"/><rect x="75" y="38" width="12" height="18" rx="1"/><rect x="100" y="33" width="12" height="23" rx="1"/><rect x="125" y="26" width="12" height="30" rx="1"/></g>`,
+    'cloud-devops': `
+      <rect class="scene-frame" x="29" y="18" width="70" height="14" rx="3"/><rect class="scene-frame" x="29" y="38" width="70" height="14" rx="3"/>
+      <path d="M38 25h3m5 0h3m-11 20h3m5 0h3m56-10h10"/>
+      <path class="scene-action" style="--scene-y:-6px" d="M137 46V21m-10 10 10-10 10 10"/>`,
+    productivity: `
+      <rect class="scene-frame" x="29" y="19" width="122" height="34" rx="6"/>
+      <rect x="39" y="26" width="21" height="20" rx="3"/><rect class="scene-panel scene-action" style="--scene-y:-6px" x="79" y="26" width="22" height="20" rx="3"/><rect x="120" y="26" width="21" height="20" rx="3"/>
+      <path d="M46 36h7m77-4v8"/><path class="scene-action" style="--scene-y:-6px" d="m91 31-4 6h6l-4 4"/>`,
+    other: `
+      <path class="scene-guide" d="M53 35h20m34 0h20"/>
+      <rect class="scene-frame" x="28" y="22" width="25" height="26" rx="4"/><rect class="scene-frame" x="127" y="22" width="25" height="26" rx="4"/>
+      <rect class="scene-frame scene-action" style="--scene-y:-5px;--scene-rotation:9deg" x="77" y="22" width="26" height="26" rx="4"/>
+      <path class="scene-action" style="--scene-y:-5px;--scene-rotation:9deg" d="M86 35h8m-4-4v8"/>`,
+  };
+
+  function renderScene({ id }, className) {
+    return `<span class="${className}"><svg viewBox="0 0 180 70" aria-hidden="true">${PURPOSE_SCENES[id]}</svg></span>`;
+  }
+
   function labelForCategory(id) {
     return Object.hasOwn(CATEGORY_LABELS, id) ? CATEGORY_LABELS[id] : id;
   }
@@ -208,7 +389,7 @@
     if (!query) return true;
     const fields = [
       titleOf(plugin), plugin.canonicalName, plugin.id, plugin.scopedName, descriptionOf(plugin, true),
-      ...categoriesOf(plugin).flatMap((id) => [id, labelForCategory(id)]),
+      ...categoriesOf(plugin).flatMap((id) => [id, labelForCategory(id), Object.hasOwn(CATEGORY_PURPOSES, id) ? CATEGORY_PURPOSES[id][0] : '']),
       ...badgesOf(plugin).flatMap((id) => [id, labelForBadge(id)]),
       ...(Array.isArray(plugin.taxonomy?.tags) ? plugin.taxonomy.tags : []),
     ];
@@ -271,7 +452,7 @@
 
   function renderBadges(plugin, limit) {
     const badges = badgesOf(plugin).slice(0, limit ?? Infinity);
-    const tags = badges.map((id) => `<span class="badge">${icon(badgeIcon(id))}${escapeHtml(labelForBadge(id))}</span>`);
+    const tags = badges.map((id) => `<span class="badge"${Object.hasOwn(BADGE_TITLES, id) ? ` title="${BADGE_TITLES[id]}"` : ''}>${icon(badgeIcon(id))}${escapeHtml(labelForBadge(id))}</span>`);
     if (plugin.isDiscovery) tags.unshift(renderDiscoveryTag());
     return tags.length ? `<span class="badges">${tags.join('')}</span>` : '';
   }
@@ -285,8 +466,21 @@
     return `<span class="star-count" aria-label="${stars} 个星标">${icon('star')}<span>${stars}</span></span>`;
   }
 
-  function categoryLabelFor(plugin) {
-    return escapeHtml(categoriesOf(plugin).map(labelForCategory).join(' / ') || '—');
+  function renderPagination(totalPages) {
+    pagination.hidden = !visiblePlugins.length;
+    if (pagination.hidden) return;
+    previousPage.disabled = currentPage === 1;
+    nextPage.disabled = currentPage === totalPages;
+    byId('site-page-status').textContent = `第 ${currentPage} / ${totalPages} 页 · 共 ${visiblePlugins.length} 款`;
+
+    const start = Math.max(2, Math.min(currentPage - 1, totalPages - 3));
+    const pages = totalPages > 1 ? [1] : [currentPage];
+    for (let i = start; i <= Math.min(start + 2, totalPages - 1); i++) pages.push(i);
+    if (totalPages > 1) pages.push(totalPages);
+    pageNumbers.innerHTML = pages.map((number, index) => `
+      ${index && number - pages[index - 1] > 1 ? '<span aria-hidden="true">…</span>' : ''}
+      <button type="button" data-page-number="${number}" aria-label="第 ${number} 页"${number === currentPage ? ' aria-current="page"' : ''}>${number}</button>`
+    ).join('');
   }
 
   function renderGrid(animate = false) {
@@ -298,9 +492,18 @@
     byId('catalog-count').textContent = visiblePlugins.length === plugins.length
       ? `${plugins.length} 款`
       : `${visiblePlugins.length} / ${plugins.length} 款`;
+    renderResults(animate);
+  }
+
+  function renderResults(animate = false) {
+    const totalPages = Math.max(1, Math.ceil(visiblePlugins.length / pageSize));
+    currentPage = Math.min(currentPage, totalPages);
+    const offset = (currentPage - 1) * pageSize;
+    pagePlugins = visiblePlugins.slice(offset, offset + pageSize);
+    renderPagination(totalPages);
     grid.className = view === 'grid' ? 'grid' : 'table-wrap';
 
-    if (!visiblePlugins.length) {
+    if (!pagePlugins.length) {
       if (feedStatus === 'loading') grid.innerHTML = '<p class="empty">正在同步目录…</p>';
       else if (feedStatus === 'error' && !plugins.length) grid.innerHTML = '<p class="empty">无法连接目录。<button type="button" class="settings-link" data-settings>打开目录设置</button></p>';
       else grid.innerHTML = `<p class="empty empty-results" role="status">${icon('empty')}${plugins.length ? '没有匹配的插件。' : '该目录暂无插件。'}</p>`;
@@ -308,25 +511,41 @@
     }
 
     if (view === 'table') {
-      const rows = visiblePlugins.map((plugin, index) => `
+      const rows = pagePlugins.map((plugin, index) => `
         <tr data-plugin="${index}">
-          <td><button type="button" class="table-title" aria-haspopup="dialog">${renderMark(plugin)}${escapeHtml(titleOf(plugin))}${plugin.isDiscovery ? renderDiscoveryTag() : ''}${icon('chevron-right', 'card-arrow')}</button></td>
-          <td>${categoryLabelFor(plugin)}</td>
+          <td><button type="button" class="table-title" aria-haspopup="dialog">${renderMark(plugin)}${escapeHtml(titleOf(plugin))}${plugin.isDiscovery ? renderDiscoveryTag() : ''}${icon('chevron-right', 'card-arrow')}</button>
+            ${renderPurpose(getPlainPurpose(plugin))}</td>
           <td class="table-version">${plugin.version ? `v${escapeHtml(plugin.version)}` : '—'}</td>
           <td>${renderStars(plugin)}</td>
         </tr>`).join('');
-      grid.innerHTML = `<table class="table" aria-label="插件目录"><thead><tr><th scope="col">插件</th><th scope="col">分类</th><th scope="col">版本</th><th scope="col">星标</th></tr></thead><tbody>${rows}</tbody></table>`;
+      grid.innerHTML = `<table class="table" aria-label="插件目录"><thead><tr><th scope="col">插件</th><th scope="col">版本</th><th scope="col">星标</th></tr></thead><tbody>${rows}</tbody></table>`;
       return;
     }
 
-    grid.innerHTML = visiblePlugins.map((plugin, index) => `
-      <button type="button" class="card${animate && index < 12 ? ' entering' : ''}" data-plugin="${index}" aria-haspopup="dialog"${animate && index < 12 ? ` style="--enter-delay:${Math.min(index, 6) * 25}ms"` : ''}>
-        <span class="card-top">${renderMark(plugin)}${icon('chevron-right', 'card-arrow')}</span>
-        <span class="card-title">${escapeHtml(titleOf(plugin))}</span>
-        <span class="card-description">${escapeHtml(descriptionOf(plugin))}</span>
+    grid.innerHTML = pagePlugins.map((plugin, index) => {
+      const purpose = getPlainPurpose(plugin);
+      return `
+      <button type="button" class="card${animate ? ' entering' : ''}" data-plugin="${index}" aria-haspopup="dialog"${animate ? ` style="--enter-delay:${Math.min(index, 7) * 18}ms"` : ''}>
+        ${renderScene(purpose, 'card-scene')}
+        <span class="card-top"><span class="card-title">${escapeHtml(titleOf(plugin))}</span>${icon('chevron-right', 'card-arrow')}</span>
+        ${renderPurpose(purpose)}
         ${renderBadges(plugin, 3)}
-        <span class="card-bottom"><span>${categoryLabelFor(plugin)}</span>${renderStars(plugin)}</span>
-      </button>`).join('');
+        <span class="card-bottom">${renderStars(plugin)}</span>
+      </button>`;
+    }).join('');
+  }
+
+  function changePage(next) {
+    if (next === currentPage || next < 1 || next > Math.ceil(visiblePlugins.length / pageSize)) return;
+    currentPage = next;
+    renderResults(true);
+    byId('catalog-title').focus({ preventScroll: true });
+    byId('catalog-page').scrollIntoView({ block: 'start', behavior: reduceMotion.matches ? 'instant' : 'smooth' });
+  }
+
+  function resetResults() {
+    currentPage = 1;
+    renderGrid();
   }
 
   const DEFAULT_PAGES_FEED_URL = 'https://azwosile.github.io/agy-market-catalog/index.json';
@@ -360,6 +579,7 @@
 
   function renderCatalog(items, animate = false) {
     plugins = items;
+    currentPage = 1;
     byId('stat-total').textContent = activeFeedUrl ? `${items.length} 款` : '—';
     renderCategories();
     renderNavigation();
@@ -448,6 +668,8 @@
   }
 
   function openPeek(plugin) {
+    const purpose = getPlainPurpose(plugin);
+    const description = descriptionOf(plugin).trim();
     const repoUrl = String(plugin.repository?.url || '').trim();
     const repo = isSafeUrl(repoUrl) ? new URL(repoUrl) : null;
     const github = repo?.hostname.toLowerCase() === 'github.com' && !repo.username && !repo.password && !repo.port;
@@ -458,10 +680,11 @@
       ? `npx --yes github:azwosile/agy-market add ${repoUrl}`
       : '';
     byId('peek-content').innerHTML = `
-      ${renderMark(plugin)}
+      ${renderScene(purpose, 'peek-scene')}
       <h2 id="peek-title">${escapeHtml(titleOf(plugin))}</h2>
+      ${renderPurpose(purpose)}
       <p class="peek-meta">${plugin.version ? `v${escapeHtml(plugin.version)} · ` : ''}${renderStars(plugin)}</p>
-      <p class="peek-desc">${escapeHtml(descriptionOf(plugin) || '暂无简介。')}</p>
+      ${description && description !== purpose.summary ? `<p class="peek-desc">${escapeHtml(description)}</p>` : ''}
       ${renderBadges(plugin)}
       ${repo ? `<div class="peek-links">
         <a href="${escapeHtml(repo.href)}" target="_blank" rel="noopener noreferrer">${icon(github ? 'github' : 'link')}${github ? 'GitHub 仓库' : '源码仓库'}${icon('external', 'peek-link-external')}</a>
@@ -497,7 +720,7 @@
       search.value = '';
     }
     renderNavigation();
-    if (page === 'catalog') renderGrid();
+    if (page === 'catalog') resetResults();
     if (page === 'catalog' && nextCategory !== 'all') {
       byId('catalog-title').focus({ preventScroll: true });
       byId('catalog-page').scrollIntoView({ block: 'start' });
@@ -618,13 +841,26 @@
     const item = event.target.closest('[data-category]');
     if (item) showPage('catalog', item.dataset.category);
   });
-  search.addEventListener('input', () => renderGrid());
-  discovery.addEventListener('change', () => void syncDiscovery());
+  search.addEventListener('input', resetResults);
+  discovery.addEventListener('change', () => {
+    resetResults();
+    void syncDiscovery(true);
+  });
   category.addEventListener('change', () => {
     renderNavigation();
-    renderGrid();
+    resetResults();
   });
-  sort.addEventListener('change', () => renderGrid());
+  sort.addEventListener('change', resetResults);
+  pageSizeSelect.addEventListener('change', () => {
+    pageSize = Number(pageSizeSelect.value);
+    resetResults();
+  });
+  previousPage.addEventListener('click', () => changePage(currentPage - 1));
+  nextPage.addEventListener('click', () => changePage(currentPage + 1));
+  pageNumbers.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-page-number]');
+    if (button) changePage(Number(button.dataset.pageNumber));
+  });
   byId('site-feed-form').addEventListener('submit', (event) => {
     event.preventDefault();
     void fetchCatalog();
@@ -634,7 +870,7 @@
     if (item) {
       const rowButton = item.querySelector('button');
       if (rowButton) rowButton.focus({ preventScroll: true });
-      openPeek(visiblePlugins[Number(item.dataset.plugin)]);
+      openPeek(pagePlugins[Number(item.dataset.plugin)]);
     } else if (event.target.closest('[data-settings]')) {
       showPage('settings');
     }
@@ -644,7 +880,7 @@
       if (view === button.dataset.view) return;
       view = button.dataset.view;
       setPressed(button, index);
-      renderGrid(true);
+      renderResults(true);
     });
   });
 

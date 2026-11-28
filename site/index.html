@@ -203,6 +203,24 @@
           </div>
           <p id="discovery-status" class="discovery-status" role="status"></p>
           <div id="site-grid" class="grid" aria-busy="true"><p class="empty">正在同步目录…</p></div>
+          <nav id="site-pagination" class="pagination" aria-label="插件目录分页" hidden>
+            <div class="pagination-controls">
+              <button id="site-page-prev" type="button">上一页</button>
+              <div id="site-page-numbers" class="pagination-numbers"></div>
+              <button id="site-page-next" type="button">下一页</button>
+            </div>
+            <div class="pagination-details">
+              <p id="site-page-status" role="status"></p>
+              <label class="select-control">
+                <select id="site-page-size" aria-label="每页插件数量">
+                  <option value="12">每页 12 款</option>
+                  <option value="24" selected>每页 24 款</option>
+                  <option value="48">每页 48 款</option>
+                </select>
+                <svg class="icon select-chevron" viewBox="0 0 20 20" aria-hidden="true"><use href="#icon-chevron-down"/></svg>
+              </label>
+            </div>
+          </nav>
         </section>
 
         <section id="settings-page" class="settings" aria-labelledby="settings-heading" hidden>
