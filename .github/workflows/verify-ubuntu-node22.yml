@@ -1,0 +1,46 @@
+name: Verify AGY Market 2.0.0 on Ubuntu and Node 22
+on:
+  push:
+    branches: [codex/verify-ubuntu-node22-7cab75b]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: agy-market
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 7cab75bf91228dd320e5a44ad4edd9f85abf22f6
+          path: agy-market
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: azwosile/agy-market-catalog
+          ref: ad616095e94b38584d1f7cc25920303399073438
+          path: agy-market-catalog
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Record runner and revisions
+        run: |
+          cat /etc/os-release
+          node --version
+          git rev-parse HEAD
+          git -C ../agy-market-catalog rev-parse HEAD
+      - name: Build sidecar UI and static site
+        run: node scripts/build.mjs --site
+      - name: Run unit and integration tests
+        run: node --test test/*.test.mjs
+      - name: Pack and verify release archive
+        run: |
+          node scripts/pack-release.mjs
+          cd dist
+          sha256sum -c agy-market.tar.gz.sha256
+          cat agy-market.tar.gz.sha256
